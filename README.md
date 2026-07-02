@@ -70,6 +70,7 @@ and copies hide under GPU compute.
 | Linear layer-swap cycle | [`src/swap`](src/swap) |
 | Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) |
 | PagedAttention block-paged KV cache | [`src/cache`](src/cache) |
+| `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
 The GPU-specific paths are behind `cuda` / `rocm`
@@ -105,17 +106,25 @@ cargo build            # debug build
 cargo build --release  # optimized build
 ```
 
-Run the demonstration binary. With no arguments it profiles a representative
+The binary exposes two subcommands:
+
+```bash
+cargo run -- --help          # top-level help
+cargo run -- profile         # profile a sample 70B-class model (no GPU needed)
+cargo run -- serve --help    # full serve flag list (specs §4)
+```
+
+**`profile`** — with no `--model-path` it profiles a representative
 Llama-3-70B-class model against a simulated 16 GB card:
 
 ```bash
-cargo run
+cargo run -- profile
 ```
 
 Example output:
 
 ```
-flip v0.1.0 — Phase 1 (Local Foundation)
+flip v0.1.0
   gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
@@ -136,12 +145,9 @@ free VRAM    : simulated 16 GiB (no GPU device)
   ▶ resident       :      36.2%
 ──────────────────────────────────────────────
 
+kv cache     : 512 paged blocks × 16 tok, 5.00 MiB/block → 8192 token capacity
 swap cycle   : 3 streaming pass(es), window of 29 layer(s)
-  ...
 pipeline     : 4 steps, 2 overlapped (DMA hidden under compute)
-  A:compute —              | B:prefetch p0 → [A]
-  A:compute p0 [A]         | B:prefetch p1 → [B]
-  ...
 ```
 
 Point it at a real model directory (containing `config.json` and
@@ -149,11 +155,21 @@ Point it at a real model directory (containing `config.json` and
 layer sizes:
 
 ```bash
-cargo run -- /path/to/models/Llama-3-70B-Instruct
+cargo run -- profile --model-path /path/to/models/Llama-3-70B-Instruct
 ```
 
-The storage engine will memory-map the shards, build the layer catalog, and the
-profiler will use real per-block byte sizes plus the true Pinned Zone cost.
+**`serve`** — resolves the full serving configuration (specs §4) and runs the
+planning pipeline. The OpenAI-compatible server loop itself is a later milestone;
+today this validates the config and prepares the engine end-to-end:
+
+```bash
+cargo run -- serve \
+    --model-path /path/to/models/Llama-3-70B-Instruct \
+    --vram-budget-gb 13.5 \
+    --context-length 8192 \
+    --port 8000 \
+    --host 127.0.0.1
+```
 
 ## Running the tests
 
@@ -197,7 +213,8 @@ slot, and never more than the model has.
 ```
 src/
 ├── lib.rs            # crate root & public API re-exports
-├── main.rs           # demonstration binary
+├── main.rs           # CLI entry point (serve / profile dispatch)
+├── cli.rs            # clap argument definitions
 ├── error.rs          # unified FlipError / Result
 ├── model/            # config.json parsing, quant schemes, tensor naming
 ├── storage/          # mmap engine, safetensors parser, layer catalog
