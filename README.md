@@ -52,13 +52,14 @@ ability to run models many times larger than the card.
 The data path for a streamed layer:
 
 ```
-mmap weights ──► pinned staging buffer ──► streaming-zone buffer ──► compute
-   (NVMe)         (page-locked host)          (VRAM)
+mmap weights ──► CPU-RAM cache ──► pinned staging buffer ──► streaming-zone buffer ──► compute
+   (NVMe)         (hot layers)       (page-locked host)          (VRAM)
 ```
 
-Memory-mapping skips the OS read-buffer copy; the page-locked (pinned) host
-buffer lets the PCIe controller DMA straight to VRAM asynchronously, so disk I/O
-and copies hide under GPU compute.
+Memory-mapping skips the OS read-buffer copy; the tiered CPU-RAM cache keeps hot
+layers resident across token steps so they skip the disk read; and the
+page-locked (pinned) host buffer lets the PCIe controller DMA straight to VRAM
+asynchronously, so disk I/O and copies hide under GPU compute.
 
 ## Components
 
@@ -73,7 +74,8 @@ and copies hide under GPU compute.
 | Page-locked host staging buffers | [`src/memory`](src/memory) |
 | Linear layer-swap cycle | [`src/swap`](src/swap) |
 | Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) |
-| PagedAttention block-paged KV cache | [`src/cache`](src/cache) |
+| PagedAttention block-paged KV cache | [`src/cache/paged.rs`](src/cache/paged.rs) |
+| Tiered CPU-RAM LRU layer cache | [`src/cache/ram.rs`](src/cache/ram.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
@@ -171,9 +173,14 @@ cargo run -- serve \
     --model-path /path/to/models/Llama-3-70B-Instruct \
     --vram-budget-gb 13.5 \
     --context-length 8192 \
+    --ram-cache-gb 32 \
     --port 8000 \
     --host 127.0.0.1
 ```
+
+`--ram-cache-gb` sizes the tiered CPU-RAM layer cache. When set, `serve` runs two
+forward passes and reports the cache hit rate, showing how hot layers are served
+from RAM on the second pass instead of being re-read from NVMe.
 
 ## Running the tests
 
@@ -226,7 +233,7 @@ src/
 ├── memory/           # page-size discovery + page-locked staging buffers
 ├── swap/             # linear layer-swap cycle (windows over the model)
 ├── pipeline/         # double-buffered A/B schedule + host executor
-├── cache/            # PagedAttention block-paged KV cache
+├── cache/            # PagedAttention KV cache + tiered CPU-RAM layer cache
 └── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
 tests/
 └── phase1.rs         # integration tests
