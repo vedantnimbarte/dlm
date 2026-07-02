@@ -15,7 +15,7 @@ pub mod swap;
 pub use error::{FlipError, Result};
 pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};
-pub use pipeline::{DoubleBufferSchedule, HostPipeline, PipelineStep};
+pub use pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, PipelineStep};
 pub use profiler::{VramPlan, VramProfiler};
 pub use storage::{LayerCatalog, MmapShard, MmapStore};
 pub use swap::{LayerSwapPlan, StreamPass};

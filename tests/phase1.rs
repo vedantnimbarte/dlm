@@ -7,7 +7,9 @@
 
 use flip::memory::{page_size, PinKind, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
-use flip::pipeline::{fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, WeightSource};
+use flip::pipeline::{
+    fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, MmapWeightSource, WeightSource,
+};
 use flip::profiler::VramProfiler;
 use flip::storage::{LayerCatalog, MmapStore};
 use flip::swap::{LayerSwapPlan, StreamPass};
@@ -325,6 +327,92 @@ fn host_pipeline_computes_each_window_over_intact_data() {
         assert_eq!(t.byte_len, expected.len());
         assert_eq!(t.checksum, fold_checksum(&expected));
     }
+}
+
+/// Like `write_multi_tensor`, but fills each tensor with a byte pattern unique
+/// to its position so a mis-copied window is detectable by checksum.
+fn write_patterned_model(dir: &std::path::Path, tensors: &[(&str, usize)]) {
+    let mut entries = Vec::new();
+    let mut data: Vec<u8> = Vec::new();
+    let mut offset = 0usize;
+    for (i, (name, len)) in tensors.iter().enumerate() {
+        entries.push(format!(
+            r#""{name}":{{"dtype":"U8","shape":[{len}],"data_offsets":[{offset},{}]}}"#,
+            offset + len
+        ));
+        data.extend(std::iter::repeat((i as u8).wrapping_add(1)).take(*len));
+        offset += len;
+    }
+    let header = format!("{{{}}}", entries.join(","));
+    let path = dir.join("model-00001-of-00001.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(header.as_bytes()).unwrap();
+    f.write_all(&data).unwrap();
+    f.flush().unwrap();
+}
+
+#[test]
+fn mmap_source_streams_real_weights_through_pipeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_patterned_model(
+        tmp.path(),
+        &[
+            ("model.embed_tokens.weight", 40),
+            ("model.layers.0.attn.weight", 100),
+            ("model.layers.0.mlp.weight", 60), // layer 0 = 160 bytes
+            ("model.layers.1.attn.weight", 100),
+            ("model.layers.1.mlp.weight", 60), // layer 1 = 160 bytes
+            ("model.layers.2.attn.weight", 100),
+            ("model.layers.2.mlp.weight", 60), // layer 2 = 160 bytes
+            ("lm_head.weight", 40),
+        ],
+    );
+
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let catalog = LayerCatalog::build(&store);
+    assert_eq!(catalog.num_layers(), 3);
+    assert_eq!(catalog.max_layer_bytes(), 160);
+
+    // Window of 2 layers over 3 → 2 passes (layers 0-1, then 2).
+    let vram = flip::profiler::VramPlan {
+        free_bytes: 0,
+        safety_bytes: 0,
+        kv_total_bytes: 0,
+        pinned_bytes: 0,
+        per_layer_weight_bytes: 160,
+        usable_bytes: 0,
+        layers_to_load: 2,
+        num_layers: 3,
+    };
+    let swap = LayerSwapPlan::from_plan(&vram);
+    assert_eq!(swap.num_passes(), 2);
+
+    let sched = DoubleBufferSchedule::from_swap_plan(&swap);
+    let source = MmapWeightSource::new(&store, &catalog);
+
+    // Verify the source concatenates the real mapped bytes for pass 0.
+    let pass0 = swap.passes[0];
+    let mut expected0 = Vec::new();
+    expected0.extend_from_slice(store.tensor_bytes("model.layers.0.attn.weight").unwrap());
+    expected0.extend_from_slice(store.tensor_bytes("model.layers.0.mlp.weight").unwrap());
+    expected0.extend_from_slice(store.tensor_bytes("model.layers.1.attn.weight").unwrap());
+    expected0.extend_from_slice(store.tensor_bytes("model.layers.1.mlp.weight").unwrap());
+    assert_eq!(source.load_window(&pass0).unwrap(), expected0);
+    assert_eq!(source.window_bytes(&pass0), 320);
+
+    // Run the double-buffered pipeline over the real weights.
+    let mut pipeline = HostPipeline::new(320).unwrap();
+    let trace = pipeline.execute(&sched, &source).unwrap();
+
+    assert_eq!(trace.len(), 2);
+    for (i, t) in trace.iter().enumerate() {
+        let window = source.load_window(&swap.passes[i]).unwrap();
+        assert_eq!(t.byte_len, window.len());
+        assert_eq!(t.checksum, fold_checksum(&window));
+    }
+    // Windows carry different data, so their checksums must differ.
+    assert_ne!(trace[0].checksum, trace[1].checksum);
 }
 
 #[test]

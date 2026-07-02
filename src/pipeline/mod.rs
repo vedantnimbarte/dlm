@@ -16,9 +16,11 @@
 
 pub mod buffer;
 pub mod schedule;
+pub mod source;
 
 pub use buffer::{BufferId, DeviceBuffer};
 pub use schedule::{DoubleBufferSchedule, PipelineStep};
+pub use source::MmapWeightSource;
 
 use crate::error::Result;
 use crate::memory::PinnedBuffer;
