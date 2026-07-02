@@ -23,6 +23,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Profile a model and print the VRAM plan + streaming schedule (no server).
     Profile(ProfileArgs),
+    /// Run the end-to-end CPU generation loop on a synthetic model (demo).
+    Generate(GenerateArgs),
 }
 
 /// Distributed operating mode (`--distributed-mode`).
@@ -131,6 +133,55 @@ pub struct ProfileArgs {
     pub ram_cache_gb: Option<f64>,
 }
 
+/// Arguments for `flip generate`.
+///
+/// Runs the real CPU generation loop over a **randomly-initialized** synthetic
+/// model to exercise the full pipeline end-to-end. Weights are not trained, so
+/// output token ids are deterministic-but-meaningless — this validates the
+/// machinery, not model quality.
+#[derive(Debug, Args)]
+pub struct GenerateArgs {
+    /// Prompt as comma-separated token ids (no tokenizer yet).
+    #[arg(long, value_delimiter = ',', default_value = "1")]
+    pub prompt: Vec<u32>,
+
+    /// Number of new tokens to generate.
+    #[arg(long, default_value_t = 16)]
+    pub max_new_tokens: usize,
+
+    /// Stop when this token id is produced.
+    #[arg(long)]
+    pub eos_token: Option<u32>,
+
+    /// Vocabulary size.
+    #[arg(long, default_value_t = 32)]
+    pub vocab_size: usize,
+
+    /// Residual-stream width (`d_model`).
+    #[arg(long, default_value_t = 64)]
+    pub hidden_size: usize,
+
+    /// Number of transformer layers.
+    #[arg(long, default_value_t = 2)]
+    pub num_layers: u32,
+
+    /// Query attention heads (must divide `hidden_size`).
+    #[arg(long, default_value_t = 4)]
+    pub num_heads: usize,
+
+    /// Key/value heads (must divide `num_heads`).
+    #[arg(long, default_value_t = 2)]
+    pub num_kv_heads: usize,
+
+    /// FFN inner width.
+    #[arg(long, default_value_t = 128)]
+    pub intermediate_size: usize,
+
+    /// PRNG seed for the synthetic weights.
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +265,21 @@ mod tests {
         assert_eq!(QuantArg::Int4.to_scheme(), QuantScheme::Int4);
         assert_eq!(QuantArg::Int8.to_scheme(), QuantScheme::Int8);
         assert_eq!(QuantArg::Fp16.to_scheme(), QuantScheme::Fp16);
+    }
+
+    #[test]
+    fn generate_parses_prompt_and_defaults() {
+        let cli = Cli::try_parse_from(["flip", "generate", "--prompt", "1,2,3", "--seed", "42"])
+            .unwrap();
+        let Command::Generate(a) = cli.command else {
+            panic!("expected generate");
+        };
+        assert_eq!(a.prompt, vec![1, 2, 3]);
+        assert_eq!(a.seed, 42);
+        assert_eq!(a.max_new_tokens, 16);
+        assert_eq!(a.vocab_size, 32);
+        assert_eq!(a.num_heads, 4);
+        assert!(a.eos_token.is_none());
     }
 
     #[test]

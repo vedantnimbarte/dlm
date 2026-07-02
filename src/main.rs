@@ -9,14 +9,16 @@
 
 use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
-use flip::cli::{Cli, Command, ProfileArgs, ServeArgs};
+use flip::cli::{Cli, Command, GenerateArgs, ProfileArgs, ServeArgs};
+use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
+use flip::generate::{GenerationConfig, Generator, Sampler};
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, TieredWeightSource};
 use flip::profiler::{VramPlan, VramProfiler};
 use flip::storage::{LayerCatalog, MmapStore};
 use flip::swap::LayerSwapPlan;
-use flip::{gpu, Result};
+use flip::{gpu, FlipError, Result};
 use std::path::Path;
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -26,7 +28,148 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Profile(args) => run_profile(args),
         Command::Serve(args) => run_serve(args),
+        Command::Generate(args) => run_generate(args),
     }
+}
+
+/// Deterministic SplitMix64 PRNG for synthetic weights (no external deps).
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A small weight in roughly [-scale, scale).
+    fn weight(&mut self, scale: f32) -> f32 {
+        let unit = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
+        (unit * 2.0 - 1.0) * scale
+    }
+
+    fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| self.weight(scale)).collect()
+    }
+}
+
+/// `flip generate` — end-to-end CPU generation over a synthetic random model.
+fn run_generate(args: GenerateArgs) -> Result<()> {
+    println!("flip v{}", env!("CARGO_PKG_VERSION"));
+    println!("  gpu backend  : {}", gpu::active_vendor().label());
+    println!();
+
+    if args.hidden_size == 0 || args.num_heads == 0 || args.num_kv_heads == 0 {
+        return Err(FlipError::InvalidConfig("dimensions must be > 0".into()));
+    }
+    if args.hidden_size % args.num_heads != 0 {
+        return Err(FlipError::InvalidConfig(format!(
+            "hidden_size ({}) not divisible by num_heads ({})",
+            args.hidden_size, args.num_heads
+        )));
+    }
+    if args.num_heads % args.num_kv_heads != 0 {
+        return Err(FlipError::InvalidConfig(format!(
+            "num_heads ({}) not divisible by num_kv_heads ({})",
+            args.num_heads, args.num_kv_heads
+        )));
+    }
+    if let Some(&max) = args.prompt.iter().max() {
+        if (max as usize) >= args.vocab_size {
+            return Err(FlipError::InvalidConfig(format!(
+                "prompt token {max} out of vocab range {}",
+                args.vocab_size
+            )));
+        }
+    }
+
+    let head_dim = args.hidden_size / args.num_heads;
+    let cfg = BlockConfig {
+        hidden_size: args.hidden_size,
+        num_heads: args.num_heads,
+        num_kv_heads: args.num_kv_heads,
+        head_dim,
+        intermediate_size: args.intermediate_size,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+    };
+
+    // Synthesize small random weights (RMSNorm keeps activations bounded).
+    let scale = 0.02;
+    let mut rng = Rng::new(args.seed);
+    let layers: Vec<LayerTensors> = (0..args.num_layers)
+        .map(|_| LayerTensors {
+            q_proj: rng.vec(cfg.q_dim() * cfg.hidden_size, scale),
+            k_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, scale),
+            v_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, scale),
+            o_proj: rng.vec(cfg.hidden_size * cfg.q_dim(), scale),
+            gate_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, scale),
+            up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, scale),
+            down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, scale),
+            input_layernorm: vec![1.0; cfg.hidden_size],
+            post_attention_layernorm: vec![1.0; cfg.hidden_size],
+        })
+        .collect();
+    let kernel = CpuKernel::new(cfg, layers)?;
+
+    let embedding = rng.vec(args.vocab_size * args.hidden_size, scale);
+    let lm_head = rng.vec(args.vocab_size * args.hidden_size, scale);
+    let final_norm = vec![1.0; args.hidden_size];
+
+    let kv_config = KvCacheConfig {
+        num_layers: args.num_layers,
+        num_kv_heads: args.num_kv_heads as u32,
+        head_dim: head_dim as u32,
+        block_size: 16,
+    };
+    // One block per 16 tokens over the whole sequence, plus a margin.
+    let total_tokens = args.prompt.len() + args.max_new_tokens;
+    let kv_blocks = (total_tokens as u64).div_ceil(16) as u32 + 2;
+
+    let generator = Generator::new(
+        kernel,
+        embedding,
+        final_norm,
+        lm_head,
+        args.vocab_size,
+        1e-5,
+        kv_config,
+        kv_blocks,
+    )?;
+
+    println!("generate     : demo with randomly-initialized weights (seed {})", args.seed);
+    println!(
+        "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
+        args.vocab_size,
+        args.hidden_size,
+        args.num_layers,
+        args.num_heads,
+        args.num_kv_heads,
+        head_dim,
+    );
+    println!("prompt       : {:?}", args.prompt);
+
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: args.max_new_tokens,
+        eos_token: args.eos_token,
+        sampler: Sampler::Greedy,
+    };
+    let generated = generator.generate(&args.prompt, &gen_cfg)?;
+
+    let mut full = args.prompt.clone();
+    full.extend_from_slice(&generated);
+    println!("generated    : {generated:?}");
+    println!("sequence     : {full:?}");
+    println!();
+    println!("note         : weights are untrained random values — token ids are");
+    println!("               deterministic but not meaningful text.");
+    Ok(())
 }
 
 /// Print the shared startup banner (backend + host page size).
