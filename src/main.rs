@@ -10,6 +10,7 @@ use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::profiler::VramProfiler;
 use flip::storage::{LayerCatalog, MmapStore};
+use flip::pipeline::DoubleBufferSchedule;
 use flip::swap::LayerSwapPlan;
 use flip::{cuda, Result};
 
@@ -120,6 +121,29 @@ fn main() -> Result<()> {
         staging.kind(),
         staging.as_ptr(),
     );
+
+    // Build the double-buffered A/B schedule (Phase 2 §3.2).
+    let sched = DoubleBufferSchedule::from_swap_plan(&swap);
+    println!();
+    println!(
+        "pipeline     : {} steps, {} overlapped (DMA hidden under compute)",
+        sched.num_steps(),
+        sched.overlapping_steps(),
+    );
+    for step in sched.steps.iter().take(4) {
+        let compute = step
+            .compute
+            .map(|p| format!("compute p{} [{:?}]", p.pass_index, step.compute_buffer))
+            .unwrap_or_else(|| "compute —".to_string());
+        let prefetch = step
+            .prefetch
+            .map(|p| format!("prefetch p{} → [{:?}]", p.pass_index, step.prefetch_buffer))
+            .unwrap_or_else(|| "prefetch —".to_string());
+        println!("  A:{compute:<22} | B:{prefetch}");
+    }
+    if sched.num_steps() > 4 {
+        println!("  … {} more step(s)", sched.num_steps() - 4);
+    }
 
     Ok(())
 }

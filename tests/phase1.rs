@@ -7,9 +7,10 @@
 
 use flip::memory::{page_size, PinKind, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
+use flip::pipeline::{fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, WeightSource};
 use flip::profiler::VramProfiler;
 use flip::storage::{LayerCatalog, MmapStore};
-use flip::swap::LayerSwapPlan;
+use flip::swap::{LayerSwapPlan, StreamPass};
 use std::io::Write;
 
 /// Serialize a multi-tensor safetensors file (byte tensors) into `dir`.
@@ -231,6 +232,85 @@ fn pinned_buffer_round_trips_bytes() {
 #[test]
 fn pinned_buffer_rejects_zero_length() {
     assert!(PinnedBuffer::with_len(0).is_err());
+}
+
+/// Synthetic weight source: each window is `per_layer_bytes` per layer, filled
+/// with a byte pattern unique to the pass so clobbering is detectable.
+struct MockSource {
+    per_layer_bytes: usize,
+}
+
+impl WeightSource for MockSource {
+    fn load_window(&self, pass: &StreamPass) -> flip::Result<Vec<u8>> {
+        let len = self.per_layer_bytes * pass.layer_count() as usize;
+        Ok(vec![(pass.pass_index as u8).wrapping_add(1); len])
+    }
+}
+
+fn plan_with_window(num_layers: u32, window: u32) -> LayerSwapPlan {
+    let config = ModelConfig::from_json_bytes(
+        format!(
+            r#"{{"hidden_size":1024,"num_attention_heads":16,"num_hidden_layers":{num_layers},"vocab_size":32000}}"#
+        )
+        .as_bytes(),
+        QuantScheme::Int4,
+    )
+    .unwrap();
+    let profiler = VramProfiler::new(4096);
+    let free = profiler.kv_total_bytes(&config)
+        + profiler.safety_margin_bytes
+        + profiler.per_layer_weight_bytes(&config) * window as u64;
+    let plan = profiler.plan_with_free(&config, free);
+    assert_eq!(plan.layers_to_load, window);
+    LayerSwapPlan::from_plan(&plan)
+}
+
+#[test]
+fn double_buffer_schedule_overlaps_and_alternates() {
+    // 3 windows of 4 layers over 12 layers.
+    let swap = plan_with_window(12, 4);
+    assert_eq!(swap.num_passes(), 3);
+
+    let sched = DoubleBufferSchedule::from_swap_plan(&swap);
+    // N windows → N+1 steps (1 prologue + N steady).
+    assert_eq!(sched.num_steps(), 4);
+    // Prologue: prefetch only, no compute.
+    assert!(sched.steps[0].compute.is_none());
+    assert_eq!(sched.steps[0].prefetch.unwrap().pass_index, 0);
+    assert_eq!(sched.steps[0].prefetch_buffer, BufferId::A);
+    // Overlap in every steady step except the last (nothing left to prefetch).
+    assert_eq!(sched.overlapping_steps(), 2);
+    // Compute buffers ping-pong A, B, A.
+    assert_eq!(sched.steps[1].compute_buffer, BufferId::A);
+    assert_eq!(sched.steps[2].compute_buffer, BufferId::B);
+    assert_eq!(sched.steps[3].compute_buffer, BufferId::A);
+    // Each prefetch targets the buffer opposite the concurrent compute.
+    assert_eq!(sched.steps[1].prefetch_buffer, BufferId::B);
+}
+
+#[test]
+fn host_pipeline_computes_each_window_over_intact_data() {
+    let swap = plan_with_window(12, 4);
+    let sched = DoubleBufferSchedule::from_swap_plan(&swap);
+
+    let per_layer_bytes = 64;
+    let source = MockSource { per_layer_bytes };
+    let window_bytes = per_layer_bytes * swap.window_size as usize;
+
+    let mut pipeline = HostPipeline::new(window_bytes).unwrap();
+    let trace = pipeline.execute(&sched, &source).unwrap();
+
+    // Every window computed exactly once, in order.
+    assert_eq!(trace.len(), swap.num_passes());
+    for (i, t) in trace.iter().enumerate() {
+        assert_eq!(t.pass_index, i as u32);
+        // The bytes the compute step saw must equal this pass's source bytes —
+        // proving the concurrent prefetch of the next window (into the other
+        // buffer) did not corrupt the buffer under compute.
+        let expected = source.load_window(&swap.passes[i]).unwrap();
+        assert_eq!(t.byte_len, expected.len());
+        assert_eq!(t.checksum, fold_checksum(&expected));
+    }
 }
 
 #[test]
