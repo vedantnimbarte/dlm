@@ -141,12 +141,13 @@ cargo build            # debug build
 cargo build --release  # optimized build
 ```
 
-The binary exposes two subcommands:
+The binary exposes three subcommands:
 
 ```bash
 cargo run -- --help          # top-level help
 cargo run -- profile         # profile a sample 70B-class model (no GPU needed)
 cargo run -- serve --help    # full serve flag list (specs §4)
+cargo run -- generate --help # end-to-end CPU generation on a synthetic model
 ```
 
 **`profile`** — with no `--model-path` it profiles a representative
@@ -210,6 +211,18 @@ cargo run -- serve \
 `--ram-cache-gb` sizes the tiered CPU-RAM layer cache. When set, `serve` runs two
 forward passes and reports the cache hit rate, showing how hot layers are served
 from RAM on the second pass instead of being re-read from NVMe.
+
+**`generate`** — drives the full CPU generation loop (embedding → transformer
+stack → LM head → greedy sampling) on a **randomly-initialized** synthetic model.
+There is no checkpoint loader or tokenizer yet, so it operates on token ids and
+the output is deterministic-but-meaningless — it exercises the whole pipeline
+end-to-end through the binary:
+
+```bash
+cargo run -- generate --prompt 1,2,3 --max-new-tokens 8 --seed 42
+# prompt       : [1, 2, 3]
+# generated    : [19, 6, 29, 6, 29, 6, 29, 5]
+```
 
 ## Running the tests
 
