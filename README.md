@@ -105,6 +105,7 @@ limit.
 | Forward-pass orchestration (block-level `ComputeKernel` trait) | [`src/forward`](src/forward) |
 | CPU forward path — real decode block (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
 | CPU token-generation loop (embed → stack → LM head → sample) | [`src/generate.rs`](src/generate.rs) |
+| Safetensors → CPU model loader (F32/F16/BF16) | [`src/loader.rs`](src/loader.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
 
@@ -224,6 +225,18 @@ cargo run -- generate --prompt 1,2,3 --max-new-tokens 8 --seed 42
 # generated    : [19, 6, 29, 6, 29, 6, 29, 5]
 ```
 
+Point `generate` at a **real** checkpoint to run it on CPU. The loader
+([`src/loader.rs`](src/loader.rs)) reads the standard HuggingFace-named tensors
+(F32/F16/BF16) out of the mapped safetensors and materializes the transformer,
+embedding, and LM head:
+
+```bash
+cargo run -- generate --model-path /path/to/small-model --prompt 1,2,3
+```
+
+(Still no tokenizer, so prompt/output are token ids; quantized `qweight`
+checkpoints route through the dequant kernel — the loader covers float dtypes.)
+
 ## Running the tests
 
 ```bash
@@ -280,6 +293,7 @@ src/
 ├── activation/       # residual activation pool (buffer reuse)
 ├── forward/          # forward-pass orchestration + real CPU decode block
 ├── generate.rs       # CPU token-generation loop (embed / LM head / sampling)
+├── loader.rs         # safetensors → CPU model (F32/F16/BF16)
 └── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
 tests/
 └── phase1.rs         # integration tests
