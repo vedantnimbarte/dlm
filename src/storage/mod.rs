@@ -6,4 +6,4 @@ pub mod safetensors;
 
 pub use catalog::LayerCatalog;
 pub use mmap_store::{MmapShard, MmapStore};
-pub use safetensors::{Dtype, SafetensorsHeader, TensorInfo};
+pub use safetensors::{bytes_to_f32, Dtype, SafetensorsHeader, TensorInfo};

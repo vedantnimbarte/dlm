@@ -83,6 +83,79 @@ struct RawTensor {
     data_offsets: [usize; 2],
 }
 
+/// Convert a half-precision (IEEE 754 binary16) bit pattern to `f32`.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 1;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let val = if exp == 0 {
+        // Zero or subnormal.
+        (mant as f32) * 2f32.powi(-24)
+    } else if exp == 0x1f {
+        if mant == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
+    } else {
+        (1.0 + mant as f32 / 1024.0) * 2f32.powi(exp as i32 - 15)
+    };
+    if sign == 1 {
+        -val
+    } else {
+        val
+    }
+}
+
+/// Decode a tensor's raw little-endian bytes into `f32` elements.
+///
+/// Supports the float dtypes small checkpoints ship in — F32, F16, BF16. Integer
+/// and quantized dtypes are rejected (those go through the dequant path).
+pub fn bytes_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
+    match dtype {
+        Dtype::F32 => {
+            if bytes.len() % 4 != 0 {
+                return Err(FlipError::SafetensorsHeader(format!(
+                    "F32 tensor byte length {} is not a multiple of 4",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        Dtype::F16 => {
+            if bytes.len() % 2 != 0 {
+                return Err(FlipError::SafetensorsHeader(format!(
+                    "F16 tensor byte length {} is not a multiple of 2",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect())
+        }
+        Dtype::BF16 => {
+            if bytes.len() % 2 != 0 {
+                return Err(FlipError::SafetensorsHeader(format!(
+                    "BF16 tensor byte length {} is not a multiple of 2",
+                    bytes.len()
+                )));
+            }
+            // bfloat16 is the high 16 bits of an f32.
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect())
+        }
+        other => Err(FlipError::InvalidConfig(format!(
+            "cannot convert dtype {other:?} to f32 (use the dequant path)"
+        ))),
+    }
+}
+
 /// Parsed metadata for a single tensor. Byte offsets are relative to the start
 /// of the data section (i.e. after the 8-byte prefix and JSON header).
 #[derive(Debug, Clone)]
