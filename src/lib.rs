@@ -7,6 +7,7 @@ pub mod activation;
 pub mod cache;
 pub mod cli;
 pub mod error;
+pub mod forward;
 pub mod gpu;
 pub mod memory;
 pub mod model;
@@ -19,6 +20,7 @@ pub mod swap;
 pub use activation::{ActivationBuffer, ActivationPool};
 pub use cache::{KvCacheConfig, LayerRamCache, PagedKvCache};
 pub use error::{FlipError, Result};
+pub use forward::{ComputeKernel, ForwardConfig, ForwardOrchestrator, LayerWeights, StubKernel};
 pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};
 pub use pipeline::{
