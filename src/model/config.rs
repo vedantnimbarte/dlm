@@ -46,6 +46,10 @@ struct RawConfig {
     intermediate_size: Option<u32>,
     #[serde(default)]
     max_position_embeddings: Option<u32>,
+    #[serde(default)]
+    rope_theta: Option<f32>,
+    #[serde(default)]
+    rms_norm_eps: Option<f32>,
 }
 
 /// Validated model geometry consumed by the profiler and storage planner.
@@ -66,6 +70,10 @@ pub struct ModelConfig {
     pub intermediate_size: u32,
     /// Model's own maximum context, if declared.
     pub max_position_embeddings: Option<u32>,
+    /// RoPE base frequency (default 10000).
+    pub rope_theta: f32,
+    /// RMSNorm epsilon (default 1e-5).
+    pub rms_eps: f32,
     /// On-disk weight precision.
     pub quant: QuantScheme,
 }
@@ -108,6 +116,8 @@ impl ModelConfig {
                 .intermediate_size
                 .unwrap_or(raw.hidden_size.saturating_mul(4)),
             max_position_embeddings: raw.max_position_embeddings,
+            rope_theta: raw.rope_theta.unwrap_or(10000.0),
+            rms_eps: raw.rms_norm_eps.unwrap_or(1e-5),
             quant,
         };
 
