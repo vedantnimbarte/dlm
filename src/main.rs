@@ -12,7 +12,7 @@ use flip::cache::{KvCacheConfig, PagedKvCache};
 use flip::cli::{Cli, Command, ProfileArgs, ServeArgs};
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
-use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource};
+use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, TieredWeightSource};
 use flip::profiler::{VramPlan, VramProfiler};
 use flip::storage::{LayerCatalog, MmapStore};
 use flip::swap::LayerSwapPlan;
@@ -61,6 +61,7 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
         args.model_path.as_deref(),
         args.context_length,
         args.vram_budget_gb,
+        args.ram_cache_gb,
     )
 }
 
@@ -94,6 +95,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         Some(&args.model_path),
         args.context_length,
         args.vram_budget_gb,
+        args.ram_cache_gb,
     )?;
 
     println!();
@@ -110,6 +112,7 @@ fn report_plan(
     model_dir: Option<&Path>,
     context_length: u32,
     vram_budget_gb: Option<f64>,
+    ram_cache_gb: Option<f64>,
 ) -> Result<()> {
     // Map shards + measure real weight sizes when a directory is supplied.
     let mut mapped: Option<(MmapStore, LayerCatalog)> = None;
@@ -184,22 +187,48 @@ fn report_plan(
     // With a real mapped model, stream its weights end-to-end through the host
     // pipeline (disk → pinned → device → compute).
     if let Some((store, catalog)) = mapped.as_ref().filter(|(_, c)| !c.is_empty()) {
-        let source = MmapWeightSource::new(store, catalog);
+        let inner = MmapWeightSource::new(store, catalog);
         let max_window = swap
             .passes
             .iter()
-            .map(|p| source.window_bytes(p))
+            .map(|p| inner.window_bytes(p))
             .max()
             .unwrap_or(0)
             .max(1);
         let mut pipeline = HostPipeline::new(max_window as usize)?;
-        let trace = pipeline.execute(&sched, &source)?;
-        let moved: usize = trace.iter().map(|t| t.byte_len).sum();
-        println!(
-            "streamed     : {} window(s) executed, {:.2} GiB moved through pinned staging",
-            trace.len(),
-            moved as f64 / GIB as f64,
-        );
+
+        match ram_cache_gb {
+            // Tiered RAM cache: run two forward passes to show cross-step reuse.
+            Some(gb) => {
+                let cache_bytes = (gb * GIB as f64) as u64;
+                let tiered = TieredWeightSource::new(inner, cache_bytes);
+                pipeline.execute(&sched, &tiered)?; // token step 1 (cold)
+                let trace = pipeline.execute(&sched, &tiered)?; // token step 2 (warm)
+                let moved: usize = trace.iter().map(|t| t.byte_len).sum();
+                let cs = tiered.cache_stats();
+                println!(
+                    "streamed     : 2 forward pass(es), {:.2} GiB/pass through pinned staging",
+                    moved as f64 / GIB as f64,
+                );
+                println!(
+                    "ram cache    : {:.2} GiB budget → {} hits / {} misses ({:.0}% hit rate), {} evictions",
+                    cache_bytes as f64 / GIB as f64,
+                    cs.hits,
+                    cs.misses,
+                    cs.hit_rate() * 100.0,
+                    cs.evictions,
+                );
+            }
+            None => {
+                let trace = pipeline.execute(&sched, &inner)?;
+                let moved: usize = trace.iter().map(|t| t.byte_len).sum();
+                println!(
+                    "streamed     : {} window(s) executed, {:.2} GiB moved through pinned staging",
+                    trace.len(),
+                    moved as f64 / GIB as f64,
+                );
+            }
+        }
     }
 
     Ok(())

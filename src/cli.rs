@@ -77,6 +77,10 @@ pub struct ServeArgs {
     #[arg(long, value_enum, default_value_t = QuantArg::Int4)]
     pub quant: QuantArg,
 
+    /// System-RAM budget (GiB) for the tiered layer cache between NVMe and GPU.
+    #[arg(long, value_name = "GB")]
+    pub ram_cache_gb: Option<f64>,
+
     /// TCP port for the API server.
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
@@ -121,6 +125,10 @@ pub struct ProfileArgs {
     /// Manual upper VRAM cap in gigabytes. Overrides the live device query.
     #[arg(long, value_name = "GB")]
     pub vram_budget_gb: Option<f64>,
+
+    /// System-RAM budget (GiB) for the tiered layer cache between NVMe and GPU.
+    #[arg(long, value_name = "GB")]
+    pub ram_cache_gb: Option<f64>,
 }
 
 #[cfg(test)]
