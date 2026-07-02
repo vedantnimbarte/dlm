@@ -61,6 +61,12 @@ pub enum FlipError {
         total: u32,
     },
 
+    #[error("activation pool exhausted: {in_use} buffer(s) in use, cap {max}")]
+    ActivationPoolExhausted { in_use: usize, max: usize },
+
+    #[error("shape mismatch: expected {expected} elements, got {got}")]
+    ShapeMismatch { expected: usize, got: usize },
+
     #[error("GPU runtime error ({api}): code {code}")]
     Gpu { api: &'static str, code: i32 },
 

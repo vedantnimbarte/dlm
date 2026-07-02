@@ -3,6 +3,7 @@
 //! Phase 1 (Local Foundation) library surface. Modules are added
 //! bottom-up as the engine is built; see `PRD.md` §5 for the phase map.
 
+pub mod activation;
 pub mod cache;
 pub mod cli;
 pub mod error;
@@ -15,6 +16,7 @@ pub mod quant;
 pub mod storage;
 pub mod swap;
 
+pub use activation::{ActivationBuffer, ActivationPool};
 pub use cache::{KvCacheConfig, LayerRamCache, PagedKvCache};
 pub use error::{FlipError, Result};
 pub use memory::{PinKind, PinnedBuffer};
