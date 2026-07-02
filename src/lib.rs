@@ -4,5 +4,7 @@
 //! bottom-up as the engine is built; see `PRD.md` §5 for the phase map.
 
 pub mod error;
+pub mod model;
 
 pub use error::{FlipError, Result};
+pub use model::{ModelConfig, QuantScheme};
