@@ -10,7 +10,7 @@ use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::profiler::VramProfiler;
 use flip::storage::{LayerCatalog, MmapStore};
-use flip::pipeline::DoubleBufferSchedule;
+use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource};
 use flip::swap::LayerSwapPlan;
 use flip::{cuda, Result};
 
@@ -51,7 +51,8 @@ fn main() -> Result<()> {
     println!();
 
     // If a model dir was given, map its shards and measure real weight sizes.
-    let mut catalog: Option<LayerCatalog> = None;
+    // Keep the store alive alongside the catalog so we can stream from it below.
+    let mut mapped: Option<(MmapStore, LayerCatalog)> = None;
     if let Some(dir) = args.get(1) {
         if let Ok(store) = MmapStore::open_dir(dir) {
             let cat = LayerCatalog::build(&store);
@@ -68,9 +69,10 @@ fn main() -> Result<()> {
                 cat.pinned_bytes() as f64 / (1024.0 * 1024.0),
             );
             println!();
-            catalog = Some(cat);
+            mapped = Some((store, cat));
         }
     }
+    let catalog = mapped.as_ref().map(|(_, cat)| cat);
 
     // Determine free VRAM: live device when CUDA is present, else simulate 16 GiB.
     let profiler = VramProfiler::new(8192);
@@ -85,7 +87,7 @@ fn main() -> Result<()> {
     }
 
     // Prefer measured catalog sizes; fall back to the parameter estimate.
-    let plan = match &catalog {
+    let plan = match catalog {
         Some(cat) if !cat.is_empty() => profiler.plan_from_catalog(&config, cat, free_bytes),
         _ => profiler.plan_with_free(&config, free_bytes),
     };
@@ -143,6 +145,28 @@ fn main() -> Result<()> {
     }
     if sched.num_steps() > 4 {
         println!("  … {} more step(s)", sched.num_steps() - 4);
+    }
+
+    // With a real mapped model, stream its weights end-to-end through the
+    // double-buffered host pipeline (disk → pinned → device → compute).
+    if let Some((store, catalog)) = mapped.as_ref().filter(|(_, c)| !c.is_empty()) {
+        let source = MmapWeightSource::new(store, catalog);
+        let max_window = swap
+            .passes
+            .iter()
+            .map(|p| source.window_bytes(p))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut pipeline = HostPipeline::new(max_window as usize)?;
+        let trace = pipeline.execute(&sched, &source)?;
+        let moved: usize = trace.iter().map(|t| t.byte_len).sum();
+        println!();
+        println!(
+            "streamed     : {} window(s) executed, {:.2} GiB moved through pinned staging",
+            trace.len(),
+            moved as f64 / GIB as f64,
+        );
     }
 
     Ok(())
