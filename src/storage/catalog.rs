@@ -18,6 +18,12 @@ use std::collections::BTreeMap;
 pub struct LayerCatalog {
     /// Byte size of each transformer block, keyed by layer index.
     layer_bytes: BTreeMap<u32, u64>,
+    /// Ordered tensor names making up each transformer block. This is what a
+    /// [`WeightSource`](crate::pipeline::WeightSource) walks to stream a layer's
+    /// weights out of the map.
+    layer_tensors: BTreeMap<u32, Vec<String>>,
+    /// Names of the pinned tensors (embedding, LM head, norms, misc).
+    pinned_tensors: Vec<String>,
     /// Total bytes of all pinned tensors (embedding, LM head, norms, misc).
     pinned_bytes: u64,
 }
@@ -26,6 +32,8 @@ impl LayerCatalog {
     /// Build a catalog by scanning every tensor across all shards of a store.
     pub fn build(store: &MmapStore) -> Self {
         let mut layer_bytes: BTreeMap<u32, u64> = BTreeMap::new();
+        let mut layer_tensors: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        let mut pinned_tensors: Vec<String> = Vec::new();
         let mut pinned_bytes: u64 = 0;
 
         for info in store.iter_tensors() {
@@ -33,14 +41,30 @@ impl LayerCatalog {
             match classify(&info.name) {
                 TensorRole::Layer(idx) => {
                     *layer_bytes.entry(idx).or_insert(0) += bytes;
+                    layer_tensors
+                        .entry(idx)
+                        .or_default()
+                        .push(info.name.clone());
                 }
                 // Every non-layer tensor is resident overhead.
-                _ => pinned_bytes += bytes,
+                _ => {
+                    pinned_bytes += bytes;
+                    pinned_tensors.push(info.name.clone());
+                }
             }
         }
 
+        // Sort each layer's tensor list so streaming order is deterministic
+        // regardless of shard iteration order.
+        for names in layer_tensors.values_mut() {
+            names.sort();
+        }
+        pinned_tensors.sort();
+
         Self {
             layer_bytes,
+            layer_tensors,
+            pinned_tensors,
             pinned_bytes,
         }
     }
@@ -58,6 +82,16 @@ impl LayerCatalog {
     /// Bytes of a specific transformer block, if present.
     pub fn layer_bytes(&self, index: u32) -> Option<u64> {
         self.layer_bytes.get(&index).copied()
+    }
+
+    /// Ordered tensor names composing a transformer block, if present.
+    pub fn layer_tensor_names(&self, index: u32) -> Option<&[String]> {
+        self.layer_tensors.get(&index).map(Vec::as_slice)
+    }
+
+    /// Names of every pinned tensor (embedding, LM head, norms, misc).
+    pub fn pinned_tensor_names(&self) -> &[String] {
+        &self.pinned_tensors
     }
 
     /// Largest single-block size — the figure the streaming buffers must be

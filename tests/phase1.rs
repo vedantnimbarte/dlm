@@ -109,6 +109,20 @@ fn catalog_groups_layers_and_pinned_overhead() {
     assert_eq!(catalog.total_layer_bytes(), 1800);
     // Pinned = embed(1000) + norm(50) + lm_head(1000) = 2050.
     assert_eq!(catalog.pinned_bytes(), 2050);
+
+    // Per-layer tensor names are recorded in sorted order.
+    assert_eq!(
+        catalog.layer_tensor_names(0),
+        Some(
+            &[
+                "model.layers.0.mlp.down_proj.weight".to_string(),
+                "model.layers.0.self_attn.q_proj.weight".to_string(),
+            ][..]
+        )
+    );
+    assert_eq!(catalog.layer_tensor_names(2), None);
+    // Pinned tensor names captured too.
+    assert_eq!(catalog.pinned_tensor_names().len(), 3);
 }
 
 #[test]
