@@ -9,25 +9,18 @@ transformer blocks resident and continuously "flips" the next window in over the
 PCIe bus while the GPU computes the current one — trading a bit of speed for the
 ability to run models many times larger than the card.
 
-> **Status:** early development. Phase 1 (local foundation) is complete and
-> Phase 2 (async pipeline) is underway. The engine core — memory-mapped storage,
-> dynamic VRAM profiling, page-locked staging buffers, and the double-buffered
-> streaming schedule — is implemented and unit-tested. The GPU execution path
-> and the `flip serve` API server are not yet wired; see the [Roadmap](#roadmap).
-
 ---
 
 ## Table of contents
 
 - [How it works](#how-it-works)
-- [What's implemented](#whats-implemented)
+- [Components](#components)
 - [Prerequisites](#prerequisites)
 - [Build & run locally](#build--run-locally)
 - [Running the tests](#running-the-tests)
 - [The VRAM budget math](#the-vram-budget-math)
 - [Project layout](#project-layout)
 - [Building with CUDA](#building-with-cuda)
-- [Roadmap](#roadmap)
 
 ---
 
@@ -63,27 +56,24 @@ Memory-mapping skips the OS read-buffer copy; the page-locked (pinned) host
 buffer lets the PCIe controller DMA straight to VRAM asynchronously, so disk I/O
 and copies hide under GPU compute.
 
-## What's implemented
+## Components
 
-| Component | Module | Status |
-|---|---|---|
-| Memory-mapped, zero-copy safetensors reader | [`src/storage`](src/storage) | ✅ |
-| Sharded checkpoint support + tensor index | [`src/storage/mmap_store.rs`](src/storage/mmap_store.rs) | ✅ |
-| Layer catalog (real per-layer + pinned byte sizes) | [`src/storage/catalog.rs`](src/storage/catalog.rs) | ✅ |
-| `config.json` geometry + quantization parsing | [`src/model`](src/model) | ✅ |
-| Tensor role classification (pinned vs. streamed) | [`src/model/naming.rs`](src/model/naming.rs) | ✅ |
-| Dynamic VRAM profiling math | [`src/profiler`](src/profiler) | ✅ |
-| Page-locked host staging buffers | [`src/memory`](src/memory) | ✅ |
-| Linear layer-swap cycle | [`src/swap`](src/swap) | ✅ |
-| Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) | ✅ |
-| CUDA runtime FFI (mem-info, host-alloc, streams, async memcpy) | [`src/cuda`](src/cuda) | 🚧 bindings only |
-| GPU compute / kernel execution | — | ⏳ planned |
-| `flip serve` CLI + OpenAI-compatible API | — | ⏳ planned |
+| Component | Module |
+|---|---|
+| Memory-mapped, zero-copy safetensors reader | [`src/storage`](src/storage) |
+| Sharded checkpoint support + tensor index | [`src/storage/mmap_store.rs`](src/storage/mmap_store.rs) |
+| Layer catalog (real per-layer + pinned byte sizes) | [`src/storage/catalog.rs`](src/storage/catalog.rs) |
+| `config.json` geometry + quantization parsing | [`src/model`](src/model) |
+| Tensor role classification (pinned vs. streamed) | [`src/model/naming.rs`](src/model/naming.rs) |
+| Dynamic VRAM profiling math | [`src/profiler`](src/profiler) |
+| Page-locked host staging buffers | [`src/memory`](src/memory) |
+| Linear layer-swap cycle | [`src/swap`](src/swap) |
+| Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) |
+| CUDA runtime FFI (mem-info, host-alloc, streams, async memcpy) | [`src/cuda`](src/cuda) |
 
-Everything that doesn't require a GPU runs and is tested on any machine. The
-CUDA-specific paths are behind a `cuda` [feature flag](#building-with-cuda); with
-it off, the engine uses a page-aligned host fallback so the logic is fully
-exercisable off-GPU.
+The CUDA-specific paths are behind a `cuda` [feature flag](#building-with-cuda);
+with it off, the engine uses a page-aligned host fallback with the same layout
+contract, so the logic runs on any machine.
 
 ## Prerequisites
 
@@ -110,8 +100,8 @@ cargo build            # debug build
 cargo build --release  # optimized build
 ```
 
-Run the Phase 1/2 demonstration binary. With no arguments it profiles a
-representative Llama-3-70B-class model against a simulated 16 GB card:
+Run the demonstration binary. With no arguments it profiles a representative
+Llama-3-70B-class model against a simulated 16 GB card:
 
 ```bash
 cargo run
@@ -202,7 +192,7 @@ slot, and never more than the model has.
 ```
 src/
 ├── lib.rs            # crate root & public API re-exports
-├── main.rs           # Phase 1/2 demonstration binary
+├── main.rs           # demonstration binary
 ├── error.rs          # unified FlipError / Result
 ├── model/            # config.json parsing, quant schemes, tensor naming
 ├── storage/          # mmap engine, safetensors parser, layer catalog
@@ -233,21 +223,6 @@ With the feature on, `PinnedBuffer` allocates genuine page-locked memory via
 it off, buffers are page-aligned host allocations (same layout contract,
 promotable in place later via `cudaHostRegister`) so nothing about the pipeline
 shape changes between builds.
-
-## Roadmap
-
-Phased milestones (from `PRD.md` §5):
-
-- **Phase 1 — Local Foundation** ✅
-  - mmap storage manager, dynamic VRAM profiling, linear layer-swap cycle.
-- **Phase 2 — Asynchronous Acceleration** 🚧
-  - Double-buffered CUDA streams (schedule ✅, GPU execution ⏳), PagedAttention
-    KV layout, tiered CPU-RAM cache, `clap`-based CLI.
-- **Phase 3 — Distributed Scalability** ⏳
-  - Speculative decoding, continuous batching, gRPC multi-node topology, and the
-    OpenAI-compatible server (`/v1/chat/completions`).
-
----
 
 See [`PRD.md`](PRD.md) for product requirements and [`specs.md`](specs.md) for
 the full technical specification.
