@@ -14,7 +14,7 @@ pub mod profiler;
 pub mod storage;
 pub mod swap;
 
-pub use cache::{KvCacheConfig, PagedKvCache};
+pub use cache::{KvCacheConfig, LayerRamCache, PagedKvCache};
 pub use error::{FlipError, Result};
 pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};
