@@ -6,6 +6,7 @@
 //! 70B-class model against a simulated 16 GiB card and prints the resulting
 //! layer-streaming schedule. Pass a model directory to profile real weights.
 
+use flip::cache::{KvCacheConfig, PagedKvCache};
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::profiler::VramProfiler;
@@ -93,6 +94,18 @@ fn main() -> Result<()> {
     };
 
     print_plan(&plan);
+
+    // Size the PagedAttention KV pool from the plan's KV budget (Cache Zone).
+    let kv_cfg = KvCacheConfig::from_model(&config, 16);
+    let kv_cache = PagedKvCache::with_budget(kv_cfg, plan.kv_total_bytes);
+    println!();
+    println!(
+        "kv cache     : {} paged blocks × {} tok, {:.2} MiB/block → {} token capacity",
+        kv_cache.total_blocks(),
+        kv_cfg.block_size,
+        kv_cfg.bytes_per_block() as f64 / (1024.0 * 1024.0),
+        kv_cache.capacity_tokens(),
+    );
 
     let swap = LayerSwapPlan::from_plan(&plan);
     println!();
