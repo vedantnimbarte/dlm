@@ -5,7 +5,9 @@
 //!   2. VRAM profiling math
 //!   3. page-locked host staging buffers + the linear swap cycle
 
-use flip::memory::{page_size, PinKind, PinnedBuffer};
+use flip::memory::{page_size, PinnedBuffer};
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+use flip::memory::PinKind;
 use flip::model::{ModelConfig, QuantScheme};
 use flip::pipeline::{
     fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, MmapWeightSource,
@@ -232,7 +234,7 @@ fn pinned_buffer_is_page_aligned_and_sized() {
     assert_eq!(buf.len(), 100);
 
     // Off-GPU build reports the page-aligned fallback kind.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     assert_eq!(buf.kind(), PinKind::PageAligned);
 }
 
@@ -507,107 +509,86 @@ fn tiered_cache_evicts_under_pressure() {
 }
 
 #[test]
-fn forward_orchestrator_runs_layers_with_residual_and_kv_growth() {
+fn orchestrator_drives_stub_kernel_with_kv_growth() {
     use flip::cache::{KvCacheConfig, PagedKvCache};
-    use flip::forward::{ForwardConfig, ForwardOrchestrator, LayerWeights, StubKernel};
+    use flip::forward::{ForwardOrchestrator, StubKernel};
 
-    let hidden_size = 4;
-    let num_layers = 3u32;
-
-    // Per-layer weights with distinct means 1.0, 2.0, 3.0.
-    let weights: Vec<LayerWeights> = (0..num_layers)
-        .map(|l| LayerWeights::new(l, vec![(l + 1) as f32; 8]))
-        .collect();
-
-    // KV cache big enough for the tokens we append.
-    let kv_cfg = KvCacheConfig {
-        num_layers,
-        num_kv_heads: 2,
-        head_dim: 8,
-        block_size: 16,
-    };
-    let kv = PagedKvCache::new(kv_cfg, 8);
-
-    let cfg = ForwardConfig { num_layers, hidden_size };
-    let mut orch = ForwardOrchestrator::new(StubKernel, cfg, kv);
-
-    // Prefill 10 tokens.
-    let mut hidden = vec![0.0f32; hidden_size];
-    orch.step(0, 10, &mut hidden, &weights).unwrap();
-
-    // Each layer adds (attention mean + mlp mean) = 2*mean per element.
-    // Total = 2*(1+2+3) = 12 added to every element (started at 0).
-    assert_eq!(hidden, vec![12.0; hidden_size]);
-
-    // KV grew by the 10 prefill tokens.
-    assert_eq!(orch.kv().sequence_len(0), 10);
-
-    // Decode one more token.
-    orch.step(0, 1, &mut hidden, &weights).unwrap();
-    assert_eq!(hidden, vec![24.0; hidden_size]);
-    assert_eq!(orch.kv().sequence_len(0), 11);
-
-    // The activation pool reused a single scratch buffer across all sublayers:
-    // 2 sublayers × 3 layers × 2 steps = 12 acquisitions, 1 allocation.
-    let ps = orch.pool_stats();
-    assert_eq!(ps.allocations, 1);
-    assert_eq!(ps.reuses, 11);
-    assert_eq!(ps.peak_in_use, 1);
-}
-
-#[test]
-fn forward_orchestrator_materializes_quantized_weights() {
-    use flip::cache::{KvCacheConfig, PagedKvCache};
-    use flip::forward::{ForwardConfig, ForwardOrchestrator, LayerWeights, StubKernel};
-    use flip::quant::quantize_affine;
-
-    // Materialize one layer's weights by dequantizing a 4-bit tensor — proving
-    // the dequant path feeds the compute path.
-    let values: Vec<f32> = vec![2.0; 8];
-    let q = quantize_affine(&values, 8).unwrap();
-    let w = LayerWeights::from_quant(0, &q);
-    assert!((w.mean() - 2.0).abs() < 1e-4);
-
-    let kv = PagedKvCache::new(
-        KvCacheConfig { num_layers: 1, num_kv_heads: 1, head_dim: 4, block_size: 8 },
-        4,
+    let kernel = StubKernel::new(3, 4, 2); // 3 layers, hidden 4, kv_dim 2
+    let budget = PagedKvCache::new(
+        KvCacheConfig { num_layers: 3, num_kv_heads: 1, head_dim: 2, block_size: 16 },
+        8,
     );
-    let mut orch = ForwardOrchestrator::new(
-        StubKernel,
-        ForwardConfig { num_layers: 1, hidden_size: 2 },
-        kv,
-    );
-    let mut hidden = vec![0.0f32; 2];
-    orch.step(7, 1, &mut hidden, &[w]).unwrap();
-    // One layer, two sublayers, each adds ~2.0 → ~4.0.
-    for v in &hidden {
-        assert!((v - 4.0).abs() < 1e-3);
-    }
-}
+    let mut orch = ForwardOrchestrator::new(kernel, budget);
 
-#[test]
-fn forward_orchestrator_validates_shapes() {
-    use flip::cache::{KvCacheConfig, PagedKvCache};
-    use flip::forward::{ForwardConfig, ForwardOrchestrator, LayerWeights, StubKernel};
-
-    let kv = PagedKvCache::new(
-        KvCacheConfig { num_layers: 2, num_kv_heads: 1, head_dim: 4, block_size: 8 },
-        4,
-    );
-    let mut orch = ForwardOrchestrator::new(
-        StubKernel,
-        ForwardConfig { num_layers: 2, hidden_size: 4 },
-        kv,
-    );
-
-    let weights = vec![LayerWeights::new(0, vec![1.0; 4])]; // only 1, need 2
     let mut hidden = vec![0.0f32; 4];
-    assert!(orch.step(0, 1, &mut hidden, &weights).is_err());
+    orch.decode_token(&mut hidden).unwrap();
+    // Each layer adds (layer + 1): 1 + 2 + 3 = 6 to every element.
+    assert_eq!(hidden, vec![6.0; 4]);
+    for l in 0..3 {
+        assert_eq!(orch.layer_kv_len(l), 1);
+    }
+    assert_eq!(orch.position(), 1);
 
-    // Correct layer count but wrong hidden length.
-    let weights2 = vec![LayerWeights::new(0, vec![1.0; 4]), LayerWeights::new(1, vec![1.0; 4])];
-    let mut bad_hidden = vec![0.0f32; 3];
-    assert!(orch.step(0, 1, &mut bad_hidden, &weights2).is_err());
+    orch.decode_token(&mut hidden).unwrap();
+    assert_eq!(hidden, vec![12.0; 4]);
+    for l in 0..3 {
+        assert_eq!(orch.layer_kv_len(l), 2);
+    }
+    assert_eq!(orch.position(), 2);
+    assert_eq!(orch.kv_budget().sequence_len(0), 2);
+}
+
+#[test]
+fn orchestrator_runs_real_cpu_block_autoregressively() {
+    use flip::cache::{KvCacheConfig, PagedKvCache};
+    use flip::forward::{BlockConfig, CpuKernel, ForwardOrchestrator, LayerTensors};
+
+    let cfg = BlockConfig {
+        hidden_size: 4,
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 2,
+        intermediate_size: 6,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+    };
+    // Two zero-weight (identity) layers → hidden passes through unchanged.
+    let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg); 2]).unwrap();
+    let budget = PagedKvCache::new(
+        KvCacheConfig { num_layers: 2, num_kv_heads: 1, head_dim: 2, block_size: 16 },
+        8,
+    );
+    let mut orch = ForwardOrchestrator::new(kernel, budget);
+
+    let original = vec![1.5f32, -2.0, 0.5, 3.0];
+    let mut hidden = original.clone();
+
+    // Decode two tokens autoregressively.
+    orch.decode_token(&mut hidden).unwrap();
+    orch.decode_token(&mut hidden).unwrap();
+
+    // Identity layers leave the residual stream untouched.
+    assert_eq!(hidden, original);
+    // Each layer accumulated real K/V for both token positions.
+    assert_eq!(orch.layer_kv_len(0), 2);
+    assert_eq!(orch.layer_kv_len(1), 2);
+    assert_eq!(orch.position(), 2);
+}
+
+#[test]
+fn orchestrator_validates_hidden_length() {
+    use flip::cache::{KvCacheConfig, PagedKvCache};
+    use flip::forward::{ForwardOrchestrator, StubKernel};
+
+    let kernel = StubKernel::new(2, 4, 1);
+    let budget = PagedKvCache::new(
+        KvCacheConfig { num_layers: 2, num_kv_heads: 1, head_dim: 1, block_size: 8 },
+        4,
+    );
+    let mut orch = ForwardOrchestrator::new(kernel, budget);
+
+    let mut wrong = vec![0.0f32; 3]; // hidden_size is 4
+    assert!(orch.decode_token(&mut wrong).is_err());
 }
 
 #[test]

@@ -1,85 +1,95 @@
 //! Compute-kernel abstraction for the forward pass.
 //!
-//! The actual transformer math (matmuls, attention, activations) is the one
-//! piece that must run on the GPU. Everything else in `flip` — streaming,
-//! caching, residual pooling, KV paging — is orchestration around it. To keep
-//! that orchestration testable off-GPU, the math sits behind the
-//! [`ComputeKernel`] trait: a real CUDA/HIP kernel implements it for production,
-//! and [`StubKernel`] implements it deterministically for tests.
+//! The transformer math is the one piece that must ultimately run on the GPU;
+//! everything else in `flip` is orchestration around it. The math sits behind
+//! the block-level [`ComputeKernel`] trait so the orchestration is testable
+//! off-GPU: the real CPU block ([`CpuKernel`](crate::forward::cpu::CpuKernel))
+//! implements it for correctness, [`StubKernel`] implements it trivially for
+//! pure orchestration tests, and a future CUDA/HIP kernel implements it for
+//! production — all interchangeable behind [`ForwardOrchestrator`].
+//!
+//! [`ForwardOrchestrator`]: crate::forward::ForwardOrchestrator
 
 use crate::error::Result;
-use crate::quant::Quant4Tensor;
+use crate::forward::cpu::KvLayerCache;
 
-/// Materialized (dequantized) weights for one transformer block.
+/// A per-layer transformer-block kernel.
 ///
-/// A real block has many matrices (q/k/v/o projections, gate/up/down MLP); the
-/// skeleton keeps a single flat `values` array so the orchestration flow can be
-/// exercised end-to-end. The GPU implementation replaces this with per-matrix
-/// device tensors.
-#[derive(Debug, Clone)]
-pub struct LayerWeights {
-    pub layer: u32,
-    pub values: Vec<f32>,
-}
-
-impl LayerWeights {
-    /// Build from an already-materialized f32 array.
-    pub fn new(layer: u32, values: Vec<f32>) -> Self {
-        Self { layer, values }
-    }
-
-    /// Materialize a layer's weights by dequantizing a 4-bit tensor — the tie
-    /// between the streaming/dequant path and the compute path.
-    pub fn from_quant(layer: u32, tensor: &Quant4Tensor) -> Self {
-        Self {
-            layer,
-            values: tensor.dequantize(),
-        }
-    }
-
-    /// A scalar summary of the weights, used by the stub kernel to make each
-    /// layer's contribution distinct and deterministic.
-    pub fn mean(&self) -> f32 {
-        if self.values.is_empty() {
-            0.0
-        } else {
-            self.values.iter().sum::<f32>() / self.values.len() as f32
-        }
-    }
-}
-
-/// The pluggable transformer math backend.
-///
-/// Each method computes a sublayer's **residual delta** for the current hidden
-/// state: the orchestrator adds it back (`h = h + f(h)`). Splitting attention
-/// and MLP mirrors the two residual connections in a decoder block.
+/// One call runs a whole decoder block for a single token: it updates `hidden`
+/// in place (both residual connections included) and appends this token's K/V to
+/// the layer's history in `kv`. The kernel reports the model's shape so the
+/// orchestrator can size its per-layer KV storage.
 pub trait ComputeKernel {
-    /// Attention sublayer: write the residual delta for `hidden` into `delta`.
-    fn attention(&self, weights: &LayerWeights, hidden: &[f32], delta: &mut [f32]) -> Result<()>;
+    /// Number of transformer blocks the kernel holds.
+    fn num_layers(&self) -> u32;
 
-    /// MLP sublayer: write the residual delta for `hidden` into `delta`.
-    fn mlp(&self, weights: &LayerWeights, hidden: &[f32], delta: &mut [f32]) -> Result<()>;
+    /// Residual-stream width the kernel expects for `hidden`.
+    fn hidden_size(&self) -> usize;
+
+    /// Key/value width per token (`num_kv_heads × head_dim`).
+    fn kv_dim(&self) -> usize;
+
+    /// Run block `layer` for one token at absolute `position`, updating `hidden`
+    /// and appending to `kv`.
+    fn run_block(
+        &self,
+        layer: u32,
+        hidden: &mut [f32],
+        kv: &mut KvLayerCache,
+        position: usize,
+    ) -> Result<()>;
 }
 
-/// A deterministic CPU stand-in for a real GPU kernel.
+/// A deterministic stand-in for a real kernel.
 ///
-/// It performs no real attention or matmul — each sublayer contributes a delta
-/// equal to the layer's weight mean, so the orchestration (residual
-/// accumulation, buffer reuse, KV growth) is exactly verifiable while remaining
-/// numerically trivial. It is **not** an inference implementation.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct StubKernel;
+/// It does no transformer math: each layer adds a constant (`layer + 1`) to
+/// every hidden element and appends a zero K/V entry, so the orchestration
+/// (per-layer iteration, KV growth, position advance) is exactly verifiable
+/// while staying numerically trivial. **Not** an inference implementation.
+#[derive(Debug, Clone, Copy)]
+pub struct StubKernel {
+    num_layers: u32,
+    hidden_size: usize,
+    kv_dim: usize,
+}
+
+impl StubKernel {
+    /// A stub for a model of the given shape.
+    pub fn new(num_layers: u32, hidden_size: usize, kv_dim: usize) -> Self {
+        Self {
+            num_layers,
+            hidden_size,
+            kv_dim,
+        }
+    }
+}
 
 impl ComputeKernel for StubKernel {
-    fn attention(&self, weights: &LayerWeights, _hidden: &[f32], delta: &mut [f32]) -> Result<()> {
-        let s = weights.mean();
-        delta.iter_mut().for_each(|d| *d = s);
-        Ok(())
+    fn num_layers(&self) -> u32 {
+        self.num_layers
     }
 
-    fn mlp(&self, weights: &LayerWeights, _hidden: &[f32], delta: &mut [f32]) -> Result<()> {
-        let s = weights.mean();
-        delta.iter_mut().for_each(|d| *d = s);
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    fn run_block(
+        &self,
+        layer: u32,
+        hidden: &mut [f32],
+        kv: &mut KvLayerCache,
+        _position: usize,
+    ) -> Result<()> {
+        let zero = vec![0.0f32; self.kv_dim];
+        kv.append(&zero, &zero)?;
+        let delta = (layer + 1) as f32;
+        for h in hidden.iter_mut() {
+            *h += delta;
+        }
         Ok(())
     }
 }

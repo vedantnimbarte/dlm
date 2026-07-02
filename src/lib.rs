@@ -20,7 +20,9 @@ pub mod swap;
 pub use activation::{ActivationBuffer, ActivationPool};
 pub use cache::{KvCacheConfig, LayerRamCache, PagedKvCache};
 pub use error::{FlipError, Result};
-pub use forward::{ComputeKernel, ForwardConfig, ForwardOrchestrator, LayerWeights, StubKernel};
+pub use forward::{
+    BlockConfig, ComputeKernel, CpuKernel, ForwardOrchestrator, LayerTensors, StubKernel,
+};
 pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};
 pub use pipeline::{

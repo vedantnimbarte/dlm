@@ -20,6 +20,7 @@
 //! block config and a KV handle) once the GPU backend lands.
 
 use crate::error::{FlipError, Result};
+use crate::forward::kernel::ComputeKernel;
 
 /// Shape + hyperparameters of one decoder block.
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +130,11 @@ impl KvLayerCache {
             keys: Vec::new(),
             values: Vec::new(),
         }
+    }
+
+    /// Key/value width per position.
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
     }
 
     /// Cached token positions.
@@ -307,6 +313,60 @@ pub fn decode_block(
         *h += *d;
     }
     Ok(h1)
+}
+
+/// A real CPU [`ComputeKernel`] holding a model's per-layer weights.
+///
+/// Each `run_block` call dispatches to [`decode_block`], giving the
+/// [`ForwardOrchestrator`](crate::forward::ForwardOrchestrator) a fully
+/// functional (if slow, single-token) CPU forward path. This is the reference
+/// implementation the GPU kernel is validated against.
+#[derive(Debug, Clone)]
+pub struct CpuKernel {
+    cfg: BlockConfig,
+    layers: Vec<LayerTensors>,
+}
+
+impl CpuKernel {
+    /// Build a kernel from a shared block config and one [`LayerTensors`] per
+    /// layer, validating every layer's matrix dimensions up front.
+    pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>) -> Result<Self> {
+        for layer in &layers {
+            layer.validate(&cfg)?;
+        }
+        Ok(Self { cfg, layers })
+    }
+
+    /// The block configuration.
+    pub fn config(&self) -> &BlockConfig {
+        &self.cfg
+    }
+}
+
+impl ComputeKernel for CpuKernel {
+    fn num_layers(&self) -> u32 {
+        self.layers.len() as u32
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.kv_dim()
+    }
+
+    fn run_block(
+        &self,
+        layer: u32,
+        hidden: &mut [f32],
+        kv: &mut KvLayerCache,
+        position: usize,
+    ) -> Result<()> {
+        let out = decode_block(&self.cfg, &self.layers[layer as usize], hidden, kv, position)?;
+        hidden.copy_from_slice(&out);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
