@@ -172,7 +172,7 @@ impl KvLayerCache {
 // ── numeric primitives ──────────────────────────────────────────────────────
 
 /// Matrix-vector product for a row-major `[out_dim, in_dim]` matrix.
-fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+pub(crate) fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_dim * in_dim);
     debug_assert_eq!(x.len(), in_dim);
     let mut y = vec![0.0f32; out_dim];
@@ -184,7 +184,7 @@ fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
 }
 
 /// Root-mean-square layer norm with a learned scale.
-fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len() as f32;
     let mean_sq = x.iter().map(|&v| v * v).sum::<f32>() / n;
     let inv = 1.0 / (mean_sq + eps).sqrt();

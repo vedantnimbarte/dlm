@@ -8,6 +8,7 @@ pub mod cache;
 pub mod cli;
 pub mod error;
 pub mod forward;
+pub mod generate;
 pub mod gpu;
 pub mod memory;
 pub mod model;
@@ -23,6 +24,7 @@ pub use error::{FlipError, Result};
 pub use forward::{
     BlockConfig, ComputeKernel, CpuKernel, ForwardOrchestrator, LayerTensors, StubKernel,
 };
+pub use generate::{argmax, GenerationConfig, Generator, Sampler};
 pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};
 pub use pipeline::{

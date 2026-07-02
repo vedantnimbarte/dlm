@@ -40,6 +40,35 @@ pub trait ComputeKernel {
     ) -> Result<()>;
 }
 
+/// Borrowing a kernel is itself a kernel — lets a [`ForwardOrchestrator`] hold a
+/// reference so an owner (e.g. a text generator) can drive many passes without
+/// moving or cloning its weights.
+///
+/// [`ForwardOrchestrator`]: crate::forward::ForwardOrchestrator
+impl<K: ComputeKernel> ComputeKernel for &K {
+    fn num_layers(&self) -> u32 {
+        (**self).num_layers()
+    }
+
+    fn hidden_size(&self) -> usize {
+        (**self).hidden_size()
+    }
+
+    fn kv_dim(&self) -> usize {
+        (**self).kv_dim()
+    }
+
+    fn run_block(
+        &self,
+        layer: u32,
+        hidden: &mut [f32],
+        kv: &mut KvLayerCache,
+        position: usize,
+    ) -> Result<()> {
+        (**self).run_block(layer, hidden, kv, position)
+    }
+}
+
 /// A deterministic stand-in for a real kernel.
 ///
 /// It does no transformer math: each layer adds a constant (`layer + 1`) to
