@@ -8,10 +8,21 @@
 //! [`HostPipeline`](crate::pipeline::HostPipeline) then stages the result
 //! through page-locked memory into a streaming-zone buffer.
 
+use crate::cache::LayerRamCache;
 use crate::error::Result;
 use crate::pipeline::WeightSource;
 use crate::storage::{LayerCatalog, MmapStore};
 use crate::swap::StreamPass;
+use std::cell::RefCell;
+
+/// Loads the concatenated weight bytes of a single transformer layer.
+///
+/// This is the granularity the tiered CPU-RAM cache operates at: one layer is
+/// the unit that is cached, evicted, and reused across token steps.
+pub trait LayerLoader {
+    /// Bytes for every tensor in `layer`, concatenated in catalog order.
+    fn load_layer(&self, layer: u32) -> Result<Vec<u8>>;
+}
 
 /// Streams layer weights out of a memory-mapped checkpoint.
 ///
@@ -38,16 +49,69 @@ impl<'a> MmapWeightSource<'a> {
     }
 }
 
+impl LayerLoader for MmapWeightSource<'_> {
+    fn load_layer(&self, layer: u32) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.catalog.layer_bytes(layer).unwrap_or(0) as usize);
+        if let Some(names) = self.catalog.layer_tensor_names(layer) {
+            for name in names {
+                // Zero-copy slice from the map, copied once into the buffer.
+                out.extend_from_slice(self.store.tensor_bytes(name)?);
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl WeightSource for MmapWeightSource<'_> {
     fn load_window(&self, pass: &StreamPass) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(self.window_bytes(pass) as usize);
         for layer in pass.layers() {
-            if let Some(names) = self.catalog.layer_tensor_names(layer) {
-                for name in names {
-                    // Zero-copy slice from the map, copied once into the window.
-                    out.extend_from_slice(self.store.tensor_bytes(name)?);
-                }
-            }
+            out.extend_from_slice(&self.load_layer(layer)?);
+        }
+        Ok(out)
+    }
+}
+
+/// A [`WeightSource`] that fronts a per-layer [`LayerLoader`] with a bounded
+/// CPU-RAM LRU cache ([`LayerRamCache`]).
+///
+/// On each window it assembles the layers from RAM when cached and falls back to
+/// the underlying loader (disk) on a miss, so hot layers survive across forward
+/// passes. The cache lives behind a `RefCell` because [`WeightSource::load_window`]
+/// takes `&self` (the [`HostPipeline`](crate::pipeline::HostPipeline) borrows the
+/// source immutably) while cache bookkeeping needs interior mutability.
+pub struct TieredWeightSource<L: LayerLoader> {
+    loader: L,
+    cache: RefCell<LayerRamCache>,
+}
+
+impl<L: LayerLoader> TieredWeightSource<L> {
+    /// Wrap `loader` with a RAM cache bounded to `cache_bytes`.
+    pub fn new(loader: L, cache_bytes: u64) -> Self {
+        Self {
+            loader,
+            cache: RefCell::new(LayerRamCache::new(cache_bytes)),
+        }
+    }
+
+    /// A snapshot of cache effectiveness (hits/misses/evictions).
+    pub fn cache_stats(&self) -> crate::cache::RamCacheStats {
+        self.cache.borrow().stats()
+    }
+
+    /// The wrapped loader.
+    pub fn loader(&self) -> &L {
+        &self.loader
+    }
+}
+
+impl<L: LayerLoader> WeightSource for TieredWeightSource<L> {
+    fn load_window(&self, pass: &StreamPass) -> Result<Vec<u8>> {
+        let mut cache = self.cache.borrow_mut();
+        let mut out = Vec::new();
+        for layer in pass.layers() {
+            let bytes = cache.get_or_load(layer, || self.loader.load_layer(layer))?;
+            out.extend_from_slice(bytes);
         }
         Ok(out)
     }

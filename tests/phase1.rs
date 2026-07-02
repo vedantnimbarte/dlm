@@ -8,7 +8,8 @@
 use flip::memory::{page_size, PinKind, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
 use flip::pipeline::{
-    fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, MmapWeightSource, WeightSource,
+    fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, MmapWeightSource,
+    TieredWeightSource, WeightSource,
 };
 use flip::profiler::VramProfiler;
 use flip::storage::{LayerCatalog, MmapStore};
@@ -413,6 +414,96 @@ fn mmap_source_streams_real_weights_through_pipeline() {
     }
     // Windows carry different data, so their checksums must differ.
     assert_ne!(trace[0].checksum, trace[1].checksum);
+}
+
+#[test]
+fn tiered_cache_serves_second_pass_from_ram() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_patterned_model(
+        tmp.path(),
+        &[
+            ("model.embed_tokens.weight", 40),
+            ("model.layers.0.w", 100),
+            ("model.layers.1.w", 100),
+            ("model.layers.2.w", 100),
+            ("lm_head.weight", 40),
+        ],
+    );
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let catalog = LayerCatalog::build(&store);
+    assert_eq!(catalog.num_layers(), 3);
+
+    // Whole model resident in one window (3 layers).
+    let vram = flip::profiler::VramPlan {
+        free_bytes: 0,
+        safety_bytes: 0,
+        kv_total_bytes: 0,
+        pinned_bytes: 0,
+        per_layer_weight_bytes: 100,
+        usable_bytes: 0,
+        layers_to_load: 3,
+        num_layers: 3,
+    };
+    let swap = LayerSwapPlan::from_plan(&vram);
+    let sched = DoubleBufferSchedule::from_swap_plan(&swap);
+
+    // RAM cache big enough for all 3 layers (300 bytes).
+    let inner = MmapWeightSource::new(&store, &catalog);
+    let tiered = TieredWeightSource::new(inner, 300);
+
+    let window_bytes = 300;
+    let mut pipeline = HostPipeline::new(window_bytes).unwrap();
+
+    // First forward pass: all 3 layers are cold → 3 misses, 0 hits.
+    pipeline.execute(&sched, &tiered).unwrap();
+    let s1 = tiered.cache_stats();
+    assert_eq!(s1.misses, 3);
+    assert_eq!(s1.hits, 0);
+    assert_eq!(s1.entries, 3);
+
+    // Second forward pass: everything served from RAM → +3 hits, no new misses.
+    let trace = pipeline.execute(&sched, &tiered).unwrap();
+    let s2 = tiered.cache_stats();
+    assert_eq!(s2.misses, 3);
+    assert_eq!(s2.hits, 3);
+    assert_eq!(s2.evictions, 0);
+
+    // Data is still correct after caching.
+    let direct = MmapWeightSource::new(&store, &catalog);
+    let expected = direct.load_window(&swap.passes[0]).unwrap();
+    assert_eq!(trace[0].checksum, fold_checksum(&expected));
+}
+
+#[test]
+fn tiered_cache_evicts_under_pressure() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_patterned_model(
+        tmp.path(),
+        &[
+            ("model.layers.0.w", 100),
+            ("model.layers.1.w", 100),
+            ("model.layers.2.w", 100),
+        ],
+    );
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let catalog = LayerCatalog::build(&store);
+
+    // Budget for only 2 of the 3 layers → the third forces an eviction.
+    let tiered = TieredWeightSource::new(MmapWeightSource::new(&store, &catalog), 200);
+
+    // Stream each layer as its own single-layer window, in order.
+    for layer in 0..3u32 {
+        let pass = flip::swap::StreamPass {
+            pass_index: layer,
+            first_layer: layer,
+            last_layer: layer,
+        };
+        tiered.load_window(&pass).unwrap();
+    }
+    let stats = tiered.cache_stats();
+    assert_eq!(stats.misses, 3);
+    assert_eq!(stats.evictions, 1);
+    assert!(stats.resident_bytes <= 200);
 }
 
 #[test]

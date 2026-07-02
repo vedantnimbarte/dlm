@@ -20,7 +20,7 @@ pub mod source;
 
 pub use buffer::{BufferId, DeviceBuffer};
 pub use schedule::{DoubleBufferSchedule, PipelineStep};
-pub use source::MmapWeightSource;
+pub use source::{LayerLoader, MmapWeightSource, TieredWeightSource};
 
 use crate::error::Result;
 use crate::memory::PinnedBuffer;
