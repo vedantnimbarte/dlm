@@ -345,6 +345,11 @@ with nvcc and enables `GpuKernel` (the device `run_block`). `cargo check
 --features cuda-kernels` type-checks the Rust FFI without the toolkit; building a
 binary that runs the kernels needs nvcc + a GPU.
 
+On a CUDA machine, `cargo test --features cuda-kernels` runs
+[`tests/gpu_parity.rs`](tests/gpu_parity.rs), which decodes the same random model
+on both `CpuKernel` and `GpuKernel` and asserts the hidden states match — the CPU
+kernel is the correctness oracle for the device code.
+
 Type-checking works without either toolkit installed; building/linking requires
 the corresponding runtime on the link path:
 
