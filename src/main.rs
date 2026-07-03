@@ -9,9 +9,12 @@
 
 use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
-use flip::cli::{Cli, Command, GenerateArgs, ProfileArgs, ServeArgs, TokenizeArgs};
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
+use flip::cli::{Cli, Command, Device, GenerateArgs, ProfileArgs, ServeArgs, TokenizeArgs};
+#[cfg(feature = "cuda-kernels")]
+use flip::forward::GpuKernel;
+use flip::forward::{BlockConfig, ComputeKernel, LayerTensors};
 use flip::generate::{GenerationConfig, Generator, Sampler};
+use flip::loader::ModelParts;
 use flip::tokenizer::BpeTokenizer;
 use flip::memory::{page_size, PinnedBuffer};
 use flip::model::{ModelConfig, QuantScheme};
@@ -111,11 +114,10 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     }
     let max_context = (prompt_ids.len() + args.max_new_tokens) as u32;
 
-    // Build the generator: a real mapped model, or a synthetic random one.
-    let (generator, vocab_size) = if let Some(dir) = &args.model_path {
+    // Materialize the model (real checkpoint or synthetic) into host weights.
+    let (parts, is_synthetic) = if let Some(dir) = &args.model_path {
         let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
         let store = MmapStore::open_dir(dir)?;
-        let generator = flip::loader::load_generator(&store, &config, max_context)?;
         println!("generate     : model {}", dir.display());
         println!(
             "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
@@ -126,51 +128,97 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
             config.num_kv_heads,
             config.head_dim(),
         );
-        (generator, config.vocab_size as usize)
+        (flip::loader::load_model_parts(&store, &config, max_context)?, false)
     } else {
-        let generator = build_synthetic(&args, max_context)?;
+        let parts = build_synthetic_parts(&args, max_context)?;
         println!("generate     : demo with randomly-initialized weights (seed {})", args.seed);
         println!(
             "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
-            args.vocab_size,
-            args.hidden_size,
-            args.num_layers,
-            args.num_heads,
-            args.num_kv_heads,
-            args.hidden_size / args.num_heads,
+            parts.vocab_size,
+            parts.cfg.hidden_size,
+            parts.layers.len(),
+            parts.cfg.num_heads,
+            parts.cfg.num_kv_heads,
+            parts.cfg.head_dim,
         );
-        (generator, args.vocab_size)
+        (parts, true)
     };
 
     // Prompt ids must fit the model's vocabulary.
     if let Some(&max) = prompt_ids.iter().max() {
-        if max as usize >= vocab_size {
+        if max as usize >= parts.vocab_size {
             return Err(FlipError::InvalidConfig(format!(
-                "prompt token {max} out of vocab range {vocab_size} (tokenizer/model mismatch?)"
+                "prompt token {max} out of vocab range {} (tokenizer/model mismatch?)",
+                parts.vocab_size
             )));
         }
     }
 
+    println!("device       : {:?}", args.device);
     if let Some(text) = &args.text {
         println!("prompt text  : {text:?}");
     }
     println!("prompt ids   : {prompt_ids:?}");
 
-    let generated = generator.generate(&prompt_ids, &gen_cfg)?;
-    println!("generated ids: {generated:?}");
+    generate_on_device(parts, args.device, &prompt_ids, &gen_cfg, tokenizer.as_ref())?;
 
-    // Detokenize when a tokenizer is in play.
-    if let Some(tok) = &tokenizer {
-        println!("generated txt: {:?}", tok.decode(&generated)?);
-        let mut full = prompt_ids.clone();
-        full.extend_from_slice(&generated);
-        println!("full text    : {:?}", tok.decode(&full)?);
-    }
-
-    if args.model_path.is_none() {
+    if is_synthetic {
         println!();
         println!("note         : weights are untrained random values — output is not");
         println!("               meaningful text.");
+    }
+    Ok(())
+}
+
+/// Wrap the model parts in the chosen kernel and run generation.
+fn generate_on_device(
+    parts: ModelParts,
+    device: Device,
+    prompt_ids: &[u32],
+    gen_cfg: &GenerationConfig,
+    tokenizer: Option<&BpeTokenizer>,
+) -> Result<()> {
+    match device {
+        Device::Cpu => {
+            let generator = parts.into_cpu_generator()?;
+            run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
+        }
+        #[cfg(feature = "cuda-kernels")]
+        Device::Gpu => {
+            let kernel = GpuKernel::new(parts.cfg, parts.layers)?;
+            let generator = Generator::new(
+                kernel,
+                parts.embedding,
+                parts.final_norm,
+                parts.lm_head,
+                parts.vocab_size,
+                parts.rms_eps,
+                parts.kv_config,
+                parts.kv_blocks,
+            )?;
+            run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
+        }
+        #[cfg(not(feature = "cuda-kernels"))]
+        Device::Gpu => Err(FlipError::InvalidConfig(
+            "--device gpu requires building with `--features cuda-kernels`".into(),
+        )),
+    }
+}
+
+/// Generate and print ids, plus decoded text when a tokenizer is present.
+fn run_generation<K: ComputeKernel>(
+    generator: &Generator<K>,
+    prompt_ids: &[u32],
+    gen_cfg: &GenerationConfig,
+    tokenizer: Option<&BpeTokenizer>,
+) -> Result<()> {
+    let generated = generator.generate(prompt_ids, gen_cfg)?;
+    println!("generated ids: {generated:?}");
+    if let Some(tok) = tokenizer {
+        println!("generated txt: {:?}", tok.decode(&generated)?);
+        let mut full = prompt_ids.to_vec();
+        full.extend_from_slice(&generated);
+        println!("full text    : {:?}", tok.decode(&full)?);
     }
     Ok(())
 }
@@ -189,8 +237,8 @@ fn resolve_tokenizer(args: &GenerateArgs) -> Result<BpeTokenizer> {
     Ok(BpeTokenizer::bytes_only())
 }
 
-/// Build a synthetic random-weight generator from the geometry flags.
-fn build_synthetic(args: &GenerateArgs, max_context: u32) -> Result<Generator<CpuKernel>> {
+/// Build synthetic random-weight model parts from the geometry flags.
+fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelParts> {
     if args.hidden_size == 0 || args.num_heads == 0 || args.num_kv_heads == 0 {
         return Err(FlipError::InvalidConfig("dimensions must be > 0".into()));
     }
@@ -234,7 +282,6 @@ fn build_synthetic(args: &GenerateArgs, max_context: u32) -> Result<Generator<Cp
             post_attention_layernorm: vec![1.0; cfg.hidden_size],
         })
         .collect();
-    let kernel = CpuKernel::new(cfg, layers)?;
 
     let embedding = rng.vec(args.vocab_size * args.hidden_size, scale);
     let lm_head = rng.vec(args.vocab_size * args.hidden_size, scale);
@@ -248,16 +295,17 @@ fn build_synthetic(args: &GenerateArgs, max_context: u32) -> Result<Generator<Cp
     };
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
-    Generator::new(
-        kernel,
+    Ok(ModelParts {
+        cfg,
+        layers,
         embedding,
         final_norm,
         lm_head,
-        args.vocab_size,
-        1e-5,
+        vocab_size: args.vocab_size,
+        rms_eps: 1e-5,
         kv_config,
         kv_blocks,
-    )
+    })
 }
 
 /// Print the shared startup banner (backend + host page size).

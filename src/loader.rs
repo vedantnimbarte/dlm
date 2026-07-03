@@ -97,17 +97,59 @@ fn load_linear(
     )))
 }
 
+/// A model materialized to host `f32` weights, ready to wrap in a compute kernel
+/// of the caller's choosing (CPU or GPU).
+pub struct ModelParts {
+    pub cfg: BlockConfig,
+    pub layers: Vec<LayerTensors>,
+    pub embedding: Vec<f32>,
+    pub final_norm: Vec<f32>,
+    pub lm_head: Vec<f32>,
+    pub vocab_size: usize,
+    pub rms_eps: f32,
+    pub kv_config: KvCacheConfig,
+    pub kv_blocks: u32,
+}
+
+impl ModelParts {
+    /// Wrap the CPU kernel around these weights and build a generator.
+    pub fn into_cpu_generator(self) -> Result<Generator<CpuKernel>> {
+        let kernel = CpuKernel::new(self.cfg, self.layers)?;
+        Generator::new(
+            kernel,
+            self.embedding,
+            self.final_norm,
+            self.lm_head,
+            self.vocab_size,
+            self.rms_eps,
+            self.kv_config,
+            self.kv_blocks,
+        )
+    }
+}
+
 /// Build a CPU [`Generator`] from a mapped checkpoint and its config.
 ///
-/// `max_context` sizes the KV block pool (tokens the sequence may reach). Uses
-/// the standard `model.layers.{i}.*`, `model.embed_tokens.weight`,
-/// `model.norm.weight`, and `lm_head.weight` names; a tied LM head (missing
-/// `lm_head.weight`) falls back to the embedding matrix.
+/// Convenience wrapper over [`load_model_parts`] + [`ModelParts::into_cpu_generator`].
 pub fn load_generator(
     store: &MmapStore,
     config: &ModelConfig,
     max_context: u32,
 ) -> Result<Generator<CpuKernel>> {
+    load_model_parts(store, config, max_context)?.into_cpu_generator()
+}
+
+/// Materialize a checkpoint into [`ModelParts`] (host `f32` weights + shapes).
+///
+/// `max_context` sizes the KV block pool (tokens the sequence may reach). Uses
+/// the standard `model.layers.{i}.*`, `model.embed_tokens.weight`,
+/// `model.norm.weight`, and `lm_head.weight` names; a tied LM head (missing
+/// `lm_head.weight`) falls back to the embedding matrix.
+pub fn load_model_parts(
+    store: &MmapStore,
+    config: &ModelConfig,
+    max_context: u32,
+) -> Result<ModelParts> {
     let hidden = config.hidden_size as usize;
     let num_heads = config.num_attention_heads as usize;
     let num_kv_heads = config.num_kv_heads as usize;
@@ -150,7 +192,6 @@ pub fn load_generator(
         tensors.validate(&cfg)?;
         layers.push(tensors);
     }
-    let kernel = CpuKernel::new(cfg, layers)?;
 
     let embedding = load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?;
     let final_norm = load_tensor(store, "model.norm.weight", hidden)?;
@@ -169,14 +210,15 @@ pub fn load_generator(
     };
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
-    Generator::new(
-        kernel,
+    Ok(ModelParts {
+        cfg,
+        layers,
         embedding,
         final_norm,
         lm_head,
-        vocab,
-        config.rms_eps,
+        vocab_size: vocab,
+        rms_eps: config.rms_eps,
         kv_config,
         kv_blocks,
-    )
+    })
 }

@@ -53,6 +53,15 @@ pub enum DistributedMode {
     Worker,
 }
 
+/// Compute device for generation (`--device`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Device {
+    /// Host CPU (always available).
+    Cpu,
+    /// CUDA GPU (requires building with `--features cuda-kernels`).
+    Gpu,
+}
+
 /// On-disk weight precision (`--quant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum QuantArg {
@@ -209,6 +218,10 @@ pub struct GenerateArgs {
     /// PRNG seed for the synthetic weights.
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
+
+    /// Compute device. `gpu` requires a `cuda-kernels` build.
+    #[arg(long, value_enum, default_value_t = Device::Cpu)]
+    pub device: Device,
 }
 
 #[cfg(test)]
@@ -325,6 +338,16 @@ mod tests {
             panic!("expected generate");
         };
         assert_eq!(a.text.as_deref(), Some("hello"));
+        assert_eq!(a.device, Device::Cpu); // default
+    }
+
+    #[test]
+    fn generate_device_selection() {
+        let cli = Cli::try_parse_from(["flip", "generate", "--device", "gpu"]).unwrap();
+        let Command::Generate(a) = cli.command else {
+            panic!("expected generate");
+        };
+        assert_eq!(a.device, Device::Gpu);
     }
 
     #[test]
