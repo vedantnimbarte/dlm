@@ -16,6 +16,7 @@ pub mod model;
 pub mod pipeline;
 pub mod profiler;
 pub mod quant;
+pub mod server;
 pub mod storage;
 pub mod swap;
 pub mod tokenizer;
