@@ -185,6 +185,51 @@ impl<K: ComputeKernel> Generator<K> {
     }
 }
 
+/// A resumable, single-token-at-a-time generation, decoupled from the full
+/// `generate` loop so a scheduler can interleave many of them (continuous
+/// batching). Borrows the generator's weights; each session owns its own KV
+/// state, so stepping sessions in any order yields identical per-session output.
+pub struct GenerationSession<'a, K: ComputeKernel> {
+    generator: &'a Generator<K>,
+    orchestrator: crate::forward::ForwardOrchestrator<&'a K>,
+    last_hidden: Vec<f32>,
+    sampler: Sampler,
+}
+
+impl<K: ComputeKernel> Generator<K> {
+    /// Begin a step-wise generation: prefills `prompt` and leaves the session
+    /// ready to emit the first continuation token via [`GenerationSession::step`].
+    pub fn start_session(&self, prompt: &[u32], sampler: Sampler) -> Result<GenerationSession<'_, K>> {
+        if prompt.is_empty() {
+            return Err(FlipError::InvalidConfig("prompt must be non-empty".into()));
+        }
+        let budget = crate::cache::PagedKvCache::new(self.kv_config, self.kv_total_blocks);
+        let mut orchestrator = crate::forward::ForwardOrchestrator::new(&self.kernel, budget);
+        let mut hidden = vec![0.0f32; self.hidden_size];
+        for &token in prompt {
+            hidden = self.embed(token)?;
+            orchestrator.decode_token(&mut hidden)?;
+        }
+        Ok(GenerationSession {
+            generator: self,
+            orchestrator,
+            last_hidden: hidden,
+            sampler,
+        })
+    }
+}
+
+impl<K: ComputeKernel> GenerationSession<'_, K> {
+    /// Emit the next token and advance the internal state by one step.
+    pub fn step(&mut self) -> Result<u32> {
+        let logits = self.generator.logits(&self.last_hidden);
+        let next = self.sampler.sample(&logits);
+        self.last_hidden = self.generator.embed(next)?;
+        self.orchestrator.decode_token(&mut self.last_hidden)?;
+        Ok(next)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

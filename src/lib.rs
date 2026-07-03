@@ -4,6 +4,7 @@
 //! bottom-up as the engine is built; see `PRD.md` §5 for the phase map.
 
 pub mod activation;
+pub mod batching;
 pub mod cache;
 pub mod cli;
 pub mod error;
@@ -28,7 +29,7 @@ pub use error::{FlipError, Result};
 pub use forward::{
     BlockConfig, ComputeKernel, CpuKernel, ForwardOrchestrator, LayerTensors, StubKernel,
 };
-pub use generate::{argmax, GenerationConfig, Generator, Sampler};
+pub use generate::{argmax, GenerationConfig, GenerationSession, Generator, Sampler};
 pub use loader::load_generator;
 pub use memory::{PinKind, PinnedBuffer};
 pub use model::{ModelConfig, QuantScheme};
