@@ -156,6 +156,30 @@ pub fn bytes_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
     }
 }
 
+/// Decode a tensor's raw little-endian bytes into `i32` elements (I32/U32).
+///
+/// Used for the packed integer tensors in quantized checkpoints (`qweight`,
+/// `qzeros`), whose 4-bit codes are bit-packed into 32-bit words.
+pub fn bytes_to_i32(bytes: &[u8], dtype: Dtype) -> Result<Vec<i32>> {
+    match dtype {
+        Dtype::I32 | Dtype::U32 => {
+            if bytes.len() % 4 != 0 {
+                return Err(FlipError::SafetensorsHeader(format!(
+                    "I32 tensor byte length {} is not a multiple of 4",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        other => Err(FlipError::InvalidConfig(format!(
+            "cannot convert dtype {other:?} to i32"
+        ))),
+    }
+}
+
 /// Parsed metadata for a single tensor. Byte offsets are relative to the start
 /// of the data section (i.e. after the 8-byte prefix and JSON header).
 #[derive(Debug, Clone)]
