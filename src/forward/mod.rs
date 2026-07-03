@@ -6,9 +6,13 @@
 //! [`StubKernel`] without touching the orchestration.
 
 pub mod cpu;
+#[cfg(feature = "cuda-kernels")]
+pub mod gpu;
 pub mod kernel;
 pub mod orchestrator;
 
 pub use cpu::{decode_block, BlockConfig, CpuKernel, KvLayerCache, LayerTensors};
+#[cfg(feature = "cuda-kernels")]
+pub use gpu::GpuKernel;
 pub use kernel::{ComputeKernel, StubKernel};
 pub use orchestrator::ForwardOrchestrator;

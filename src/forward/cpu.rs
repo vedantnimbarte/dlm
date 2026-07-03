@@ -160,6 +160,16 @@ impl KvLayerCache {
         Ok(())
     }
 
+    /// All cached keys, flat `[positions * kv_dim]` (for uploading to a device).
+    pub fn keys(&self) -> &[f32] {
+        &self.keys
+    }
+
+    /// All cached values, flat `[positions * kv_dim]`.
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
     fn key_at(&self, pos: usize) -> &[f32] {
         &self.keys[pos * self.kv_dim..(pos + 1) * self.kv_dim]
     }
