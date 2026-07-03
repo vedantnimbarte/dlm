@@ -25,6 +25,7 @@ ability to run models many times larger than the card.
 - [The VRAM budget math](#the-vram-budget-math)
 - [Project layout](#project-layout)
 - [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
+- [Distributed & scaling](#distributed--scaling)
 
 ---
 
@@ -113,6 +114,10 @@ limit.
 | CPU token-generation loop (embed → stack → LM head → sample) | [`src/generate.rs`](src/generate.rs) |
 | Safetensors → CPU model loader (F32/F16/BF16 + GPTQ 4-bit) | [`src/loader.rs`](src/loader.rs) |
 | Byte-level BPE tokenizer (encode/decode + vocab/merges) | [`src/tokenizer.rs`](src/tokenizer.rs) |
+| OpenAI-compatible HTTP API server | [`src/server`](src/server) |
+| Speculative decoding (draft/target, exact output) | [`src/speculative.rs`](src/speculative.rs) |
+| Continuous batching scheduler | [`src/batching.rs`](src/batching.rs) |
+| Distributed master-worker pipeline (heartbeat + fallback) | [`src/distributed`](src/distributed) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
 | GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, memcpy) | [`src/gpu`](src/gpu) |
 | CUDA device `run_block` kernel (feature `cuda-kernels`) | [`src/gpu/kernels.cu`](src/gpu/kernels.cu) |
@@ -204,23 +209,25 @@ layer sizes:
 cargo run -- profile --model-path /path/to/models/Llama-3-70B-Instruct
 ```
 
-**`serve`** — resolves the full serving configuration (specs §4) and runs the
-planning pipeline. The OpenAI-compatible server loop itself is a later milestone;
-today this validates the config and prepares the engine end-to-end:
+**`serve`** — starts the **OpenAI-compatible HTTP API server** for a model. It
+exposes `POST /v1/chat/completions`, `POST /v1/completions`, and `GET /v1/models`
+so clients like Open WebUI can talk to `flip` unchanged:
 
 ```bash
 cargo run -- serve \
-    --model-path /path/to/models/Llama-3-70B-Instruct \
-    --vram-budget-gb 13.5 \
+    --model-path /path/to/small-model \
     --context-length 8192 \
-    --ram-cache-gb 32 \
     --port 8000 \
     --host 127.0.0.1
+
+# then, from another shell:
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"flip","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
 
-`--ram-cache-gb` sizes the tiered CPU-RAM layer cache. When set, `serve` runs two
-forward passes and reports the cache hit rate, showing how hot layers are served
-from RAM on the second pass instead of being re-read from NVMe.
+With `--distributed-mode worker` the process instead serves its layer shard to a
+master over TCP (see [Distributed & scaling](#distributed--scaling)).
 
 **`generate`** — drives the full CPU generation loop (embedding → transformer
 stack → LM head → greedy sampling) on a **randomly-initialized** synthetic model.
@@ -330,8 +337,12 @@ src/
 ├── activation/       # residual activation pool (buffer reuse)
 ├── forward/          # forward-pass orchestration + real CPU decode block
 ├── generate.rs       # CPU token-generation loop (embed / LM head / sampling)
-├── loader.rs         # safetensors → CPU model (F32/F16/BF16)
+├── loader.rs         # safetensors → CPU model (F32/F16/BF16 + GPTQ)
 ├── tokenizer.rs      # byte-level BPE tokenizer (encode / decode)
+├── server/           # OpenAI-compatible HTTP API (chat/completions/models)
+├── speculative.rs    # speculative decoding (draft proposes, target verifies)
+├── batching.rs       # continuous batching scheduler
+├── distributed/      # master-worker pipeline: protocol, worker, coordinator
 └── gpu/              # vendor-neutral backend + CUDA device kernels (kernels.cu)
 tests/
 └── phase1.rs         # integration tests
@@ -378,6 +389,44 @@ allocates genuine page-locked memory (`cudaHostAlloc` / `hipHostMalloc`) and
 page-aligned host allocations (same layout contract, promotable in place later
 via `cudaHostRegister` / `hipHostRegister`), so nothing about the pipeline shape
 changes between builds.
+
+## Distributed & scaling
+
+The Phase 3 serving and scaling components (all CPU-testable, driven by the same
+inference engine):
+
+- **OpenAI-compatible server** ([`src/server`](src/server)) — a dependency-free
+  HTTP/1.1 server exposing `/v1/chat/completions`, `/v1/completions`, `/v1/models`.
+  Wraps a generator + tokenizer; started by `flip serve`.
+- **Speculative decoding** ([`src/speculative.rs`](src/speculative.rs)) — a cheap
+  draft model proposes `gamma` tokens, the target verifies them; accepted tokens
+  advance in bulk. With greedy sampling the output is provably **identical** to
+  plain target decoding (tested), with acceptance-rate stats.
+- **Continuous batching** ([`src/batching.rs`](src/batching.rs)) — a scheduler
+  keeps up to `max_batch` generations in flight, advancing each one token per
+  tick and admitting queued requests as slots free. Each request's output is
+  identical to running it alone (tested), independent of interleaving.
+- **Distributed master-worker** ([`src/distributed`](src/distributed)) — layers
+  are partitioned into shards across worker nodes; a coordinator streams the
+  hidden state through them over a length-prefixed binary TCP protocol (bit-exact
+  `f32`, so a distributed forward equals a local one). **Heartbeats** track
+  liveness and an unreachable worker **falls back to local CPU-RAM** execution, so
+  a forward pass still completes. Start a worker with `flip serve
+  --distributed-mode worker`.
+
+```rust
+// Split a model across two worker nodes; the coordinator routes through them.
+let shards = flip::distributed::partition_layers(num_layers, 2);
+let mut coord = flip::distributed::Coordinator::new(cfg, layers, embed, norm, head, vocab, routes)?;
+let tokens = coord.generate(&prompt, 32)?;   // == local greedy; survives a dead worker
+```
+
+> **Scope note.** These components run and are tested on CPU over localhost. The
+> pieces that need real hardware — fused batched/speculative *speedups* (a batch
+> kernel), multi-GPU NCCL/RCCL transport, and gRPC/Protobuf instead of the
+> hand-rolled TCP protocol — are documented at their call sites; the scheduling,
+> protocol, routing, fault-tolerance, and correctness are all implemented and
+> verified here.
 
 See [`PRD.md`](PRD.md) for product requirements and [`specs.md`](specs.md) for
 the full technical specification.
