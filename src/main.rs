@@ -185,7 +185,10 @@ fn generate_on_device(
         }
         #[cfg(feature = "cuda-kernels")]
         Device::Gpu => {
-            let kernel = GpuKernel::new(parts.cfg, parts.layers)?;
+            // KV buffers must hold the whole sequence the pool was sized for.
+            let max_kv_tokens =
+                parts.kv_blocks as usize * parts.kv_config.block_size as usize;
+            let kernel = GpuKernel::new(parts.cfg, parts.layers, max_kv_tokens)?;
             let generator = Generator::new(
                 kernel,
                 parts.embedding,

@@ -70,7 +70,8 @@ fn gpu_run_block_matches_cpu() {
     // Identical weights to both kernels.
     let layers = random_layers(&cfg, num_layers, 0xC0FFEE);
     let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
-    let gpu = GpuKernel::new(cfg, layers).unwrap();
+    // KV capacity ≥ the tokens we decode below.
+    let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
 
     let kv_cfg = KvCacheConfig {
         num_layers,

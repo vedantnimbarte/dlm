@@ -1,17 +1,20 @@
 //! GPU compute kernel — the device `run_block` (feature `cuda-kernels`).
 //!
 //! Structurally identical to [`CpuKernel`](crate::forward::CpuKernel): it holds a
-//! model's per-layer weights (here resident in VRAM) and implements
-//! [`ComputeKernel`] by running one decode block per token. The transformer math
-//! lives in `src/gpu/kernels.cu` and is invoked through the `flip_decode_block`
-//! FFI entry point.
+//! model's per-layer weights in VRAM and implements [`ComputeKernel`] by running
+//! one decode block per token. The transformer math lives in
+//! `src/gpu/kernels.cu`, invoked through the `flip_decode_block` FFI entry point.
 //!
-//! Per call it uploads the hidden state and the current K/V history to the
-//! device, launches the block, and reads back the updated hidden state plus the
-//! new token's K/V (appended to the host [`KvLayerCache`], which stays the
-//! source of truth). This re-uploads KV each layer — correct but not optimal; a
-//! production version keeps KV resident on device. Requires nvcc at build time
-//! and a GPU at run time; the CPU kernel is the correctness oracle.
+//! **KV stays on device.** Each layer owns persistent `kv_keys`/`kv_values`
+//! buffers in VRAM (sized for the sequence). Per token the kernel writes the new
+//! K/V into the next slot in place and attends over the buffer directly, so only
+//! the hidden vector (`hidden_size` floats) crosses the PCIe bus each layer —
+//! not the whole KV history. The host [`KvLayerCache`] passed by the orchestrator
+//! is used only for length bookkeeping on this path (the real K/V is in VRAM); we
+//! append zero placeholders to keep its length in step without a device→host copy.
+//!
+//! Requires nvcc at build time and a GPU at run time; the CPU kernel is the
+//! correctness oracle ([`tests/gpu_parity.rs`]).
 
 use crate::error::{FlipError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
@@ -20,7 +23,10 @@ use crate::gpu::device::{synchronize, DeviceBuffer};
 
 extern "C" {
     /// One decode block on the device (see `src/gpu/kernels.cu`). Returns a
-    /// `cudaError_t` (0 == success). All pointers are device pointers.
+    /// `cudaError_t` (0 == success). All pointers are device pointers; `kv_keys`
+    /// and `kv_values` are persistent buffers written in place at slot
+    /// `num_positions`.
+    #[allow(clippy::too_many_arguments)]
     fn flip_decode_block(
         hidden_size: i32,
         q_dim: i32,
@@ -41,16 +47,14 @@ extern "C" {
         in_norm: *const f32,
         post_norm: *const f32,
         x: *mut f32,
-        kv_keys: *const f32,
-        kv_values: *const f32,
+        kv_keys: *mut f32,
+        kv_values: *mut f32,
         num_positions: i32,
         position: i32,
-        new_key: *mut f32,
-        new_value: *mut f32,
     ) -> i32;
 }
 
-/// One layer's weights resident in device memory.
+/// One layer's weights plus its persistent K/V history, resident in VRAM.
 struct GpuLayer {
     q_proj: DeviceBuffer,
     k_proj: DeviceBuffer,
@@ -61,10 +65,12 @@ struct GpuLayer {
     down_proj: DeviceBuffer,
     input_layernorm: DeviceBuffer,
     post_attention_layernorm: DeviceBuffer,
+    kv_keys: DeviceBuffer,
+    kv_values: DeviceBuffer,
 }
 
 impl GpuLayer {
-    fn upload(t: &LayerTensors) -> Result<Self> {
+    fn upload(t: &LayerTensors, kv_buffer_len: usize) -> Result<Self> {
         Ok(Self {
             q_proj: DeviceBuffer::from_slice(&t.q_proj)?,
             k_proj: DeviceBuffer::from_slice(&t.k_proj)?,
@@ -75,27 +81,35 @@ impl GpuLayer {
             down_proj: DeviceBuffer::from_slice(&t.down_proj)?,
             input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
             post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
+            kv_keys: DeviceBuffer::new(kv_buffer_len)?,
+            kv_values: DeviceBuffer::new(kv_buffer_len)?,
         })
     }
 }
 
-/// A GPU [`ComputeKernel`] holding a model's weights in VRAM.
+/// A GPU [`ComputeKernel`] holding a model's weights (and its KV history) in VRAM.
 pub struct GpuKernel {
     cfg: BlockConfig,
     layers: Vec<GpuLayer>,
+    /// Max tokens the per-layer KV buffers can hold.
+    kv_capacity_tokens: usize,
 }
 
 impl GpuKernel {
-    /// Upload a model's weights to the device. Validates dimensions first.
-    pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>) -> Result<Self> {
+    /// Upload a model's weights to the device and allocate per-layer KV history
+    /// buffers sized for up to `max_kv_tokens` positions.
+    pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>, max_kv_tokens: usize) -> Result<Self> {
+        let cap = max_kv_tokens.max(1);
+        let kv_buffer_len = cap * cfg.kv_dim();
         let mut gpu_layers = Vec::with_capacity(layers.len());
         for layer in &layers {
             layer.validate(&cfg)?;
-            gpu_layers.push(GpuLayer::upload(layer)?);
+            gpu_layers.push(GpuLayer::upload(layer, kv_buffer_len)?);
         }
         Ok(Self {
             cfg,
             layers: gpu_layers,
+            kv_capacity_tokens: cap,
         })
     }
 }
@@ -122,17 +136,24 @@ impl ComputeKernel for GpuKernel {
     ) -> Result<()> {
         let w = &self.layers[layer as usize];
         let kv_dim = self.cfg.kv_dim();
-        let num_positions = kv.len();
 
-        // Stage hidden + current KV history in VRAM.
+        // Prior sequence length. The device buffers are overwritten from slot 0
+        // each sequence (attention only reads slots [0, num_positions+1)), so no
+        // per-generation reset is needed — stale slots beyond the window are
+        // never read.
+        let num_positions = kv.len();
+        if num_positions >= self.kv_capacity_tokens {
+            return Err(FlipError::InvalidConfig(format!(
+                "GPU KV capacity {} exceeded at position {position}",
+                self.kv_capacity_tokens
+            )));
+        }
+
+        // Only the hidden vector crosses the bus; KV lives in VRAM.
         let d_hidden = DeviceBuffer::from_slice(hidden)?;
-        let d_keys = DeviceBuffer::from_slice(kv.keys())?;
-        let d_values = DeviceBuffer::from_slice(kv.values())?;
-        let d_new_key = DeviceBuffer::new(kv_dim)?;
-        let d_new_value = DeviceBuffer::new(kv_dim)?;
 
         // SAFETY: all pointers are live device allocations of the sizes the
-        // kernel expects (validated weight dims; hidden/kv sized above).
+        // kernel expects; kv buffers have capacity for `num_positions + 1`.
         let code = unsafe {
             flip_decode_block(
                 self.cfg.hidden_size as i32,
@@ -154,12 +175,10 @@ impl ComputeKernel for GpuKernel {
                 w.input_layernorm.as_ptr(),
                 w.post_attention_layernorm.as_ptr(),
                 d_hidden.as_mut_ptr(),
-                d_keys.as_ptr(),
-                d_values.as_ptr(),
+                w.kv_keys.as_mut_ptr(),
+                w.kv_values.as_mut_ptr(),
                 num_positions as i32,
                 position as i32,
-                d_new_key.as_mut_ptr(),
-                d_new_value.as_mut_ptr(),
             )
         };
         if code != 0 {
@@ -169,14 +188,11 @@ impl ComputeKernel for GpuKernel {
             });
         }
         synchronize()?;
-
-        // Read back the updated hidden state and the new token's K/V.
         d_hidden.download(hidden)?;
-        let mut new_key = vec![0.0f32; kv_dim];
-        let mut new_value = vec![0.0f32; kv_dim];
-        d_new_key.download(&mut new_key)?;
-        d_new_value.download(&mut new_value)?;
-        kv.append(&new_key, &new_value)?;
+
+        // Keep the orchestrator's length bookkeeping in step. The real K/V is in
+        // VRAM; these host placeholders are never read on the GPU path.
+        kv.append(&vec![0.0; kv_dim], &vec![0.0; kv_dim])?;
         Ok(())
     }
 }

@@ -116,22 +116,25 @@ __global__ void copy_kernel(const float* src, float* dst, int n) {
 
 static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 
+// `kv_keys` / `kv_values` are **persistent** device buffers (capacity
+// max_positions * kv_dim) owned by the caller across the whole sequence. This
+// call writes the new token's K/V into slot `num_positions` in place and attends
+// over the first `num_positions + 1` slots — so the KV history never leaves VRAM
+// and only the hidden vector crosses the PCIe bus per token.
 extern "C" int flip_decode_block(
     int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
     int inter, float rope_theta, float rms_eps,
     const float* q_proj, const float* k_proj, const float* v_proj, const float* o_proj,
     const float* gate_proj, const float* up_proj, const float* down_proj,
     const float* in_norm, const float* post_norm,
-    float* x,                                         // [hidden] in/out
-    const float* kv_keys, const float* kv_values,     // [num_positions * kv_dim]
-    int num_positions, int position,
-    float* new_key, float* new_value)                 // [kv_dim] out
+    float* x,                              // [hidden] in/out
+    float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
+    int num_positions, int position)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
 
     float *normed, *q, *k, *v, *ctx, *attn_out, *normed2, *gate, *up, *inter_buf, *down;
-    float *keys_all, *values_all;
     cudaMalloc(&normed, hidden_size * sizeof(float));
     cudaMalloc(&q, q_dim * sizeof(float));
     cudaMalloc(&k, kv_dim * sizeof(float));
@@ -143,8 +146,6 @@ extern "C" int flip_decode_block(
     cudaMalloc(&up, inter * sizeof(float));
     cudaMalloc(&inter_buf, inter * sizeof(float));
     cudaMalloc(&down, hidden_size * sizeof(float));
-    cudaMalloc(&keys_all, (long)total_pos * kv_dim * sizeof(float));
-    cudaMalloc(&values_all, (long)total_pos * kv_dim * sizeof(float));
 
     // Attention sublayer.
     rmsnorm_kernel<<<1, hidden_size>>>(x, in_norm, normed, hidden_size, rms_eps);
@@ -154,17 +155,12 @@ extern "C" int flip_decode_block(
     rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, rope_theta);
     rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, rope_theta);
 
-    // Assemble the full K/V history (prior positions + this token) on device.
-    if (num_positions > 0) {
-        cudaMemcpy(keys_all, kv_keys, (long)num_positions * kv_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(values_all, kv_values, (long)num_positions * kv_dim * sizeof(float), cudaMemcpyDeviceToDevice);
-    }
-    copy_kernel<<<grid_for(kv_dim, B), B>>>(k, keys_all + (long)num_positions * kv_dim, kv_dim);
-    copy_kernel<<<grid_for(kv_dim, B), B>>>(v, values_all + (long)num_positions * kv_dim, kv_dim);
-    copy_kernel<<<grid_for(kv_dim, B), B>>>(k, new_key, kv_dim);
-    copy_kernel<<<grid_for(kv_dim, B), B>>>(v, new_value, kv_dim);
+    // Append this token's K/V into the persistent history at slot num_positions.
+    copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
+    copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
 
-    attention_kernel<<<grid_for(num_heads, B), B>>>(q, keys_all, values_all, ctx, num_heads, num_kv_heads, head_dim, total_pos);
+    // Attend over history + this token, reading the persistent buffers directly.
+    attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos);
     matvec_kernel<<<grid_for(hidden_size, B), B>>>(o_proj, ctx, attn_out, hidden_size, q_dim);
     add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
@@ -180,7 +176,7 @@ extern "C" int flip_decode_block(
 
     cudaFree(normed); cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(ctx);
     cudaFree(attn_out); cudaFree(normed2); cudaFree(gate); cudaFree(up);
-    cudaFree(inter_buf); cudaFree(down); cudaFree(keys_all); cudaFree(values_all);
+    cudaFree(inter_buf); cudaFree(down);
 
     if (err != cudaSuccess) return (int)err;
     return (int)cudaGetLastError();
