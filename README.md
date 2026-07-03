@@ -79,7 +79,10 @@ Three interchangeable kernels sit behind the trait:
   The transformer math is in [`src/gpu/kernels.cu`](src/gpu/kernels.cu) (RMSNorm,
   RoPE, GQA attention, SwiGLU — mirroring the CPU oracle op-for-op); the Rust
   side ([`src/forward/gpu.rs`](src/forward/gpu.rs)) uploads weights to VRAM and
-  launches the block. Requires nvcc + a GPU; validated against the CPU kernel.
+  launches the block. **KV history stays resident in VRAM** — the new token's
+  K/V is appended in place and attention reads it directly, so only the hidden
+  vector crosses the PCIe bus per token, not the whole history. Requires nvcc + a
+  GPU; validated against the CPU kernel.
 
 Around the stack, [`src/generate.rs`](src/generate.rs) closes the loop:
 `token → embedding → transformer stack → final RMSNorm → LM head → logits →
