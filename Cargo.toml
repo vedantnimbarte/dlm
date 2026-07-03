@@ -24,6 +24,10 @@ cuda = []
 # Without either feature, the crate builds and runs with a page-aligned host-memory
 # fallback so the engine is fully testable off-GPU on any machine.
 rocm = []
+# GPU compute kernels: compiles src/gpu/kernels.cu with nvcc and enables GpuKernel
+# (the device `run_block`). Implies `cuda`; requires the CUDA toolkit (nvcc) at
+# build time. `cargo check` type-checks the Rust FFI without nvcc.
+cuda-kernels = ["cuda"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

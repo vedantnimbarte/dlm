@@ -22,7 +22,44 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=amdhip64");
     }
 
+    if std::env::var("CARGO_FEATURE_CUDA_KERNELS").is_ok() {
+        compile_cuda_kernels();
+        println!("cargo:rerun-if-changed=src/gpu/kernels.cu");
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
+}
+
+/// Compile `src/gpu/kernels.cu` into a static library with nvcc and link it.
+///
+/// Degrades gracefully: if nvcc is not found we emit a warning and skip, so
+/// `cargo check --features cuda-kernels` type-checks the Rust FFI without the
+/// toolkit. Linking a binary that actually calls the kernels then requires nvcc.
+fn compile_cuda_kernels() {
+    let nvcc = std::env::var("CUDA_PATH")
+        .map(|p| format!("{p}/bin/nvcc"))
+        .unwrap_or_else(|_| "nvcc".to_string());
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let lib_path = format!("{out_dir}/libflip_kernels.a");
+
+    let status = std::process::Command::new(&nvcc)
+        .args(["-O3", "-Xcompiler", "-fPIC", "-lib", "src/gpu/kernels.cu", "-o"])
+        .arg(&lib_path)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:rustc-link-search=native={out_dir}");
+            println!("cargo:rustc-link-lib=static=flip_kernels");
+        }
+        Ok(s) => {
+            println!("cargo:warning=nvcc failed to compile src/gpu/kernels.cu (exit {s}); GPU kernels will be unresolved at link time");
+        }
+        Err(_) => {
+            println!("cargo:warning=cuda-kernels enabled but nvcc was not found; skipping device-code compilation (cargo check still type-checks the FFI)");
+        }
+    }
 }
