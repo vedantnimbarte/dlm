@@ -401,19 +401,27 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let engine = std::sync::Arc::new(flip::server::Engine::new(
-                generator, tokenizer, "flip", 128, created,
-            ));
+            // Batched, streaming engine: a background scheduler interleaves
+            // concurrent requests a token at a time.
+            let engine = flip::server::EngineService::start(
+                generator,
+                tokenizer,
+                config.vocab_size as usize,
+                "flip",
+                128,
+                created,
+                8, // max concurrent batch
+            );
             let server = flip::server::HttpServer::bind(&listen)?;
             println!();
-            println!("serving      : OpenAI-compatible API on http://{listen}");
-            println!("  endpoints  : POST /v1/chat/completions, POST /v1/completions, GET /v1/models");
+            println!("serving      : OpenAI-compatible API on http://{listen} (batched)");
+            println!("  endpoints  : POST /v1/chat/completions (stream supported), GET /v1/models");
             if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
                 println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
                 println!("               currently runs the model locally (distributed routing available");
                 println!("               via flip::distributed::Coordinator).");
             }
-            server.serve(flip::server::router(engine))?; // blocks
+            server.serve(flip::server::engine::router(engine))?; // blocks
             Ok(())
         }
     }
