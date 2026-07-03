@@ -75,8 +75,11 @@ Three interchangeable kernels sit behind the trait:
   serves as the correctness oracle and porting spec for the GPU kernel.
 - **`StubKernel`** — a trivial deterministic kernel for testing the
   orchestration (KV growth, per-layer iteration) in isolation.
-- **GPU kernel** — a CUDA/HIP `run_block` implementation for production
-  inference (not yet built; the hardware-gated piece).
+- **`GpuKernel`** — a CUDA `run_block` on the device (feature `cuda-kernels`).
+  The transformer math is in [`src/gpu/kernels.cu`](src/gpu/kernels.cu) (RMSNorm,
+  RoPE, GQA attention, SwiGLU — mirroring the CPU oracle op-for-op); the Rust
+  side ([`src/forward/gpu.rs`](src/forward/gpu.rs)) uploads weights to VRAM and
+  launches the block. Requires nvcc + a GPU; validated against the CPU kernel.
 
 Around the stack, [`src/generate.rs`](src/generate.rs) closes the loop:
 `token → embedding → transformer stack → final RMSNorm → LM head → logits →
@@ -108,7 +111,8 @@ limit.
 | Safetensors → CPU model loader (F32/F16/BF16 + GPTQ 4-bit) | [`src/loader.rs`](src/loader.rs) |
 | Byte-level BPE tokenizer (encode/decode + vocab/merges) | [`src/tokenizer.rs`](src/tokenizer.rs) |
 | `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
-| GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, async memcpy) | [`src/gpu`](src/gpu) |
+| GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, memcpy) | [`src/gpu`](src/gpu) |
+| CUDA device `run_block` kernel (feature `cuda-kernels`) | [`src/gpu/kernels.cu`](src/gpu/kernels.cu) |
 
 The GPU-specific paths are behind `cuda` / `rocm`
 [feature flags](#building-for-gpu-nvidia--amd); with neither, the engine uses a
@@ -317,7 +321,7 @@ src/
 ├── generate.rs       # CPU token-generation loop (embed / LM head / sampling)
 ├── loader.rs         # safetensors → CPU model (F32/F16/BF16)
 ├── tokenizer.rs      # byte-level BPE tokenizer (encode / decode)
-└── gpu/              # vendor-neutral backend: CUDA + ROCm/HIP FFI + wrappers
+└── gpu/              # vendor-neutral backend + CUDA device kernels (kernels.cu)
 tests/
 └── phase1.rs         # integration tests
 build.rs              # links cudart / amdhip64 for the selected GPU feature
@@ -332,8 +336,14 @@ across vendors.
 | Feature | Vendor | Runtime | Env var |
 |---|---|---|---|
 | `cuda` | NVIDIA | `cudart` | `CUDA_PATH` |
+| `cuda-kernels` | NVIDIA | `cudart` + compiled `kernels.cu` (nvcc) | `CUDA_PATH` |
 | `rocm` | AMD | `amdhip64` | `ROCM_PATH` |
 | _(none)_ | — | host fallback | — |
+
+`cuda-kernels` additionally compiles [`src/gpu/kernels.cu`](src/gpu/kernels.cu)
+with nvcc and enables `GpuKernel` (the device `run_block`). `cargo check
+--features cuda-kernels` type-checks the Rust FFI without the toolkit; building a
+binary that runs the kernels needs nvcc + a GPU.
 
 Type-checking works without either toolkit installed; building/linking requires
 the corresponding runtime on the link path:
