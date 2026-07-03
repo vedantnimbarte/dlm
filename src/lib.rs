@@ -40,6 +40,7 @@ pub use pipeline::{
 };
 pub use profiler::{VramPlan, VramProfiler};
 pub use quant::Quant4Tensor;
+pub use speculative::{SpeculativeDecoder, SpeculativeResult, SpeculativeSession};
 pub use storage::{LayerCatalog, MmapShard, MmapStore};
 pub use swap::{LayerSwapPlan, StreamPass};
 pub use tokenizer::BpeTokenizer;

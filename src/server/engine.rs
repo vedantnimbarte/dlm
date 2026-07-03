@@ -57,8 +57,62 @@ impl EngineService {
         created: u64,
         max_batch: usize,
     ) -> Arc<Self> {
+        Self::start_inner(
+            generator,
+            None,
+            0,
+            tokenizer,
+            vocab_size,
+            model_id,
+            default_max_tokens,
+            created,
+            max_batch,
+        )
+    }
+
+    /// Start the engine with speculative decoding: `draft` proposes `gamma`
+    /// tokens per round for `generator` (the target) to verify. Output is
+    /// identical to [`start`](Self::start); `draft` must share the target's
+    /// tokenizer/vocabulary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_speculative<K: ComputeKernel + Send + 'static>(
+        generator: Generator<K>,
+        draft: Generator<K>,
+        gamma: usize,
+        tokenizer: BpeTokenizer,
+        vocab_size: usize,
+        model_id: impl Into<String>,
+        default_max_tokens: usize,
+        created: u64,
+        max_batch: usize,
+    ) -> Arc<Self> {
+        Self::start_inner(
+            generator,
+            Some(draft),
+            gamma,
+            tokenizer,
+            vocab_size,
+            model_id,
+            default_max_tokens,
+            created,
+            max_batch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner<K: ComputeKernel + Send + 'static>(
+        generator: Generator<K>,
+        draft: Option<Generator<K>>,
+        gamma: usize,
+        tokenizer: BpeTokenizer,
+        vocab_size: usize,
+        model_id: impl Into<String>,
+        default_max_tokens: usize,
+        created: u64,
+        max_batch: usize,
+    ) -> Arc<Self> {
         let (job_tx, job_rx) = channel::<Job>();
-        std::thread::spawn(move || engine_loop(generator, job_rx, max_batch));
+        std::thread::spawn(move || engine_loop(generator, draft, gamma, job_rx, max_batch));
         Arc::new(Self {
             job_tx: Mutex::new(job_tx),
             next_id: AtomicU64::new(1),
@@ -102,8 +156,17 @@ impl EngineService {
     }
 }
 
-fn engine_loop<K: ComputeKernel>(generator: Generator<K>, job_rx: Receiver<Job>, max_batch: usize) {
-    let mut sched = BatchScheduler::new(&generator, max_batch);
+fn engine_loop<K: ComputeKernel>(
+    generator: Generator<K>,
+    draft: Option<Generator<K>>,
+    gamma: usize,
+    job_rx: Receiver<Job>,
+    max_batch: usize,
+) {
+    let mut sched = match &draft {
+        Some(d) => BatchScheduler::with_speculative(&generator, d, max_batch, gamma),
+        None => BatchScheduler::new(&generator, max_batch),
+    };
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
 
     loop {

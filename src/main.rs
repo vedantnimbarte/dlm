@@ -390,6 +390,27 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         }
         DistributedMode::Standalone | DistributedMode::Master => {
             let generator = parts.into_cpu_generator()?;
+
+            // Optional draft model for speculative decoding. It must share the
+            // target's vocabulary (same tokenizer) for the accept/reject rule to
+            // be exact.
+            let draft = match &args.draft_model_path {
+                Some(dir) => {
+                    let dcfg = ModelConfig::from_path(dir, args.quant.to_scheme())?;
+                    if dcfg.vocab_size != config.vocab_size {
+                        return Err(FlipError::InvalidConfig(format!(
+                            "draft vocab {} != target vocab {}",
+                            dcfg.vocab_size, config.vocab_size
+                        )));
+                    }
+                    let dstore = MmapStore::open_dir(dir)?;
+                    let dparts =
+                        flip::loader::load_model_parts(&dstore, &dcfg, args.context_length)?;
+                    Some(dparts.into_cpu_generator()?)
+                }
+                None => None,
+            };
+
             let tokenizer = if args.model_path.join("vocab.json").exists()
                 && args.model_path.join("merges.txt").exists()
             {
@@ -402,19 +423,36 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             // Batched, streaming engine: a background scheduler interleaves
-            // concurrent requests a token at a time.
-            let engine = flip::server::EngineService::start(
-                generator,
-                tokenizer,
-                config.vocab_size as usize,
-                "flip",
-                128,
-                created,
-                8, // max concurrent batch
-            );
+            // concurrent requests a token at a time. With a draft model it
+            // decodes speculatively (draft proposes, target verifies).
+            const SPEC_GAMMA: usize = 4;
+            let speculative = draft.is_some();
+            let engine = match draft {
+                Some(d) => flip::server::EngineService::start_speculative(
+                    generator,
+                    d,
+                    SPEC_GAMMA,
+                    tokenizer,
+                    config.vocab_size as usize,
+                    "flip",
+                    128,
+                    created,
+                    8, // max concurrent batch
+                ),
+                None => flip::server::EngineService::start(
+                    generator,
+                    tokenizer,
+                    config.vocab_size as usize,
+                    "flip",
+                    128,
+                    created,
+                    8, // max concurrent batch
+                ),
+            };
             let server = flip::server::HttpServer::bind(&listen)?;
             println!();
-            println!("serving      : OpenAI-compatible API on http://{listen} (batched)");
+            let mode = if speculative { "batched + speculative" } else { "batched" };
+            println!("serving      : OpenAI-compatible API on http://{listen} ({mode})");
             println!("  endpoints  : POST /v1/chat/completions (stream supported), GET /v1/models");
             if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
                 println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
