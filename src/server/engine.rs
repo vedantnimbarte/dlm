@@ -9,7 +9,7 @@
 //! The [`router`] wires this into the OpenAI endpoints, supporting `stream: true`
 //! for `/v1/chat/completions`.
 
-use crate::batching::BatchScheduler;
+use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
 use crate::generate::Generator;
 use crate::server::http::{Handler, Request, Response};
@@ -20,10 +20,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-/// A token event streamed back for one request.
+/// A token event streamed back for one request. `Done` carries the request's
+/// speculative acceptance stats when it was decoded speculatively (`None` on the
+/// plain path).
 pub enum TokenEvent {
     Next(u32),
-    Done,
+    Done(Option<AcceptanceStats>),
 }
 
 struct Job {
@@ -191,13 +193,18 @@ fn engine_loop<K: ComputeKernel>(
                 }
                 for id in tick.finished {
                     if let Some(s) = sinks.remove(&id) {
-                        let _ = s.send(TokenEvent::Done);
+                        let stats = tick
+                            .finished_stats
+                            .iter()
+                            .find(|(fid, _)| *fid == id)
+                            .map(|(_, st)| *st);
+                        let _ = s.send(TokenEvent::Done(stats));
                     }
                 }
             }
             Err(_) => {
                 for (_, s) in sinks.drain() {
-                    let _ = s.send(TokenEvent::Done);
+                    let _ = s.send(TokenEvent::Done(None));
                 }
             }
         }
@@ -214,7 +221,7 @@ fn enqueue<K: ComputeKernel>(
             sinks.insert(job.id, job.sink);
         }
         Err(_) => {
-            let _ = job.sink.send(TokenEvent::Done);
+            let _ = job.sink.send(TokenEvent::Done(None));
         }
     }
 }
@@ -254,6 +261,28 @@ struct Usage {
     prompt_tokens: usize,
     completion_tokens: usize,
     total_tokens: usize,
+    /// Present only when the request was decoded speculatively.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speculative: Option<SpeculativeUsage>,
+}
+
+/// Speculative-decoding acceptance, reported inside `usage` when a draft model
+/// served the request.
+#[derive(Serialize)]
+struct SpeculativeUsage {
+    draft_proposed: usize,
+    draft_accepted: usize,
+    acceptance_rate: f64,
+}
+
+impl From<AcceptanceStats> for SpeculativeUsage {
+    fn from(s: AcceptanceStats) -> Self {
+        SpeculativeUsage {
+            draft_proposed: s.proposed,
+            draft_accepted: s.accepted,
+            acceptance_rate: s.acceptance_rate(),
+        }
+    }
 }
 #[derive(Serialize)]
 struct ChatResponse {
@@ -285,6 +314,9 @@ struct Chunk {
     created: u64,
     model: String,
     choices: Vec<ChunkChoice>,
+    /// Emitted only on the final speculative chunk (choices empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 #[derive(Serialize)]
@@ -363,10 +395,14 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         // Collect the whole completion, then return it.
         let rx = engine.submit(ids, max_tokens, None);
         let mut tokens = Vec::new();
+        let mut spec = None;
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => tokens.push(t),
-                TokenEvent::Done => break,
+                TokenEvent::Done(stats) => {
+                    spec = stats;
+                    break;
+                }
             }
         }
         let text = engine.tokenizer.decode(&tokens).unwrap_or_default();
@@ -384,6 +420,7 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
                 prompt_tokens,
                 completion_tokens: tokens.len(),
                 total_tokens: prompt_tokens + tokens.len(),
+                speculative: spec.map(SpeculativeUsage::from),
             },
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
@@ -402,6 +439,7 @@ fn stream_chat(engine: Arc<EngineService>, ids: Vec<u32>, max_tokens: usize, mod
                 created,
                 model: model.clone(),
                 choices: vec![ChunkChoice { index: 0, delta, finish_reason: finish }],
+                usage: None,
             };
             let json = serde_json::to_string(&chunk).unwrap_or_default();
             write!(w, "data: {json}\n\n")?;
@@ -411,18 +449,47 @@ fn stream_chat(engine: Arc<EngineService>, ids: Vec<u32>, max_tokens: usize, mod
         // First chunk announces the assistant role.
         send_chunk(w, Delta { role: Some("assistant"), content: None }, None)?;
 
+        let prompt_tokens = ids.len();
+        let mut completion_tokens = 0usize;
+        let mut spec = None;
         let rx = engine.submit(ids, max_tokens, None);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
+                    completion_tokens += 1;
                     let piece = engine.tokenizer.decode(&[t]).unwrap_or_default();
                     send_chunk(w, Delta { role: None, content: Some(piece) }, None)?;
                 }
-                TokenEvent::Done => break,
+                TokenEvent::Done(stats) => {
+                    spec = stats;
+                    break;
+                }
             }
         }
 
         send_chunk(w, Delta { role: None, content: None }, Some("length"))?;
+
+        // When speculating, a final usage-only chunk carries the acceptance
+        // stats (OpenAI-style: empty choices + a `usage` object).
+        if let Some(stats) = spec {
+            let chunk = Chunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.clone(),
+                choices: vec![],
+                usage: Some(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    speculative: Some(stats.into()),
+                }),
+            };
+            let json = serde_json::to_string(&chunk).unwrap_or_default();
+            write!(w, "data: {json}\n\n")?;
+            w.flush()?;
+        }
+
         write!(w, "data: [DONE]\n\n")?;
         w.flush()
     })
