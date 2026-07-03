@@ -59,13 +59,36 @@ pub struct Finished {
     pub tokens: Vec<u32>,
 }
 
+/// Speculative acceptance for a single request: how many draft tokens it
+/// proposed and how many the target accepted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcceptanceStats {
+    pub proposed: usize,
+    pub accepted: usize,
+}
+
+impl AcceptanceStats {
+    /// Fraction of proposed draft tokens accepted (0.0–1.0; 0.0 if none proposed).
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.proposed == 0 {
+            0.0
+        } else {
+            self.accepted as f64 / self.proposed as f64
+        }
+    }
+}
+
 /// What one scheduler tick produced: `(request id, token)` pairs emitted this
 /// step, and the ids of requests that finished (their last token is in
 /// `produced`). Streaming consumers forward `produced` and close on `finished`.
+///
+/// `finished_stats` carries the speculative acceptance for each finished request
+/// that was decoding speculatively; it is empty on the plain path.
 #[derive(Debug, Clone, Default)]
 pub struct Tick {
     pub produced: Vec<(u64, u32)>,
     pub finished: Vec<u64>,
+    pub finished_stats: Vec<(u64, AcceptanceStats)>,
 }
 
 /// A continuous-batching scheduler over a borrowed generator.
@@ -217,8 +240,13 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
 
             if done {
                 if let Decoder::Speculative(s) = &a.decoder {
-                    self.proposed += s.proposed();
-                    self.accepted += s.accepted();
+                    let stats = AcceptanceStats {
+                        proposed: s.proposed(),
+                        accepted: s.accepted(),
+                    };
+                    self.proposed += stats.proposed;
+                    self.accepted += stats.accepted;
+                    tick.finished_stats.push((a.id, stats));
                 }
                 tick.finished.push(a.id);
             } else {
