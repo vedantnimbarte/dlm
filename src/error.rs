@@ -51,6 +51,9 @@ pub enum FlipError {
     #[error("invalid quantized tensor layout: {0}")]
     QuantLayout(String),
 
+    #[error("tokenizer error: {0}")]
+    Tokenizer(String),
+
     #[error("host memory allocation failed for {bytes} bytes (align {align})")]
     HostAlloc { bytes: usize, align: usize },
 

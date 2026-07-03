@@ -18,6 +18,7 @@ pub mod profiler;
 pub mod quant;
 pub mod storage;
 pub mod swap;
+pub mod tokenizer;
 
 pub use activation::{ActivationBuffer, ActivationPool};
 pub use cache::{KvCacheConfig, LayerRamCache, PagedKvCache};
@@ -37,3 +38,4 @@ pub use profiler::{VramPlan, VramProfiler};
 pub use quant::Quant4Tensor;
 pub use storage::{LayerCatalog, MmapShard, MmapStore};
 pub use swap::{LayerSwapPlan, StreamPass};
+pub use tokenizer::BpeTokenizer;
