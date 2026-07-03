@@ -1,9 +1,10 @@
 //! Speculative decoding must produce exactly the target-greedy sequence.
 
+use flip::batching::BatchScheduler;
 use flip::cache::KvCacheConfig;
 use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
 use flip::generate::{GenerationConfig, Generator, Sampler};
-use flip::speculative::SpeculativeDecoder;
+use flip::speculative::{SpeculativeDecoder, SpeculativeSession};
 
 struct Rng(u64);
 impl Rng {
@@ -101,4 +102,71 @@ fn identical_draft_is_fully_accepted() {
     assert!(spec.proposed > 0);
     assert_eq!(spec.accepted, spec.proposed);
     assert!((spec.acceptance_rate() - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn session_round_by_round_equals_target_greedy() {
+    let prompt = [1u32, 2, 3];
+    let n = 8;
+    let (target, draft) = (build_generator(1), build_generator(2));
+
+    // Drive the resumable session one round at a time (as the scheduler does),
+    // capping each round to the tokens still wanted.
+    let mut session = SpeculativeSession::new(&target, &draft, 4, &prompt);
+    let mut out = Vec::new();
+    while out.len() < n {
+        let emitted = session.step(n - out.len()).unwrap();
+        assert!(!emitted.is_empty(), "a round must make progress");
+        assert!(out.len() + emitted.len() <= n, "round overshot the budget");
+        out.extend(emitted);
+    }
+
+    assert_eq!(out, greedy(&build_generator(1), &prompt, n));
+    assert!(session.accepted() <= session.proposed());
+}
+
+#[test]
+fn speculative_scheduler_matches_greedy_across_requests() {
+    let target = build_generator(1);
+    let draft = build_generator(2); // different draft: exactness must still hold
+    let requests: Vec<(u64, Vec<u32>, usize)> = vec![
+        (1, vec![1, 2, 3], 7),
+        (2, vec![7], 5),
+        (3, vec![4, 5], 6),
+    ];
+
+    // max_batch = 2 forces staggered admission while speculating.
+    let mut sched = BatchScheduler::with_speculative(&target, &draft, 2, 4);
+    for (id, prompt, n) in &requests {
+        sched.submit(*id, prompt.clone(), *n, None).unwrap();
+    }
+    let mut results = sched.run().unwrap();
+    results.sort_by_key(|f| f.id);
+
+    assert_eq!(results.len(), requests.len());
+    for (f, (id, prompt, n)) in results.iter().zip(&requests) {
+        assert_eq!(f.tokens, greedy(&target, prompt, *n), "request {id} diverged");
+        assert_eq!(f.tokens.len(), *n);
+    }
+    // Every retired slot contributed to the acceptance stats.
+    let (proposed, accepted) = sched.speculative_stats();
+    assert!(proposed > 0 && accepted <= proposed);
+}
+
+#[test]
+fn speculative_scheduler_respects_eos() {
+    let target = build_generator(1);
+    let draft = build_generator(1); // identical draft → full acceptance
+    // The token greedy decoding would emit second, used as EOS.
+    let two = greedy(&target, &[1, 2], 2);
+    let eos = two[1];
+
+    let mut sched = BatchScheduler::with_speculative(&target, &draft, 4, 4);
+    sched.submit(1, vec![1, 2], 10, Some(eos)).unwrap();
+    let results = sched.run().unwrap();
+
+    assert_eq!(results.len(), 1);
+    // Stops at EOS (included), before the 10-token cap, matching plain decoding.
+    assert_eq!(*results[0].tokens.last().unwrap(), eos);
+    assert_eq!(results[0].tokens, two);
 }
