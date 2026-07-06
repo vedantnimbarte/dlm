@@ -31,20 +31,135 @@ pub fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+/// A tiny SplitMix64 PRNG for stochastic sampling (no external deps). Seeded per
+/// session, so a fixed `seed` makes temperature sampling reproducible.
+#[derive(Debug, Clone)]
+pub struct SplitMix64(u64);
+
+impl SplitMix64 {
+    /// Seed the generator.
+    pub fn new(seed: u64) -> Self {
+        SplitMix64(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A uniform float in `[0, 1)`.
+    pub fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
 /// Token-selection strategy over a logit vector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sampler {
     /// Deterministic argmax.
     Greedy,
+    /// Temperature scaling with optional top-k and nucleus (top-p) truncation.
+    /// `top_k == 0` keeps all tokens; `top_p >= 1.0` disables nucleus filtering;
+    /// `temperature <= 0` collapses to [`Greedy`](Sampler::Greedy).
+    TopPK {
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        seed: u64,
+    },
 }
 
 impl Sampler {
-    /// Pick the next token id from `logits`.
-    pub fn sample(&self, logits: &[f32]) -> u32 {
+    /// The RNG seed a session should use (0 for the deterministic [`Greedy`]).
+    ///
+    /// [`Greedy`]: Sampler::Greedy
+    pub fn seed(&self) -> u64 {
         match self {
-            Sampler::Greedy => argmax(logits),
+            Sampler::Greedy => 0,
+            Sampler::TopPK { seed, .. } => *seed,
         }
     }
+
+    /// Pick the next token id from `logits`, advancing `rng` for stochastic
+    /// samplers (unused by [`Greedy`](Sampler::Greedy)).
+    pub fn sample(&self, logits: &[f32], rng: &mut SplitMix64) -> u32 {
+        match *self {
+            Sampler::Greedy => argmax(logits),
+            Sampler::TopPK { temperature, top_p, top_k, .. } => {
+                if temperature <= 0.0 {
+                    return argmax(logits);
+                }
+                sample_topk_topp(logits, temperature, top_p, top_k as usize, rng)
+            }
+        }
+    }
+}
+
+/// Temperature + top-k + nucleus (top-p) sampling. Returns a token index drawn
+/// from the filtered, renormalized distribution.
+fn sample_topk_topp(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    rng: &mut SplitMix64,
+) -> u32 {
+    if logits.is_empty() {
+        return 0;
+    }
+    // Candidate indices sorted by logit, descending.
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_unstable_by(|&a, &b| {
+        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // top-k cap.
+    let k = if top_k > 0 { top_k.min(idx.len()) } else { idx.len() };
+    idx.truncate(k);
+
+    // Softmax with temperature over the retained logits (subtract the max for
+    // numerical stability; idx[0] is the global max since we sorted).
+    let max_logit = logits[idx[0]];
+    let mut probs: Vec<f32> = idx
+        .iter()
+        .map(|&i| ((logits[i] - max_logit) / temperature).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    for p in &mut probs {
+        *p /= sum;
+    }
+
+    // Nucleus (top-p): keep the smallest prefix whose cumulative mass ≥ top_p.
+    if top_p > 0.0 && top_p < 1.0 {
+        let mut cum = 0.0f32;
+        let mut cut = probs.len();
+        for (j, &p) in probs.iter().enumerate() {
+            cum += p;
+            if cum >= top_p {
+                cut = j + 1;
+                break;
+            }
+        }
+        probs.truncate(cut);
+        idx.truncate(cut);
+        let s: f32 = probs.iter().sum();
+        for p in &mut probs {
+            *p /= s;
+        }
+    }
+
+    // Inverse-CDF sample.
+    let r = rng.next_f32();
+    let mut cum = 0.0f32;
+    for (j, &p) in probs.iter().enumerate() {
+        cum += p;
+        if r < cum {
+            return idx[j] as u32;
+        }
+    }
+    idx[idx.len() - 1] as u32
 }
 
 /// Generation parameters.
@@ -170,10 +285,11 @@ impl<K: ComputeKernel> Generator<K> {
         }
 
         // Decode loop.
+        let mut rng = SplitMix64::new(cfg.sampler.seed());
         let mut generated = Vec::with_capacity(cfg.max_new_tokens);
         for _ in 0..cfg.max_new_tokens {
             let logits = self.logits(&hidden);
-            let next = cfg.sampler.sample(&logits);
+            let next = cfg.sampler.sample(&logits, &mut rng);
             generated.push(next);
             if cfg.eos_token == Some(next) {
                 break;
@@ -194,6 +310,7 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     orchestrator: crate::forward::ForwardOrchestrator<&'a K>,
     last_hidden: Vec<f32>,
     sampler: Sampler,
+    rng: SplitMix64,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -214,6 +331,7 @@ impl<K: ComputeKernel> Generator<K> {
             generator: self,
             orchestrator,
             last_hidden: hidden,
+            rng: SplitMix64::new(sampler.seed()),
             sampler,
         })
     }
@@ -223,7 +341,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
         let logits = self.generator.logits(&self.last_hidden);
-        let next = self.sampler.sample(&logits);
+        let next = self.sampler.sample(&logits, &mut self.rng);
         self.last_hidden = self.generator.embed(next)?;
         self.orchestrator.decode_token(&mut self.last_hidden)?;
         Ok(next)
@@ -279,6 +397,37 @@ mod tests {
     fn argmax_picks_largest() {
         assert_eq!(argmax(&[0.1, 0.9, 0.3]), 1);
         assert_eq!(argmax(&[5.0, 5.0, 1.0]), 0); // first max wins
+    }
+
+    #[test]
+    fn samplers_behave() {
+        let logits = [1.0f32, 5.0, 2.0, 0.5];
+        let mut rng = SplitMix64::new(42);
+
+        // temperature 0 collapses to greedy.
+        let zero = Sampler::TopPK { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 1 };
+        assert_eq!(zero.sample(&logits, &mut rng), 1);
+
+        // top_k = 1 keeps only the argmax, so any draw returns it.
+        let k1 = Sampler::TopPK { temperature: 2.0, top_p: 1.0, top_k: 1, seed: 7 };
+        for _ in 0..20 {
+            assert_eq!(k1.sample(&logits, &mut rng), 1);
+        }
+
+        // A dominant logit + tight nucleus keeps only that token.
+        let peaked = [0.0f32, 0.0, 20.0, 0.0];
+        let nucleus = Sampler::TopPK { temperature: 1.0, top_p: 0.5, top_k: 0, seed: 3 };
+        for _ in 0..20 {
+            assert_eq!(nucleus.sample(&peaked, &mut rng), 2);
+        }
+
+        // A fixed seed makes temperature sampling reproducible.
+        let s = Sampler::TopPK { temperature: 1.5, top_p: 1.0, top_k: 0, seed: 99 };
+        let mut a = SplitMix64::new(s.seed());
+        let mut b = SplitMix64::new(s.seed());
+        let seq_a: Vec<u32> = (0..8).map(|_| s.sample(&logits, &mut a)).collect();
+        let seq_b: Vec<u32> = (0..8).map(|_| s.sample(&logits, &mut b)).collect();
+        assert_eq!(seq_a, seq_b);
     }
 
     #[test]
