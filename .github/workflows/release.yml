@@ -1,0 +1,44 @@
+name: release
+
+# Build prebuilt `flip` binaries and attach them to the GitHub Release when a
+# version tag is pushed (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+# install.sh downloads these, so users never build from source.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {} # run manually from a tag ref
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Builds the default (CPU) feature set — runs on any machine with no GPU
+      # toolchain. GPU builds (--features cuda-kernels) are source-only.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: flip
+          target: ${{ matrix.target }}
+          # Version-independent asset name so install.sh can use the
+          # `releases/latest/download/` redirect.
+          archive: flip-$target
+          tar: unix
+          token: ${{ secrets.GITHUB_TOKEN }}

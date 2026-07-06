@@ -43,3 +43,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Release binaries (shipped by the install script): stripped + thin-LTO for a
+# small download and a faster inference loop.
+[profile.release]
+strip = true
+lto = "thin"

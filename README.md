@@ -15,8 +15,35 @@ ability to run models many times larger than the card.
 
 ---
 
+## Install
+
+One line — downloads a prebuilt binary for your platform (Linux/macOS, x86-64 or
+arm64) and installs it to `~/.local/bin`. No clone, no build, no Rust toolchain:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/Flip/main/install.sh | sh
+```
+
+Then:
+
+```sh
+flip doctor          # check your machine + run a self-test
+flip --help          # subcommands: serve, generate, profile, tokenize, doctor
+```
+
+Set `FLIP_INSTALL_DIR` to change the location. Prefer building from source, or
+want the GPU build? See [Build & run locally](#build--run-locally) and
+[Building for GPU](#building-for-gpu-nvidia--amd) — the prebuilt binary is the CPU
+build (runs anywhere); GPU support (`--features cuda-kernels`) is source-only.
+
+Rust users can also `cargo install --git https://github.com/vedantnimbarte/Flip`
+(builds from source).
+
+---
+
 ## Table of contents
 
+- [Install](#install)
 - [How it works](#how-it-works)
 - [Components](#components)
 - [Prerequisites](#prerequisites)
