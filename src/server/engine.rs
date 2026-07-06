@@ -46,6 +46,7 @@ pub struct EngineService {
     model_id: String,
     created: u64,
     default_max_tokens: usize,
+    chat_template: ChatTemplate,
 }
 
 impl EngineService {
@@ -124,7 +125,17 @@ impl EngineService {
             model_id: model_id.into(),
             created,
             default_max_tokens,
+            chat_template: ChatTemplate::default(),
         })
+    }
+
+    /// Set the chat template (called right after [`start`](Self::start), while
+    /// the `Arc` is still unique). Defaults to [`ChatTemplate::Plain`].
+    pub fn with_chat_template(mut self: Arc<Self>, template: ChatTemplate) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.chat_template = template;
+        }
+        self
     }
 
     /// Submit a request; returns a channel that yields its tokens then `Done`.
@@ -242,6 +253,14 @@ struct ChatMessage {
     content: String,
 }
 
+/// OpenAI `stop`: either a single string or a list of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Stop {
+    One(String),
+    Many(Vec<String>),
+}
+
 #[derive(Deserialize)]
 struct ChatRequest {
     #[serde(default)]
@@ -263,6 +282,26 @@ struct ChatRequest {
     /// Optional RNG seed for reproducible sampling.
     #[serde(default)]
     seed: Option<u64>,
+    /// Stop sequence(s): generation is cut before the first occurrence.
+    #[serde(default)]
+    stop: Option<Stop>,
+}
+
+/// Flatten the `stop` field into a list of non-empty stop strings.
+fn normalize_stop(stop: Option<Stop>) -> Vec<String> {
+    match stop {
+        None => Vec::new(),
+        Some(Stop::One(s)) => vec![s],
+        Some(Stop::Many(v)) => v,
+    }
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect()
+}
+
+/// Byte offset of the earliest stop-sequence occurrence in `text`, if any.
+fn earliest_stop(text: &str, stops: &[String]) -> Option<usize> {
+    stops.iter().filter_map(|s| text.find(s.as_str())).min()
 }
 
 /// Build a [`Sampler`] from the request's sampling fields. Falls back to greedy
@@ -366,20 +405,94 @@ struct ModelsResponse {
     data: Vec<ModelCard>,
 }
 
-fn build_chat_prompt(messages: &[ChatMessage]) -> String {
-    let mut p = String::new();
-    for m in messages {
-        p.push_str(&m.role);
-        p.push_str(": ");
-        p.push_str(&m.content);
-        p.push('\n');
+/// How chat messages are rendered into the model's prompt string. Real instruct
+/// models are trained on a specific format with special control tokens; using
+/// the wrong one degrades output. The control tokens only become single ids when
+/// the tokenizer registers them as special (HF `tokenizer.json`); otherwise they
+/// tokenize as ordinary text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatTemplate {
+    /// `role: content` lines, then `assistant:` (default; no special tokens).
+    #[default]
+    Plain,
+    /// ChatML (`<|im_start|>role … <|im_end|>`), used by Qwen and others.
+    ChatMl,
+    /// Llama-3 (`<|start_header_id|>role<|end_header_id|> … <|eot_id|>`).
+    Llama3,
+}
+
+impl ChatTemplate {
+    /// Parse a `--chat-template` value.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "plain" => Some(ChatTemplate::Plain),
+            "chatml" => Some(ChatTemplate::ChatMl),
+            "llama3" | "llama-3" => Some(ChatTemplate::Llama3),
+            _ => None,
+        }
     }
-    p.push_str("assistant:");
-    p
+
+    /// Render `messages` into the prompt string for this template.
+    fn apply(&self, messages: &[ChatMessage]) -> String {
+        let mut p = String::new();
+        match self {
+            ChatTemplate::Plain => {
+                for m in messages {
+                    p.push_str(&m.role);
+                    p.push_str(": ");
+                    p.push_str(&m.content);
+                    p.push('\n');
+                }
+                p.push_str("assistant:");
+            }
+            ChatTemplate::ChatMl => {
+                for m in messages {
+                    p.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content));
+                }
+                p.push_str("<|im_start|>assistant\n");
+            }
+            ChatTemplate::Llama3 => {
+                p.push_str("<|begin_of_text|>");
+                for m in messages {
+                    p.push_str(&format!(
+                        "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+                        m.role, m.content
+                    ));
+                }
+                p.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            }
+        }
+        p
+    }
 }
 
 fn error_json(message: &str) -> Vec<u8> {
     format!(r#"{{"error":{{"message":{message:?},"type":"invalid_request_error"}}}}"#).into_bytes()
+}
+
+/// True if the request carries `Authorization: Bearer <key>` matching `key`.
+fn authorized(req: &Request, key: &str) -> bool {
+    req.headers
+        .get("authorization")
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|t| t.trim() == key)
+        .unwrap_or(false)
+}
+
+/// Wrap [`router`] with bearer-token auth: when `api_key` is set, `/v1/*`
+/// requests must carry a matching `Authorization: Bearer` header (health and
+/// root stay open). With `api_key = None` this is exactly [`router`].
+pub fn secured_router(engine: Arc<EngineService>, api_key: Option<String>) -> Handler {
+    let inner = router(engine);
+    match api_key {
+        None => inner,
+        Some(key) => Arc::new(move |req: &Request| {
+            if req.path.starts_with("/v1/") && !authorized(req, &key) {
+                return Response::json(401, error_json("missing or invalid API key"));
+            }
+            inner(req)
+        }),
+    }
 }
 
 /// Build the HTTP router for the batched/streaming engine.
@@ -414,33 +527,50 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     if parsed.messages.is_empty() {
         return Response::json(400, error_json("messages must not be empty"));
     }
-    let prompt = build_chat_prompt(&parsed.messages);
+    let prompt = engine.chat_template.apply(&parsed.messages);
     let ids = match engine.encode_prompt(&prompt) {
         Ok(ids) => ids,
         Err(e) => return Response::json(400, error_json(&e)),
     };
     let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
+    let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
     let prompt_tokens = ids.len();
 
     if parsed.stream {
-        stream_chat(Arc::clone(engine), ids, max_tokens, model, sampler)
+        stream_chat(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
     } else {
-        // Collect the whole completion, then return it.
+        // Collect the completion, ending early at the first stop sequence.
         let rx = engine.submit(ids, max_tokens, None, sampler);
         let mut tokens = Vec::new();
         let mut spec = None;
         for ev in rx {
             match ev {
-                TokenEvent::Next(t) => tokens.push(t),
+                TokenEvent::Next(t) => {
+                    tokens.push(t);
+                    if !stops.is_empty() {
+                        let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
+                        if earliest_stop(&so_far, &stops).is_some() {
+                            break; // dropping the receiver ends generation
+                        }
+                    }
+                }
                 TokenEvent::Done(stats) => {
                     spec = stats;
                     break;
                 }
             }
         }
-        let text = engine.tokenizer.decode(&tokens).unwrap_or_default();
+        // Truncate the decoded text before the stop sequence, if one hit.
+        let mut text = engine.tokenizer.decode(&tokens).unwrap_or_default();
+        let finish_reason = match earliest_stop(&text, &stops) {
+            Some(cut) => {
+                text.truncate(cut);
+                "stop"
+            }
+            None => "length",
+        };
         let body = ChatResponse {
             id: format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed)),
             object: "chat.completion",
@@ -449,7 +579,7 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             choices: vec![Choice {
                 index: 0,
                 message: RespMessage { role: "assistant", content: text },
-                finish_reason: "length",
+                finish_reason,
             }],
             usage: Usage {
                 prompt_tokens,
@@ -469,6 +599,7 @@ fn stream_chat(
     max_tokens: usize,
     model: String,
     sampler: Sampler,
+    stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed));
@@ -493,13 +624,38 @@ fn stream_chat(
         let prompt_tokens = ids.len();
         let mut completion_tokens = 0usize;
         let mut spec = None;
+        // Only needed with stop sequences: accumulate ids and re-decode so a stop
+        // spanning multiple tokens is detected and the visible text truncated.
+        let mut acc_ids: Vec<u32> = Vec::new();
+        let mut sent_chars = 0usize;
+        let mut finish = "length";
         let rx = engine.submit(ids, max_tokens, None, sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
                     completion_tokens += 1;
-                    let piece = engine.tokenizer.decode(&[t]).unwrap_or_default();
-                    send_chunk(w, Delta { role: None, content: Some(piece) }, None)?;
+                    if stops.is_empty() {
+                        // Fast path: emit each token's piece directly.
+                        let piece = engine.tokenizer.decode(&[t]).unwrap_or_default();
+                        send_chunk(w, Delta { role: None, content: Some(piece) }, None)?;
+                    } else {
+                        // Stop-aware path: emit the newly-visible suffix up to any
+                        // stop sequence, then finish.
+                        acc_ids.push(t);
+                        let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
+                        let cut = earliest_stop(&full, &stops);
+                        let visible = &full[..cut.unwrap_or(full.len())];
+                        let vis_chars = visible.chars().count();
+                        if vis_chars > sent_chars {
+                            let delta: String = visible.chars().skip(sent_chars).collect();
+                            sent_chars = vis_chars;
+                            send_chunk(w, Delta { role: None, content: Some(delta) }, None)?;
+                        }
+                        if cut.is_some() {
+                            finish = "stop";
+                            break;
+                        }
+                    }
                 }
                 TokenEvent::Done(stats) => {
                     spec = stats;
@@ -508,7 +664,7 @@ fn stream_chat(
             }
         }
 
-        send_chunk(w, Delta { role: None, content: None }, Some("length"))?;
+        send_chunk(w, Delta { role: None, content: None }, Some(finish))?;
 
         // When speculating, a final usage-only chunk carries the acceptance
         // stats (OpenAI-style: empty choices + a `usage` object).
@@ -534,4 +690,40 @@ fn stream_chat(
         write!(w, "data: [DONE]\n\n")?;
         w.flush()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_template_parse_and_render() {
+        assert_eq!(ChatTemplate::parse("chatml"), Some(ChatTemplate::ChatMl));
+        assert_eq!(ChatTemplate::parse("llama-3"), Some(ChatTemplate::Llama3));
+        assert_eq!(ChatTemplate::parse("plain"), Some(ChatTemplate::Plain));
+        assert!(ChatTemplate::parse("bogus").is_none());
+
+        let msgs = vec![ChatMessage { role: "user".into(), content: "hi".into() }];
+
+        let cm = ChatTemplate::ChatMl.apply(&msgs);
+        assert!(cm.contains("<|im_start|>user\nhi<|im_end|>"), "{cm}");
+        assert!(cm.ends_with("<|im_start|>assistant\n"), "{cm}");
+
+        let l3 = ChatTemplate::Llama3.apply(&msgs);
+        assert!(l3.starts_with("<|begin_of_text|>"), "{l3}");
+        assert!(l3.contains("<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"), "{l3}");
+        assert!(l3.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"), "{l3}");
+    }
+
+    #[test]
+    fn stop_helpers() {
+        assert_eq!(normalize_stop(None), Vec::<String>::new());
+        assert_eq!(normalize_stop(Some(Stop::One("x".into()))), vec!["x".to_string()]);
+        assert_eq!(
+            normalize_stop(Some(Stop::Many(vec!["a".into(), "".into()]))),
+            vec!["a".to_string()]
+        );
+        assert_eq!(earliest_stop("abcXYdef", &["XY".into(), "de".into()]), Some(3));
+        assert_eq!(earliest_stop("abc", &["z".into()]), None);
+    }
 }
