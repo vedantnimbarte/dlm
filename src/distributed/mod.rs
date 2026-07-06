@@ -2,9 +2,11 @@
 //! streaming a pipelined forward pass across worker nodes, with heartbeats and a
 //! local CPU-RAM fallback for fault tolerance.
 //!
-//! Transport is a length-prefixed binary protocol over TCP ([`protocol`]) rather
-//! than gRPC/Protobuf, so hidden-state tensors round-trip bit-for-bit and the
-//! whole layer is dependency-free and testable over localhost.
+//! Messages are **Protobuf** (`prost`) sent as length-prefixed frames over plain
+//! TCP ([`protocol`]) — tensors ride in a packed `repeated float` field so they
+//! round-trip bit-for-bit. We keep the synchronous TCP framing rather than the
+//! full gRPC/tonic/HTTP-2 stack, so the layer stays sync, thread-per-connection,
+//! and testable over localhost.
 
 pub mod coordinator;
 pub mod protocol;

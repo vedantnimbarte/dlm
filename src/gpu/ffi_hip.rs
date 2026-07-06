@@ -30,6 +30,7 @@ pub const HIP_HOST_MALLOC_MAPPED: c_uint = 0x02;
 pub const HIP_HOST_MALLOC_WRITE_COMBINED: c_uint = 0x04;
 
 extern "C" {
+    fn hipSetDevice(device: c_int) -> hipError_t;
     fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
     fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError_t;
     fn hipHostFree(ptr: *mut c_void) -> hipError_t;
@@ -51,6 +52,19 @@ extern "C" {
     fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
     fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
     fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: c_uint) -> hipError_t;
+}
+
+/// Make GPU `id` the current device for subsequent allocations and launches.
+pub(super) fn set_device(id: u32) -> Result<()> {
+    // SAFETY: no pointers; just selects the active device index.
+    let code = unsafe { hipSetDevice(id as c_int) };
+    if code != HIP_SUCCESS {
+        return Err(FlipError::Gpu {
+            api: "hipSetDevice",
+            code,
+        });
+    }
+    Ok(())
 }
 
 /// Query free/total device memory.

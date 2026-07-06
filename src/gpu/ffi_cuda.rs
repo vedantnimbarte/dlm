@@ -29,6 +29,7 @@ pub const CUDA_HOST_ALLOC_MAPPED: c_uint = 0x02;
 pub const CUDA_HOST_ALLOC_WRITE_COMBINED: c_uint = 0x04;
 
 extern "C" {
+    fn cudaSetDevice(device: c_int) -> cudaError_t;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
     fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> cudaError_t;
     fn cudaFreeHost(ptr: *mut c_void) -> cudaError_t;
@@ -52,6 +53,19 @@ extern "C" {
     fn cudaEventDestroy(event: cudaEvent_t) -> cudaError_t;
     fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError_t;
     fn cudaStreamWaitEvent(stream: cudaStream_t, event: cudaEvent_t, flags: c_uint) -> cudaError_t;
+}
+
+/// Make GPU `id` the current device for subsequent allocations and launches.
+pub(super) fn set_device(id: u32) -> Result<()> {
+    // SAFETY: no pointers; just selects the active device index.
+    let code = unsafe { cudaSetDevice(id as c_int) };
+    if code != CUDA_SUCCESS {
+        return Err(FlipError::Gpu {
+            api: "cudaSetDevice",
+            code,
+        });
+    }
+    Ok(())
 }
 
 /// Query free/total device memory.

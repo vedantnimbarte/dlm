@@ -419,13 +419,25 @@ inference engine):
   acceptance is surfaced in the OpenAI `usage` response under a `speculative`
   block (`draft_proposed`, `draft_accepted`, `acceptance_rate`); streaming
   responses carry it in a final usage-only chunk.
+- **Multi-GPU pipeline parallelism** ([`src/forward/multigpu.rs`](src/forward/multigpu.rs))
+  — `flip serve --multi-gpu-ids 0,1,2` splits the model's layers into contiguous
+  per-GPU stages ([`partition_layers`]) and runs each layer on the GPU that owns
+  it, calling `cudaSetDevice`/`hipSetDevice` before its block so only the hidden
+  residual crosses the inter-GPU boundary (specs §3.3). It's a `ComputeKernel`
+  wrapper (`PipelineParallelKernel`), so the batched/speculative server drives a
+  multi-GPU model unchanged. Off-GPU `set_device` is a no-op, so a split run is
+  **bit-for-bit identical** to a single-device run (tested).
 - **Distributed master-worker** ([`src/distributed`](src/distributed)) — layers
   are partitioned into shards across worker nodes; a coordinator streams the
-  hidden state through them over a length-prefixed binary TCP protocol (bit-exact
-  `f32`, so a distributed forward equals a local one). **Heartbeats** track
-  liveness and an unreachable worker **falls back to local CPU-RAM** execution, so
-  a forward pass still completes. Start a worker with `flip serve
-  --distributed-mode worker`.
+  hidden state through them as **Protobuf** (`prost`) messages, length-prefixed
+  over plain TCP. Tensors ride in a packed `repeated float` field (bit-exact
+  `f32`, so a distributed forward equals a local one); the framing stays
+  synchronous and thread-per-connection rather than the full gRPC/tonic stack.
+  **Heartbeats** track liveness and an unreachable worker **falls back to local
+  CPU-RAM** execution, so a forward pass still completes. Start a worker with
+  `flip serve --distributed-mode worker`.
+
+[`partition_layers`]: src/distributed/shard.rs
 
 ```rust
 // Split a model across two worker nodes; the coordinator routes through them.

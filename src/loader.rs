@@ -15,7 +15,7 @@
 
 use crate::cache::KvCacheConfig;
 use crate::error::{FlipError, Result};
-use crate::forward::{BlockConfig, CpuKernel, LayerTensors};
+use crate::forward::{BlockConfig, CpuKernel, LayerTensors, PipelineParallelKernel};
 use crate::generate::Generator;
 use crate::model::ModelConfig;
 use crate::quant::{dequantize_gptq_4bit, PackedQuantConfig};
@@ -115,6 +115,29 @@ impl ModelParts {
     /// Wrap the CPU kernel around these weights and build a generator.
     pub fn into_cpu_generator(self) -> Result<Generator<CpuKernel>> {
         let kernel = CpuKernel::new(self.cfg, self.layers)?;
+        Generator::new(
+            kernel,
+            self.embedding,
+            self.final_norm,
+            self.lm_head,
+            self.vocab_size,
+            self.rms_eps,
+            self.kv_config,
+            self.kv_blocks,
+        )
+    }
+
+    /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
+    /// parallelism, `specs.md` §3.3) and build a generator over the resulting
+    /// [`PipelineParallelKernel`]. Off-GPU it runs on the CPU kernel with the
+    /// same layer partition, so output equals [`into_cpu_generator`].
+    ///
+    /// [`into_cpu_generator`]: ModelParts::into_cpu_generator
+    pub fn into_pipeline_parallel_generator(
+        self,
+        gpu_ids: &[u32],
+    ) -> Result<Generator<PipelineParallelKernel<CpuKernel>>> {
+        let kernel = PipelineParallelKernel::new(CpuKernel::new(self.cfg, self.layers)?, gpu_ids)?;
         Generator::new(
             kernel,
             self.embedding,

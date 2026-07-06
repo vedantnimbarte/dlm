@@ -72,6 +72,27 @@ pub struct DeviceMemory {
     pub total: u64,
 }
 
+/// Make GPU `id` the current device, so subsequent allocations and kernel
+/// launches target it (`cudaSetDevice`/`hipSetDevice`). Used by multi-GPU
+/// pipeline parallelism to place each layer on the device that owns it. On a
+/// host build (no GPU backend) this is a no-op, so the pipeline still runs (on
+/// the CPU kernel) and stays testable off-GPU.
+pub fn set_device(id: u32) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        ffi_cuda::set_device(id)
+    }
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    {
+        ffi_hip::set_device(id)
+    }
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+    {
+        let _ = id;
+        Ok(())
+    }
+}
+
 /// Query the current device's free and total VRAM.
 pub fn mem_get_info() -> Result<DeviceMemory> {
     #[cfg(feature = "cuda")]
