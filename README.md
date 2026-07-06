@@ -405,7 +405,12 @@ inference engine):
   be **streamed** to the client token by token. Started by `flip serve`.
   Per-request **sampling** is honored: `temperature`, `top_p`, `top_k`, and `seed`
   select temperature/nucleus/top-k sampling (temperature `0` → deterministic
-  greedy). The engine picks its compute kernel from `flip serve` flags:
+  greedy); `stop` sequences truncate the completion. **Real tokenizers** load from
+  HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,
+  and `--chat-template {plain,chatml,llama3}` renders chat messages in the model's
+  trained format (control tokens become single ids via the special-token
+  vocabulary). Hardening: `--api-key` requires a bearer token on `/v1/*`, and the
+  request body is size-capped. The engine picks its compute kernel from flags:
   - `--stream [--resident-layers N]` — **layer streaming**
     ([`src/forward/streaming.rs`](src/forward/streaming.rs)): only a bounded window
     of layers is held in memory (pinned embedding/LM-head stay resident); the rest
@@ -414,8 +419,19 @@ inference engine):
     defaults to the VRAM plan's `layers_to_load`. Output is bit-for-bit identical to
     a fully-resident run (tested end-to-end).
   - `--device gpu` — run the batched engine on the CUDA `GpuKernel`
-    (requires a `cuda-kernels` build).
+    (all layers resident in VRAM; requires a `cuda-kernels` build).
+  - `--stream --device gpu` — stream a window of layer weights **through VRAM**
+    ([`src/forward/streaming_gpu.rs`](src/forward/streaming_gpu.rs)) while KV stays
+    resident: run a model larger than VRAM on the GPU. **Experimental —
+    compile-checked but not yet validated on real GPU hardware.**
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
+
+  **Diagnostics.** `flip doctor` reports the GPU backend and free VRAM, runs a CPU
+  inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a
+  live CPU-vs-GPU parity probe; pass `--model-path` to check a checkpoint loads and
+  tokenizes. This is how you validate the GPU paths on real hardware (there is no
+  GPU in CI, so `--device gpu`, `--stream --device gpu`, and `--multi-gpu-ids` are
+  compile-checked only until run through `flip doctor` / a real serve on a GPU box).
 - **Speculative decoding** ([`src/speculative.rs`](src/speculative.rs)) — a cheap
   draft model proposes `gamma` tokens, the target verifies them; accepted tokens
   advance in bulk. With greedy sampling the output is provably **identical** to

@@ -13,8 +13,48 @@
 //!   merges), handy as a fallback and for testing the pipeline with no vocab.
 
 use crate::error::{FlipError, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// A segment of input text: either a matched special token or ordinary text.
+enum Seg {
+    Special(u32),
+    Text(String),
+}
+
+// ── HuggingFace `tokenizer.json` shape (only the BPE fields we use). ──────────
+
+#[derive(Deserialize)]
+struct HfTokenizer {
+    #[serde(default)]
+    added_tokens: Vec<HfAddedToken>,
+    model: HfModel,
+}
+
+#[derive(Deserialize)]
+struct HfAddedToken {
+    id: u32,
+    content: String,
+    #[serde(default)]
+    special: bool,
+}
+
+#[derive(Deserialize)]
+struct HfModel {
+    #[serde(default)]
+    vocab: HashMap<String, u32>,
+    #[serde(default)]
+    merges: Vec<HfMerge>,
+}
+
+/// Merges are `"a b"` in older files, `["a","b"]` in newer ones.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HfMerge {
+    Str(String),
+    Pair([String; 2]),
+}
 
 /// Build the GPT-2 reversible byte↔char mapping.
 ///
@@ -59,6 +99,11 @@ pub struct BpeTokenizer {
     byte_encoder: [char; 256],
     /// Printable char → byte.
     byte_decoder: HashMap<char, u8>,
+    /// Special tokens (e.g. `<|eot_id|>`): literal string → id. These match as
+    /// whole units before BPE and decode back to their literal text.
+    special_encoder: HashMap<String, u32>,
+    /// Id → special-token literal.
+    special_decoder: HashMap<u32, String>,
 }
 
 impl BpeTokenizer {
@@ -77,7 +122,20 @@ impl BpeTokenizer {
             merges,
             byte_encoder,
             byte_decoder,
+            special_encoder: HashMap::new(),
+            special_decoder: HashMap::new(),
         }
+    }
+
+    /// Register special tokens (literal string → id), matched as whole units
+    /// before BPE and decoded back verbatim. Consumes and returns `self` for
+    /// chaining.
+    pub fn with_special(mut self, specials: impl IntoIterator<Item = (String, u32)>) -> Self {
+        for (s, id) in specials {
+            self.special_decoder.insert(id, s.clone());
+            self.special_encoder.insert(s, id);
+        }
+        self
     }
 
     /// A trivial byte tokenizer: 256 tokens (one per byte), no merges. Every text
@@ -97,6 +155,8 @@ impl BpeTokenizer {
             merges: HashMap::new(),
             byte_encoder,
             byte_decoder,
+            special_encoder: HashMap::new(),
+            special_decoder: HashMap::new(),
         }
     }
 
@@ -128,8 +188,55 @@ impl BpeTokenizer {
         Ok(Self::new(encoder, merges_list))
     }
 
-    /// Load `vocab.json` + `merges.txt` from a model directory.
+    /// Load a HuggingFace `tokenizer.json` (the single-file "fast tokenizer"
+    /// format modern models ship). Reads the BPE `model.vocab` + `model.merges`
+    /// and registers `added_tokens` marked `special` (so chat-template control
+    /// tokens like `<|eot_id|>` encode to their own id). Only BPE-model
+    /// tokenizers are supported — SentencePiece/Unigram checkpoints are not.
+    pub fn from_hf_json(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path).map_err(|source| FlipError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let hf: HfTokenizer =
+            serde_json::from_slice(&bytes).map_err(|source| FlipError::Json {
+                context: "tokenizer.json".to_string(),
+                source,
+            })?;
+        if !hf.model.vocab.is_empty() && hf.model.merges.is_empty() {
+            // A vocab with no merges is almost certainly a Unigram model.
+            return Err(FlipError::Tokenizer(
+                "tokenizer.json has no BPE merges (Unigram/SentencePiece unsupported)".into(),
+            ));
+        }
+        let merges_list = hf
+            .model
+            .merges
+            .into_iter()
+            .filter_map(|m| match m {
+                HfMerge::Pair([a, b]) => Some((a, b)),
+                HfMerge::Str(s) => {
+                    let mut it = s.split_whitespace();
+                    Some((it.next()?.to_string(), it.next()?.to_string()))
+                }
+            })
+            .collect();
+        let specials: Vec<(String, u32)> = hf
+            .added_tokens
+            .into_iter()
+            .filter(|t| t.special)
+            .map(|t| (t.content, t.id))
+            .collect();
+        Ok(Self::new(hf.model.vocab, merges_list).with_special(specials))
+    }
+
+    /// Load a tokenizer from a model directory: prefer HF `tokenizer.json`, else
+    /// fall back to the classic `vocab.json` + `merges.txt` pair.
     pub fn from_dir(dir: &Path) -> Result<Self> {
+        let hf = dir.join("tokenizer.json");
+        if hf.exists() {
+            return Self::from_hf_json(&hf);
+        }
         Self::from_files(&dir.join("vocab.json"), &dir.join("merges.txt"))
     }
 
@@ -138,40 +245,102 @@ impl BpeTokenizer {
         self.encoder.len()
     }
 
-    /// Encode text into token ids.
+    /// Encode text into token ids. Registered special tokens are matched as whole
+    /// units (longest-match) and emit their own id; the text between is BPE'd.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
-        for chunk in pretokenize(text) {
-            for symbol in self.bpe(chunk.as_bytes()) {
-                let id = self.encoder.get(&symbol).ok_or_else(|| {
-                    FlipError::Tokenizer(format!("token {symbol:?} not in vocabulary"))
-                })?;
-                ids.push(*id);
+        for seg in self.split_special(text) {
+            match seg {
+                Seg::Special(id) => ids.push(id),
+                Seg::Text(chunk_text) => {
+                    for chunk in pretokenize(&chunk_text) {
+                        for symbol in self.bpe(chunk.as_bytes()) {
+                            let id = self.encoder.get(&symbol).ok_or_else(|| {
+                                FlipError::Tokenizer(format!("token {symbol:?} not in vocabulary"))
+                            })?;
+                            ids.push(*id);
+                        }
+                    }
+                }
             }
         }
         Ok(ids)
     }
 
-    /// Decode token ids back into text (lossy on invalid UTF-8).
-    pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        let mut joined = String::new();
-        for &id in ids {
-            let tok = self
-                .decoder
-                .get(&id)
-                .ok_or_else(|| FlipError::Tokenizer(format!("unknown token id {id}")))?;
-            joined.push_str(tok);
+    /// Split `text` on registered special tokens (longest-match wins).
+    fn split_special(&self, text: &str) -> Vec<Seg> {
+        if self.special_encoder.is_empty() {
+            return vec![Seg::Text(text.to_string())];
         }
-        // Map the byte-chars back to raw bytes, then interpret as UTF-8.
-        let mut bytes = Vec::with_capacity(joined.len());
-        for ch in joined.chars() {
+        let mut out = Vec::new();
+        let mut buf = String::new();
+        let mut i = 0;
+        while i < text.len() {
+            let matched = if text.is_char_boundary(i) {
+                self.special_encoder
+                    .iter()
+                    .filter(|(sp, _)| text[i..].starts_with(sp.as_str()))
+                    .max_by_key(|(sp, _)| sp.len())
+                    .map(|(sp, &id)| (sp.len(), id))
+            } else {
+                None
+            };
+            if let Some((len, id)) = matched {
+                if !buf.is_empty() {
+                    out.push(Seg::Text(std::mem::take(&mut buf)));
+                }
+                out.push(Seg::Special(id));
+                i += len;
+            } else {
+                let ch = text[i..].chars().next().expect("valid char at boundary");
+                buf.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        if !buf.is_empty() {
+            out.push(Seg::Text(buf));
+        }
+        out
+    }
+
+    /// Decode token ids back into text (lossy on invalid UTF-8). Special-token
+    /// ids render as their literal text; runs of byte tokens are byte-decoded.
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        let mut result = String::new();
+        let mut run = String::new();
+        for &id in ids {
+            if let Some(special) = self.special_decoder.get(&id) {
+                self.flush_byte_run(&mut run, &mut result)?;
+                result.push_str(special);
+            } else {
+                let tok = self
+                    .decoder
+                    .get(&id)
+                    .ok_or_else(|| FlipError::Tokenizer(format!("unknown token id {id}")))?;
+                run.push_str(tok);
+            }
+        }
+        self.flush_byte_run(&mut run, &mut result)?;
+        Ok(result)
+    }
+
+    /// Byte-decode an accumulated run of byte-level tokens into `out`, clearing
+    /// the run.
+    fn flush_byte_run(&self, run: &mut String, out: &mut String) -> Result<()> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(run.len());
+        for ch in run.chars() {
             let b = self
                 .byte_decoder
                 .get(&ch)
                 .ok_or_else(|| FlipError::Tokenizer(format!("char {ch:?} is not a byte token")))?;
             bytes.push(*b);
         }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        out.push_str(&String::from_utf8_lossy(&bytes));
+        run.clear();
+        Ok(())
     }
 
     /// Apply BPE merges to one pre-tokenized chunk, returning its token strings.
@@ -327,5 +496,50 @@ mod tests {
         vocab.insert(enc[b'a' as usize].to_string(), 0);
         let tok = BpeTokenizer::new(vocab, vec![]);
         assert!(tok.encode("z").is_err());
+    }
+
+    #[test]
+    fn special_tokens_encode_as_single_ids_and_round_trip() {
+        let tok = BpeTokenizer::bytes_only().with_special([("<|eot|>".to_string(), 999u32)]);
+
+        // A special token in the middle splits the surrounding text.
+        let ids = tok.encode("hi<|eot|>x").unwrap();
+        assert!(ids.contains(&999), "special id missing: {ids:?}");
+        // The special token is exactly one id (not BPE'd into pieces).
+        assert_eq!(ids.iter().filter(|&&i| i == 999).count(), 1);
+        assert_eq!(tok.decode(&ids).unwrap(), "hi<|eot|>x");
+
+        // Leading special token.
+        let ids2 = tok.encode("<|eot|>done").unwrap();
+        assert_eq!(ids2[0], 999);
+        assert_eq!(tok.decode(&ids2).unwrap(), "<|eot|>done");
+    }
+
+    #[test]
+    fn loads_hf_tokenizer_json_with_special_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "added_tokens": [{"id": 5, "content": "<|end|>", "special": true}],
+                "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2}, "merges": ["a b"]}
+            }"#,
+        )
+        .unwrap();
+
+        let tok = BpeTokenizer::from_hf_json(&path).unwrap();
+        // "ab" merges to id 2; the special token becomes id 5.
+        assert_eq!(tok.encode("ab<|end|>").unwrap(), vec![2, 5]);
+        assert_eq!(tok.decode(&[2, 5]).unwrap(), "ab<|end|>");
+    }
+
+    #[test]
+    fn rejects_unigram_tokenizer_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tokenizer.json");
+        // Vocab present, no merges → Unigram/SentencePiece → unsupported.
+        std::fs::write(&path, r#"{"model": {"vocab": {"a": 0}, "merges": []}}"#).unwrap();
+        assert!(BpeTokenizer::from_hf_json(&path).is_err());
     }
 }

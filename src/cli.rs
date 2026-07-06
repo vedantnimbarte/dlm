@@ -27,6 +27,17 @@ pub enum Command {
     Generate(GenerateArgs),
     /// Tokenize text with a byte-level BPE tokenizer (round-trip check).
     Tokenize(TokenizeArgs),
+    /// Run environment diagnostics + a self-check (GPU availability, CPU
+    /// inference, and — on a `cuda-kernels` build — a CPU-vs-GPU parity check).
+    Doctor(DoctorArgs),
+}
+
+/// Arguments for `flip doctor`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Optionally check that this model directory loads and tokenizes.
+    #[arg(long, value_name = "DIR")]
+    pub model_path: Option<PathBuf>,
 }
 
 /// Arguments for `flip tokenize`.
@@ -151,6 +162,16 @@ pub struct ServeArgs {
     /// Comma-separated worker `host:port` addresses (master mode).
     #[arg(long, value_delimiter = ',', value_name = "ADDRS")]
     pub worker_nodes: Vec<String>,
+
+    /// Require this bearer token on `/v1/*` requests (`Authorization: Bearer …`).
+    /// Omit to leave the API open (localhost default).
+    #[arg(long, value_name = "KEY")]
+    pub api_key: Option<String>,
+
+    /// Chat prompt template applied to `/v1/chat/completions` messages:
+    /// `plain` (default), `chatml`, or `llama3`. Match the served model.
+    #[arg(long, value_name = "NAME", default_value = "plain")]
+    pub chat_template: String,
 }
 
 /// Arguments for `flip profile`.

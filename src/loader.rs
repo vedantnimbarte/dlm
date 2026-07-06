@@ -244,9 +244,59 @@ impl LayerSource for MmapLayerSource {
     }
 }
 
-/// Load only the **pinned** (always-resident) parts — token embedding, final
-/// norm, LM head — plus the KV sizing, and wrap `store`'s transformer layers in
-/// a [`StreamingKernel`] that keeps at most `resident_layers` in memory at once.
+/// The always-resident ("pinned zone") pieces + the on-demand layer source that
+/// both streaming kernels (host and GPU) build a generator around.
+struct StreamingPieces {
+    source: MmapLayerSource,
+    embedding: Vec<f32>,
+    final_norm: Vec<f32>,
+    lm_head: Vec<f32>,
+    vocab: usize,
+    rms_eps: f32,
+    kv_config: KvCacheConfig,
+    kv_blocks: u32,
+}
+
+/// Load the pinned pieces (embedding, final norm, LM head, KV sizing) and bind a
+/// [`MmapLayerSource`] over `store`'s transformer layers.
+fn load_streaming_pieces(
+    store: MmapStore,
+    config: &ModelConfig,
+    max_context: u32,
+) -> Result<StreamingPieces> {
+    let cfg = block_config(config);
+    let hidden = cfg.hidden_size;
+    let vocab = config.vocab_size as usize;
+
+    let embedding = load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?;
+    let final_norm = load_tensor(&store, "model.norm.weight", hidden)?;
+    let lm_head = if store.locate("lm_head.weight").is_some() {
+        load_tensor(&store, "lm_head.weight", vocab * hidden)?
+    } else {
+        embedding.clone()
+    };
+    let kv_config = KvCacheConfig {
+        num_layers: config.num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
+
+    Ok(StreamingPieces {
+        source: MmapLayerSource { store, cfg, num_layers: config.num_layers },
+        embedding,
+        final_norm,
+        lm_head,
+        vocab,
+        rms_eps: config.rms_eps,
+        kv_config,
+        kv_blocks,
+    })
+}
+
+/// Wrap `store`'s transformer layers in a host [`StreamingKernel`] that keeps at
+/// most `resident_layers` layers in memory, with the pinned pieces resident.
 ///
 /// Peak layer-weight memory is `resident_layers × per-layer` instead of the
 /// whole model, so this serves models larger than the resident budget. Output is
@@ -257,43 +307,45 @@ pub fn build_streaming_generator(
     max_context: u32,
     resident_layers: usize,
 ) -> Result<Generator<StreamingKernel<MmapLayerSource>>> {
-    let cfg = block_config(config);
-    let hidden = cfg.hidden_size;
-    let vocab = config.vocab_size as usize;
-
-    // Pinned zone: embedding + norm + head stay resident (loaded once).
-    let embedding = load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?;
-    let final_norm = load_tensor(&store, "model.norm.weight", hidden)?;
-    let lm_head = if store.locate("lm_head.weight").is_some() {
-        load_tensor(&store, "lm_head.weight", vocab * hidden)?
-    } else {
-        embedding.clone()
-    };
-
-    let kv_config = KvCacheConfig {
-        num_layers: config.num_layers,
-        num_kv_heads: cfg.num_kv_heads as u32,
-        head_dim: cfg.head_dim as u32,
-        block_size: 16,
-    };
-    let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
-
-    // Streaming zone: layers materialize on demand from the mapped store.
-    let source = MmapLayerSource {
-        store,
-        cfg,
-        num_layers: config.num_layers,
-    };
-    let kernel = StreamingKernel::new(cfg, source, resident_layers);
+    let p = load_streaming_pieces(store, config, max_context)?;
+    let cfg = p.source.cfg;
+    let kernel = StreamingKernel::new(cfg, p.source, resident_layers);
     Generator::new(
         kernel,
-        embedding,
-        final_norm,
-        lm_head,
-        vocab,
-        config.rms_eps,
-        kv_config,
-        kv_blocks,
+        p.embedding,
+        p.final_norm,
+        p.lm_head,
+        p.vocab,
+        p.rms_eps,
+        p.kv_config,
+        p.kv_blocks,
+    )
+}
+
+/// GPU counterpart of [`build_streaming_generator`]: stream a window of layer
+/// weights through VRAM ([`StreamingGpuKernel`]) while KV stays resident.
+/// Experimental — the device path is compile-checked but unvalidated on hardware.
+#[cfg(feature = "cuda-kernels")]
+pub fn build_streaming_gpu_generator(
+    store: MmapStore,
+    config: &ModelConfig,
+    max_context: u32,
+    resident_layers: usize,
+) -> Result<Generator<crate::forward::StreamingGpuKernel<MmapLayerSource>>> {
+    let p = load_streaming_pieces(store, config, max_context)?;
+    let cfg = p.source.cfg;
+    let max_kv_tokens = p.kv_blocks as usize * p.kv_config.block_size as usize;
+    let kernel =
+        crate::forward::StreamingGpuKernel::new(cfg, p.source, max_kv_tokens, resident_layers)?;
+    Generator::new(
+        kernel,
+        p.embedding,
+        p.final_norm,
+        p.lm_head,
+        p.vocab,
+        p.rms_eps,
+        p.kv_config,
+        p.kv_blocks,
     )
 }
 

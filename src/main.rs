@@ -10,9 +10,10 @@
 use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
 use flip::cli::{
-    Cli, Command, Device, DistributedMode, GenerateArgs, ProfileArgs, ServeArgs, TokenizeArgs,
+    Cli, Command, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs, ServeArgs,
+    TokenizeArgs,
 };
-use flip::forward::{BlockConfig, ComputeKernel, LayerTensors};
+use flip::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
 use flip::generate::{GenerationConfig, Generator, Sampler};
 use flip::loader::ModelParts;
 use flip::tokenizer::BpeTokenizer;
@@ -34,7 +35,136 @@ fn main() -> Result<()> {
         Command::Serve(args) => run_serve(args),
         Command::Generate(args) => run_generate(args),
         Command::Tokenize(args) => run_tokenize(args),
+        Command::Doctor(args) => run_doctor(args),
     }
+}
+
+/// `flip doctor` — environment diagnostics + a self-check. Reports the GPU
+/// backend and device memory, runs a tiny CPU inference, probes the GPU at
+/// runtime (on a `cuda-kernels` build), and optionally checks a checkpoint loads.
+fn run_doctor(args: DoctorArgs) -> Result<()> {
+    println!("flip doctor v{}", env!("CARGO_PKG_VERSION"));
+    println!("  gpu backend  : {}", gpu::active_vendor().label());
+    println!("  host page    : {} bytes", page_size());
+    match gpu::mem_get_info() {
+        Ok(m) => println!(
+            "  gpu memory   : {:.1} / {:.1} GiB free",
+            m.free as f64 / GIB as f64,
+            m.total as f64 / GIB as f64,
+        ),
+        Err(_) => println!("  gpu memory   : no device (host fallback)"),
+    }
+    match cpu_self_check() {
+        Ok(n) => println!("  cpu inference: ok ({n} tokens generated)"),
+        Err(e) => println!("  cpu inference: FAILED — {e}"),
+    }
+    gpu_self_check();
+    if let Some(dir) = &args.model_path {
+        match checkpoint_check(dir) {
+            Ok(msg) => println!("  checkpoint   : {msg}"),
+            Err(e) => println!("  checkpoint   : FAILED — {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// A tiny synthetic block config for the self-checks.
+fn tiny_cfg() -> BlockConfig {
+    BlockConfig {
+        hidden_size: 8,
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        intermediate_size: 16,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+    }
+}
+
+/// Run a few tokens through the real CPU path on a tiny synthetic model.
+fn cpu_self_check() -> Result<usize> {
+    let (vocab, hidden) = (16usize, 8usize);
+    let cfg = tiny_cfg();
+    let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)])?;
+    let mut rng = Rng::new(7);
+    let generator = Generator::new(
+        kernel,
+        rng.vec(vocab * hidden, 0.02),
+        vec![1.0; hidden],
+        rng.vec(vocab * hidden, 0.02),
+        vocab,
+        1e-5,
+        KvCacheConfig { num_layers: 1, num_kv_heads: 1, head_dim: 4, block_size: 16 },
+        8,
+    )?;
+    let out = generator.generate(
+        &[1],
+        &GenerationConfig { max_new_tokens: 4, eos_token: None, sampler: Sampler::Greedy },
+    )?;
+    Ok(out.len())
+}
+
+/// GPU runtime probe: on a `cuda-kernels` build, run one block on both the CPU
+/// and GPU kernels and report the max divergence; otherwise note it was skipped.
+#[cfg(feature = "cuda-kernels")]
+fn gpu_self_check() {
+    match gpu_parity_probe() {
+        Ok(diff) => println!("  gpu parity   : ok (max |Δ| {diff:.2e} vs cpu)"),
+        Err(e) => println!("  gpu parity   : unavailable at runtime — {e}"),
+    }
+}
+
+#[cfg(not(feature = "cuda-kernels"))]
+fn gpu_self_check() {
+    println!("  gpu parity   : skipped (build with --features cuda-kernels)");
+}
+
+/// Build one layer, run it on CPU and GPU, return the max absolute difference.
+/// Errors if the GPU is unavailable at runtime (`GpuKernel::new` fails).
+#[cfg(feature = "cuda-kernels")]
+fn gpu_parity_probe() -> Result<f32> {
+    use flip::forward::{GpuKernel, KvLayerCache};
+    let cfg = tiny_cfg();
+    let mut rng = Rng::new(3);
+    let s = 0.05;
+    let layer = LayerTensors {
+        q_proj: rng.vec(cfg.q_dim() * cfg.hidden_size, s),
+        k_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, s),
+        v_proj: rng.vec(cfg.kv_dim() * cfg.hidden_size, s),
+        o_proj: rng.vec(cfg.hidden_size * cfg.q_dim(), s),
+        gate_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
+        up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
+        down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, s),
+        input_layernorm: vec![1.0; cfg.hidden_size],
+        post_attention_layernorm: vec![1.0; cfg.hidden_size],
+    };
+    let cpu = CpuKernel::new(cfg, vec![layer.clone()])?;
+    let gpu = GpuKernel::new(cfg, vec![layer], 8)?;
+    let mut hc = vec![0.1f32; cfg.hidden_size];
+    let mut hg = hc.clone();
+    let mut kc = KvLayerCache::new(cfg.kv_dim());
+    let mut kg = KvLayerCache::new(cfg.kv_dim());
+    cpu.run_block(0, &mut hc, &mut kc, 0)?;
+    gpu.run_block(0, &mut hg, &mut kg, 0)?;
+    Ok(hc.iter().zip(&hg).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max))
+}
+
+/// Check that a checkpoint directory loads its config, maps its store, has the
+/// pinned embedding tensor, and (if present) a working tokenizer.
+fn checkpoint_check(dir: &Path) -> Result<String> {
+    let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
+    let store = MmapStore::open_dir(dir)?;
+    if store.locate("model.embed_tokens.weight").is_none() {
+        return Err(FlipError::InvalidConfig("missing model.embed_tokens.weight".into()));
+    }
+    let tok = if dir.join("tokenizer.json").exists()
+        || (dir.join("vocab.json").exists() && dir.join("merges.txt").exists())
+    {
+        format!(", tokenizer {} tokens", BpeTokenizer::from_dir(dir)?.vocab_size())
+    } else {
+        ", no tokenizer (byte fallback)".to_string()
+    };
+    Ok(format!("{} layers, vocab {}{tok}", config.num_layers, config.vocab_size))
 }
 
 /// `flip tokenize` — encode text and report the round-trip.
@@ -374,16 +504,17 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             Ok(())
         }
         DistributedMode::Standalone | DistributedMode::Master => {
-            // The kernel modes are mutually exclusive.
-            let selected = [!args.multi_gpu_ids.is_empty(), args.stream, args.device == Device::Gpu];
-            if selected.iter().filter(|&&s| s).count() > 1 {
+            // Multi-GPU is exclusive; --stream and --device may combine
+            // (--stream --device gpu = stream a window through VRAM).
+            if !args.multi_gpu_ids.is_empty() && (args.stream || args.device == Device::Gpu) {
                 return Err(FlipError::InvalidConfig(
-                    "choose only one of --multi-gpu-ids, --stream, --device gpu".into(),
+                    "--multi-gpu-ids cannot combine with --stream or --device gpu".into(),
                 ));
             }
 
             // Streaming path: keep only a window of layers resident and stream the
-            // rest from disk, so a model can exceed the resident budget.
+            // rest from disk, so a model can exceed the resident budget. Streams to
+            // host RAM (CPU) or into VRAM (--device gpu).
             if args.stream {
                 if args.draft_model_path.is_some() {
                     return Err(FlipError::InvalidConfig(
@@ -392,10 +523,14 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 }
                 let window = resident_window(&config, &args);
                 println!();
+                let dest = if args.device == Device::Gpu { "VRAM" } else { "host RAM" };
                 println!(
-                    "streaming    : {window} / {} layers resident, rest streamed from disk",
+                    "streaming    : {window} / {} layers resident in {dest}, rest streamed from disk",
                     config.num_layers,
                 );
+                if args.device == Device::Gpu {
+                    return serve_streaming_gpu(store, &config, &args, window, &listen);
+                }
                 let generator =
                     flip::loader::build_streaming_generator(store, &config, args.context_length, window)?;
                 return start_batched_server(generator, None, &args, &config, &listen);
@@ -492,6 +627,35 @@ fn serve_on_gpu(
     ))
 }
 
+/// Serve with `--stream --device gpu`: stream a window of layer weights through
+/// VRAM (`StreamingGpuKernel`). Experimental — unvalidated on hardware.
+#[cfg(feature = "cuda-kernels")]
+fn serve_streaming_gpu(
+    store: MmapStore,
+    config: &ModelConfig,
+    args: &ServeArgs,
+    window: usize,
+    listen: &str,
+) -> Result<()> {
+    println!("device       : gpu ({}) — VRAM layer streaming [experimental]", gpu::active_vendor().label());
+    let generator =
+        flip::loader::build_streaming_gpu_generator(store, config, args.context_length, window)?;
+    start_batched_server(generator, None, args, config, listen)
+}
+
+#[cfg(not(feature = "cuda-kernels"))]
+fn serve_streaming_gpu(
+    _store: MmapStore,
+    _config: &ModelConfig,
+    _args: &ServeArgs,
+    _window: usize,
+    _listen: &str,
+) -> Result<()> {
+    Err(FlipError::InvalidConfig(
+        "--stream --device gpu requires building with `--features cuda-kernels`".into(),
+    ))
+}
+
 /// Build the batched (optionally speculative) streaming engine over any compute
 /// kernel `K` and serve the OpenAI-compatible API. Generic so the CPU and
 /// multi-GPU pipeline kernels share one server path.
@@ -502,9 +666,10 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     config: &ModelConfig,
     listen: &str,
 ) -> Result<()> {
-    let tokenizer = if args.model_path.join("vocab.json").exists()
-        && args.model_path.join("merges.txt").exists()
-    {
+    let has_hf_tokenizer = args.model_path.join("tokenizer.json").exists();
+    let has_gpt2_tokenizer = args.model_path.join("vocab.json").exists()
+        && args.model_path.join("merges.txt").exists();
+    let tokenizer = if has_hf_tokenizer || has_gpt2_tokenizer {
         BpeTokenizer::from_dir(&args.model_path)?
     } else {
         BpeTokenizer::bytes_only()
@@ -513,6 +678,12 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let template = flip::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
+        FlipError::InvalidConfig(format!(
+            "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
+            args.chat_template
+        ))
+    })?;
     // Batched, streaming engine: a background scheduler interleaves concurrent
     // requests a token at a time. With a draft model it decodes speculatively
     // (draft proposes, target verifies).
@@ -538,18 +709,23 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             created,
             8, // max concurrent batch
         ),
-    };
+    }
+    .with_chat_template(template);
     let server = flip::server::HttpServer::bind(listen)?;
     println!();
     let mode = if speculative { "batched + speculative" } else { "batched" };
     println!("serving      : OpenAI-compatible API on http://{listen} ({mode})");
     println!("  endpoints  : POST /v1/chat/completions (stream supported), GET /v1/models");
+    if args.api_key.is_some() {
+        println!("  auth       : bearer token required on /v1/*");
+    }
     if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
         println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
         println!("               currently runs the model locally (distributed routing available");
         println!("               via flip::distributed::Coordinator).");
     }
-    server.serve(flip::server::engine::router(engine)) // blocks
+    let router = flip::server::engine::secured_router(engine, args.api_key.clone());
+    server.serve(router) // blocks
 }
 
 /// Shared planner/reporter: map the model (if a dir is given), profile it, size

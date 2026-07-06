@@ -77,12 +77,18 @@ impl Response {
     }
 }
 
+/// Maximum accepted request-body size (16 MiB). A larger `Content-Length` is
+/// rejected before allocating, so a malicious header can't exhaust memory.
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -158,11 +164,17 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
         }
     }
 
-    // Body per Content-Length.
+    // Body per Content-Length, capped to guard against a hostile header.
     let content_length: usize = headers
         .get("content-length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return write_response(
+            reader.get_mut(),
+            Response::json(413, br#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#.to_vec()),
+        );
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
