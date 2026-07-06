@@ -35,6 +35,9 @@ struct Pending {
     prompt: Vec<u32>,
     max_new_tokens: usize,
     eos: Option<u32>,
+    /// Sampler for the plain (non-speculative) path. Ignored when the scheduler
+    /// speculates — speculative decoding is greedy-exact by construction.
+    sampler: Sampler,
 }
 
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
@@ -149,13 +152,27 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         (self.proposed, self.accepted)
     }
 
-    /// Queue a request. Errors on an empty prompt.
+    /// Queue a request (greedy decoding). Errors on an empty prompt.
     pub fn submit(
         &mut self,
         id: u64,
         prompt: Vec<u32>,
         max_new_tokens: usize,
         eos: Option<u32>,
+    ) -> Result<()> {
+        self.submit_sampled(id, prompt, max_new_tokens, eos, Sampler::Greedy)
+    }
+
+    /// Queue a request with an explicit `sampler` for the plain path. The sampler
+    /// is honored only when the scheduler is not speculating (speculative
+    /// decoding is greedy-exact); otherwise it is ignored.
+    pub fn submit_sampled(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+        eos: Option<u32>,
+        sampler: Sampler,
     ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::FlipError::InvalidConfig("prompt is empty".into()));
@@ -165,6 +182,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             prompt,
             max_new_tokens,
             eos,
+            sampler,
         });
         Ok(())
     }
@@ -196,7 +214,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     self.gamma,
                     &p.prompt,
                 )),
-                None => Decoder::Plain(self.generator.start_session(&p.prompt, Sampler::Greedy)?),
+                None => Decoder::Plain(self.generator.start_session(&p.prompt, p.sampler)?),
             };
             self.active.push(Active {
                 id: p.id,
