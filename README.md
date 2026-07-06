@@ -403,6 +403,19 @@ inference engine):
   `/v1/completions`, `/v1/models`. Behind it, an `EngineService` runs a background
   batching thread so concurrent requests are **continuously batched** and each can
   be **streamed** to the client token by token. Started by `flip serve`.
+  Per-request **sampling** is honored: `temperature`, `top_p`, `top_k`, and `seed`
+  select temperature/nucleus/top-k sampling (temperature `0` → deterministic
+  greedy). The engine picks its compute kernel from `flip serve` flags:
+  - `--stream [--resident-layers N]` — **layer streaming**
+    ([`src/forward/streaming.rs`](src/forward/streaming.rs)): only a bounded window
+    of layers is held in memory (pinned embedding/LM-head stay resident); the rest
+    are materialized on demand from the mmap'd checkpoint through an LRU and evicted
+    least-recently-used, so a model can **exceed the resident budget**. The window
+    defaults to the VRAM plan's `layers_to_load`. Output is bit-for-bit identical to
+    a fully-resident run (tested end-to-end).
+  - `--device gpu` — run the batched engine on the CUDA `GpuKernel`
+    (requires a `cuda-kernels` build).
+  - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
 - **Speculative decoding** ([`src/speculative.rs`](src/speculative.rs)) — a cheap
   draft model proposes `gamma` tokens, the target verifies them; accepted tokens
   advance in bulk. With greedy sampling the output is provably **identical** to
