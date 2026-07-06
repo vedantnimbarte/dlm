@@ -389,12 +389,11 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             Ok(())
         }
         DistributedMode::Standalone | DistributedMode::Master => {
-            let generator = parts.into_cpu_generator()?;
-
             // Optional draft model for speculative decoding. It must share the
             // target's vocabulary (same tokenizer) for the accept/reject rule to
-            // be exact.
-            let draft = match &args.draft_model_path {
+            // be exact. Loaded as parts so it can take the same kernel as the
+            // target below.
+            let draft_parts = match &args.draft_model_path {
                 Some(dir) => {
                     let dcfg = ModelConfig::from_path(dir, args.quant.to_scheme())?;
                     if dcfg.vocab_size != config.vocab_size {
@@ -404,64 +403,98 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         )));
                     }
                     let dstore = MmapStore::open_dir(dir)?;
-                    let dparts =
-                        flip::loader::load_model_parts(&dstore, &dcfg, args.context_length)?;
-                    Some(dparts.into_cpu_generator()?)
+                    Some(flip::loader::load_model_parts(&dstore, &dcfg, args.context_length)?)
                 }
                 None => None,
             };
 
-            let tokenizer = if args.model_path.join("vocab.json").exists()
-                && args.model_path.join("merges.txt").exists()
-            {
-                BpeTokenizer::from_dir(&args.model_path)?
+            // Pick the compute kernel. With --multi-gpu-ids the target's layers
+            // are split into a pipeline across the local GPUs (specs §3.3); the
+            // small, pinned draft model stays on the first GPU. Both paths feed
+            // the same batched/speculative server.
+            if args.multi_gpu_ids.is_empty() {
+                let generator = parts.into_cpu_generator()?;
+                let draft = draft_parts.map(|p| p.into_cpu_generator()).transpose()?;
+                start_batched_server(generator, draft, &args, &config, &listen)
             } else {
-                BpeTokenizer::bytes_only()
-            };
-            let created = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            // Batched, streaming engine: a background scheduler interleaves
-            // concurrent requests a token at a time. With a draft model it
-            // decodes speculatively (draft proposes, target verifies).
-            let speculative = draft.is_some();
-            let engine = match draft {
-                Some(d) => flip::server::EngineService::start_speculative(
-                    generator,
-                    d,
-                    args.draft_gamma,
-                    tokenizer,
-                    config.vocab_size as usize,
-                    "flip",
-                    128,
-                    created,
-                    8, // max concurrent batch
-                ),
-                None => flip::server::EngineService::start(
-                    generator,
-                    tokenizer,
-                    config.vocab_size as usize,
-                    "flip",
-                    128,
-                    created,
-                    8, // max concurrent batch
-                ),
-            };
-            let server = flip::server::HttpServer::bind(&listen)?;
-            println!();
-            let mode = if speculative { "batched + speculative" } else { "batched" };
-            println!("serving      : OpenAI-compatible API on http://{listen} ({mode})");
-            println!("  endpoints  : POST /v1/chat/completions (stream supported), GET /v1/models");
-            if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
-                println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
-                println!("               currently runs the model locally (distributed routing available");
-                println!("               via flip::distributed::Coordinator).");
+                let ids = args.multi_gpu_ids.clone();
+                let split = flip::distributed::partition_layers(config.num_layers as usize, ids.len());
+                println!();
+                println!("multi-gpu    : pipeline-parallel layer split (specs §3.3)");
+                for (stage, shard) in split.iter().enumerate() {
+                    println!(
+                        "  gpu {:<6}: layers {}..{} ({} layer(s))",
+                        ids[stage], shard.start, shard.end, shard.len(),
+                    );
+                }
+                let generator = parts.into_pipeline_parallel_generator(&ids)?;
+                let draft = draft_parts
+                    .map(|p| p.into_pipeline_parallel_generator(&ids[..1]))
+                    .transpose()?;
+                start_batched_server(generator, draft, &args, &config, &listen)
             }
-            server.serve(flip::server::engine::router(engine))?; // blocks
-            Ok(())
         }
     }
+}
+
+/// Build the batched (optionally speculative) streaming engine over any compute
+/// kernel `K` and serve the OpenAI-compatible API. Generic so the CPU and
+/// multi-GPU pipeline kernels share one server path.
+fn start_batched_server<K: ComputeKernel + Send + 'static>(
+    generator: Generator<K>,
+    draft: Option<Generator<K>>,
+    args: &ServeArgs,
+    config: &ModelConfig,
+    listen: &str,
+) -> Result<()> {
+    let tokenizer = if args.model_path.join("vocab.json").exists()
+        && args.model_path.join("merges.txt").exists()
+    {
+        BpeTokenizer::from_dir(&args.model_path)?
+    } else {
+        BpeTokenizer::bytes_only()
+    };
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Batched, streaming engine: a background scheduler interleaves concurrent
+    // requests a token at a time. With a draft model it decodes speculatively
+    // (draft proposes, target verifies).
+    let speculative = draft.is_some();
+    let engine = match draft {
+        Some(d) => flip::server::EngineService::start_speculative(
+            generator,
+            d,
+            args.draft_gamma,
+            tokenizer,
+            config.vocab_size as usize,
+            "flip",
+            128,
+            created,
+            8, // max concurrent batch
+        ),
+        None => flip::server::EngineService::start(
+            generator,
+            tokenizer,
+            config.vocab_size as usize,
+            "flip",
+            128,
+            created,
+            8, // max concurrent batch
+        ),
+    };
+    let server = flip::server::HttpServer::bind(listen)?;
+    println!();
+    let mode = if speculative { "batched + speculative" } else { "batched" };
+    println!("serving      : OpenAI-compatible API on http://{listen} ({mode})");
+    println!("  endpoints  : POST /v1/chat/completions (stream supported), GET /v1/models");
+    if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
+        println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
+        println!("               currently runs the model locally (distributed routing available");
+        println!("               via flip::distributed::Coordinator).");
+    }
+    server.serve(flip::server::engine::router(engine)) // blocks
 }
 
 /// Shared planner/reporter: map the model (if a dir is given), profile it, size
