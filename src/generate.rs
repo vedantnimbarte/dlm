@@ -419,6 +419,11 @@ impl<K: ComputeKernel> Generator<K> {
             last_hidden: hidden,
             rng: SplitMix64::new(sampler.seed()),
             sampler,
+            // Only the suffix is known here — the snapshot carries KV state, not
+            // the prefix token ids — so the repetition penalty won't cover the
+            // cached prefix. Thread the prefix ids through the snapshot when
+            // resume_session is wired into the server with sampling.
+            seen: suffix.iter().copied().collect(),
         })
     }
 }
