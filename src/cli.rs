@@ -200,6 +200,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub resident_layers: Option<usize>,
 
+    /// How many layers ahead to prefetch while streaming (`--stream`). Higher
+    /// hides more load latency behind compute but needs a bigger
+    /// `--resident-layers` window (clamped to window − 1). `0` disables prefetch.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub prefetch_depth: usize,
+
     /// Cluster role.
     #[arg(long, value_enum, default_value_t = DistributedMode::Standalone)]
     pub distributed_mode: DistributedMode,

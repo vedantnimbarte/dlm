@@ -89,7 +89,7 @@ fn streaming_generation_matches_resident() {
 
     // Streaming: only 2 of 6 layers resident at a time (rest streamed from disk).
     let store_b = MmapStore::open_dir(tmp.path()).unwrap();
-    let streaming = dlm::loader::build_streaming_generator(store_b, &config, 32, 2).unwrap();
+    let streaming = dlm::loader::build_streaming_generator(store_b, &config, 32, 2, 1).unwrap();
     let out_streaming = streaming.generate(&prompt, &cfg).unwrap();
 
     assert_eq!(

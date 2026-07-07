@@ -165,6 +165,11 @@ impl<S: LayerSource> Shared<S> {
 pub struct StreamingKernel<S: LayerSource + 'static> {
     shared: Arc<Shared<S>>,
     num_layers: u32,
+    /// How many layers ahead to keep loading (1 = just the next). Clamped to
+    /// `window - 1` so prefetched layers aren't evicted before they're used.
+    prefetch_depth: u32,
+    /// Resident window size (LRU capacity), for clamping the depth.
+    window: u32,
     /// Requests to prefetch a layer; `None` once the kernel is being dropped.
     prefetch_tx: Option<Sender<u32>>,
     worker: Option<JoinHandle<()>>,
@@ -197,13 +202,27 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
                 }
             })
         };
+        let window = resident_layers.max(1) as u32;
         Self {
             shared,
             num_layers,
+            // Default: one layer ahead (clamped to the window).
+            prefetch_depth: 1.min(window.saturating_sub(1)),
+            window,
             prefetch_tx: Some(tx),
             worker: Some(worker),
             stopped,
         }
+    }
+
+    /// Keep `depth` layers loading ahead of the compute thread instead of one.
+    /// Useful when a layer's load latency exceeds a single block's compute, so
+    /// one lookahead can't fully hide it. Clamped to `window - 1` (can't usefully
+    /// prefetch more layers than the resident window holds). `0` disables
+    /// prefetch.
+    pub fn with_prefetch_depth(mut self, depth: u32) -> Self {
+        self.prefetch_depth = depth.min(self.window.saturating_sub(1));
+        self
     }
 
     /// Cache stats (hits/misses/evictions/prefetched) accumulated so far.
@@ -249,10 +268,13 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         position: usize,
     ) -> Result<()> {
         let tensors = self.shared.fetch(layer)?;
-        // Kick off the next layer's load now, so it overlaps this block's compute
-        // (layers run strictly in order, wrapping per token).
+        // Kick off the next `prefetch_depth` layers' loads now, so they overlap
+        // this and following blocks' compute (layers run strictly in order,
+        // wrapping per token). Already-resident/in-flight layers de-dupe cheaply.
         if let Some(tx) = &self.prefetch_tx {
-            let _ = tx.send((layer + 1) % self.num_layers);
+            for ahead in 1..=self.prefetch_depth {
+                let _ = tx.send((layer + ahead) % self.num_layers);
+            }
         }
         // Compute without holding the cache lock — the worker loads in parallel.
         let out = decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?;
@@ -362,6 +384,31 @@ mod tests {
 
         let s = k.stats();
         assert!(s.prefetched >= 1, "background worker should have prefetched a layer: {s:?}");
+    }
+
+    #[test]
+    fn deeper_prefetch_loads_more_layers_ahead() {
+        let c = cfg();
+        // Window of 6 with depth 3: one block requests three layers ahead.
+        let k = StreamingKernel::new(c, SlowSource(layers(&c, 6)), 6).with_prefetch_depth(3);
+        let mut h = vec![0.5f32; 8];
+        let mut kv = KvLayerCache::new(c.kv_dim());
+        k.run_block(0, &mut h, &mut kv, 0).unwrap(); // requests prefetch of 1,2,3
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(k.stats().prefetched, 3, "depth-3 should prefetch three layers: {:?}", k.stats());
+    }
+
+    #[test]
+    fn prefetch_depth_clamped_to_window() {
+        let c = cfg();
+        // Window of 2 only has room for 1 layer ahead; a requested depth of 5
+        // must clamp to 1 (else it would thrash the tiny window).
+        let k = StreamingKernel::new(c, SlowSource(layers(&c, 6)), 2).with_prefetch_depth(5);
+        let mut h = vec![0.5f32; 8];
+        let mut kv = KvLayerCache::new(c.kv_dim());
+        k.run_block(0, &mut h, &mut kv, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(k.stats().prefetched, 1, "depth must clamp to window-1: {:?}", k.stats());
     }
 
     #[test]

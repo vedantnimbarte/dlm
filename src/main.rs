@@ -578,11 +578,22 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     "streaming    : {window} / {} layers resident in {dest}, rest streamed from disk",
                     config.num_layers,
                 );
+                let depth = args.prefetch_depth.min(window.saturating_sub(1));
+                if depth > 0 {
+                    println!("  prefetch   : {depth} layer(s) ahead (overlaps load with compute)");
+                } else {
+                    println!("  prefetch   : off (window too small or --prefetch-depth 0)");
+                }
                 if device == Device::Gpu {
                     return serve_streaming_gpu(store, &config, &args, window, &listen);
                 }
-                let generator =
-                    dlm::loader::build_streaming_generator(store, &config, args.context_length, window)?;
+                let generator = dlm::loader::build_streaming_generator(
+                    store,
+                    &config,
+                    args.context_length,
+                    window,
+                    args.prefetch_depth,
+                )?;
                 return start_batched_server(generator, None, &args, &config, &listen);
             }
 
