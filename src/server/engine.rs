@@ -6,8 +6,8 @@
 //! Concurrent requests are therefore **continuously batched** (interleaved a
 //! token at a time), and a request can be **streamed** to the client as SSE.
 //!
-//! The [`router`] wires this into the OpenAI endpoints, supporting `stream: true`
-//! for `/v1/chat/completions`.
+//! The [`router`] wires this into the OpenAI and Anthropic endpoints, supporting
+//! `stream: true` for both `/v1/chat/completions` and `/v1/messages`.
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
@@ -470,13 +470,16 @@ fn error_json(message: &str) -> Vec<u8> {
     format!(r#"{{"error":{{"message":{message:?},"type":"invalid_request_error"}}}}"#).into_bytes()
 }
 
-/// True if the request carries `Authorization: Bearer <key>` matching `key`.
+/// True if the request carries a matching key via `Authorization: Bearer <key>`
+/// (OpenAI style) or `x-api-key: <key>` (Anthropic style).
 fn authorized(req: &Request, key: &str) -> bool {
-    req.headers
+    let bearer = req
+        .headers
         .get("authorization")
         .and_then(|h| h.strip_prefix("Bearer "))
-        .map(|t| t.trim() == key)
-        .unwrap_or(false)
+        .map(str::trim);
+    let api_key = req.headers.get("x-api-key").map(|h| h.trim());
+    bearer == Some(key) || api_key == Some(key)
 }
 
 /// Wrap [`router`] with bearer-token auth: when `api_key` is set, `/v1/*`
@@ -513,10 +516,69 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
                 Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
             }
             ("POST", "/v1/chat/completions") => handle_chat(&engine, req),
+            ("POST", "/v1/messages") => handle_messages(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
             _ => Response::json(405, error_json("method not allowed")),
         }
     })
+}
+
+/// A collected non-streaming completion.
+struct Generated {
+    text: String,
+    /// True if a stop sequence was hit (vs. running to `max_tokens`).
+    stopped: bool,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    spec: Option<AcceptanceStats>,
+}
+
+/// Run one request to completion, ending early at the first stop sequence and
+/// truncating the decoded text before it. Shared by the OpenAI and Anthropic
+/// non-streaming handlers.
+fn collect_completion(
+    engine: &Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    sampler: Sampler,
+    stops: &[String],
+) -> Generated {
+    let prompt_tokens = ids.len();
+    let rx = engine.submit(ids, max_tokens, None, sampler);
+    let mut tokens = Vec::new();
+    let mut spec = None;
+    for ev in rx {
+        match ev {
+            TokenEvent::Next(t) => {
+                tokens.push(t);
+                if !stops.is_empty() {
+                    let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
+                    if earliest_stop(&so_far, stops).is_some() {
+                        break; // dropping the receiver ends generation
+                    }
+                }
+            }
+            TokenEvent::Done(stats) => {
+                spec = stats;
+                break;
+            }
+        }
+    }
+    let mut text = engine.tokenizer.decode(&tokens).unwrap_or_default();
+    let stopped = match earliest_stop(&text, stops) {
+        Some(cut) => {
+            text.truncate(cut);
+            true
+        }
+        None => false,
+    };
+    Generated {
+        text,
+        stopped,
+        prompt_tokens,
+        completion_tokens: tokens.len(),
+        spec,
+    }
 }
 
 fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
@@ -536,41 +598,11 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
-    let prompt_tokens = ids.len();
 
     if parsed.stream {
         stream_chat(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
     } else {
-        // Collect the completion, ending early at the first stop sequence.
-        let rx = engine.submit(ids, max_tokens, None, sampler);
-        let mut tokens = Vec::new();
-        let mut spec = None;
-        for ev in rx {
-            match ev {
-                TokenEvent::Next(t) => {
-                    tokens.push(t);
-                    if !stops.is_empty() {
-                        let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
-                        if earliest_stop(&so_far, &stops).is_some() {
-                            break; // dropping the receiver ends generation
-                        }
-                    }
-                }
-                TokenEvent::Done(stats) => {
-                    spec = stats;
-                    break;
-                }
-            }
-        }
-        // Truncate the decoded text before the stop sequence, if one hit.
-        let mut text = engine.tokenizer.decode(&tokens).unwrap_or_default();
-        let finish_reason = match earliest_stop(&text, &stops) {
-            Some(cut) => {
-                text.truncate(cut);
-                "stop"
-            }
-            None => "length",
-        };
+        let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
         let body = ChatResponse {
             id: format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed)),
             object: "chat.completion",
@@ -578,18 +610,258 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             model,
             choices: vec![Choice {
                 index: 0,
-                message: RespMessage { role: "assistant", content: text },
-                finish_reason,
+                message: RespMessage { role: "assistant", content: g.text },
+                finish_reason: if g.stopped { "stop" } else { "length" },
             }],
             usage: Usage {
-                prompt_tokens,
-                completion_tokens: tokens.len(),
-                total_tokens: prompt_tokens + tokens.len(),
-                speculative: spec.map(SpeculativeUsage::from),
+                prompt_tokens: g.prompt_tokens,
+                completion_tokens: g.completion_tokens,
+                total_tokens: g.prompt_tokens + g.completion_tokens,
+                speculative: g.spec.map(SpeculativeUsage::from),
             },
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
     }
+}
+
+// ── Anthropic Messages API shapes (`POST /v1/messages`) ─────────────────────
+
+/// Anthropic message/system content: either a plain string or a list of blocks.
+/// Only text blocks carry content we render; other block types contribute their
+/// `text` field (usually empty) and are otherwise ignored.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AnthropicContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+#[derive(Deserialize)]
+struct ContentBlock {
+    #[serde(default)]
+    text: String,
+}
+
+impl AnthropicContent {
+    fn to_text(&self) -> String {
+        match self {
+            AnthropicContent::Text(s) => s.clone(),
+            AnthropicContent::Blocks(bs) => {
+                bs.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("")
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AnthropicMessage {
+    role: String,
+    content: AnthropicContent,
+}
+
+#[derive(Deserialize)]
+struct MessagesRequest {
+    #[serde(default)]
+    model: Option<String>,
+    messages: Vec<AnthropicMessage>,
+    /// Required by Anthropic; we still default it to the server's max if absent.
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    system: Option<AnthropicContent>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    stop_sequences: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct TextBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct AnthropicUsage {
+    input_tokens: usize,
+    output_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct MessagesResponse {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'static str,
+    model: String,
+    content: Vec<TextBlock>,
+    stop_reason: &'static str,
+    stop_sequence: Option<String>,
+    usage: AnthropicUsage,
+}
+
+fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: MessagesRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
+    };
+    if parsed.messages.is_empty() {
+        return Response::json(400, error_json("messages must not be empty"));
+    }
+
+    // Fold `system` + messages into the shared chat template. The Anthropic
+    // `system` field becomes a leading system-role message.
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(parsed.messages.len() + 1);
+    if let Some(sys) = &parsed.system {
+        let text = sys.to_text();
+        if !text.is_empty() {
+            messages.push(ChatMessage { role: "system".into(), content: text });
+        }
+    }
+    for m in &parsed.messages {
+        messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
+    }
+    let prompt = engine.chat_template.apply(&messages);
+    let ids = match engine.encode_prompt(&prompt) {
+        Ok(ids) => ids,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+
+    let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    let id = engine.next_id.load(Ordering::Relaxed);
+    let sampler = match parsed.temperature {
+        Some(t) if t > 0.0 => Sampler::TopPK {
+            temperature: t,
+            top_p: parsed.top_p.unwrap_or(1.0),
+            top_k: parsed.top_k.unwrap_or(0),
+            seed: id,
+        },
+        _ => Sampler::Greedy,
+    };
+    let stops: Vec<String> = parsed
+        .stop_sequences
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
+
+    if parsed.stream {
+        return stream_messages(Arc::clone(engine), ids, max_tokens, model, sampler, stops);
+    }
+
+    let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+    let body = MessagesResponse {
+        id: format!("msg-{id}"),
+        kind: "message",
+        role: "assistant",
+        model,
+        content: vec![TextBlock { kind: "text", text: g.text }],
+        // No EOS handling on this path, so natural end == hit max_tokens.
+        stop_reason: if g.stopped { "stop_sequence" } else { "max_tokens" },
+        stop_sequence: None,
+        usage: AnthropicUsage {
+            input_tokens: g.prompt_tokens,
+            output_tokens: g.completion_tokens,
+        },
+    };
+    Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
+}
+
+/// Stream an Anthropic Messages response as Server-Sent Events, following the
+/// event sequence Anthropic clients expect: `message_start`,
+/// `content_block_start`, a run of `content_block_delta` (`text_delta`),
+/// `content_block_stop`, `message_delta` (with `stop_reason`), `message_stop`.
+fn stream_messages(
+    engine: Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    model: String,
+    sampler: Sampler,
+    stops: Vec<String>,
+) -> Response {
+    Response::stream(200, "text/event-stream", move |w| {
+        let id = format!("msg-{}", engine.next_id.load(Ordering::Relaxed));
+        let prompt_tokens = ids.len();
+        // Anthropic frames carry both an `event:` line and a `data:` line.
+        let send = |w: &mut dyn std::io::Write, event: &str, data: serde_json::Value| -> std::io::Result<()> {
+            write!(w, "event: {event}\ndata: {data}\n\n")?;
+            w.flush()
+        };
+
+        send(w, "message_start", serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+            },
+        }))?;
+        send(w, "content_block_start", serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }))?;
+
+        let mut completion_tokens = 0usize;
+        // Stop-aware emission mirrors stream_chat: accumulate ids, re-decode, and
+        // emit only the newly-visible suffix up to any stop sequence.
+        let mut acc_ids: Vec<u32> = Vec::new();
+        let mut sent_chars = 0usize;
+        let mut stop_reason = "max_tokens";
+        let mut stop_sequence: Option<String> = None;
+        let rx = engine.submit(ids, max_tokens, None, sampler);
+        for ev in rx {
+            match ev {
+                TokenEvent::Next(t) => {
+                    completion_tokens += 1;
+                    acc_ids.push(t);
+                    let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
+                    let cut = if stops.is_empty() { None } else { earliest_stop(&full, &stops) };
+                    let visible = &full[..cut.unwrap_or(full.len())];
+                    let vis_chars = visible.chars().count();
+                    if vis_chars > sent_chars {
+                        let delta: String = visible.chars().skip(sent_chars).collect();
+                        sent_chars = vis_chars;
+                        send(w, "content_block_delta", serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": delta},
+                        }))?;
+                    }
+                    if let Some(c) = cut {
+                        stop_reason = "stop_sequence";
+                        stop_sequence = stops.iter().find(|s| full[..].find(s.as_str()) == Some(c)).cloned();
+                        break;
+                    }
+                }
+                TokenEvent::Done(_) => break,
+            }
+        }
+
+        send(w, "content_block_stop", serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0,
+        }))?;
+        send(w, "message_delta", serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+            "usage": {"output_tokens": completion_tokens},
+        }))?;
+        send(w, "message_stop", serde_json::json!({"type": "message_stop"}))
+    })
 }
 
 /// Stream a chat completion as Server-Sent Events.
@@ -725,5 +997,37 @@ mod tests {
         );
         assert_eq!(earliest_stop("abcXYdef", &["XY".into(), "de".into()]), Some(3));
         assert_eq!(earliest_stop("abc", &["z".into()]), None);
+    }
+
+    #[test]
+    fn anthropic_content_string_or_blocks() {
+        let s: AnthropicContent = serde_json::from_str(r#""hello""#).unwrap();
+        assert_eq!(s.to_text(), "hello");
+
+        let b: AnthropicContent =
+            serde_json::from_str(r#"[{"type":"text","text":"a"},{"type":"text","text":"b"}]"#)
+                .unwrap();
+        assert_eq!(b.to_text(), "ab");
+    }
+
+    #[test]
+    fn anthropic_request_folds_system_and_messages() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"model":"m","max_tokens":16,"system":"be terse",
+                "messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.max_tokens, Some(16));
+
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(ChatMessage { role: "system".into(), content: sys.to_text() });
+        }
+        for m in &req.messages {
+            messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
+        }
+        let prompt = ChatTemplate::Plain.apply(&messages);
+        assert!(prompt.starts_with("system: be terse\nuser: hi\n"), "{prompt}");
+        assert!(prompt.ends_with("assistant:"), "{prompt}");
     }
 }

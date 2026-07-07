@@ -150,6 +150,31 @@ fn speculative_stream_emits_usage_chunk() {
 }
 
 #[test]
+fn streaming_messages_emits_anthropic_sse_events() {
+    let addr = start_server();
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4,"stream":true}"#;
+    let resp = post(addr, "/v1/messages", body);
+
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(resp.contains("Content-Type: text/event-stream"), "{resp}");
+    // The full Anthropic event sequence, in order.
+    for ev in [
+        "event: message_start",
+        "event: content_block_start",
+        "event: content_block_delta",
+        "event: content_block_stop",
+        "event: message_delta",
+        "event: message_stop",
+    ] {
+        assert!(resp.contains(ev), "missing {ev}:\n{resp}");
+    }
+    assert!(resp.contains(r#""type":"text_delta""#), "{resp}");
+    // Ran to max_tokens (no stop sequence), so stop_reason reflects that.
+    assert!(resp.contains(r#""stop_reason":"max_tokens""#), "{resp}");
+    assert!(resp.contains(r#""output_tokens":4"#), "{resp}");
+}
+
+#[test]
 fn concurrent_requests_are_served() {
     let addr = start_server();
     let handles: Vec<_> = (0..3)
