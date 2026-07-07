@@ -21,34 +21,47 @@
 use crate::error::Result;
 use crate::forward::cpu::{decode_block, BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 /// Supplies one transformer layer's materialized weights on demand.
 ///
 /// The production source ([`MmapLayerSource`](crate::loader::MmapLayerSource))
 /// reads and dequantizes the layer's tensors from a memory-mapped checkpoint;
-/// tests can back it with an in-memory `Vec`.
-pub trait LayerSource: Send {
+/// tests can back it with an in-memory `Vec`. `Sync` is required so a background
+/// prefetch thread can pull the next layer while the current one computes.
+pub trait LayerSource: Send + Sync {
     /// Total transformer layers available.
     fn num_layers(&self) -> u32;
     /// Materialize layer `layer`'s weights.
     fn load_layer(&self, layer: u32) -> Result<LayerTensors>;
 }
 
-/// Cache-effectiveness snapshot for a [`StreamingKernel`].
+/// Cache-effectiveness snapshot for a [`StreamingKernel`]. `prefetched` counts
+/// layers the background worker materialized ahead of the compute thread needing
+/// them — the overlap that hides load latency.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    pub prefetched: u64,
 }
 
 /// A bounded LRU of materialized layers (front of `order` = least recent).
+/// Layers are `Arc`ed so the compute thread can hold one for `decode_block`
+/// without keeping the cache locked — letting the prefetch worker load in
+/// parallel, and surviving eviction while in flight.
 struct LayerLru {
     capacity: usize,
-    map: HashMap<u32, LayerTensors>,
+    map: HashMap<u32, Arc<LayerTensors>>,
     order: VecDeque<u32>,
+    /// Layers currently being loaded (by compute or the worker); de-dupes
+    /// concurrent loads of the same layer.
+    loading: HashSet<u32>,
     stats: StreamStats,
 }
 
@@ -58,6 +71,7 @@ impl LayerLru {
             capacity: capacity.max(1),
             map: HashMap::new(),
             order: VecDeque::new(),
+            loading: HashSet::new(),
             stats: StreamStats::default(),
         }
     }
@@ -69,7 +83,7 @@ impl LayerLru {
         self.order.push_back(layer);
     }
 
-    fn insert(&mut self, layer: u32, tensors: LayerTensors) {
+    fn insert(&mut self, layer: u32, tensors: Arc<LayerTensors>) {
         while self.map.len() >= self.capacity {
             if let Some(evict) = self.order.pop_front() {
                 self.map.remove(&evict);
@@ -83,49 +97,148 @@ impl LayerLru {
     }
 }
 
-/// A streaming [`ComputeKernel`]: only a window of layers is resident; the rest
-/// are pulled from `source` on demand.
-pub struct StreamingKernel<S: LayerSource> {
+/// State shared between the compute thread and the prefetch worker.
+struct Shared<S: LayerSource> {
     cfg: BlockConfig,
     source: S,
-    num_layers: u32,
     cache: Mutex<LayerLru>,
+    /// Signaled when a layer finishes loading, so waiters can recheck.
+    ready: Condvar,
 }
 
-impl<S: LayerSource> StreamingKernel<S> {
-    /// Stream `source`'s layers keeping at most `resident_layers` in memory.
-    pub fn new(cfg: BlockConfig, source: S, resident_layers: usize) -> Self {
-        let num_layers = source.num_layers();
-        Self {
-            cfg,
-            source,
-            num_layers,
-            cache: Mutex::new(LayerLru::new(resident_layers)),
+impl<S: LayerSource> Shared<S> {
+    /// Ensure `layer` is resident, loading it (blocking, without holding the
+    /// cache lock) if absent. Concurrent callers for the same layer de-dupe: one
+    /// loads, the rest wait on `ready`. `by_worker` tags a background prefetch in
+    /// the stats. Returns an `Arc` clone of the layer.
+    fn ensure(&self, layer: u32, by_worker: bool) -> Result<Arc<LayerTensors>> {
+        let mut cache = self.cache.lock().unwrap();
+        loop {
+            if let Some(t) = cache.map.get(&layer) {
+                let t = Arc::clone(t);
+                cache.touch(layer);
+                return Ok(t);
+            }
+            if cache.loading.contains(&layer) {
+                cache = self.ready.wait(cache).unwrap();
+                continue;
+            }
+            // We own the load. Release the lock so compute/other loads proceed.
+            cache.loading.insert(layer);
+            drop(cache);
+            let loaded = self.source.load_layer(layer);
+            let mut cache = self.cache.lock().unwrap();
+            cache.loading.remove(&layer);
+            self.ready.notify_all();
+            let arc = Arc::new(loaded?);
+            cache.insert(layer, Arc::clone(&arc));
+            if by_worker {
+                cache.stats.prefetched += 1;
+            }
+            return Ok(arc);
         }
     }
 
-    /// Cache stats (hits/misses/evictions) accumulated so far.
+    /// Compute-path fetch: records a hit (resident) or miss (had to load), then
+    /// ensures the layer is available.
+    fn fetch(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(t) = cache.map.get(&layer) {
+                let t = Arc::clone(t);
+                cache.stats.hits += 1;
+                cache.touch(layer);
+                return Ok(t);
+            }
+            cache.stats.misses += 1;
+        }
+        self.ensure(layer, false)
+    }
+}
+
+/// A streaming [`ComputeKernel`]: only a window of layers is resident; the rest
+/// are pulled from `source` on demand. A background worker **prefetches the next
+/// layer while the current one computes**, so a layer's load latency is hidden
+/// behind the previous layer's arithmetic (layers are consumed strictly in
+/// order). Output is identical to loading synchronously — prefetch only changes
+/// *when* the load happens.
+pub struct StreamingKernel<S: LayerSource + 'static> {
+    shared: Arc<Shared<S>>,
+    num_layers: u32,
+    /// Requests to prefetch a layer; `None` once the kernel is being dropped.
+    prefetch_tx: Option<Sender<u32>>,
+    worker: Option<JoinHandle<()>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl<S: LayerSource + 'static> StreamingKernel<S> {
+    /// Stream `source`'s layers keeping at most `resident_layers` in memory,
+    /// prefetching one layer ahead in the background.
+    pub fn new(cfg: BlockConfig, source: S, resident_layers: usize) -> Self {
+        let num_layers = source.num_layers();
+        let shared = Arc::new(Shared {
+            cfg,
+            source,
+            cache: Mutex::new(LayerLru::new(resident_layers)),
+            ready: Condvar::new(),
+        });
+        let (tx, rx) = channel::<u32>();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let shared = Arc::clone(&shared);
+            let stopped = Arc::clone(&stopped);
+            std::thread::spawn(move || {
+                while let Ok(layer) = rx.recv() {
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Best-effort: a failed load just becomes a compute-path miss.
+                    let _ = shared.ensure(layer, true);
+                }
+            })
+        };
+        Self {
+            shared,
+            num_layers,
+            prefetch_tx: Some(tx),
+            worker: Some(worker),
+            stopped,
+        }
+    }
+
+    /// Cache stats (hits/misses/evictions/prefetched) accumulated so far.
     pub fn stats(&self) -> StreamStats {
-        self.cache.lock().unwrap().stats
+        self.shared.cache.lock().unwrap().stats
     }
 
     /// Number of layers currently held resident.
     pub fn resident_len(&self) -> usize {
-        self.cache.lock().unwrap().map.len()
+        self.shared.cache.lock().unwrap().map.len()
     }
 }
 
-impl<S: LayerSource> ComputeKernel for StreamingKernel<S> {
+impl<S: LayerSource + 'static> Drop for StreamingKernel<S> {
+    fn drop(&mut self) {
+        // Close the request channel and let the worker finish its current load.
+        self.stopped.store(true, Ordering::Relaxed);
+        self.prefetch_tx.take();
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
     fn num_layers(&self) -> u32 {
         self.num_layers
     }
 
     fn hidden_size(&self) -> usize {
-        self.cfg.hidden_size
+        self.shared.cfg.hidden_size
     }
 
     fn kv_dim(&self) -> usize {
-        self.cfg.kv_dim()
+        self.shared.cfg.kv_dim()
     }
 
     fn run_block(
@@ -135,18 +248,14 @@ impl<S: LayerSource> ComputeKernel for StreamingKernel<S> {
         kv: &mut KvLayerCache,
         position: usize,
     ) -> Result<()> {
-        let mut cache = self.cache.lock().unwrap();
-        if cache.map.contains_key(&layer) {
-            cache.stats.hits += 1;
-            cache.touch(layer);
-        } else {
-            cache.stats.misses += 1;
-            let tensors = self.source.load_layer(layer)?;
-            cache.insert(layer, tensors);
+        let tensors = self.shared.fetch(layer)?;
+        // Kick off the next layer's load now, so it overlaps this block's compute
+        // (layers run strictly in order, wrapping per token).
+        if let Some(tx) = &self.prefetch_tx {
+            let _ = tx.send((layer + 1) % self.num_layers);
         }
-        // Run the block from the resident copy (borrow tied to the guard).
-        let tensors = cache.map.get(&layer).expect("just inserted/looked up");
-        let out = decode_block(&self.cfg, tensors, hidden, kv, position)?;
+        // Compute without holding the cache lock — the worker loads in parallel.
+        let out = decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?;
         hidden.copy_from_slice(&out);
         Ok(())
     }
@@ -224,5 +333,52 @@ mod tests {
         assert_eq!(h_res, h_str, "streamed forward diverged from resident");
         assert!(streaming.resident_len() <= 2, "window exceeded capacity");
         assert!(streaming.stats().evictions > 0, "expected eviction with a small window");
+    }
+
+    /// A source that sleeps on load, so a prefetch started during one block's
+    /// compute has time to finish before the next block is requested.
+    struct SlowSource(Vec<LayerTensors>);
+    impl LayerSource for SlowSource {
+        fn num_layers(&self) -> u32 {
+            self.0.len() as u32
+        }
+        fn load_layer(&self, layer: u32) -> Result<LayerTensors> {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(self.0[layer as usize].clone())
+        }
+    }
+
+    #[test]
+    fn worker_prefetches_next_layer() {
+        let c = cfg();
+        let k = StreamingKernel::new(c, SlowSource(layers(&c, 4)), 4);
+        let mut h = vec![0.5f32; 8];
+        let mut kv = KvLayerCache::new(c.kv_dim());
+
+        // Compute layer 0; this requests a prefetch of layer 1. With no further
+        // run_block competing, the worker loads layer 1 uncontended.
+        k.run_block(0, &mut h, &mut kv, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let s = k.stats();
+        assert!(s.prefetched >= 1, "background worker should have prefetched a layer: {s:?}");
+    }
+
+    #[test]
+    fn prefetch_makes_later_blocks_hit() {
+        // Over several tokens the worker keeps a layer ahead, so most on-demand
+        // fetches are hits rather than blocking loads.
+        let c = cfg();
+        let k = StreamingKernel::new(c, SlowSource(layers(&c, 4)), 4);
+        let mut h = vec![0.5f32; 8];
+        let mut kv = KvLayerCache::new(c.kv_dim());
+        for pos in 0..4 {
+            for layer in 0..4 {
+                k.run_block(layer, &mut h, &mut kv, pos).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2)); // let prefetch land
+            }
+        }
+        let s = k.stats();
+        assert!(s.hits > s.misses, "prefetch should make hits dominate: {s:?}");
     }
 }
