@@ -93,8 +93,8 @@ fn gpu_run_block_matches_cpu() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_cpu = ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), false);
-    let mut orch_gpu = ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16), false);
+    let mut orch_cpu = ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_gpu = ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
 
     // Same starting hidden state, decoded autoregressively on both.
     let mut hidden_cpu: Vec<f32> = (0..cfg.hidden_size)
@@ -151,8 +151,8 @@ fn streaming_gpu_matches_resident() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_res = ForwardOrchestrator::new(resident, PagedKvCache::new(kv_cfg, 32), false);
-    let mut orch_str = ForwardOrchestrator::new(streaming, PagedKvCache::new(kv_cfg, 32), false);
+    let mut orch_res = ForwardOrchestrator::new(resident, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+    let mut orch_str = ForwardOrchestrator::new(streaming, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
 
     let mut h_res: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.02 - 0.3).collect();
     let mut h_str = h_res.clone();

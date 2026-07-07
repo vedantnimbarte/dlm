@@ -15,7 +15,7 @@ pub mod streaming;
 #[cfg(feature = "cuda-kernels")]
 pub mod streaming_gpu;
 
-pub use cpu::{decode_block, BlockConfig, CpuKernel, KvLayerCache, LayerTensors};
+pub use cpu::{decode_block, BlockConfig, CpuKernel, KvLayerCache, KvQuant, LayerTensors};
 #[cfg(feature = "cuda-kernels")]
 pub use gpu::GpuKernel;
 pub use kernel::{ComputeKernel, StubKernel};

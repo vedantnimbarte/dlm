@@ -245,8 +245,8 @@ pub struct Generator<K: ComputeKernel> {
     rms_eps: f32,
     kv_config: KvCacheConfig,
     kv_total_blocks: u32,
-    /// Store per-layer KV history int8-quantized (half the memory, approximate).
-    quantize_kv: bool,
+    /// Per-layer KV precision (int8/int4 shrink KV memory, approximate).
+    kv_quant: crate::forward::KvQuant,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -285,15 +285,20 @@ impl<K: ComputeKernel> Generator<K> {
             rms_eps,
             kv_config,
             kv_total_blocks,
-            quantize_kv: false,
+            kv_quant: crate::forward::KvQuant::None,
         })
     }
 
-    /// Store per-layer KV history int8-quantized: about half the KV memory, at a
-    /// small approximation. Affects sessions started after this call.
-    pub fn with_quantized_kv(mut self) -> Self {
-        self.quantize_kv = true;
+    /// Set the per-layer KV precision (int8/int4 shrink KV memory, approximate).
+    /// Affects sessions started after this call.
+    pub fn with_kv_quant(mut self, kv_quant: crate::forward::KvQuant) -> Self {
+        self.kv_quant = kv_quant;
         self
+    }
+
+    /// Shorthand for int8 KV (about half the memory).
+    pub fn with_quantized_kv(self) -> Self {
+        self.with_kv_quant(crate::forward::KvQuant::Int8)
     }
 
     /// Layer-streaming cache stats, if the kernel streams weights (else `None`).
@@ -337,7 +342,7 @@ impl<K: ComputeKernel> Generator<K> {
 
         // Fresh KV state per generation (single sequence).
         let budget = PagedKvCache::new(self.kv_config, self.kv_total_blocks);
-        let mut orch = ForwardOrchestrator::new(&self.kernel, budget, self.quantize_kv);
+        let mut orch = ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
 
         // Prefill: run every prompt token, carrying the last hidden state.
         let mut hidden = vec![0.0f32; self.hidden_size];
@@ -390,7 +395,7 @@ impl<K: ComputeKernel> Generator<K> {
             return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         }
         let budget = crate::cache::PagedKvCache::new(self.kv_config, self.kv_total_blocks);
-        let mut orchestrator = crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.quantize_kv);
+        let mut orchestrator = crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
         let mut hidden = vec![0.0f32; self.hidden_size];
         for &token in prompt {
             hidden = self.embed(token)?;
@@ -638,14 +643,16 @@ mod tests {
         // Exercises the int8 KV path through the full generate loop (quantized
         // caches, quantizing append, dequantizing attention). Tokens may differ
         // from f32 by argmax flips, so we only require it runs and is well-formed.
-        let gen = attention_generator().with_quantized_kv();
-        let out = gen
-            .generate(
-                &[1, 2, 3],
-                &GenerationConfig { max_new_tokens: 5, eos_token: None, sampler: Sampler::Greedy },
-            )
-            .unwrap();
-        assert_eq!(out.len(), 5);
+        for quant in [crate::forward::KvQuant::Int8, crate::forward::KvQuant::Int4] {
+            let gen = attention_generator().with_kv_quant(quant);
+            let out = gen
+                .generate(
+                    &[1, 2, 3],
+                    &GenerationConfig { max_new_tokens: 5, eos_token: None, sampler: Sampler::Greedy },
+                )
+                .unwrap();
+            assert_eq!(out.len(), 5, "{quant:?}");
+        }
     }
 
     #[test]

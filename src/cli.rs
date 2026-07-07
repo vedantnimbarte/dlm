@@ -138,6 +138,28 @@ impl QuantArg {
     }
 }
 
+/// KV cache precision (`--kv-quant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KvQuantArg {
+    /// Exact f32 (default).
+    None,
+    /// int8 — about half the KV memory.
+    Int8,
+    /// int4 — about a quarter of the KV memory, more error.
+    Int4,
+}
+
+impl KvQuantArg {
+    /// Map to the engine's [`KvQuant`](crate::forward::KvQuant).
+    pub fn to_kv_quant(self) -> crate::forward::KvQuant {
+        match self {
+            KvQuantArg::None => crate::forward::KvQuant::None,
+            KvQuantArg::Int8 => crate::forward::KvQuant::Int8,
+            KvQuantArg::Int4 => crate::forward::KvQuant::Int4,
+        }
+    }
+}
+
 /// Arguments for `dlm serve` (mirrors the `specs.md` §4 schema).
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -211,10 +233,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub auto_prefetch: bool,
 
-    /// Store the KV cache int8-quantized: about half the KV memory (which can
-    /// exceed the weights at long context), at a small approximation.
-    #[arg(long, default_value_t = false)]
-    pub quantize_kv: bool,
+    /// KV cache precision: `none` (exact f32), `int8` (≈half memory), or `int4`
+    /// (≈quarter memory, more error). The KV cache can exceed the weights at long
+    /// context, so quantizing it lets more context fit in a given budget.
+    #[arg(long, value_enum, default_value_t = KvQuantArg::None)]
+    pub kv_quant: KvQuantArg,
 
     /// Cluster role.
     #[arg(long, value_enum, default_value_t = DistributedMode::Standalone)]

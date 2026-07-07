@@ -53,19 +53,12 @@ pub struct ForwardOrchestrator<K: ComputeKernel> {
 
 impl<K: ComputeKernel> ForwardOrchestrator<K> {
     /// Build an orchestrator around a kernel and a KV budget pool. One real
-    /// [`KvLayerCache`] is allocated per layer, sized to the kernel's KV width.
-    /// With `quantize_kv`, the per-layer KV history is stored int8 (half the
-    /// memory, approximate).
-    pub fn new(kernel: K, budget: PagedKvCache, quantize_kv: bool) -> Self {
+    /// [`KvLayerCache`] is allocated per layer at precision `kv_quant` (int8/int4
+    /// shrink the KV memory, approximate).
+    pub fn new(kernel: K, budget: PagedKvCache, kv_quant: crate::forward::KvQuant) -> Self {
         let kv_dim = kernel.kv_dim();
         let kv_layers = (0..kernel.num_layers())
-            .map(|_| {
-                if quantize_kv {
-                    KvLayerCache::new_quantized(kv_dim)
-                } else {
-                    KvLayerCache::new(kv_dim)
-                }
-            })
+            .map(|_| KvLayerCache::new_quant(kv_dim, kv_quant))
             .collect();
         Self {
             kernel,

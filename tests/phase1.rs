@@ -744,7 +744,7 @@ fn orchestrator_drives_stub_kernel_with_kv_growth() {
         KvCacheConfig { num_layers: 3, num_kv_heads: 1, head_dim: 2, block_size: 16 },
         8,
     );
-    let mut orch = ForwardOrchestrator::new(kernel, budget, false);
+    let mut orch = ForwardOrchestrator::new(kernel, budget, dlm::forward::KvQuant::None);
 
     let mut hidden = vec![0.0f32; 4];
     orch.decode_token(&mut hidden).unwrap();
@@ -784,7 +784,7 @@ fn orchestrator_runs_real_cpu_block_autoregressively() {
         KvCacheConfig { num_layers: 2, num_kv_heads: 1, head_dim: 2, block_size: 16 },
         8,
     );
-    let mut orch = ForwardOrchestrator::new(kernel, budget, false);
+    let mut orch = ForwardOrchestrator::new(kernel, budget, dlm::forward::KvQuant::None);
 
     let original = vec![1.5f32, -2.0, 0.5, 3.0];
     let mut hidden = original.clone();
@@ -811,7 +811,7 @@ fn orchestrator_validates_hidden_length() {
         KvCacheConfig { num_layers: 2, num_kv_heads: 1, head_dim: 1, block_size: 8 },
         4,
     );
-    let mut orch = ForwardOrchestrator::new(kernel, budget, false);
+    let mut orch = ForwardOrchestrator::new(kernel, budget, dlm::forward::KvQuant::None);
 
     let mut wrong = vec![0.0f32; 3]; // hidden_size is 4
     assert!(orch.decode_token(&mut wrong).is_err());
