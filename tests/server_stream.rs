@@ -1,11 +1,11 @@
 //! The batched/streaming engine behind the HTTP server: non-streaming and SSE
 //! chat completions, plus concurrent requests.
 
-use flip::cache::KvCacheConfig;
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
-use flip::generate::Generator;
-use flip::server::{engine::router, EngineService, HttpServer};
-use flip::tokenizer::BpeTokenizer;
+use dlm::cache::KvCacheConfig;
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::Generator;
+use dlm::server::{engine::router, EngineService, HttpServer};
+use dlm::tokenizer::BpeTokenizer;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
@@ -42,7 +42,7 @@ fn start_server() -> SocketAddr {
         build_generator(),
         BpeTokenizer::bytes_only(),
         256,
-        "flip-test",
+        "dlm-test",
         16,
         0,
         4, // max batch
@@ -62,7 +62,7 @@ fn start_speculative_server() -> SocketAddr {
         4,                 // gamma
         BpeTokenizer::bytes_only(),
         256,
-        "flip-test",
+        "dlm-test",
         16,
         0,
         4, // max batch

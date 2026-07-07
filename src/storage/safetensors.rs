@@ -11,7 +11,7 @@
 //! We parse only the header here; the actual bytes are served as slices
 //! straight out of the memory map (see [`crate::storage::MmapStore`]).
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -67,7 +67,7 @@ impl Dtype {
             "U64" => Dtype::U64,
             "F64" => Dtype::F64,
             other => {
-                return Err(FlipError::SafetensorsHeader(format!(
+                return Err(DlmError::SafetensorsHeader(format!(
                     "unsupported dtype tag {other:?}"
                 )))
             }
@@ -115,7 +115,7 @@ pub fn bytes_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => {
             if bytes.len() % 4 != 0 {
-                return Err(FlipError::SafetensorsHeader(format!(
+                return Err(DlmError::SafetensorsHeader(format!(
                     "F32 tensor byte length {} is not a multiple of 4",
                     bytes.len()
                 )));
@@ -127,7 +127,7 @@ pub fn bytes_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
         }
         Dtype::F16 => {
             if bytes.len() % 2 != 0 {
-                return Err(FlipError::SafetensorsHeader(format!(
+                return Err(DlmError::SafetensorsHeader(format!(
                     "F16 tensor byte length {} is not a multiple of 2",
                     bytes.len()
                 )));
@@ -139,7 +139,7 @@ pub fn bytes_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
         }
         Dtype::BF16 => {
             if bytes.len() % 2 != 0 {
-                return Err(FlipError::SafetensorsHeader(format!(
+                return Err(DlmError::SafetensorsHeader(format!(
                     "BF16 tensor byte length {} is not a multiple of 2",
                     bytes.len()
                 )));
@@ -150,7 +150,7 @@ pub fn bytes_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                 .collect())
         }
-        other => Err(FlipError::InvalidConfig(format!(
+        other => Err(DlmError::InvalidConfig(format!(
             "cannot convert dtype {other:?} to f32 (use the dequant path)"
         ))),
     }
@@ -164,7 +164,7 @@ pub fn bytes_to_i32(bytes: &[u8], dtype: Dtype) -> Result<Vec<i32>> {
     match dtype {
         Dtype::I32 | Dtype::U32 => {
             if bytes.len() % 4 != 0 {
-                return Err(FlipError::SafetensorsHeader(format!(
+                return Err(DlmError::SafetensorsHeader(format!(
                     "I32 tensor byte length {} is not a multiple of 4",
                     bytes.len()
                 )));
@@ -174,7 +174,7 @@ pub fn bytes_to_i32(bytes: &[u8], dtype: Dtype) -> Result<Vec<i32>> {
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect())
         }
-        other => Err(FlipError::InvalidConfig(format!(
+        other => Err(DlmError::InvalidConfig(format!(
             "cannot convert dtype {other:?} to i32"
         ))),
     }
@@ -224,7 +224,7 @@ impl SafetensorsHeader {
     /// ranges actually fit within the data section.
     pub fn parse(bytes: &[u8], file_len: usize) -> Result<Self> {
         if bytes.len() < HEADER_LEN_PREFIX {
-            return Err(FlipError::SafetensorsHeader(format!(
+            return Err(DlmError::SafetensorsHeader(format!(
                 "file too small ({} bytes) to contain an 8-byte header prefix",
                 bytes.len()
             )));
@@ -235,22 +235,22 @@ impl SafetensorsHeader {
 
         let data_offset = HEADER_LEN_PREFIX
             .checked_add(header_len)
-            .ok_or_else(|| FlipError::SafetensorsHeader("header length overflow".into()))?;
+            .ok_or_else(|| DlmError::SafetensorsHeader("header length overflow".into()))?;
 
         if data_offset > file_len {
-            return Err(FlipError::SafetensorsHeader(format!(
+            return Err(DlmError::SafetensorsHeader(format!(
                 "declared header length {header_len} runs past end of file ({file_len} bytes)"
             )));
         }
         if bytes.len() < data_offset {
-            return Err(FlipError::SafetensorsHeader(
+            return Err(DlmError::SafetensorsHeader(
                 "provided prefix is shorter than the declared header".into(),
             ));
         }
 
         let json = &bytes[HEADER_LEN_PREFIX..data_offset];
         let raw: BTreeMap<String, serde_json::Value> =
-            serde_json::from_slice(json).map_err(|source| FlipError::Json {
+            serde_json::from_slice(json).map_err(|source| DlmError::Json {
                 context: "safetensors header".to_string(),
                 source,
             })?;
@@ -261,7 +261,7 @@ impl SafetensorsHeader {
 
         for (name, value) in raw {
             if name == "__metadata__" {
-                metadata = serde_json::from_value(value).map_err(|source| FlipError::Json {
+                metadata = serde_json::from_value(value).map_err(|source| DlmError::Json {
                     context: "safetensors __metadata__".to_string(),
                     source,
                 })?;
@@ -269,7 +269,7 @@ impl SafetensorsHeader {
             }
 
             let raw_tensor: RawTensor =
-                serde_json::from_value(value).map_err(|source| FlipError::Json {
+                serde_json::from_value(value).map_err(|source| DlmError::Json {
                     context: format!("safetensors tensor {name:?}"),
                     source,
                 })?;
@@ -278,7 +278,7 @@ impl SafetensorsHeader {
             let [begin, end] = raw_tensor.data_offsets;
 
             if begin > end || end > data_section_len {
-                return Err(FlipError::TensorOutOfBounds {
+                return Err(DlmError::TensorOutOfBounds {
                     name,
                     start: begin,
                     end,
@@ -290,7 +290,7 @@ impl SafetensorsHeader {
             // corrupt header can't hand out a mis-sized slice downstream.
             let expected = raw_tensor.shape.iter().product::<usize>() * dtype.size_in_bytes();
             if expected != end - begin {
-                return Err(FlipError::SafetensorsHeader(format!(
+                return Err(DlmError::SafetensorsHeader(format!(
                     "tensor {name:?}: shape/dtype implies {expected} bytes but range spans {}",
                     end - begin
                 )));

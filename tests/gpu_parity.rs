@@ -9,8 +9,8 @@
 //! `exp`/`rsqrt`/`pow`).
 #![cfg(feature = "cuda-kernels")]
 
-use flip::cache::{KvCacheConfig, PagedKvCache};
-use flip::forward::{BlockConfig, CpuKernel, ForwardOrchestrator, GpuKernel, LayerTensors};
+use dlm::cache::{KvCacheConfig, PagedKvCache};
+use dlm::forward::{BlockConfig, CpuKernel, ForwardOrchestrator, GpuKernel, LayerTensors};
 
 /// Deterministic SplitMix64 for reproducible synthetic weights.
 struct Rng(u64);

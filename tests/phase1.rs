@@ -5,17 +5,17 @@
 //!   2. VRAM profiling math
 //!   3. page-locked host staging buffers + the linear swap cycle
 
-use flip::memory::{page_size, PinnedBuffer};
+use dlm::memory::{page_size, PinnedBuffer};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-use flip::memory::PinKind;
-use flip::model::{ModelConfig, QuantScheme};
-use flip::pipeline::{
+use dlm::memory::PinKind;
+use dlm::model::{ModelConfig, QuantScheme};
+use dlm::pipeline::{
     fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, MmapWeightSource,
     TieredWeightSource, WeightSource,
 };
-use flip::profiler::VramProfiler;
-use flip::storage::{LayerCatalog, MmapStore};
-use flip::swap::{LayerSwapPlan, StreamPass};
+use dlm::profiler::VramProfiler;
+use dlm::storage::{LayerCatalog, MmapStore};
+use dlm::swap::{LayerSwapPlan, StreamPass};
 use std::io::Write;
 
 /// Serialize a multi-tensor safetensors file (byte tensors) into `dir`.
@@ -260,7 +260,7 @@ struct MockSource {
 }
 
 impl WeightSource for MockSource {
-    fn load_window(&self, pass: &StreamPass) -> flip::Result<Vec<u8>> {
+    fn load_window(&self, pass: &StreamPass) -> dlm::Result<Vec<u8>> {
         let len = self.per_layer_bytes * pass.layer_count() as usize;
         Ok(vec![(pass.pass_index as u8).wrapping_add(1); len])
     }
@@ -378,7 +378,7 @@ fn mmap_source_streams_real_weights_through_pipeline() {
     assert_eq!(catalog.max_layer_bytes(), 160);
 
     // Window of 2 layers over 3 → 2 passes (layers 0-1, then 2).
-    let vram = flip::profiler::VramPlan {
+    let vram = dlm::profiler::VramPlan {
         free_bytes: 0,
         safety_bytes: 0,
         kv_total_bytes: 0,
@@ -436,7 +436,7 @@ fn tiered_cache_serves_second_pass_from_ram() {
     assert_eq!(catalog.num_layers(), 3);
 
     // Whole model resident in one window (3 layers).
-    let vram = flip::profiler::VramPlan {
+    let vram = dlm::profiler::VramPlan {
         free_bytes: 0,
         safety_bytes: 0,
         kv_total_bytes: 0,
@@ -495,7 +495,7 @@ fn tiered_cache_evicts_under_pressure() {
 
     // Stream each layer as its own single-layer window, in order.
     for layer in 0..3u32 {
-        let pass = flip::swap::StreamPass {
+        let pass = dlm::swap::StreamPass {
             pass_index: layer,
             first_layer: layer,
             last_layer: layer,
@@ -534,7 +534,7 @@ fn write_f32_model(dir: &std::path::Path, tensors: &[(String, Vec<f32>)]) {
 
 #[test]
 fn bytes_to_f32_decodes_float_dtypes() {
-    use flip::storage::{bytes_to_f32, Dtype};
+    use dlm::storage::{bytes_to_f32, Dtype};
 
     let f32_bytes: Vec<u8> = [1.0f32, -2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
     assert_eq!(bytes_to_f32(&f32_bytes, Dtype::F32).unwrap(), vec![1.0, -2.0]);
@@ -584,13 +584,13 @@ fn loader_builds_generator_from_real_checkpoint() {
     let config = ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Fp16).unwrap();
     let store = MmapStore::open_dir(tmp.path()).unwrap();
 
-    let generator = flip::loader::load_generator(&store, &config, 16).unwrap();
+    let generator = dlm::loader::load_generator(&store, &config, 16).unwrap();
     assert_eq!(generator.vocab_size(), vocab);
 
-    let cfg = flip::generate::GenerationConfig {
+    let cfg = dlm::generate::GenerationConfig {
         max_new_tokens: 4,
         eos_token: None,
-        sampler: flip::generate::Sampler::Greedy,
+        sampler: dlm::generate::Sampler::Greedy,
     };
     let out1 = generator.generate(&[1, 2], &cfg).unwrap();
     assert_eq!(out1.len(), 4);
@@ -632,7 +632,7 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 
 #[test]
 fn loader_materializes_gptq_quantized_projection() {
-    use flip::quant::{pack_gptq_4bit, PackedQuantConfig};
+    use dlm::quant::{pack_gptq_4bit, PackedQuantConfig};
 
     let tmp = tempfile::tempdir().unwrap();
     let (h, nh, nkv, hd, inter, vocab) = (8usize, 2usize, 1usize, 4usize, 8usize, 6usize);
@@ -672,9 +672,9 @@ fn loader_materializes_gptq_quantized_projection() {
     let store = MmapStore::open_dir(tmp.path()).unwrap();
 
     // Loads and runs — the quantized q_proj is dequantized into LayerTensors.
-    let generator = flip::loader::load_generator(&store, &config, 8).unwrap();
+    let generator = dlm::loader::load_generator(&store, &config, 8).unwrap();
     let out = generator
-        .generate(&[1, 2], &flip::generate::GenerationConfig { max_new_tokens: 3, eos_token: None, sampler: flip::generate::Sampler::Greedy })
+        .generate(&[1, 2], &dlm::generate::GenerationConfig { max_new_tokens: 3, eos_token: None, sampler: dlm::generate::Sampler::Greedy })
         .unwrap();
     assert_eq!(out.len(), 3);
     assert!(out.iter().all(|&t| (t as usize) < vocab));
@@ -707,17 +707,17 @@ fn loader_ties_lm_head_to_embedding_when_absent() {
     );
     let config = ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Fp16).unwrap();
     let store = MmapStore::open_dir(tmp.path()).unwrap();
-    let generator = flip::loader::load_generator(&store, &config, 8).unwrap();
+    let generator = dlm::loader::load_generator(&store, &config, 8).unwrap();
     let out = generator
-        .generate(&[0], &flip::generate::GenerationConfig::default())
+        .generate(&[0], &dlm::generate::GenerationConfig::default())
         .unwrap();
     assert!(!out.is_empty());
 }
 
 #[test]
 fn orchestrator_drives_stub_kernel_with_kv_growth() {
-    use flip::cache::{KvCacheConfig, PagedKvCache};
-    use flip::forward::{ForwardOrchestrator, StubKernel};
+    use dlm::cache::{KvCacheConfig, PagedKvCache};
+    use dlm::forward::{ForwardOrchestrator, StubKernel};
 
     let kernel = StubKernel::new(3, 4, 2); // 3 layers, hidden 4, kv_dim 2
     let budget = PagedKvCache::new(
@@ -746,8 +746,8 @@ fn orchestrator_drives_stub_kernel_with_kv_growth() {
 
 #[test]
 fn orchestrator_runs_real_cpu_block_autoregressively() {
-    use flip::cache::{KvCacheConfig, PagedKvCache};
-    use flip::forward::{BlockConfig, CpuKernel, ForwardOrchestrator, LayerTensors};
+    use dlm::cache::{KvCacheConfig, PagedKvCache};
+    use dlm::forward::{BlockConfig, CpuKernel, ForwardOrchestrator, LayerTensors};
 
     let cfg = BlockConfig {
         hidden_size: 4,
@@ -783,8 +783,8 @@ fn orchestrator_runs_real_cpu_block_autoregressively() {
 
 #[test]
 fn orchestrator_validates_hidden_length() {
-    use flip::cache::{KvCacheConfig, PagedKvCache};
-    use flip::forward::{ForwardOrchestrator, StubKernel};
+    use dlm::cache::{KvCacheConfig, PagedKvCache};
+    use dlm::forward::{ForwardOrchestrator, StubKernel};
 
     let kernel = StubKernel::new(2, 4, 1);
     let budget = PagedKvCache::new(

@@ -10,9 +10,9 @@
 //! acquired for a layer's work and released back into a free list when done, so
 //! the whole forward pass reuses a handful of buffers instead of allocating one
 //! per layer. The pool is bounded — acquiring beyond its cap returns
-//! [`FlipError::ActivationPoolExhausted`] rather than growing without limit.
+//! [`DlmError::ActivationPoolExhausted`] rather than growing without limit.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 
 /// Bytes per `f32` element.
 const F32_BYTES: usize = 4;
@@ -50,7 +50,7 @@ impl ActivationBuffer {
     /// residual add `h = h + f(h)` that carries state across streamed layers.
     pub fn add_assign_slice(&mut self, other: &[f32]) -> Result<()> {
         if other.len() != self.data.len() {
-            return Err(FlipError::ShapeMismatch {
+            return Err(DlmError::ShapeMismatch {
                 expected: self.data.len(),
                 got: other.len(),
             });
@@ -138,7 +138,7 @@ impl ActivationPool {
     }
 
     /// Acquire a zero-initialized buffer, reusing a pooled one when available.
-    /// Errors with [`FlipError::ActivationPoolExhausted`] when all buffers are
+    /// Errors with [`DlmError::ActivationPoolExhausted`] when all buffers are
     /// checked out and the cap is reached.
     pub fn acquire(&mut self) -> Result<ActivationBuffer> {
         let data = if let Some(mut buf) = self.free.pop() {
@@ -149,7 +149,7 @@ impl ActivationPool {
             self.allocations += 1;
             vec![0.0f32; self.buffer_elems]
         } else {
-            return Err(FlipError::ActivationPoolExhausted {
+            return Err(DlmError::ActivationPoolExhausted {
                 in_use: self.in_use,
                 max: self.max_buffers,
             });

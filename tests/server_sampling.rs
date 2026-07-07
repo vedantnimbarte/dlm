@@ -1,14 +1,14 @@
-//! The batched OpenAI server (`EngineService`, what `flip serve` runs) must
+//! The batched OpenAI server (`EngineService`, what `dlm serve` runs) must
 //! honor per-request sampling params: a request carrying `temperature`/`top_p`/
 //! `seed` is accepted and produces output, and `temperature: 0` reduces to the
 //! deterministic greedy path. (The sampler math itself is unit-tested in
 //! `generate.rs`; this proves the params thread through the HTTP layer.)
 
-use flip::cache::KvCacheConfig;
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
-use flip::generate::Generator;
-use flip::server::{engine::router, EngineService, HttpServer};
-use flip::tokenizer::BpeTokenizer;
+use dlm::cache::KvCacheConfig;
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::Generator;
+use dlm::server::{engine::router, EngineService, HttpServer};
+use dlm::tokenizer::BpeTokenizer;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
@@ -39,7 +39,7 @@ fn start_server() -> SocketAddr {
         64,
     )
     .unwrap();
-    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "flip", 8, 0, 8);
+    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm", 8, 0, 8);
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     std::thread::spawn(move || server.serve(router(engine)).unwrap());
@@ -61,7 +61,7 @@ fn request(addr: SocketAddr, body: &str) -> String {
 #[test]
 fn temperature_request_is_accepted_and_produces_output() {
     let addr = start_server();
-    let body = r#"{"model":"flip","messages":[{"role":"user","content":"Hi"}],"max_tokens":4,"temperature":1.5,"top_p":0.9,"seed":42}"#;
+    let body = r#"{"model":"dlm","messages":[{"role":"user","content":"Hi"}],"max_tokens":4,"temperature":1.5,"top_p":0.9,"seed":42}"#;
     let resp = request(addr, body);
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     assert!(resp.contains(r#""completion_tokens":4"#), "{resp}");

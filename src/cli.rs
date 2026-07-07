@@ -8,9 +8,9 @@ use crate::model::QuantScheme;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// `flip` — dynamic layer-streaming inference engine.
+/// `dlm` — dynamic layer-streaming inference engine.
 #[derive(Debug, Parser)]
-#[command(name = "flip", version, about, long_about = None)]
+#[command(name = "dlm", version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -36,7 +36,7 @@ pub enum Command {
     Pull(PullArgs),
 }
 
-/// Arguments for `flip search`.
+/// Arguments for `dlm search`.
 #[derive(Debug, Args)]
 pub struct SearchArgs {
     /// Search terms (e.g. `llama-3.2`). Omit to list the top models overall.
@@ -48,7 +48,7 @@ pub struct SearchArgs {
     pub limit: usize,
 }
 
-/// Arguments for `flip pull`.
+/// Arguments for `dlm pull`.
 #[derive(Debug, Args)]
 pub struct PullArgs {
     /// Repo id (`org/model`); a full HF URL is also accepted.
@@ -63,7 +63,7 @@ pub struct PullArgs {
     pub token: Option<String>,
 }
 
-/// Arguments for `flip doctor`.
+/// Arguments for `dlm doctor`.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Optionally check that this model directory loads and tokenizes.
@@ -71,7 +71,7 @@ pub struct DoctorArgs {
     pub model_path: Option<PathBuf>,
 }
 
-/// Arguments for `flip tokenize`.
+/// Arguments for `dlm tokenize`.
 #[derive(Debug, Args)]
 pub struct TokenizeArgs {
     /// Text to encode.
@@ -138,7 +138,7 @@ impl QuantArg {
     }
 }
 
-/// Arguments for `flip serve` (mirrors the `specs.md` §4 schema).
+/// Arguments for `dlm serve` (mirrors the `specs.md` §4 schema).
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Model directory containing `config.json` + `*.safetensors` shards.
@@ -185,7 +185,7 @@ pub struct ServeArgs {
     /// Compute device for the serving engine. Defaults to `gpu` on a
     /// `cuda-kernels` build (else `cpu`); pass `--device cpu` to force CPU.
     /// Ignored when `--multi-gpu-ids` is set. If `gpu` is chosen but no device is
-    /// usable, flip warns and falls back to CPU.
+    /// usable, dlm warns and falls back to CPU.
     #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
 
@@ -219,7 +219,7 @@ pub struct ServeArgs {
     pub chat_template: String,
 }
 
-/// Arguments for `flip profile`.
+/// Arguments for `dlm profile`.
 #[derive(Debug, Args)]
 pub struct ProfileArgs {
     /// Model directory to profile. If omitted, a built-in 70B-class sample
@@ -244,7 +244,7 @@ pub struct ProfileArgs {
     pub ram_cache_gb: Option<f64>,
 }
 
-/// Arguments for `flip generate`.
+/// Arguments for `dlm generate`.
 ///
 /// Runs the real CPU generation loop over a **randomly-initialized** synthetic
 /// model to exercise the full pipeline end-to-end. Weights are not trained, so
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn serve_parses_full_spec_schema() {
         let cli = Cli::try_parse_from([
-            "flip",
+            "dlm",
             "serve",
             "--model-path",
             "/models/Llama-3-70B",
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn serve_applies_defaults() {
-        let cli = Cli::try_parse_from(["flip", "serve", "--model-path", "/m"]).unwrap();
+        let cli = Cli::try_parse_from(["dlm", "serve", "--model-path", "/m"]).unwrap();
         let Command::Serve(a) = cli.command else {
             panic!("expected serve");
         };
@@ -382,12 +382,12 @@ mod tests {
 
     #[test]
     fn serve_requires_model_path() {
-        assert!(Cli::try_parse_from(["flip", "serve"]).is_err());
+        assert!(Cli::try_parse_from(["dlm", "serve"]).is_err());
     }
 
     #[test]
     fn profile_model_path_is_optional() {
-        let cli = Cli::try_parse_from(["flip", "profile"]).unwrap();
+        let cli = Cli::try_parse_from(["dlm", "profile"]).unwrap();
         let Command::Profile(a) = cli.command else {
             panic!("expected profile");
         };
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn generate_parses_prompt_and_defaults() {
-        let cli = Cli::try_parse_from(["flip", "generate", "--prompt", "1,2,3", "--seed", "42"])
+        let cli = Cli::try_parse_from(["dlm", "generate", "--prompt", "1,2,3", "--seed", "42"])
             .unwrap();
         let Command::Generate(a) = cli.command else {
             panic!("expected generate");
@@ -419,14 +419,14 @@ mod tests {
 
     #[test]
     fn tokenize_and_generate_text_parse() {
-        let cli = Cli::try_parse_from(["flip", "tokenize", "--text", "hi there"]).unwrap();
+        let cli = Cli::try_parse_from(["dlm", "tokenize", "--text", "hi there"]).unwrap();
         let Command::Tokenize(a) = cli.command else {
             panic!("expected tokenize");
         };
         assert_eq!(a.text, "hi there");
         assert!(a.tokenizer.is_none());
 
-        let cli = Cli::try_parse_from(["flip", "generate", "--text", "hello"]).unwrap();
+        let cli = Cli::try_parse_from(["dlm", "generate", "--text", "hello"]).unwrap();
         let Command::Generate(a) = cli.command else {
             panic!("expected generate");
         };
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn generate_device_selection() {
-        let cli = Cli::try_parse_from(["flip", "generate", "--device", "gpu"]).unwrap();
+        let cli = Cli::try_parse_from(["dlm", "generate", "--device", "gpu"]).unwrap();
         let Command::Generate(a) = cli.command else {
             panic!("expected generate");
         };
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn rejects_unknown_distributed_mode() {
         assert!(Cli::try_parse_from([
-            "flip", "serve", "--model-path", "/m", "--distributed-mode", "bogus"
+            "dlm", "serve", "--model-path", "/m", "--distributed-mode", "bogus"
         ])
         .is_err());
     }

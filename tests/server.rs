@@ -1,10 +1,10 @@
 //! End-to-end test of the OpenAI-compatible HTTP server over a real socket.
 
-use flip::cache::KvCacheConfig;
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
-use flip::generate::Generator;
-use flip::server::{router, Engine, HttpServer};
-use flip::tokenizer::BpeTokenizer;
+use dlm::cache::KvCacheConfig;
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::Generator;
+use dlm::server::{router, Engine, HttpServer};
+use dlm::tokenizer::BpeTokenizer;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ fn build_engine() -> Engine<CpuKernel> {
         64,
     )
     .unwrap();
-    Engine::new(generator, BpeTokenizer::bytes_only(), "flip-test", 8, 0)
+    Engine::new(generator, BpeTokenizer::bytes_only(), "dlm-test", 8, 0)
 }
 
 fn start_server() -> SocketAddr {
@@ -65,7 +65,7 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
 #[test]
 fn chat_completions_endpoint() {
     let addr = start_server();
-    let body = r#"{"model":"flip","messages":[{"role":"user","content":"Hi"}],"max_tokens":4}"#;
+    let body = r#"{"model":"dlm","messages":[{"role":"user","content":"Hi"}],"max_tokens":4}"#;
     let resp = request(addr, "POST", "/v1/chat/completions", body);
 
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
@@ -91,7 +91,7 @@ fn models_endpoint_lists_the_served_model() {
     let addr = start_server();
     let resp = request(addr, "GET", "/v1/models", "");
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
-    assert!(resp.contains(r#""id":"flip-test""#), "{resp}");
+    assert!(resp.contains(r#""id":"dlm-test""#), "{resp}");
     assert!(resp.contains(r#""object":"list""#), "{resp}");
 }
 

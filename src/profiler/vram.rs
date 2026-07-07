@@ -203,7 +203,7 @@ impl VramProfiler {
     }
 
     /// Profile against the live device, querying `M_free` via `cudaMemGetInfo`.
-    /// Errors with [`crate::error::FlipError::GpuUnavailable`] on a non-GPU
+    /// Errors with [`crate::error::DlmError::GpuUnavailable`] on a non-GPU
     /// build — use [`plan_with_free`](Self::plan_with_free) for off-GPU planning.
     pub fn profile(&self, config: &ModelConfig) -> Result<VramPlan> {
         let dev = gpu::mem_get_info()?;

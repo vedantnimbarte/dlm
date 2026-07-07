@@ -14,7 +14,7 @@
 //!   promoted in place later via `cudaHostRegister`/`hipHostRegister`. This keeps
 //!   every buffer allocation-compatible with async DMA streams from Phase 1 on.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::memory::page::round_up_to_page;
 use std::alloc::{dealloc, Layout};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
@@ -58,7 +58,7 @@ impl PinnedBuffer {
     /// otherwise a page-aligned host allocation with the same layout guarantees.
     pub fn with_len(len: usize) -> Result<Self> {
         if len == 0 {
-            return Err(FlipError::HostAlloc {
+            return Err(DlmError::HostAlloc {
                 bytes: 0,
                 align: crate::memory::page::page_size(),
             });
@@ -92,14 +92,14 @@ impl PinnedBuffer {
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     fn alloc_backend(len: usize, capacity: usize) -> Result<Self> {
         let align = crate::memory::page::page_size();
-        let layout = Layout::from_size_align(capacity, align).map_err(|_| FlipError::HostAlloc {
+        let layout = Layout::from_size_align(capacity, align).map_err(|_| DlmError::HostAlloc {
             bytes: capacity,
             align,
         })?;
         // SAFETY: `capacity > 0` (rounded from a non-zero `len`), and the layout
         // is valid. `alloc_zeroed` returns null on failure, handled below.
         let raw = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw).ok_or(FlipError::HostAlloc {
+        let ptr = NonNull::new(raw).ok_or(DlmError::HostAlloc {
             bytes: capacity,
             align,
         })?;

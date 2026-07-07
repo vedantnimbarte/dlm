@@ -4,9 +4,9 @@
 //! `build_streaming_generator` path (pinned embedding/head + on-demand layer
 //! materialization from a memory-mapped store), not just the kernel.
 
-use flip::generate::{GenerationConfig, Sampler};
-use flip::model::{ModelConfig, QuantScheme};
-use flip::storage::MmapStore;
+use dlm::generate::{GenerationConfig, Sampler};
+use dlm::model::{ModelConfig, QuantScheme};
+use dlm::storage::MmapStore;
 use std::io::Write;
 
 /// Write an F32 safetensors checkpoint from named 1-D tensors.
@@ -84,12 +84,12 @@ fn streaming_generation_matches_resident() {
 
     // Resident: all layers held in memory.
     let store_a = MmapStore::open_dir(tmp.path()).unwrap();
-    let resident = flip::loader::load_generator(&store_a, &config, 32).unwrap();
+    let resident = dlm::loader::load_generator(&store_a, &config, 32).unwrap();
     let out_resident = resident.generate(&prompt, &cfg).unwrap();
 
     // Streaming: only 2 of 6 layers resident at a time (rest streamed from disk).
     let store_b = MmapStore::open_dir(tmp.path()).unwrap();
-    let streaming = flip::loader::build_streaming_generator(store_b, &config, 32, 2).unwrap();
+    let streaming = dlm::loader::build_streaming_generator(store_b, &config, 32, 2).unwrap();
     let out_streaming = streaming.generate(&prompt, &cfg).unwrap();
 
     assert_eq!(

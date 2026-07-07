@@ -4,10 +4,10 @@
 //! the real partitioning + per-layer dispatch on the CPU kernel — the same way
 //! `distributed.rs` validates the cross-node path over localhost.
 
-use flip::cache::KvCacheConfig;
-use flip::generate::{GenerationConfig, Generator, Sampler};
-use flip::loader::ModelParts;
-use flip::forward::{BlockConfig, LayerTensors};
+use dlm::cache::KvCacheConfig;
+use dlm::generate::{GenerationConfig, Generator, Sampler};
+use dlm::loader::ModelParts;
+use dlm::forward::{BlockConfig, LayerTensors};
 
 struct Rng(u64);
 impl Rng {
@@ -75,7 +75,7 @@ fn build_parts() -> ModelParts {
 }
 
 // build_parts uses the same seed each call, so two builds are identical models.
-fn greedy<K: flip::forward::ComputeKernel>(gen: &Generator<K>, prompt: &[u32], n: usize) -> Vec<u32> {
+fn greedy<K: dlm::forward::ComputeKernel>(gen: &Generator<K>, prompt: &[u32], n: usize) -> Vec<u32> {
     gen.generate(
         prompt,
         &GenerationConfig { max_new_tokens: n, eos_token: None, sampler: Sampler::Greedy },

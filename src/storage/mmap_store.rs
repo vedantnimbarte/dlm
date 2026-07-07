@@ -1,6 +1,6 @@
 //! Memory-mapped weight storage engine.
 //!
-//! Per `specs.md` §3.2(1), `flip` maps model shards from the NVMe SSD directly
+//! Per `specs.md` §3.2(1), `dlm` maps model shards from the NVMe SSD directly
 //! into the process address space, skipping the OS read-buffer copy. The kernel
 //! then demand-pages 4 KiB regions straight from disk as the streaming pipeline
 //! touches them. Tensor bytes are handed out as borrowed slices (`&[u8]`) that
@@ -8,7 +8,7 @@
 //! path. Those slices are what the pinned-memory staging buffers
 //! (`cudaHostAlloc`) copy from before the async DMA into VRAM.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::storage::safetensors::{SafetensorsHeader, TensorInfo};
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
@@ -30,14 +30,14 @@ impl MmapShard {
     /// so aggressive readahead would only evict pages we still need.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path).map_err(|source| FlipError::Io {
+        let file = File::open(&path).map_err(|source| DlmError::Io {
             path: path.clone(),
             source,
         })?;
 
         let file_len = file
             .metadata()
-            .map_err(|source| FlipError::Io {
+            .map_err(|source| DlmError::Io {
                 path: path.clone(),
                 source,
             })?
@@ -51,7 +51,7 @@ impl MmapShard {
         let mmap = unsafe {
             MmapOptions::new()
                 .map(&file)
-                .map_err(|source| FlipError::Mmap {
+                .map_err(|source| DlmError::Mmap {
                     path: path.clone(),
                     source,
                 })?
@@ -99,14 +99,14 @@ impl MmapShard {
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
         let info = self
             .tensor_info(name)
-            .ok_or_else(|| FlipError::UnknownTensor(name.to_string()))?;
+            .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
 
         let start = self.header.data_offset + info.begin;
         let end = self.header.data_offset + info.end;
 
         // Defensive re-check; the header parser already validated ranges, but
         // this keeps the unsafe-free slice indexing panic-proof.
-        self.mmap.get(start..end).ok_or_else(|| FlipError::TensorOutOfBounds {
+        self.mmap.get(start..end).ok_or_else(|| DlmError::TensorOutOfBounds {
             name: name.to_string(),
             start,
             end,
@@ -147,14 +147,14 @@ impl MmapStore {
     /// Files are opened in sorted order for deterministic shard indices.
     pub fn open_dir(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
-        let read_dir = std::fs::read_dir(dir).map_err(|source| FlipError::Io {
+        let read_dir = std::fs::read_dir(dir).map_err(|source| DlmError::Io {
             path: dir.to_path_buf(),
             source,
         })?;
 
         let mut shard_paths: Vec<PathBuf> = Vec::new();
         for entry in read_dir {
-            let entry = entry.map_err(|source| FlipError::Io {
+            let entry = entry.map_err(|source| DlmError::Io {
                 path: dir.to_path_buf(),
                 source,
             })?;
@@ -166,7 +166,7 @@ impl MmapStore {
         shard_paths.sort();
 
         if shard_paths.is_empty() {
-            return Err(FlipError::InvalidConfig(format!(
+            return Err(DlmError::InvalidConfig(format!(
                 "no .safetensors shards found in {}",
                 dir.display()
             )));
@@ -214,7 +214,7 @@ impl MmapStore {
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
         let (shard, _) = self
             .locate(name)
-            .ok_or_else(|| FlipError::UnknownTensor(name.to_string()))?;
+            .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
         shard.tensor_bytes(name)
     }
 

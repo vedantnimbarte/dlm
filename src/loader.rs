@@ -5,7 +5,7 @@
 //! ([`bytes_to_f32`] handles F32/F16/BF16), and assembles a
 //! [`Generator`] over a [`CpuKernel`] ready to run [`generate`].
 //!
-//! This is the connector that lets `flip generate --model-path <dir>` run a real
+//! This is the connector that lets `dlm generate --model-path <dir>` run a real
 //! (small) model on CPU. Quantized checkpoints (AWQ/GPTQ `qweight` triplets)
 //! would be materialized through the [`quant`](crate::quant) dequant kernel here
 //! — this loader covers the float dtypes small models ship in.
@@ -14,7 +14,7 @@
 //! [`generate`]: crate::generate::Generator::generate
 
 use crate::cache::KvCacheConfig;
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::{
     BlockConfig, CpuKernel, LayerSource, LayerTensors, PipelineParallelKernel, StreamingKernel,
 };
@@ -27,7 +27,7 @@ use crate::storage::{bytes_to_f32, bytes_to_i32, MmapStore};
 fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec<f32>> {
     let values = load_floats(store, name)?;
     if values.len() != expected_len {
-        return Err(FlipError::InvalidConfig(format!(
+        return Err(DlmError::InvalidConfig(format!(
             "tensor {name:?}: expected {expected_len} elements, got {}",
             values.len()
         )));
@@ -39,7 +39,7 @@ fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec
 fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     let (shard, info) = store
         .locate(name)
-        .ok_or_else(|| FlipError::UnknownTensor(name.to_string()))?;
+        .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
     bytes_to_f32(shard.tensor_bytes(name)?, info.dtype)
 }
 
@@ -47,7 +47,7 @@ fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
 fn load_ints(store: &MmapStore, name: &str) -> Result<Vec<i32>> {
     let (shard, info) = store
         .locate(name)
-        .ok_or_else(|| FlipError::UnknownTensor(name.to_string()))?;
+        .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
     bytes_to_i32(shard.tensor_bytes(name)?, info.dtype)
 }
 
@@ -75,14 +75,14 @@ fn load_linear(
 
         // Infer the group size from the scales shape ([in/group_size, out]).
         if scales.is_empty() || scales.len() % out_features != 0 {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "{base}.scales length {} is not a multiple of out_features {out_features}",
                 scales.len()
             )));
         }
         let num_groups = scales.len() / out_features;
         if num_groups == 0 || in_features % num_groups != 0 {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "{base}: {num_groups} groups do not divide in_features {in_features}"
             )));
         }
@@ -94,7 +94,7 @@ fn load_linear(
         return dequantize_gptq_4bit(&qweight, &qzeros, &scales, &cfg);
     }
 
-    Err(FlipError::UnknownTensor(format!(
+    Err(DlmError::UnknownTensor(format!(
         "{base}.weight or {base}.qweight"
     )))
 }

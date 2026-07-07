@@ -1,10 +1,10 @@
 //! Speculative decoding must produce exactly the target-greedy sequence.
 
-use flip::batching::BatchScheduler;
-use flip::cache::KvCacheConfig;
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
-use flip::generate::{GenerationConfig, Generator, Sampler};
-use flip::speculative::{SpeculativeDecoder, SpeculativeSession};
+use dlm::batching::BatchScheduler;
+use dlm::cache::KvCacheConfig;
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::{GenerationConfig, Generator, Sampler};
+use dlm::speculative::{SpeculativeDecoder, SpeculativeSession};
 
 struct Rng(u64);
 impl Rng {

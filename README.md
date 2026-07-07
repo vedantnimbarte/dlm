@@ -1,15 +1,15 @@
 <p align="center">
-  <img src="logo.png" alt="flip logo" width="200">
+  <img src="logo.png" alt="dlm logo" width="200">
 </p>
 
-# flip
+# dlm
 
-**Dynamic layer-streaming inference engine** — run massive LLMs (70B, 405B+) on
-consumer GPUs (e.g. 16 GB VRAM) by streaming transformer layers in and out of
-VRAM instead of resident-loading the whole model.
+**dlm (Dynamic LLM)** — a dynamic layer-streaming inference engine. Run massive
+LLMs (70B, 405B+) on consumer GPUs (e.g. 16 GB VRAM) by streaming transformer
+layers in and out of VRAM instead of resident-loading the whole model.
 
-Rather than keeping every weight in VRAM, `flip` keeps only a small window of
-transformer blocks resident and continuously "flips" the next window in over the
+Rather than keeping every weight in VRAM, `dlm` keeps only a small window of
+transformer blocks resident and continuously streams the next window in over the
 PCIe bus while the GPU computes the current one — trading a bit of speed for the
 ability to run models many times larger than the card.
 
@@ -21,28 +21,28 @@ One line — downloads a prebuilt binary for your platform (Linux/macOS, x86-64 
 arm64) and installs it to `~/.local/bin`. No clone, no build, no Rust toolchain:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/Flip/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/install.sh | sh
 ```
 
 On **Linux x86-64 with an NVIDIA GPU** the installer picks the **CUDA (GPU)
 build** automatically, and it runs on the GPU by default — pass `--device cpu` to
 any command to force CPU. Everywhere else it installs the portable **CPU build**.
-Force the CPU build with `FLIP_CPU=1 curl … | sh`. (The GPU build links the CUDA
+Force the CPU build with `DLM_CPU=1 curl … | sh`. (The GPU build links the CUDA
 runtime; if it can't load, the installer falls back to the CPU build on its own.)
 
 Then:
 
 ```sh
-flip search llama-3.2   # find models on the Hugging Face hub
-flip pull <org/model>   # download one locally (no hf CLI needed)
-flip doctor             # check your machine + run a self-test
-flip --help             # subcommands: search, pull, serve, generate, profile, tokenize, doctor
+dlm search llama-3.2   # find models on the Hugging Face hub
+dlm pull <org/model>   # download one locally (no hf CLI needed)
+dlm doctor             # check your machine + run a self-test
+dlm --help             # subcommands: search, pull, serve, generate, profile, tokenize, doctor
 ```
 
-Set `FLIP_INSTALL_DIR` to change the location. To build the GPU binary yourself,
+Set `DLM_INSTALL_DIR` to change the location. To build the GPU binary yourself,
 see [Building for GPU](#building-for-gpu-nvidia--amd).
 
-Rust users can also `cargo install --git https://github.com/vedantnimbarte/Flip`
+Rust users can also `cargo install --git https://github.com/vedantnimbarte/dlm`
 (builds from source).
 
 ---
@@ -62,7 +62,7 @@ Rust users can also `cargo install --git https://github.com/vedantnimbarte/Flip`
 
 ## How it works
 
-`flip` partitions VRAM into three regions:
+`dlm` partitions VRAM into three regions:
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -150,8 +150,8 @@ any machine.
 Clone and build (host-only, no GPU needed):
 
 ```bash
-git clone <your-fork-url> flip
-cd flip
+git clone <your-fork-url> dlm
+cd dlm
 cargo build            # debug build
 cargo build --release  # optimized build
 ```
@@ -172,7 +172,7 @@ cargo run -- doctor          # check machine (GPU/VRAM) + run an inference self-
 **`search` / `pull`** — find and download models straight from the
 [Hugging Face hub](https://huggingface.co), no `hf` CLI or manual file-grabbing
 needed. `pull` shells out to `curl` (built into Linux, macOS, and Windows 10/11)
-to fetch only the files flip loads (`config.json`, `*.safetensors`, tokenizer):
+to fetch only the files dlm loads (`config.json`, `*.safetensors`, tokenizer):
 
 ```bash
 cargo run -- search llama-3.2                 # most-downloaded matches, safetensors only
@@ -195,7 +195,7 @@ cargo run -- profile
 Example output:
 
 ```
-flip v0.1.0
+dlm v0.1.0
   gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
@@ -231,7 +231,7 @@ cargo run -- profile --model-path /path/to/models/Llama-3-70B-Instruct
 
 **`serve`** — starts the **OpenAI-compatible HTTP API server** for a model. It
 exposes `POST /v1/chat/completions`, `POST /v1/completions`, and `GET /v1/models`
-so clients like Open WebUI can talk to `flip` unchanged:
+so clients like Open WebUI can talk to `dlm` unchanged:
 
 ```bash
 cargo run -- serve \
@@ -243,7 +243,7 @@ cargo run -- serve \
 # then, from another shell (add "stream": true for token-by-token SSE):
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"flip","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
+  -d '{"model":"dlm","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
 
 Concurrent requests are continuously batched by a background scheduler, and
@@ -282,7 +282,7 @@ cargo run -- generate --model-path /path/to/small-model --text "Hello"
 ```
 
 On a `cuda-kernels` build generation runs on the **GPU by default** (`GpuKernel`);
-`--device cpu` forces the CPU kernel, and if no GPU is usable flip warns and falls
+`--device cpu` forces the CPU kernel, and if no GPU is usable dlm warns and falls
 back to CPU on its own. A CPU-only build defaults to CPU, and an explicit
 `--device gpu` there errors with a clear message:
 
@@ -392,7 +392,7 @@ inference engine):
   HTTP/1.1 server exposing `/v1/chat/completions` (with `stream: true` SSE),
   `/v1/completions`, `/v1/models`. Behind it, an `EngineService` runs a background
   batching thread so concurrent requests are **continuously batched** and each can
-  be **streamed** to the client token by token. Started by `flip serve`.
+  be **streamed** to the client token by token. Started by `dlm serve`.
   Per-request **sampling** is honored: `temperature`, `top_p`, `top_k`, and `seed`
   select temperature/nucleus/top-k sampling (temperature `0` → deterministic
   greedy); `stop` sequences truncate the completion. **Real tokenizers** load from
@@ -416,12 +416,12 @@ inference engine):
     compile-checked but not yet validated on real GPU hardware.**
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
 
-  **Diagnostics.** `flip doctor` reports the GPU backend and free VRAM, runs a CPU
+  **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a
   live CPU-vs-GPU parity probe; pass `--model-path` to check a checkpoint loads and
   tokenizes. This is how you validate the GPU paths on real hardware (there is no
   GPU in CI, so `--device gpu`, `--stream --device gpu`, and `--multi-gpu-ids` are
-  compile-checked only until run through `flip doctor` / a real serve on a GPU box).
+  compile-checked only until run through `dlm doctor` / a real serve on a GPU box).
 - **Speculative decoding** ([`src/speculative.rs`](src/speculative.rs)) — a cheap
   draft model proposes `gamma` tokens, the target verifies them; accepted tokens
   advance in bulk. With greedy sampling the output is provably **identical** to
@@ -432,14 +432,14 @@ inference engine):
   tick and admitting queued requests as slots free. Each request's output is
   identical to running it alone (tested), independent of interleaving.
   `BatchScheduler::with_speculative` swaps each slot for a `SpeculativeSession`,
-  so **the server engine decodes speculatively** when `flip serve` is given
+  so **the server engine decodes speculatively** when `dlm serve` is given
   `--draft-model-path` — a tick then advances a request by a whole accept/reject
   round, streaming the accepted tokens through the same path. Per-request
   acceptance is surfaced in the OpenAI `usage` response under a `speculative`
   block (`draft_proposed`, `draft_accepted`, `acceptance_rate`); streaming
   responses carry it in a final usage-only chunk.
 - **Multi-GPU pipeline parallelism** ([`src/forward/multigpu.rs`](src/forward/multigpu.rs))
-  — `flip serve --multi-gpu-ids 0,1,2` splits the model's layers into contiguous
+  — `dlm serve --multi-gpu-ids 0,1,2` splits the model's layers into contiguous
   per-GPU stages ([`partition_layers`]) and runs each layer on the GPU that owns
   it, calling `cudaSetDevice`/`hipSetDevice` before its block so only the hidden
   residual crosses the inter-GPU boundary (specs §3.3). It's a `ComputeKernel`
@@ -454,14 +454,14 @@ inference engine):
   synchronous and thread-per-connection rather than the full gRPC/tonic stack.
   **Heartbeats** track liveness and an unreachable worker **falls back to local
   CPU-RAM** execution, so a forward pass still completes. Start a worker with
-  `flip serve --distributed-mode worker`.
+  `dlm serve --distributed-mode worker`.
 
 [`partition_layers`]: src/distributed/shard.rs
 
 ```rust
 // Split a model across two worker nodes; the coordinator routes through them.
-let shards = flip::distributed::partition_layers(num_layers, 2);
-let mut coord = flip::distributed::Coordinator::new(cfg, layers, embed, norm, head, vocab, routes)?;
+let shards = dlm::distributed::partition_layers(num_layers, 2);
+let mut coord = dlm::distributed::Coordinator::new(cfg, layers, embed, norm, head, vocab, routes)?;
 let tokens = coord.generate(&prompt, 32)?;   // == local greedy; survives a dead worker
 ```
 

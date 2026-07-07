@@ -25,7 +25,7 @@
 //! grouping, and transpose logic here is validated by round-trip
 //! ([`pack_gptq_4bit`] ↔ [`dequantize_gptq_4bit`]).
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 
 /// Codes per 32-bit word for 4-bit packing.
 const NIBBLES_PER_WORD: usize = 8;
@@ -47,19 +47,19 @@ impl PackedQuantConfig {
 
     fn validate(&self) -> Result<()> {
         if self.in_features % NIBBLES_PER_WORD != 0 {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "in_features ({}) must be a multiple of 8",
                 self.in_features
             )));
         }
         if self.out_features % NIBBLES_PER_WORD != 0 {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "out_features ({}) must be a multiple of 8",
                 self.out_features
             )));
         }
         if self.group_size == 0 || self.in_features % self.group_size != 0 {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "group_size ({}) must divide in_features ({})",
                 self.group_size, self.in_features
             )));
@@ -92,7 +92,7 @@ pub fn dequantize_gptq_4bit(
     ];
     for (name, got, want) in expect {
         if got != want {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "{name}: expected {want} elements, got {got}"
             )));
         }
@@ -126,7 +126,7 @@ pub fn pack_gptq_4bit(
     cfg.validate()?;
     let (inf, out, gs) = (cfg.in_features, cfg.out_features, cfg.group_size);
     if dense_in_by_out.len() != inf * out {
-        return Err(FlipError::QuantLayout(format!(
+        return Err(DlmError::QuantLayout(format!(
             "dense: expected {} elements, got {}",
             inf * out,
             dense_in_by_out.len()

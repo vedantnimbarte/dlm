@@ -1,6 +1,6 @@
 //! Layer-streaming compute kernel (`specs.md` §2.2 / §3.2).
 //!
-//! This is what makes `flip` run a model bigger than the resident budget: rather
+//! This is what makes `dlm` run a model bigger than the resident budget: rather
 //! than holding every layer's weights in memory ([`CpuKernel`]), a
 //! [`StreamingKernel`] keeps only a **bounded window** of materialized layers
 //! and streams the rest in on demand. Per `run_block` it fetches that layer's

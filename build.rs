@@ -1,4 +1,4 @@
-//! Build script for `flip`.
+//! Build script for `dlm`.
 //!
 //! Links the selected GPU runtime so the FFI in `src/gpu/` resolves at link
 //! time: `cuda` → `cudart` (honours `CUDA_PATH`), `rocm` → `amdhip64` (honours
@@ -43,7 +43,7 @@ fn compile_cuda_kernels() {
         .unwrap_or_else(|_| "nvcc".to_string());
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let lib_path = format!("{out_dir}/libflip_kernels.a");
+    let lib_path = format!("{out_dir}/libdlm_kernels.a");
 
     let status = std::process::Command::new(&nvcc)
         .args(["-O3", "-Xcompiler", "-fPIC", "-lib", "src/gpu/kernels.cu", "-o"])
@@ -53,7 +53,7 @@ fn compile_cuda_kernels() {
     match status {
         Ok(s) if s.success() => {
             println!("cargo:rustc-link-search=native={out_dir}");
-            println!("cargo:rustc-link-lib=static=flip_kernels");
+            println!("cargo:rustc-link-lib=static=dlm_kernels");
         }
         Ok(s) => {
             println!("cargo:warning=nvcc failed to compile src/gpu/kernels.cu (exit {s}); GPU kernels will be unresolved at link time");

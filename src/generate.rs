@@ -14,7 +14,7 @@
 //! Swapping in a GPU kernel makes it real inference with no change here.
 
 use crate::cache::{KvCacheConfig, PagedKvCache};
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::cpu::{matvec, rmsnorm};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
 
@@ -221,7 +221,7 @@ impl<K: ComputeKernel> Generator<K> {
         ];
         for (name, got, expected) in checks {
             if got != expected {
-                return Err(FlipError::InvalidConfig(format!(
+                return Err(DlmError::InvalidConfig(format!(
                     "{name}: expected {expected} elements, got {got}"
                 )));
             }
@@ -248,7 +248,7 @@ impl<K: ComputeKernel> Generator<K> {
     fn embed(&self, token: u32) -> Result<Vec<f32>> {
         let idx = token as usize;
         if idx >= self.vocab_size {
-            return Err(FlipError::InvalidConfig(format!(
+            return Err(DlmError::InvalidConfig(format!(
                 "token {token} out of vocab range {}",
                 self.vocab_size
             )));
@@ -270,7 +270,7 @@ impl<K: ComputeKernel> Generator<K> {
     /// configured sampler until `max_new_tokens` or an EOS token.
     pub fn generate(&self, prompt: &[u32], cfg: &GenerationConfig) -> Result<Vec<u32>> {
         if prompt.is_empty() {
-            return Err(FlipError::InvalidConfig("prompt must be non-empty".into()));
+            return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         }
 
         // Fresh KV state per generation (single sequence).
@@ -318,7 +318,7 @@ impl<K: ComputeKernel> Generator<K> {
     /// ready to emit the first continuation token via [`GenerationSession::step`].
     pub fn start_session(&self, prompt: &[u32], sampler: Sampler) -> Result<GenerationSession<'_, K>> {
         if prompt.is_empty() {
-            return Err(FlipError::InvalidConfig("prompt must be non-empty".into()));
+            return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         }
         let budget = crate::cache::PagedKvCache::new(self.kv_config, self.kv_total_blocks);
         let mut orchestrator = crate::forward::ForwardOrchestrator::new(&self.kernel, budget);

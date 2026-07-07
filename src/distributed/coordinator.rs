@@ -14,7 +14,7 @@
 
 use crate::distributed::protocol::{read_message, write_message, Message};
 use crate::distributed::shard::LayerShard;
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::cpu::{decode_block, matvec, rmsnorm, BlockConfig, KvLayerCache, LayerTensors};
 use crate::generate::argmax;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -93,7 +93,7 @@ impl Coordinator {
     fn embed(&self, token: u32) -> Result<Vec<f32>> {
         let idx = token as usize;
         if idx >= self.vocab_size {
-            return Err(FlipError::InvalidConfig(format!(
+            return Err(DlmError::InvalidConfig(format!(
                 "token {token} out of vocab range {}",
                 self.vocab_size
             )));
@@ -120,7 +120,7 @@ impl Coordinator {
         if self.connections[i].is_none() {
             let addr = self.routes[i].worker_addr.as_ref().unwrap();
             let stream = connect_timeout(addr, Duration::from_millis(300))
-                .map_err(|e| FlipError::Network(format!("connect {addr}: {e}")))?;
+                .map_err(|e| DlmError::Network(format!("connect {addr}: {e}")))?;
             self.connections[i] = Some(stream);
         }
         let stream = self.connections[i].as_mut().unwrap();
@@ -131,12 +131,12 @@ impl Coordinator {
                 hidden: hidden.to_vec(),
             },
         )
-        .map_err(|e| FlipError::Network(e.to_string()))?;
+        .map_err(|e| DlmError::Network(e.to_string()))?;
         match read_message(stream) {
             Ok(Message::ShardResult { hidden }) => Ok(hidden),
-            Ok(Message::Error(e)) => Err(FlipError::Network(e)),
-            Ok(_) => Err(FlipError::Network("unexpected reply".into())),
-            Err(e) => Err(FlipError::Network(e.to_string())),
+            Ok(Message::Error(e)) => Err(DlmError::Network(e)),
+            Ok(_) => Err(DlmError::Network("unexpected reply".into())),
+            Err(e) => Err(DlmError::Network(e.to_string())),
         }
     }
 
@@ -176,7 +176,7 @@ impl Coordinator {
     /// through the pipeline. Output matches a local run of the same weights.
     pub fn generate(&mut self, prompt: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
         if prompt.is_empty() {
-            return Err(FlipError::InvalidConfig("prompt must be non-empty".into()));
+            return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         }
         self.reset_kv();
 

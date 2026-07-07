@@ -9,7 +9,7 @@
 //! decoding, just faster when the draft guesses well.
 //!
 //! The speed win comes from verifying all `gamma` positions in a single *batched*
-//! target forward pass. `flip`'s CPU forward is single-token, so this
+//! target forward pass. `dlm`'s CPU forward is single-token, so this
 //! implementation verifies sequentially (one target step per position) — the
 //! accept/reject logic and its exactness are identical; only the wall-clock
 //! saving awaits a batched kernel. Acceptance statistics are reported so the

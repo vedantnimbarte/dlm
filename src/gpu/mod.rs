@@ -1,12 +1,12 @@
 //! Vendor-neutral GPU backend surface.
 //!
-//! `flip`'s streaming engine talks to the GPU through this thin, safe layer
+//! `dlm`'s streaming engine talks to the GPU through this thin, safe layer
 //! rather than any one vendor's runtime. The backend is selected at compile time
 //! by feature flag:
 //!
 //! * `cuda`  → NVIDIA CUDA Runtime (`cudart`).
 //! * `rocm`  → AMD ROCm/HIP Runtime (`amdhip64`).
-//! * neither → host fallback; GPU calls return [`FlipError::GpuUnavailable`] and
+//! * neither → host fallback; GPU calls return [`DlmError::GpuUnavailable`] and
 //!   pinned buffers degrade to page-aligned host allocations.
 //!
 //! CUDA and HIP expose near-identical runtime APIs (`hipMemGetInfo` mirrors
@@ -105,7 +105,7 @@ pub fn mem_get_info() -> Result<DeviceMemory> {
     }
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
-        Err(crate::error::FlipError::GpuUnavailable("mem_get_info"))
+        Err(crate::error::DlmError::GpuUnavailable("mem_get_info"))
     }
 }
 

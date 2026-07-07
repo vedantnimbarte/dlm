@@ -1,4 +1,4 @@
-//! # flip — dynamic layer-streaming inference engine
+//! # dlm — dynamic layer-streaming inference engine
 //!
 //! Phase 1 (Local Foundation) library surface. Modules are added
 //! bottom-up as the engine is built; see `PRD.md` §5 for the phase map.
@@ -27,7 +27,7 @@ pub mod tokenizer;
 
 pub use activation::{ActivationBuffer, ActivationPool};
 pub use cache::{KvCacheConfig, LayerRamCache, PagedKvCache};
-pub use error::{FlipError, Result};
+pub use error::{DlmError, Result};
 pub use forward::{
     BlockConfig, ComputeKernel, CpuKernel, ForwardOrchestrator, LayerTensors, StubKernel,
 };

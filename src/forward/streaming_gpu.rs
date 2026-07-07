@@ -5,7 +5,7 @@
 //! stays resident (the cache zone).
 //!
 //! It mirrors [`GpuKernel`](crate::forward::GpuKernel) op-for-op — same
-//! `flip_decode_block` device call — but instead of uploading every layer's
+//! `dlm_decode_block` device call — but instead of uploading every layer's
 //! weights up front, it holds an LRU of `resident_layers` device-resident weight
 //! sets and uploads a layer's weights from a host [`LayerSource`] on a miss,
 //! evicting the least-recently-used set. Peak weight VRAM is
@@ -18,7 +18,7 @@
 //! test covers ([`tests/gpu_parity.rs`]); the streaming/eviction layer around it
 //! is new and unproven on-device. Treat as experimental until run on a GPU.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
 use crate::forward::streaming::LayerSource;
@@ -29,7 +29,7 @@ use std::sync::Mutex;
 extern "C" {
     // Same device entry point as `forward::gpu` (see `src/gpu/kernels.cu`).
     #[allow(clippy::too_many_arguments)]
-    fn flip_decode_block(
+    fn dlm_decode_block(
         hidden_size: i32,
         q_dim: i32,
         kv_dim: i32,
@@ -192,7 +192,7 @@ impl<S: LayerSource> ComputeKernel for StreamingGpuKernel<S> {
         let kv_dim = self.cfg.kv_dim();
         let num_positions = kv.len();
         if num_positions >= self.kv_capacity_tokens {
-            return Err(FlipError::InvalidConfig(format!(
+            return Err(DlmError::InvalidConfig(format!(
                 "GPU KV capacity {} exceeded at position {position}",
                 self.kv_capacity_tokens
             )));
@@ -216,7 +216,7 @@ impl<S: LayerSource> ComputeKernel for StreamingGpuKernel<S> {
         // SAFETY: all pointers are live device allocations sized as the kernel
         // expects; the KV buffers have capacity for `num_positions + 1`.
         let code = unsafe {
-            flip_decode_block(
+            dlm_decode_block(
                 self.cfg.hidden_size as i32,
                 self.cfg.q_dim() as i32,
                 kv_dim as i32,
@@ -243,8 +243,8 @@ impl<S: LayerSource> ComputeKernel for StreamingGpuKernel<S> {
             )
         };
         if code != 0 {
-            return Err(FlipError::Gpu {
-                api: "flip_decode_block",
+            return Err(DlmError::Gpu {
+                api: "dlm_decode_block",
                 code,
             });
         }

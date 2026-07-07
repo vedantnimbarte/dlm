@@ -1,7 +1,7 @@
 //! Compute-kernel abstraction for the forward pass.
 //!
 //! The transformer math is the one piece that must ultimately run on the GPU;
-//! everything else in `flip` is orchestration around it. The math sits behind
+//! everything else in `dlm` is orchestration around it. The math sits behind
 //! the block-level [`ComputeKernel`] trait so the orchestration is testable
 //! off-GPU: the real CPU block ([`CpuKernel`](crate::forward::cpu::CpuKernel))
 //! implements it for correctness, [`StubKernel`] implements it trivially for

@@ -1,7 +1,7 @@
 //! Tiered CPU-RAM layer cache (`PRD.md` §3.2).
 //!
 //! System RAM is far larger than VRAM but far smaller than the model on NVMe, so
-//! `flip` uses it as a middle tier: a bounded, byte-budgeted LRU cache of layer
+//! `dlm` uses it as a middle tier: a bounded, byte-budgeted LRU cache of layer
 //! weights sitting between the memory-mapped checkpoint and the pinned staging
 //! buffer.
 //!

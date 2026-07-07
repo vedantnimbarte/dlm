@@ -19,7 +19,7 @@
 //! streaming `ComputeKernel` trait would widen to this signature (carrying the
 //! block config and a KV handle) once the GPU backend lands.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::kernel::ComputeKernel;
 
 /// Shape + hyperparameters of one decoder block.
@@ -88,7 +88,7 @@ impl LayerTensors {
         ];
         for (name, got, expected) in checks {
             if got != expected {
-                return Err(FlipError::QuantLayout(format!(
+                return Err(DlmError::QuantLayout(format!(
                     "LayerTensors.{name}: expected {expected} elements, got {got}"
                 )));
             }
@@ -150,7 +150,7 @@ impl KvLayerCache {
     /// Append one position's key and value vectors.
     pub fn append(&mut self, key: &[f32], value: &[f32]) -> Result<()> {
         if key.len() != self.kv_dim || value.len() != self.kv_dim {
-            return Err(FlipError::ShapeMismatch {
+            return Err(DlmError::ShapeMismatch {
                 expected: self.kv_dim,
                 got: key.len().min(value.len()),
             });
@@ -287,7 +287,7 @@ pub fn decode_block(
 ) -> Result<Vec<f32>> {
     w.validate(cfg)?;
     if hidden.len() != cfg.hidden_size {
-        return Err(FlipError::ShapeMismatch {
+        return Err(DlmError::ShapeMismatch {
             expected: cfg.hidden_size,
             got: hidden.len(),
         });

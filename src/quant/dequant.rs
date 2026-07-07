@@ -1,6 +1,6 @@
 //! 4-bit group-affine dequantization kernel (AWQ/GPTQ-style).
 //!
-//! `flip` streams 4-bit quantized weights (`specs.md` §3.1: 0.5 bytes/param) to
+//! `dlm` streams 4-bit quantized weights (`specs.md` §3.1: 0.5 bytes/param) to
 //! keep the model small on disk and on the PCIe bus. Before a layer can be used
 //! in a matmul it must be expanded back to a floating form — that expansion is
 //! this module.
@@ -20,7 +20,7 @@
 //! column interleaving and pack into `int32`; that reordering plugs in at the
 //! unpack step — the arithmetic here is identical.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 
 /// Number of distinct 4-bit codes.
 const LEVELS: f32 = 15.0; // 2^4 - 1
@@ -50,24 +50,24 @@ impl Quant4Tensor {
         num_elements: usize,
     ) -> Result<Self> {
         if group_size == 0 {
-            return Err(FlipError::QuantLayout("group_size must be > 0".into()));
+            return Err(DlmError::QuantLayout("group_size must be > 0".into()));
         }
         let expected_bytes = num_elements.div_ceil(2);
         if packed.len() < expected_bytes {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "packed has {} bytes, need {expected_bytes} for {num_elements} codes",
                 packed.len()
             )));
         }
         let num_groups = num_elements.div_ceil(group_size);
         if scales.len() != num_groups {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "expected {num_groups} scales, got {}",
                 scales.len()
             )));
         }
         if zeros.len() != num_groups {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "expected {num_groups} zero-points, got {}",
                 zeros.len()
             )));
@@ -118,7 +118,7 @@ impl Quant4Tensor {
     /// `out.len()` must equal [`len`](Self::len).
     pub fn dequantize_into(&self, out: &mut [f32]) -> Result<()> {
         if out.len() != self.num_elements {
-            return Err(FlipError::QuantLayout(format!(
+            return Err(DlmError::QuantLayout(format!(
                 "output buffer holds {} elements, tensor has {}",
                 out.len(),
                 self.num_elements
@@ -160,7 +160,7 @@ pub fn pack_codes(codes: &[u8]) -> Vec<u8> {
 /// already-quantized checkpoints rather than producing them.
 pub fn quantize_affine(values: &[f32], group_size: usize) -> Result<Quant4Tensor> {
     if group_size == 0 {
-        return Err(FlipError::QuantLayout("group_size must be > 0".into()));
+        return Err(DlmError::QuantLayout("group_size must be > 0".into()));
     }
     let n = values.len();
     let mut codes = vec![0u8; n];

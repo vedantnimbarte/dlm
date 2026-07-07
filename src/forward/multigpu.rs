@@ -19,7 +19,7 @@
 //! [`gpu::set_device`]: crate::gpu::set_device
 
 use crate::distributed::partition_layers;
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::cpu::KvLayerCache;
 use crate::forward::kernel::ComputeKernel;
 
@@ -38,7 +38,7 @@ impl<K: ComputeKernel> PipelineParallelKernel<K> {
     /// (earlier stages absorb the remainder, matching [`partition_layers`]).
     pub fn new(inner: K, gpu_ids: &[u32]) -> Result<Self> {
         if gpu_ids.is_empty() {
-            return Err(FlipError::InvalidConfig(
+            return Err(DlmError::InvalidConfig(
                 "multi-gpu pipeline needs at least one gpu id".into(),
             ));
         }

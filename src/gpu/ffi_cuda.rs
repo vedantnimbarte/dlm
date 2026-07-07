@@ -8,7 +8,7 @@
 #![allow(dead_code)] // some symbols are bound ahead of the Phase 2 GPU exec path
 
 use super::DeviceMemory;
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr::NonNull;
 
@@ -60,7 +60,7 @@ pub(super) fn set_device(id: u32) -> Result<()> {
     // SAFETY: no pointers; just selects the active device index.
     let code = unsafe { cudaSetDevice(id as c_int) };
     if code != CUDA_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "cudaSetDevice",
             code,
         });
@@ -75,7 +75,7 @@ pub(super) fn mem_get_info() -> Result<DeviceMemory> {
     // SAFETY: both out-pointers reference live stack storage for the call.
     let code = unsafe { cudaMemGetInfo(&mut free, &mut total) };
     if code != CUDA_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "cudaMemGetInfo",
             code,
         });
@@ -92,12 +92,12 @@ pub(super) fn host_alloc(bytes: usize) -> Result<NonNull<u8>> {
     // SAFETY: valid out-pointer; `bytes` is a positive page multiple.
     let code = unsafe { cudaHostAlloc(&mut raw, bytes, CUDA_HOST_ALLOC_PORTABLE) };
     if code != CUDA_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "cudaHostAlloc",
             code,
         });
     }
-    let ptr = NonNull::new(raw as *mut u8).ok_or(FlipError::HostAlloc {
+    let ptr = NonNull::new(raw as *mut u8).ok_or(DlmError::HostAlloc {
         bytes,
         align: crate::memory::page::page_size(),
     })?;
@@ -121,7 +121,7 @@ pub(super) fn device_malloc(bytes: usize) -> Result<*mut c_void> {
     // SAFETY: valid out-pointer.
     let code = unsafe { cudaMalloc(&mut raw, bytes.max(1)) };
     if code != CUDA_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "cudaMalloc",
             code,
         });
@@ -142,7 +142,7 @@ pub(super) fn copy_h2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> Re
     // SAFETY: caller guarantees `bytes` valid on both sides.
     let code = unsafe { cudaMemcpy(dst, src, bytes, CUDA_MEMCPY_HOST_TO_DEVICE) };
     if code != CUDA_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "cudaMemcpy(H2D)",
             code,
         });
@@ -155,7 +155,7 @@ pub(super) fn copy_d2h(dst: *mut c_void, src: *const c_void, bytes: usize) -> Re
     // SAFETY: caller guarantees `bytes` valid on both sides.
     let code = unsafe { cudaMemcpy(dst, src, bytes, CUDA_MEMCPY_DEVICE_TO_HOST) };
     if code != CUDA_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "cudaMemcpy(D2H)",
             code,
         });
@@ -168,7 +168,7 @@ pub(super) fn synchronize() -> Result<()> {
     // SAFETY: no arguments.
     let code = unsafe { cudaDeviceSynchronize() };
     if code != CUDA_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "cudaDeviceSynchronize",
             code,
         });

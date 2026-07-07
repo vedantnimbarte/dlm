@@ -175,7 +175,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         sampler: Sampler,
     ) -> Result<()> {
         if prompt.is_empty() {
-            return Err(crate::error::FlipError::InvalidConfig("prompt is empty".into()));
+            return Err(crate::error::DlmError::InvalidConfig("prompt is empty".into()));
         }
         self.pending.push_back(Pending {
             id,

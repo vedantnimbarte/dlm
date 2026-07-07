@@ -6,7 +6,7 @@
 // readability over speed. A production version would fuse these and use cuBLAS /
 // tensor cores.
 //
-// Entry point: `flip_decode_block`, called from Rust (see src/forward/gpu.rs)
+// Entry point: `dlm_decode_block`, called from Rust (see src/forward/gpu.rs)
 // via FFI. All pointers are device pointers. Returns a cudaError_t (0 == ok).
 //
 // NOTE: this file requires nvcc to compile and a GPU to run; it is compiled only
@@ -121,7 +121,7 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // call writes the new token's K/V into slot `num_positions` in place and attends
 // over the first `num_positions + 1` slots — so the KV history never leaves VRAM
 // and only the hidden vector crosses the PCIe bus per token.
-extern "C" int flip_decode_block(
+extern "C" int dlm_decode_block(
     int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
     int inter, float rope_theta, float rms_eps,
     const float* q_proj, const float* k_proj, const float* v_proj, const float* o_proj,

@@ -12,10 +12,10 @@
 //! per-sequence block tables. The physical KV bytes live in the Cache Zone of
 //! VRAM (or the host fallback); this layer decides which block holds what and
 //! guarantees allocation never silently overflows the budget (returning
-//! [`FlipError::KvCacheExhausted`] instead), which is what keeps the engine
+//! [`DlmError::KvCacheExhausted`] instead), which is what keeps the engine
 //! within its zero-OOM guarantee.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::model::ModelConfig;
 use std::collections::BTreeMap;
 
@@ -160,7 +160,7 @@ impl PagedKvCache {
 
     /// Append `n` tokens to a sequence, creating it if new and allocating blocks
     /// as needed. Atomic: on exhaustion it allocates nothing and returns
-    /// [`FlipError::KvCacheExhausted`], leaving the sequence untouched.
+    /// [`DlmError::KvCacheExhausted`], leaving the sequence untouched.
     pub fn append_tokens(&mut self, seq_id: u64, n: u64) -> Result<()> {
         let (cur_len, cur_blocks) = self
             .sequences
@@ -173,7 +173,7 @@ impl PagedKvCache {
         let to_alloc = needed_blocks.saturating_sub(cur_blocks);
 
         if to_alloc > self.free.len() as u64 {
-            return Err(FlipError::KvCacheExhausted {
+            return Err(DlmError::KvCacheExhausted {
                 requested: to_alloc.min(u32::MAX as u64) as u32,
                 free: self.free_blocks(),
                 total: self.total_blocks,
@@ -302,7 +302,7 @@ mod tests {
         // 40 more → 56 tokens → needs 4 blocks total, have 1, want 3 more, 1 free.
         let err = cache.append_tokens(1, 40).unwrap_err();
         match err {
-            FlipError::KvCacheExhausted { requested, free, total } => {
+            DlmError::KvCacheExhausted { requested, free, total } => {
                 assert_eq!(requested, 3);
                 assert_eq!(free, 1);
                 assert_eq!(total, 2);

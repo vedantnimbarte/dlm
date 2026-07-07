@@ -12,7 +12,7 @@
 //! * [`BpeTokenizer::bytes_only`] — a trivial 256-token byte tokenizer (no
 //!   merges), handy as a fallback and for testing the pipeline with no vocab.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -162,17 +162,17 @@ impl BpeTokenizer {
 
     /// Load a `vocab.json` + `merges.txt` pair.
     pub fn from_files(vocab_path: &Path, merges_path: &Path) -> Result<Self> {
-        let vocab_bytes = std::fs::read(vocab_path).map_err(|source| FlipError::Io {
+        let vocab_bytes = std::fs::read(vocab_path).map_err(|source| DlmError::Io {
             path: vocab_path.to_path_buf(),
             source,
         })?;
         let encoder: HashMap<String, u32> =
-            serde_json::from_slice(&vocab_bytes).map_err(|source| FlipError::Json {
+            serde_json::from_slice(&vocab_bytes).map_err(|source| DlmError::Json {
                 context: "vocab.json".to_string(),
                 source,
             })?;
 
-        let merges_text = std::fs::read_to_string(merges_path).map_err(|source| FlipError::Io {
+        let merges_text = std::fs::read_to_string(merges_path).map_err(|source| DlmError::Io {
             path: merges_path.to_path_buf(),
             source,
         })?;
@@ -194,18 +194,18 @@ impl BpeTokenizer {
     /// tokens like `<|eot_id|>` encode to their own id). Only BPE-model
     /// tokenizers are supported — SentencePiece/Unigram checkpoints are not.
     pub fn from_hf_json(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path).map_err(|source| FlipError::Io {
+        let bytes = std::fs::read(path).map_err(|source| DlmError::Io {
             path: path.to_path_buf(),
             source,
         })?;
         let hf: HfTokenizer =
-            serde_json::from_slice(&bytes).map_err(|source| FlipError::Json {
+            serde_json::from_slice(&bytes).map_err(|source| DlmError::Json {
                 context: "tokenizer.json".to_string(),
                 source,
             })?;
         if !hf.model.vocab.is_empty() && hf.model.merges.is_empty() {
             // A vocab with no merges is almost certainly a Unigram model.
-            return Err(FlipError::Tokenizer(
+            return Err(DlmError::Tokenizer(
                 "tokenizer.json has no BPE merges (Unigram/SentencePiece unsupported)".into(),
             ));
         }
@@ -256,7 +256,7 @@ impl BpeTokenizer {
                     for chunk in pretokenize(&chunk_text) {
                         for symbol in self.bpe(chunk.as_bytes()) {
                             let id = self.encoder.get(&symbol).ok_or_else(|| {
-                                FlipError::Tokenizer(format!("token {symbol:?} not in vocabulary"))
+                                DlmError::Tokenizer(format!("token {symbol:?} not in vocabulary"))
                             })?;
                             ids.push(*id);
                         }
@@ -316,7 +316,7 @@ impl BpeTokenizer {
                 let tok = self
                     .decoder
                     .get(&id)
-                    .ok_or_else(|| FlipError::Tokenizer(format!("unknown token id {id}")))?;
+                    .ok_or_else(|| DlmError::Tokenizer(format!("unknown token id {id}")))?;
                 run.push_str(tok);
             }
         }
@@ -335,7 +335,7 @@ impl BpeTokenizer {
             let b = self
                 .byte_decoder
                 .get(&ch)
-                .ok_or_else(|| FlipError::Tokenizer(format!("char {ch:?} is not a byte token")))?;
+                .ok_or_else(|| DlmError::Tokenizer(format!("char {ch:?} is not a byte token")))?;
             bytes.push(*b);
         }
         out.push_str(&String::from_utf8_lossy(&bytes));

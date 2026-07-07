@@ -69,7 +69,7 @@ impl DeviceBuffer {
     /// written, or an error if `src` exceeds capacity.
     pub fn copy_in(&mut self, src: &[u8]) -> crate::error::Result<usize> {
         if src.len() > self.storage.len() {
-            return Err(crate::error::FlipError::HostAlloc {
+            return Err(crate::error::DlmError::HostAlloc {
                 bytes: src.len(),
                 align: self.storage.len(),
             });

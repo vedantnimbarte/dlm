@@ -3,7 +3,7 @@
 //! Structurally identical to [`CpuKernel`](crate::forward::CpuKernel): it holds a
 //! model's per-layer weights in VRAM and implements [`ComputeKernel`] by running
 //! one decode block per token. The transformer math lives in
-//! `src/gpu/kernels.cu`, invoked through the `flip_decode_block` FFI entry point.
+//! `src/gpu/kernels.cu`, invoked through the `dlm_decode_block` FFI entry point.
 //!
 //! **KV stays on device.** Each layer owns persistent `kv_keys`/`kv_values`
 //! buffers in VRAM (sized for the sequence). Per token the kernel writes the new
@@ -16,7 +16,7 @@
 //! Requires nvcc at build time and a GPU at run time; the CPU kernel is the
 //! correctness oracle ([`tests/gpu_parity.rs`]).
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
 use crate::gpu::device::{synchronize, DeviceBuffer};
@@ -27,7 +27,7 @@ extern "C" {
     /// and `kv_values` are persistent buffers written in place at slot
     /// `num_positions`.
     #[allow(clippy::too_many_arguments)]
-    fn flip_decode_block(
+    fn dlm_decode_block(
         hidden_size: i32,
         q_dim: i32,
         kv_dim: i32,
@@ -143,7 +143,7 @@ impl ComputeKernel for GpuKernel {
         // never read.
         let num_positions = kv.len();
         if num_positions >= self.kv_capacity_tokens {
-            return Err(FlipError::InvalidConfig(format!(
+            return Err(DlmError::InvalidConfig(format!(
                 "GPU KV capacity {} exceeded at position {position}",
                 self.kv_capacity_tokens
             )));
@@ -155,7 +155,7 @@ impl ComputeKernel for GpuKernel {
         // SAFETY: all pointers are live device allocations of the sizes the
         // kernel expects; kv buffers have capacity for `num_positions + 1`.
         let code = unsafe {
-            flip_decode_block(
+            dlm_decode_block(
                 self.cfg.hidden_size as i32,
                 self.cfg.q_dim() as i32,
                 kv_dim as i32,
@@ -182,8 +182,8 @@ impl ComputeKernel for GpuKernel {
             )
         };
         if code != 0 {
-            return Err(FlipError::Gpu {
-                api: "flip_decode_block",
+            return Err(DlmError::Gpu {
+                api: "dlm_decode_block",
                 code,
             });
         }

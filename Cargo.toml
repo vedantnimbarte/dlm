@@ -1,17 +1,17 @@
 [package]
-name = "flip"
+name = "dlm"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "flip — dynamic layer-streaming inference engine for running massive LLMs on consumer GPUs"
+description = "dlm (Dynamic LLM) — run massive LLMs on consumer GPUs by dynamically streaming transformer layers in and out of VRAM"
 license = "Apache-2.0"
 
 [lib]
-name = "flip"
+name = "dlm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "flip"
+name = "dlm"
 path = "src/main.rs"
 
 [features]

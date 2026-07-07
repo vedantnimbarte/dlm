@@ -1,10 +1,10 @@
 //! Continuous batching must produce, per request, exactly the same tokens as
 //! running that request in isolation — regardless of interleaving or batch size.
 
-use flip::batching::BatchScheduler;
-use flip::cache::KvCacheConfig;
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
-use flip::generate::{GenerationConfig, Generator, Sampler};
+use dlm::batching::BatchScheduler;
+use dlm::cache::KvCacheConfig;
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::{GenerationConfig, Generator, Sampler};
 
 struct Rng(u64);
 impl Rng {

@@ -2,9 +2,9 @@
 //!
 //! The VRAM profiler needs the shape parameters (hidden size, head counts,
 //! layer count) to size both the streamed weight blocks and the KV cache.
-//! Fields mirror the subset of `config.json` that `flip` consumes in Phase 1.
+//! Fields mirror the subset of `config.json` that `dlm` consumes in Phase 1.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -62,7 +62,7 @@ pub struct ModelConfig {
     /// Number of key/value heads. Equals `num_attention_heads` for vanilla MHA;
     /// smaller under Grouped-Query Attention (GQA), which shrinks the KV cache.
     pub num_kv_heads: u32,
-    /// Number of transformer blocks — the layers `flip` streams in and out.
+    /// Number of transformer blocks — the layers `dlm` streams in and out.
     pub num_layers: u32,
     /// Vocabulary size (drives embedding + LM head parameter counts).
     pub vocab_size: u32,
@@ -89,7 +89,7 @@ impl ModelConfig {
             path.to_path_buf()
         };
 
-        let bytes = std::fs::read(&config_path).map_err(|source| FlipError::Io {
+        let bytes = std::fs::read(&config_path).map_err(|source| DlmError::Io {
             path: config_path.clone(),
             source,
         })?;
@@ -100,7 +100,7 @@ impl ModelConfig {
     /// Parse a config from raw JSON bytes. Separated from [`from_path`] so it
     /// can be unit-tested without touching the filesystem.
     pub fn from_json_bytes(bytes: &[u8], quant: QuantScheme) -> Result<Self> {
-        let raw: RawConfig = serde_json::from_slice(bytes).map_err(|source| FlipError::Json {
+        let raw: RawConfig = serde_json::from_slice(bytes).map_err(|source| DlmError::Json {
             context: "config.json".to_string(),
             source,
         })?;
@@ -129,18 +129,18 @@ impl ModelConfig {
     /// nonsense head dimensions.
     fn validate(&self) -> Result<()> {
         if self.num_attention_heads == 0 {
-            return Err(FlipError::InvalidConfig(
+            return Err(DlmError::InvalidConfig(
                 "num_attention_heads must be > 0".into(),
             ));
         }
         if self.num_layers == 0 {
-            return Err(FlipError::InvalidConfig("num_hidden_layers must be > 0".into()));
+            return Err(DlmError::InvalidConfig("num_hidden_layers must be > 0".into()));
         }
         if self.hidden_size == 0 {
-            return Err(FlipError::InvalidConfig("hidden_size must be > 0".into()));
+            return Err(DlmError::InvalidConfig("hidden_size must be > 0".into()));
         }
         if self.hidden_size % self.num_attention_heads != 0 {
-            return Err(FlipError::InvalidConfig(format!(
+            return Err(DlmError::InvalidConfig(format!(
                 "hidden_size ({}) is not divisible by num_attention_heads ({})",
                 self.hidden_size, self.num_attention_heads
             )));

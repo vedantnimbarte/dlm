@@ -2,10 +2,10 @@
 //! local one, fault-tolerant fallback must too, and heartbeats must reflect
 //! worker liveness.
 
-use flip::cache::KvCacheConfig;
-use flip::distributed::{partition_layers, Coordinator, ShardRoute, Worker};
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
-use flip::generate::{GenerationConfig, Generator, Sampler};
+use dlm::cache::KvCacheConfig;
+use dlm::distributed::{partition_layers, Coordinator, ShardRoute, Worker};
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::{GenerationConfig, Generator, Sampler};
 use std::net::TcpListener;
 
 struct Rng(u64);
@@ -93,7 +93,7 @@ fn reference(m: &Model) -> Generator<CpuKernel> {
 }
 
 fn start_worker(cfg: BlockConfig, layers: Vec<LayerTensors>) -> String {
-    let listener: TcpListener = flip::distributed::worker::bind("127.0.0.1:0").unwrap();
+    let listener: TcpListener = dlm::distributed::worker::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let worker = Worker::new(cfg, layers).unwrap();
     std::thread::spawn(move || {

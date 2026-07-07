@@ -9,7 +9,7 @@
 //! open.
 
 use crate::distributed::protocol::{read_message, write_message, Message};
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::cpu::{decode_block, BlockConfig, KvLayerCache, LayerTensors};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -103,5 +103,5 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<WorkerState>>, hidd
 
 /// Bind a worker listener to `addr` (e.g. `"127.0.0.1:0"`).
 pub fn bind(addr: &str) -> Result<TcpListener> {
-    TcpListener::bind(addr).map_err(|e| FlipError::Network(format!("bind {addr}: {e}")))
+    TcpListener::bind(addr).map_err(|e| DlmError::Network(format!("bind {addr}: {e}")))
 }

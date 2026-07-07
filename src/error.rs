@@ -1,15 +1,15 @@
-//! Unified error type for the `flip` engine.
+//! Unified error type for the `dlm` engine.
 
 use std::path::PathBuf;
 
 /// Result alias used throughout the crate.
-pub type Result<T> = std::result::Result<T, FlipError>;
+pub type Result<T> = std::result::Result<T, DlmError>;
 
 /// All fallible operations in Phase 1 surface through this enum so the
 /// orchestration layer can match on failure classes (I/O vs. parse vs. GPU)
 /// without stringly-typed comparisons.
 #[derive(Debug, thiserror::Error)]
-pub enum FlipError {
+pub enum DlmError {
     #[error("i/o error on {path}: {source}")]
     Io {
         path: PathBuf,

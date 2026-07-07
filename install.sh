@@ -1,19 +1,19 @@
 #!/bin/sh
-# flip installer — download a prebuilt binary and drop it on your PATH.
+# dlm installer — download a prebuilt binary and drop it on your PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/Flip/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/install.sh | sh
 #
 # On Linux x86-64 with an NVIDIA GPU it installs the CUDA (GPU) build by default;
-# everywhere else (and with FLIP_CPU=1) it installs the portable CPU build.
+# everywhere else (and with DLM_CPU=1) it installs the portable CPU build.
 #
 # Env:
-#   FLIP_INSTALL_DIR   install location (default: $HOME/.local/bin)
-#   FLIP_CPU=1         force the portable CPU build even if a GPU is detected
+#   DLM_INSTALL_DIR   install location (default: $HOME/.local/bin)
+#   DLM_CPU=1         force the portable CPU build even if a GPU is detected
 set -eu
 
-REPO="vedantnimbarte/Flip"
-BIN="flip"
-INSTALL_DIR="${FLIP_INSTALL_DIR:-$HOME/.local/bin}"
+REPO="vedantnimbarte/dlm"
+BIN="dlm"
+INSTALL_DIR="${DLM_INSTALL_DIR:-$HOME/.local/bin}"
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 info() { printf '%s\n' "$1"; }
@@ -37,10 +37,10 @@ target="${arch_part}-${os_part}"
 cpu_asset="${BIN}-${target}.tar.gz"
 
 # GPU build only exists for Linux x86-64. Pick it when an NVIDIA GPU is present
-# (nvidia-smi answers) unless FLIP_CPU=1 forces the portable CPU build.
+# (nvidia-smi answers) unless DLM_CPU=1 forces the portable CPU build.
 asset="$cpu_asset"
 kind="CPU"
-if [ "${FLIP_CPU:-}" != "1" ] && [ "$os" = "Linux" ] && [ "$arch_part" = "x86_64" ] \
+if [ "${DLM_CPU:-}" != "1" ] && [ "$os" = "Linux" ] && [ "$arch_part" = "x86_64" ] \
    && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
   asset="${BIN}-${target}-cuda.tar.gz"
   kind="GPU (CUDA)"

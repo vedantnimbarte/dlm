@@ -1,12 +1,12 @@
 //! A minimal, dependency-free HTTP/1.1 server (`std::net`, thread-per-request).
 //!
-//! `flip`'s OpenAI-compatible API (`specs.md` §3.4 / `PRD.md` §3.1) needs an HTTP
+//! `dlm`'s OpenAI-compatible API (`specs.md` §3.4 / `PRD.md` §3.1) needs an HTTP
 //! surface. Rather than pull in an async stack, this is a small blocking server:
 //! it parses a request, dispatches to a handler closure, and writes the
-//! response. It is sufficient for the local, single-node serving `flip` targets
+//! response. It is sufficient for the local, single-node serving `dlm` targets
 //! and keeps the whole engine buildable and testable with no extra dependencies.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -105,7 +105,7 @@ pub struct HttpServer {
 impl HttpServer {
     /// Bind to `addr` (e.g. `"127.0.0.1:8000"`, or `":0"` for an ephemeral port).
     pub fn bind(addr: &str) -> Result<Self> {
-        let listener = TcpListener::bind(addr).map_err(|source| FlipError::Io {
+        let listener = TcpListener::bind(addr).map_err(|source| DlmError::Io {
             path: addr.into(),
             source,
         })?;
@@ -114,7 +114,7 @@ impl HttpServer {
 
     /// The actual bound address (useful when binding to port 0).
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener.local_addr().map_err(|source| FlipError::Io {
+        self.listener.local_addr().map_err(|source| DlmError::Io {
             path: "<socket>".into(),
             source,
         })

@@ -2,14 +2,14 @@
 //!
 //! HIP mirrors the CUDA Runtime API almost 1:1, so this backend is a direct
 //! analogue of [`super::ffi_cuda`] against `libamdhip64`. The same
-//! vendor-neutral surface in [`super`] dispatches here when `flip` is built for
+//! vendor-neutral surface in [`super`] dispatches here when `dlm` is built for
 //! AMD hardware. `hipify` maps the CUDA symbol names to these `hip*` names.
 
 #![allow(non_camel_case_types)]
 #![allow(dead_code)] // some symbols are bound ahead of the Phase 2 GPU exec path
 
 use super::DeviceMemory;
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr::NonNull;
 
@@ -59,7 +59,7 @@ pub(super) fn set_device(id: u32) -> Result<()> {
     // SAFETY: no pointers; just selects the active device index.
     let code = unsafe { hipSetDevice(id as c_int) };
     if code != HIP_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "hipSetDevice",
             code,
         });
@@ -74,7 +74,7 @@ pub(super) fn mem_get_info() -> Result<DeviceMemory> {
     // SAFETY: both out-pointers reference live stack storage for the call.
     let code = unsafe { hipMemGetInfo(&mut free, &mut total) };
     if code != HIP_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "hipMemGetInfo",
             code,
         });
@@ -91,12 +91,12 @@ pub(super) fn host_alloc(bytes: usize) -> Result<NonNull<u8>> {
     // SAFETY: valid out-pointer; `bytes` is a positive page multiple.
     let code = unsafe { hipHostMalloc(&mut raw, bytes, HIP_HOST_MALLOC_PORTABLE) };
     if code != HIP_SUCCESS {
-        return Err(FlipError::Gpu {
+        return Err(DlmError::Gpu {
             api: "hipHostMalloc",
             code,
         });
     }
-    let ptr = NonNull::new(raw as *mut u8).ok_or(FlipError::HostAlloc {
+    let ptr = NonNull::new(raw as *mut u8).ok_or(DlmError::HostAlloc {
         bytes,
         align: crate::memory::page::page_size(),
     })?;

@@ -1,13 +1,13 @@
-//! Hugging Face model hub client — `flip search` / `flip pull`.
+//! Hugging Face model hub client — `dlm search` / `dlm pull`.
 //!
-//! flip needs no HTTP/TLS crate of its own: it shells out to `curl`, which ships
+//! dlm needs no HTTP/TLS crate of its own: it shells out to `curl`, which ships
 //! built-in on Linux, macOS, and Windows 10 (1803+) / 11, and handles TLS,
 //! redirects to the CDN, resume, and the progress bar. We only orchestrate:
 //! query the public JSON API and download the handful of files the loader reads.
 //!
 //! Set `HF_ENDPOINT` to use a mirror (e.g. `https://hf-mirror.com`).
 
-use crate::{FlipError, Result};
+use crate::{DlmError, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,7 +41,7 @@ pub fn normalize_repo(input: &str) -> Result<String> {
         .unwrap_or("")
         .trim_matches('/');
     if repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
-        return Err(FlipError::Hub(format!(
+        return Err(DlmError::Hub(format!(
             "expected a repo id like `org/model`, got {input:?}"
         )));
     }
@@ -81,17 +81,17 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ModelHit>> {
     );
     let body = curl_json(&url, None)?;
     serde_json::from_slice(&body)
-        .map_err(|e| FlipError::Hub(format!("could not parse search results: {e}")))
+        .map_err(|e| DlmError::Hub(format!("could not parse search results: {e}")))
 }
 
-/// Download the files flip needs from `repo` into `dest` (default
+/// Download the files dlm needs from `repo` into `dest` (default
 /// `./models/<model>`). Returns the directory the model landed in.
 pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<PathBuf> {
     let repo = normalize_repo(repo)?;
     let info_url = format!("{}/api/models/{}", base(), repo);
     let body = curl_json(&info_url, token)?;
     let info: ModelInfo = serde_json::from_slice(&body).map_err(|e| {
-        FlipError::Hub(format!("could not read model info for {repo}: {e} (private/gated? pass --token)"))
+        DlmError::Hub(format!("could not read model info for {repo}: {e} (private/gated? pass --token)"))
     })?;
 
     let wanted: Vec<&String> = info
@@ -102,15 +102,15 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         .collect();
 
     if !wanted.iter().any(|f| f.ends_with(".safetensors")) {
-        return Err(FlipError::Hub(format!(
-            "{repo} has no .safetensors weights — flip cannot load GGUF/PyTorch-only repos"
+        return Err(DlmError::Hub(format!(
+            "{repo} has no .safetensors weights — dlm cannot load GGUF/PyTorch-only repos"
         )));
     }
 
     let model_name = repo.rsplit('/').next().unwrap();
     let dir = dest.unwrap_or_else(|| Path::new("models").join(model_name));
     std::fs::create_dir_all(&dir)
-        .map_err(|e| FlipError::Hub(format!("cannot create {}: {e}", dir.display())))?;
+        .map_err(|e| DlmError::Hub(format!("cannot create {}: {e}", dir.display())))?;
 
     println!("pulling {repo} → {} ({} files)", dir.display(), wanted.len());
     for file in &wanted {
@@ -122,7 +122,7 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         println!("  {file}");
         curl_download(&url, &out, token)?;
     }
-    println!("done. run: flip serve --model-path {}", dir.display());
+    println!("done. run: dlm serve --model-path {}", dir.display());
     Ok(dir)
 }
 
@@ -142,7 +142,7 @@ fn curl_json(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
     }
     let out = cmd.output().map_err(curl_missing)?;
     if !out.status.success() {
-        return Err(FlipError::Hub(format!(
+        return Err(DlmError::Hub(format!(
             "request failed ({}): {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
@@ -161,20 +161,20 @@ fn curl_download(url: &str, out: &Path, token: Option<&str>) -> Result<()> {
     }
     let status = cmd.status().map_err(curl_missing)?;
     if !status.success() {
-        return Err(FlipError::Hub(format!("download failed for {}", out.display())));
+        return Err(DlmError::Hub(format!("download failed for {}", out.display())));
     }
     Ok(())
 }
 
-fn curl_missing(e: std::io::Error) -> FlipError {
+fn curl_missing(e: std::io::Error) -> DlmError {
     if e.kind() == std::io::ErrorKind::NotFound {
-        FlipError::Hub(
+        DlmError::Hub(
             "`curl` not found. It ships with Windows 10 (1803+), macOS, and Linux — \
              install it, or download the model manually from the Hugging Face website."
                 .into(),
         )
     } else {
-        FlipError::Hub(format!("could not run curl: {e}"))
+        DlmError::Hub(format!("could not run curl: {e}"))
     }
 }
 

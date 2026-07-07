@@ -499,7 +499,7 @@ pub fn secured_router(engine: Arc<EngineService>, api_key: Option<String>) -> Ha
 pub fn router(engine: Arc<EngineService>) -> Handler {
     Arc::new(move |req: &Request| -> Response {
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/") | ("GET", "/health") => Response::text(200, "flip: ok"),
+            ("GET", "/") | ("GET", "/health") => Response::text(200, "dlm: ok"),
             ("GET", "/v1/models") => {
                 let body = ModelsResponse {
                     object: "list",
@@ -507,7 +507,7 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
                         id: engine.model_id.clone(),
                         object: "model",
                         created: engine.created,
-                        owned_by: "flip",
+                        owned_by: "dlm",
                     }],
                 };
                 Response::json(200, serde_json::to_vec(&body).unwrap_or_default())

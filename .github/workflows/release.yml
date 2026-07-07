@@ -1,6 +1,6 @@
 name: release
 
-# Build prebuilt `flip` binaries and attach them to the GitHub Release when a
+# Build prebuilt `dlm` binaries and attach them to the GitHub Release when a
 # version tag is pushed (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
 # install.sh downloads these, so users never build from source.
 on:
@@ -35,11 +35,11 @@ jobs:
       # toolchain.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: flip
+          bin: dlm
           target: ${{ matrix.target }}
           # Version-independent asset name so install.sh can use the
           # `releases/latest/download/` redirect.
-          archive: flip-$target
+          archive: dlm-$target
           tar: unix
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -61,9 +61,9 @@ jobs:
           sub-packages: '["nvcc", "cudart"]'
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: flip
+          bin: dlm
           target: x86_64-unknown-linux-gnu
           features: cuda-kernels
-          archive: flip-$target-cuda
+          archive: dlm-$target-cuda
           tar: unix
           token: ${{ secrets.GITHUB_TOKEN }}

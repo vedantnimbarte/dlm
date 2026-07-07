@@ -1,11 +1,11 @@
 //! Server hardening on the batched OpenAI engine: bearer-token auth, a request
 //! body-size cap, and `stop` sequences.
 
-use flip::cache::KvCacheConfig;
-use flip::forward::{BlockConfig, CpuKernel, LayerTensors};
-use flip::generate::Generator;
-use flip::server::{engine::secured_router, EngineService, HttpServer};
-use flip::tokenizer::BpeTokenizer;
+use dlm::cache::KvCacheConfig;
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::Generator;
+use dlm::server::{engine::secured_router, EngineService, HttpServer};
+use dlm::tokenizer::BpeTokenizer;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
@@ -35,7 +35,7 @@ fn start_server(api_key: Option<&str>) -> SocketAddr {
         128,
     )
     .unwrap();
-    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "flip", 8, 0, 4);
+    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm", 8, 0, 4);
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     let router = secured_router(engine, api_key.map(String::from));

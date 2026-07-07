@@ -5,7 +5,7 @@
 //!
 //! 1. **Budget accounting** — append the new token to the [`PagedKvCache`]
 //!    (Cache Zone), which enforces the KV memory budget and returns
-//!    [`FlipError::KvCacheExhausted`](crate::error::FlipError::KvCacheExhausted)
+//!    [`DlmError::KvCacheExhausted`](crate::error::DlmError::KvCacheExhausted)
 //!    rather than overrunning it.
 //! 2. **Per-layer compute** — for each block, call the [`ComputeKernel`], which
 //!    runs the whole decoder block (attention + MLP, both residuals) over that
@@ -16,7 +16,7 @@
 //! CPU forward pass, a GPU kernel for production.
 
 use crate::cache::PagedKvCache;
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::cpu::KvLayerCache;
 use crate::forward::kernel::ComputeKernel;
 
@@ -54,7 +54,7 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
     /// every layer. `hidden` must be `hidden_size` long.
     pub fn decode_token(&mut self, hidden: &mut [f32]) -> Result<()> {
         if hidden.len() != self.kernel.hidden_size() {
-            return Err(FlipError::ShapeMismatch {
+            return Err(DlmError::ShapeMismatch {
                 expected: self.kernel.hidden_size(),
                 got: hidden.len(),
             });

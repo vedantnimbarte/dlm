@@ -1,29 +1,29 @@
-//! `flip` binary — command-line entry point (`specs.md` §4).
+//! `dlm` binary — command-line entry point (`specs.md` §4).
 //!
 //! Two subcommands:
-//! * `flip profile` — map/estimate a model and print the VRAM plan, KV-cache
+//! * `dlm profile` — map/estimate a model and print the VRAM plan, KV-cache
 //!   sizing, and streaming schedule. No GPU required.
-//! * `flip serve`   — resolve the full serving configuration and prepare the
+//! * `dlm serve`   — resolve the full serving configuration and prepare the
 //!   engine. The inference/serving loop itself is Phase 3; this validates the
 //!   config and runs the planning pipeline so the setup is verifiable today.
 
 use clap::Parser;
-use flip::cache::{KvCacheConfig, PagedKvCache};
-use flip::cli::{
+use dlm::cache::{KvCacheConfig, PagedKvCache};
+use dlm::cli::{
     Cli, Command, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs, PullArgs,
     SearchArgs, ServeArgs, TokenizeArgs,
 };
-use flip::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
-use flip::generate::{GenerationConfig, Generator, Sampler};
-use flip::loader::ModelParts;
-use flip::tokenizer::BpeTokenizer;
-use flip::memory::{page_size, PinnedBuffer};
-use flip::model::{ModelConfig, QuantScheme};
-use flip::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, TieredWeightSource};
-use flip::profiler::{VramPlan, VramProfiler};
-use flip::storage::{LayerCatalog, MmapStore};
-use flip::swap::LayerSwapPlan;
-use flip::{gpu, FlipError, Result};
+use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
+use dlm::generate::{GenerationConfig, Generator, Sampler};
+use dlm::loader::ModelParts;
+use dlm::tokenizer::BpeTokenizer;
+use dlm::memory::{page_size, PinnedBuffer};
+use dlm::model::{ModelConfig, QuantScheme};
+use dlm::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, TieredWeightSource};
+use dlm::profiler::{VramPlan, VramProfiler};
+use dlm::storage::{LayerCatalog, MmapStore};
+use dlm::swap::LayerSwapPlan;
+use dlm::{gpu, DlmError, Result};
 use std::path::Path;
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -41,9 +41,9 @@ fn main() -> Result<()> {
     }
 }
 
-/// `flip search` — query the Hugging Face hub and print matching models.
+/// `dlm search` — query the Hugging Face hub and print matching models.
 fn run_search(args: SearchArgs) -> Result<()> {
-    let hits = flip::hub::search(&args.query, args.limit)?;
+    let hits = dlm::hub::search(&args.query, args.limit)?;
     if hits.is_empty() {
         println!("no models found for {:?}", args.query);
         return Ok(());
@@ -52,22 +52,22 @@ fn run_search(args: SearchArgs) -> Result<()> {
         let task = h.task.as_deref().unwrap_or("-");
         println!("{:<55} ⭳ {:<10} ♥ {:<6} {}", h.id, h.downloads, h.likes, task);
     }
-    println!("\npull one with:  flip pull <id>");
+    println!("\npull one with:  dlm pull <id>");
     Ok(())
 }
 
-/// `flip pull` — download a model's loadable files from the Hugging Face hub.
+/// `dlm pull` — download a model's loadable files from the Hugging Face hub.
 fn run_pull(args: PullArgs) -> Result<()> {
     let token = args.token.or_else(|| std::env::var("HF_TOKEN").ok());
-    flip::hub::pull(&args.repo, args.local_dir, token.as_deref())?;
+    dlm::hub::pull(&args.repo, args.local_dir, token.as_deref())?;
     Ok(())
 }
 
-/// `flip doctor` — environment diagnostics + a self-check. Reports the GPU
+/// `dlm doctor` — environment diagnostics + a self-check. Reports the GPU
 /// backend and device memory, runs a tiny CPU inference, probes the GPU at
 /// runtime (on a `cuda-kernels` build), and optionally checks a checkpoint loads.
 fn run_doctor(args: DoctorArgs) -> Result<()> {
-    println!("flip doctor v{}", env!("CARGO_PKG_VERSION"));
+    println!("dlm doctor v{}", env!("CARGO_PKG_VERSION"));
     println!("  gpu backend  : {}", gpu::active_vendor().label());
     println!("  host page    : {} bytes", page_size());
     match gpu::mem_get_info() {
@@ -147,7 +147,7 @@ fn gpu_self_check() {
 /// Errors if the GPU is unavailable at runtime (`GpuKernel::new` fails).
 #[cfg(feature = "cuda-kernels")]
 fn gpu_parity_probe() -> Result<f32> {
-    use flip::forward::{GpuKernel, KvLayerCache};
+    use dlm::forward::{GpuKernel, KvLayerCache};
     let cfg = tiny_cfg();
     let mut rng = Rng::new(3);
     let s = 0.05;
@@ -179,7 +179,7 @@ fn checkpoint_check(dir: &Path) -> Result<String> {
     let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
     let store = MmapStore::open_dir(dir)?;
     if store.locate("model.embed_tokens.weight").is_none() {
-        return Err(FlipError::InvalidConfig("missing model.embed_tokens.weight".into()));
+        return Err(DlmError::InvalidConfig("missing model.embed_tokens.weight".into()));
     }
     let tok = if dir.join("tokenizer.json").exists()
         || (dir.join("vocab.json").exists() && dir.join("merges.txt").exists())
@@ -191,7 +191,7 @@ fn checkpoint_check(dir: &Path) -> Result<String> {
     Ok(format!("{} layers, vocab {}{tok}", config.num_layers, config.vocab_size))
 }
 
-/// `flip tokenize` — encode text and report the round-trip.
+/// `dlm tokenize` — encode text and report the round-trip.
 fn run_tokenize(args: TokenizeArgs) -> Result<()> {
     let tokenizer = match &args.tokenizer {
         Some(dir) => BpeTokenizer::from_dir(dir)?,
@@ -237,11 +237,11 @@ impl Rng {
     }
 }
 
-/// `flip generate` — end-to-end CPU generation. Loads a real model when
+/// `dlm generate` — end-to-end CPU generation. Loads a real model when
 /// `--model-path` is given, otherwise synthesizes a random one. With `--text`
 /// the prompt is tokenized (and the output detokenized) via a BPE tokenizer.
 fn run_generate(args: GenerateArgs) -> Result<()> {
-    println!("flip v{}", env!("CARGO_PKG_VERSION"));
+    println!("dlm v{}", env!("CARGO_PKG_VERSION"));
     println!("  gpu backend  : {}", gpu::active_vendor().label());
     println!();
 
@@ -264,7 +264,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         _ => args.prompt.clone(),
     };
     if prompt_ids.is_empty() {
-        return Err(FlipError::InvalidConfig("prompt is empty".into()));
+        return Err(DlmError::InvalidConfig("prompt is empty".into()));
     }
     let max_context = (prompt_ids.len() + args.max_new_tokens) as u32;
 
@@ -282,7 +282,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
             config.num_kv_heads,
             config.head_dim(),
         );
-        (flip::loader::load_model_parts(&store, &config, max_context)?, false)
+        (dlm::loader::load_model_parts(&store, &config, max_context)?, false)
     } else {
         let parts = build_synthetic_parts(&args, max_context)?;
         println!("generate     : demo with randomly-initialized weights (seed {})", args.seed);
@@ -301,7 +301,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     // Prompt ids must fit the model's vocabulary.
     if let Some(&max) = prompt_ids.iter().max() {
         if max as usize >= parts.vocab_size {
-            return Err(FlipError::InvalidConfig(format!(
+            return Err(DlmError::InvalidConfig(format!(
                 "prompt token {max} out of vocab range {} (tokenizer/model mismatch?)",
                 parts.vocab_size
             )));
@@ -344,7 +344,7 @@ fn generate_on_device(
             run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
         }
         #[cfg(not(feature = "cuda-kernels"))]
-        Device::Gpu => Err(FlipError::InvalidConfig(
+        Device::Gpu => Err(DlmError::InvalidConfig(
             "--device gpu requires building with `--features cuda-kernels`".into(),
         )),
     }
@@ -385,16 +385,16 @@ fn resolve_tokenizer(args: &GenerateArgs) -> Result<BpeTokenizer> {
 /// Build synthetic random-weight model parts from the geometry flags.
 fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelParts> {
     if args.hidden_size == 0 || args.num_heads == 0 || args.num_kv_heads == 0 {
-        return Err(FlipError::InvalidConfig("dimensions must be > 0".into()));
+        return Err(DlmError::InvalidConfig("dimensions must be > 0".into()));
     }
     if args.hidden_size % args.num_heads != 0 {
-        return Err(FlipError::InvalidConfig(format!(
+        return Err(DlmError::InvalidConfig(format!(
             "hidden_size ({}) not divisible by num_heads ({})",
             args.hidden_size, args.num_heads
         )));
     }
     if args.num_heads % args.num_kv_heads != 0 {
-        return Err(FlipError::InvalidConfig(format!(
+        return Err(DlmError::InvalidConfig(format!(
             "num_heads ({}) not divisible by num_kv_heads ({})",
             args.num_heads, args.num_kv_heads
         )));
@@ -455,13 +455,13 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
 
 /// Print the shared startup banner (backend + host page size).
 fn banner() {
-    println!("flip v{}", env!("CARGO_PKG_VERSION"));
+    println!("dlm v{}", env!("CARGO_PKG_VERSION"));
     println!("  gpu backend  : {}", gpu::active_vendor().label());
     println!("  host page    : {} bytes", page_size());
     println!();
 }
 
-/// `flip profile` — profile a real or sample model and print the full plan.
+/// `dlm profile` — profile a real or sample model and print the full plan.
 fn run_profile(args: ProfileArgs) -> Result<()> {
     banner();
 
@@ -489,7 +489,7 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
     )
 }
 
-/// `flip serve` — resolve the serving config, then run the planning pipeline.
+/// `dlm serve` — resolve the serving config, then run the planning pipeline.
 fn run_serve(args: ServeArgs) -> Result<()> {
     banner();
 
@@ -520,9 +520,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     match args.distributed_mode {
         DistributedMode::Worker => {
             // Serve this node's layer shard (the whole model here) to a master.
-            let parts = flip::loader::load_model_parts(&store, &config, args.context_length)?;
-            let worker = flip::distributed::Worker::new(parts.cfg, parts.layers)?;
-            let listener = flip::distributed::worker::bind(&listen)?;
+            let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
+            let worker = dlm::distributed::Worker::new(parts.cfg, parts.layers)?;
+            let listener = dlm::distributed::worker::bind(&listen)?;
             println!();
             println!("worker node  : listening on {listen} ({} layers)", config.num_layers);
             worker.serve(listener)?; // blocks
@@ -532,7 +532,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // Multi-GPU already implies GPUs and overrides --device, so only
             // --stream conflicts with it.
             if !args.multi_gpu_ids.is_empty() && args.stream {
-                return Err(FlipError::InvalidConfig(
+                return Err(DlmError::InvalidConfig(
                     "--multi-gpu-ids cannot combine with --stream".into(),
                 ));
             }
@@ -551,7 +551,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // host RAM (CPU) or into VRAM (--device gpu).
             if args.stream {
                 if args.draft_model_path.is_some() {
-                    return Err(FlipError::InvalidConfig(
+                    return Err(DlmError::InvalidConfig(
                         "--stream does not support speculative decoding (--draft-model-path) yet".into(),
                     ));
                 }
@@ -566,12 +566,12 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     return serve_streaming_gpu(store, &config, &args, window, &listen);
                 }
                 let generator =
-                    flip::loader::build_streaming_generator(store, &config, args.context_length, window)?;
+                    dlm::loader::build_streaming_generator(store, &config, args.context_length, window)?;
                 return start_batched_server(generator, None, &args, &config, &listen);
             }
 
             // Non-streaming paths materialize all layers resident.
-            let parts = flip::loader::load_model_parts(&store, &config, args.context_length)?;
+            let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
 
             // Optional draft model for speculative decoding. It must share the
             // target's vocabulary (same tokenizer) for the accept/reject rule to
@@ -580,13 +580,13 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 Some(dir) => {
                     let dcfg = ModelConfig::from_path(dir, args.quant.to_scheme())?;
                     if dcfg.vocab_size != config.vocab_size {
-                        return Err(FlipError::InvalidConfig(format!(
+                        return Err(DlmError::InvalidConfig(format!(
                             "draft vocab {} != target vocab {}",
                             dcfg.vocab_size, config.vocab_size
                         )));
                     }
                     let dstore = MmapStore::open_dir(dir)?;
-                    Some(flip::loader::load_model_parts(&dstore, &dcfg, args.context_length)?)
+                    Some(dlm::loader::load_model_parts(&dstore, &dcfg, args.context_length)?)
                 }
                 None => None,
             };
@@ -595,7 +595,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 // Split the target across local GPUs (specs §3.3); the small,
                 // pinned draft stays on the first GPU.
                 let ids = args.multi_gpu_ids.clone();
-                let split = flip::distributed::partition_layers(config.num_layers as usize, ids.len());
+                let split = dlm::distributed::partition_layers(config.num_layers as usize, ids.len());
                 println!();
                 println!("multi-gpu    : pipeline-parallel layer split (specs §3.3)");
                 for (stage, shard) in split.iter().enumerate() {
@@ -622,7 +622,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 
 /// Resolve the effective compute device. `cpu` is honored as-is. `gpu` is
 /// honored only if the binary was built with the device kernels AND a GPU
-/// actually responds; otherwise flip warns and falls back to CPU so a run never
+/// actually responds; otherwise dlm warns and falls back to CPU so a run never
 /// dies just because no GPU is present. On a CPU-only build, an explicit
 /// `--device gpu` passes through and the downstream `not(cuda-kernels)` arm
 /// reports the clearer "requires --features cuda-kernels" error.
@@ -684,7 +684,7 @@ fn serve_on_gpu(
     _config: &ModelConfig,
     _listen: &str,
 ) -> Result<()> {
-    Err(FlipError::InvalidConfig(
+    Err(DlmError::InvalidConfig(
         "--device gpu requires building with `--features cuda-kernels`".into(),
     ))
 }
@@ -701,7 +701,7 @@ fn serve_streaming_gpu(
 ) -> Result<()> {
     println!("device       : gpu ({}) — VRAM layer streaming [experimental]", gpu::active_vendor().label());
     let generator =
-        flip::loader::build_streaming_gpu_generator(store, config, args.context_length, window)?;
+        dlm::loader::build_streaming_gpu_generator(store, config, args.context_length, window)?;
     start_batched_server(generator, None, args, config, listen)
 }
 
@@ -713,7 +713,7 @@ fn serve_streaming_gpu(
     _window: usize,
     _listen: &str,
 ) -> Result<()> {
-    Err(FlipError::InvalidConfig(
+    Err(DlmError::InvalidConfig(
         "--stream --device gpu requires building with `--features cuda-kernels`".into(),
     ))
 }
@@ -740,8 +740,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let template = flip::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
-        FlipError::InvalidConfig(format!(
+    let template = dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
+        DlmError::InvalidConfig(format!(
             "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
             args.chat_template
         ))
@@ -751,29 +751,29 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     // (draft proposes, target verifies).
     let speculative = draft.is_some();
     let engine = match draft {
-        Some(d) => flip::server::EngineService::start_speculative(
+        Some(d) => dlm::server::EngineService::start_speculative(
             generator,
             d,
             args.draft_gamma,
             tokenizer,
             config.vocab_size as usize,
-            "flip",
+            "dlm",
             128,
             created,
             8, // max concurrent batch
         ),
-        None => flip::server::EngineService::start(
+        None => dlm::server::EngineService::start(
             generator,
             tokenizer,
             config.vocab_size as usize,
-            "flip",
+            "dlm",
             128,
             created,
             8, // max concurrent batch
         ),
     }
     .with_chat_template(template);
-    let server = flip::server::HttpServer::bind(listen)?;
+    let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     let mode = if speculative { "batched + speculative" } else { "batched" };
     println!("serving      : OpenAI-compatible API on http://{listen} ({mode})");
@@ -784,9 +784,9 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
         println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
         println!("               currently runs the model locally (distributed routing available");
-        println!("               via flip::distributed::Coordinator).");
+        println!("               via dlm::distributed::Coordinator).");
     }
-    let router = flip::server::engine::secured_router(engine, args.api_key.clone());
+    let router = dlm::server::engine::secured_router(engine, args.api_key.clone());
     server.serve(router) // blocks
 }
 

@@ -4,9 +4,9 @@
 //! Wraps a [`Generator`] + [`BpeTokenizer`] into an [`Engine`] and exposes a
 //! [`router`] that plugs into the [`HttpServer`](super::http::HttpServer). The
 //! request/response shapes match the OpenAI schema closely enough for clients
-//! like Open WebUI to talk to `flip` unchanged.
+//! like Open WebUI to talk to `dlm` unchanged.
 
-use crate::error::{FlipError, Result};
+use crate::error::{DlmError, Result};
 use crate::forward::ComputeKernel;
 use crate::generate::{GenerationConfig, Generator, Sampler};
 use crate::server::http::{Handler, Request, Response};
@@ -145,7 +145,7 @@ impl<K: ComputeKernel> Engine<K> {
     pub fn complete(&self, prompt: &str, max_tokens: usize) -> Result<Completion> {
         let ids = self.tokenizer.encode(prompt)?;
         if ids.is_empty() {
-            return Err(FlipError::Tokenizer("prompt encodes to no tokens".into()));
+            return Err(DlmError::Tokenizer("prompt encodes to no tokens".into()));
         }
         let cfg = GenerationConfig {
             max_new_tokens: max_tokens.max(1),
@@ -187,7 +187,7 @@ where
 {
     Arc::new(move |req: &Request| -> Response {
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/") | ("GET", "/health") => Response::text(200, "flip: ok"),
+            ("GET", "/") | ("GET", "/health") => Response::text(200, "dlm: ok"),
             ("GET", "/v1/models") => {
                 let body = ModelsResponse {
                     object: "list",
@@ -195,7 +195,7 @@ where
                         id: engine.model_id().to_string(),
                         object: "model",
                         created: engine.created,
-                        owned_by: "flip",
+                        owned_by: "dlm",
                     }],
                 };
                 Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
