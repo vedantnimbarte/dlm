@@ -45,12 +45,10 @@ Rust users can also `cargo install --git https://github.com/vedantnimbarte/Flip`
 
 - [Install](#install)
 - [How it works](#how-it-works)
-- [Components](#components)
 - [Prerequisites](#prerequisites)
 - [Build & run locally](#build--run-locally)
 - [Running the tests](#running-the-tests)
 - [The VRAM budget math](#the-vram-budget-math)
-- [Project layout](#project-layout)
 - [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
 - [Distributed & scaling](#distributed--scaling)
 
@@ -118,36 +116,6 @@ sample → next token`. With the `CpuKernel` this is a complete, end-to-end (if
 slow, single-sequence) **CPU inference path** — prompt tokens are prefilled into
 the KV history, then new tokens are generated greedily until an EOS or the token
 limit.
-
-## Components
-
-| Component | Module |
-|---|---|
-| Memory-mapped, zero-copy safetensors reader | [`src/storage`](src/storage) |
-| Sharded checkpoint support + tensor index | [`src/storage/mmap_store.rs`](src/storage/mmap_store.rs) |
-| Layer catalog (real per-layer + pinned byte sizes) | [`src/storage/catalog.rs`](src/storage/catalog.rs) |
-| `config.json` geometry + quantization parsing | [`src/model`](src/model) |
-| 4-bit dequantization kernels — group-affine + GPTQ-packed int32 | [`src/quant`](src/quant) |
-| Tensor role classification (pinned vs. streamed) | [`src/model/naming.rs`](src/model/naming.rs) |
-| Dynamic VRAM profiling math | [`src/profiler`](src/profiler) |
-| Page-locked host staging buffers | [`src/memory`](src/memory) |
-| Linear layer-swap cycle | [`src/swap`](src/swap) |
-| Double-buffered A/B streaming schedule + host executor | [`src/pipeline`](src/pipeline) |
-| PagedAttention block-paged KV cache | [`src/cache/paged.rs`](src/cache/paged.rs) |
-| Tiered CPU-RAM LRU layer cache | [`src/cache/ram.rs`](src/cache/ram.rs) |
-| Residual activation pool (buffer reuse) | [`src/activation`](src/activation) |
-| Forward-pass orchestration (block-level `ComputeKernel` trait) | [`src/forward`](src/forward) |
-| CPU forward path — real decode block (RMSNorm/RoPE/GQA/SwiGLU) | [`src/forward/cpu.rs`](src/forward/cpu.rs) |
-| CPU token-generation loop (embed → stack → LM head → sample) | [`src/generate.rs`](src/generate.rs) |
-| Safetensors → CPU model loader (F32/F16/BF16 + GPTQ 4-bit) | [`src/loader.rs`](src/loader.rs) |
-| Byte-level BPE tokenizer (encode/decode + vocab/merges) | [`src/tokenizer.rs`](src/tokenizer.rs) |
-| OpenAI-compatible HTTP API server | [`src/server`](src/server) |
-| Speculative decoding (draft/target, exact output) | [`src/speculative.rs`](src/speculative.rs) |
-| Continuous batching scheduler | [`src/batching.rs`](src/batching.rs) |
-| Distributed master-worker pipeline (heartbeat + fallback) | [`src/distributed`](src/distributed) |
-| `clap` CLI — `serve` / `profile` subcommands | [`src/cli.rs`](src/cli.rs) |
-| GPU runtime FFI — CUDA + ROCm/HIP (mem-info, host-alloc, streams, memcpy) | [`src/gpu`](src/gpu) |
-| CUDA device `run_block` kernel (feature `cuda-kernels`) | [`src/gpu/kernels.cu`](src/gpu/kernels.cu) |
 
 The GPU-specific paths are behind `cuda` / `rocm`
 [feature flags](#building-for-gpu-nvidia--amd); with neither, the engine uses a
@@ -347,37 +315,6 @@ LayersToLoad  =  ─────────────────────
 
 The result is clamped to `[1, N_layers]` — streaming needs at least one resident
 slot, and never more than the model has.
-
-## Project layout
-
-```
-src/
-├── lib.rs            # crate root & public API re-exports
-├── main.rs           # CLI entry point (serve / profile dispatch)
-├── cli.rs            # clap argument definitions
-├── error.rs          # unified FlipError / Result
-├── model/            # config.json parsing, quant schemes, tensor naming
-├── storage/          # mmap engine, safetensors parser, layer catalog
-├── profiler/         # dynamic VRAM budget math
-├── quant/            # 4-bit group-affine dequantization kernel
-├── memory/           # page-size discovery + page-locked staging buffers
-├── swap/             # linear layer-swap cycle (windows over the model)
-├── pipeline/         # double-buffered A/B schedule + host executor
-├── cache/            # PagedAttention KV cache + tiered CPU-RAM layer cache
-├── activation/       # residual activation pool (buffer reuse)
-├── forward/          # forward-pass orchestration + real CPU decode block
-├── generate.rs       # CPU token-generation loop (embed / LM head / sampling)
-├── loader.rs         # safetensors → CPU model (F32/F16/BF16 + GPTQ)
-├── tokenizer.rs      # byte-level BPE tokenizer (encode / decode)
-├── server/           # OpenAI-compatible HTTP API (chat/completions/models)
-├── speculative.rs    # speculative decoding (draft proposes, target verifies)
-├── batching.rs       # continuous batching scheduler
-├── distributed/      # master-worker pipeline: protocol, worker, coordinator
-└── gpu/              # vendor-neutral backend + CUDA device kernels (kernels.cu)
-tests/
-└── phase1.rs         # integration tests
-build.rs              # links cudart / amdhip64 for the selected GPU feature
-```
 
 ## Building for GPU (NVIDIA / AMD)
 
