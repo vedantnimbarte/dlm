@@ -6,8 +6,8 @@
 //! Concurrent requests are therefore **continuously batched** (interleaved a
 //! token at a time), and a request can be **streamed** to the client as SSE.
 //!
-//! The [`router`] wires this into the OpenAI endpoints, supporting `stream: true`
-//! for `/v1/chat/completions`.
+//! The [`router`] wires this into the OpenAI and Anthropic endpoints, supporting
+//! `stream: true` for both `/v1/chat/completions` and `/v1/messages`.
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
@@ -715,15 +715,6 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
     if parsed.messages.is_empty() {
         return Response::json(400, error_json("messages must not be empty"));
     }
-    // ponytail: streaming /v1/messages needs Anthropic's own SSE event
-    // sequence (message_start / content_block_delta / …), not OpenAI chunks.
-    // Add that when a client needs streamed Anthropic responses.
-    if parsed.stream {
-        return Response::json(
-            400,
-            error_json("streaming is not yet supported on /v1/messages; set stream=false"),
-        );
-    }
 
     // Fold `system` + messages into the shared chat template. The Anthropic
     // `system` field becomes a leading system-role message.
@@ -762,6 +753,10 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
         .collect();
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
+    if parsed.stream {
+        return stream_messages(Arc::clone(engine), ids, max_tokens, model, sampler, stops);
+    }
+
     let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
     let body = MessagesResponse {
         id: format!("msg-{id}"),
@@ -778,6 +773,95 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
         },
     };
     Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
+}
+
+/// Stream an Anthropic Messages response as Server-Sent Events, following the
+/// event sequence Anthropic clients expect: `message_start`,
+/// `content_block_start`, a run of `content_block_delta` (`text_delta`),
+/// `content_block_stop`, `message_delta` (with `stop_reason`), `message_stop`.
+fn stream_messages(
+    engine: Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    model: String,
+    sampler: Sampler,
+    stops: Vec<String>,
+) -> Response {
+    Response::stream(200, "text/event-stream", move |w| {
+        let id = format!("msg-{}", engine.next_id.load(Ordering::Relaxed));
+        let prompt_tokens = ids.len();
+        // Anthropic frames carry both an `event:` line and a `data:` line.
+        let send = |w: &mut dyn std::io::Write, event: &str, data: serde_json::Value| -> std::io::Result<()> {
+            write!(w, "event: {event}\ndata: {data}\n\n")?;
+            w.flush()
+        };
+
+        send(w, "message_start", serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+            },
+        }))?;
+        send(w, "content_block_start", serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }))?;
+
+        let mut completion_tokens = 0usize;
+        // Stop-aware emission mirrors stream_chat: accumulate ids, re-decode, and
+        // emit only the newly-visible suffix up to any stop sequence.
+        let mut acc_ids: Vec<u32> = Vec::new();
+        let mut sent_chars = 0usize;
+        let mut stop_reason = "max_tokens";
+        let mut stop_sequence: Option<String> = None;
+        let rx = engine.submit(ids, max_tokens, None, sampler);
+        for ev in rx {
+            match ev {
+                TokenEvent::Next(t) => {
+                    completion_tokens += 1;
+                    acc_ids.push(t);
+                    let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
+                    let cut = if stops.is_empty() { None } else { earliest_stop(&full, &stops) };
+                    let visible = &full[..cut.unwrap_or(full.len())];
+                    let vis_chars = visible.chars().count();
+                    if vis_chars > sent_chars {
+                        let delta: String = visible.chars().skip(sent_chars).collect();
+                        sent_chars = vis_chars;
+                        send(w, "content_block_delta", serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": delta},
+                        }))?;
+                    }
+                    if let Some(c) = cut {
+                        stop_reason = "stop_sequence";
+                        stop_sequence = stops.iter().find(|s| full[..].find(s.as_str()) == Some(c)).cloned();
+                        break;
+                    }
+                }
+                TokenEvent::Done(_) => break,
+            }
+        }
+
+        send(w, "content_block_stop", serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0,
+        }))?;
+        send(w, "message_delta", serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+            "usage": {"output_tokens": completion_tokens},
+        }))?;
+        send(w, "message_stop", serde_json::json!({"type": "message_stop"}))
+    })
 }
 
 /// Stream a chat completion as Server-Sent Events.
