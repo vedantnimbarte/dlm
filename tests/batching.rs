@@ -85,7 +85,7 @@ fn batched_requests_match_isolated_generation() {
     // max_batch = 2 forces staggered admission (4 requests, 2 slots).
     let mut sched = BatchScheduler::new(&generator, 2);
     for (id, prompt, n) in &requests {
-        sched.submit(*id, prompt.clone(), *n, None).unwrap();
+        sched.submit(*id, prompt.clone(), *n, vec![]).unwrap();
         assert!(sched.active_len() <= 2);
     }
     let mut results = sched.run().unwrap();
@@ -103,8 +103,8 @@ fn batched_requests_match_isolated_generation() {
 fn batch_size_one_is_sequential_but_correct() {
     let generator = build_generator();
     let mut sched = BatchScheduler::new(&generator, 1);
-    sched.submit(10, vec![1, 2], 4, None).unwrap();
-    sched.submit(20, vec![3], 4, None).unwrap();
+    sched.submit(10, vec![1, 2], 4, vec![]).unwrap();
+    sched.submit(20, vec![3], 4, vec![]).unwrap();
 
     let mut results = sched.run().unwrap();
     results.sort_by_key(|f| f.id);
@@ -119,7 +119,7 @@ fn eos_stops_a_request_early() {
     let first = greedy(&generator, &[1], 1)[0];
 
     let mut sched = BatchScheduler::new(&generator, 4);
-    sched.submit(1, vec![1], 10, Some(first)).unwrap();
+    sched.submit(1, vec![1], 10, vec![first]).unwrap();
     let results = sched.run().unwrap();
 
     assert_eq!(results.len(), 1);

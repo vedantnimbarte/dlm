@@ -217,6 +217,12 @@ pub struct ServeArgs {
     /// `plain` (default), `chatml`, or `llama3`. Match the served model.
     #[arg(long, value_name = "NAME", default_value = "plain")]
     pub chat_template: String,
+
+    /// Stop generation when the model produces this token id (the model's EOS).
+    /// Overrides the `eos_token_id` auto-detected from `config.json`; omit to use
+    /// that. Sets `finish_reason: stop` / `stop_reason: end_turn` when hit.
+    #[arg(long, value_name = "ID")]
+    pub eos_token: Option<u32>,
 }
 
 /// Arguments for `dlm profile`.

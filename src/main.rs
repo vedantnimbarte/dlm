@@ -746,6 +746,13 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             args.chat_template
         ))
     })?;
+    // EOS: an explicit --eos-token overrides; otherwise auto-detect from the
+    // model's config.json (`eos_token_id`, which may list several ids).
+    let eos_tokens = match args.eos_token {
+        Some(id) => vec![id],
+        None => config.eos_token_ids.clone(),
+    };
+
     // Batched, streaming engine: a background scheduler interleaves concurrent
     // requests a token at a time. With a draft model it decodes speculatively
     // (draft proposes, target verifies).
@@ -772,12 +779,20 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             8, // max concurrent batch
         ),
     }
-    .with_chat_template(template);
+    .with_chat_template(template)
+    .with_eos_tokens(eos_tokens.clone())
+    .with_context_window(args.context_length as usize);
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     let mode = if speculative { "batched + speculative" } else { "batched" };
-    println!("serving      : OpenAI-compatible API on http://{listen} ({mode})");
-    println!("  endpoints  : POST /v1/chat/completions (stream supported), GET /v1/models");
+    println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
+    println!("  openai     : POST /v1/chat/completions (stream), GET /v1/models");
+    println!("  anthropic  : POST /v1/messages (stream), POST /v1/messages/count_tokens");
+    if eos_tokens.is_empty() {
+        println!("  stop       : max_tokens only (no eos_token_id in config; pass --eos-token)");
+    } else {
+        println!("  stop       : eos {eos_tokens:?} + max_tokens, context {} tokens", args.context_length);
+    }
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
     }

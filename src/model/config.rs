@@ -50,6 +50,18 @@ struct RawConfig {
     rope_theta: Option<f32>,
     #[serde(default)]
     rms_norm_eps: Option<f32>,
+    /// EOS token id(s). HF configs use either a single int or an array (e.g.
+    /// Llama-3 lists `<|eot_id|>` and `<|end_of_text|>`).
+    #[serde(default)]
+    eos_token_id: Option<EosField>,
+}
+
+/// `eos_token_id` as it appears in `config.json`: one id or a list of them.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EosField {
+    One(u32),
+    Many(Vec<u32>),
 }
 
 /// Validated model geometry consumed by the profiler and storage planner.
@@ -70,6 +82,9 @@ pub struct ModelConfig {
     pub intermediate_size: u32,
     /// Model's own maximum context, if declared.
     pub max_position_embeddings: Option<u32>,
+    /// EOS token id(s) declared by the model; empty when the config omits them.
+    /// Generation stops when any of these is produced.
+    pub eos_token_ids: Vec<u32>,
     /// RoPE base frequency (default 10000).
     pub rope_theta: f32,
     /// RMSNorm epsilon (default 1e-5).
@@ -116,6 +131,11 @@ impl ModelConfig {
                 .intermediate_size
                 .unwrap_or(raw.hidden_size.saturating_mul(4)),
             max_position_embeddings: raw.max_position_embeddings,
+            eos_token_ids: match raw.eos_token_id {
+                Some(EosField::One(id)) => vec![id],
+                Some(EosField::Many(ids)) => ids,
+                None => Vec::new(),
+            },
             rope_theta: raw.rope_theta.unwrap_or(10000.0),
             rms_eps: raw.rms_norm_eps.unwrap_or(1e-5),
             quant,

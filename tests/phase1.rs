@@ -165,6 +165,26 @@ fn vram_math_matches_hand_computation() {
 }
 
 #[test]
+fn parses_eos_token_id_as_scalar_or_array() {
+    let base = r#""hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":128"#;
+
+    // Scalar (most models).
+    let scalar = format!("{{{base},\"eos_token_id\":2}}");
+    let c = ModelConfig::from_json_bytes(scalar.as_bytes(), QuantScheme::Fp16).unwrap();
+    assert_eq!(c.eos_token_ids, vec![2]);
+
+    // Array (e.g. Llama-3 lists two).
+    let array = format!("{{{base},\"eos_token_id\":[128001,128009]}}");
+    let c = ModelConfig::from_json_bytes(array.as_bytes(), QuantScheme::Fp16).unwrap();
+    assert_eq!(c.eos_token_ids, vec![128001, 128009]);
+
+    // Absent → empty.
+    let none = format!("{{{base}}}");
+    let c = ModelConfig::from_json_bytes(none.as_bytes(), QuantScheme::Fp16).unwrap();
+    assert!(c.eos_token_ids.is_empty());
+}
+
+#[test]
 fn profiler_uses_catalog_sizes_and_pinned_overhead() {
     let tmp = tempfile::tempdir().unwrap();
     // 4 layers of 100 bytes each, plus 500 bytes of pinned tensors.

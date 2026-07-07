@@ -32,7 +32,7 @@ struct Job {
     id: u64,
     prompt: Vec<u32>,
     max_new: usize,
-    eos: Option<u32>,
+    eos: Vec<u32>,
     sampler: Sampler,
     sink: Sender<TokenEvent>,
 }
@@ -47,6 +47,12 @@ pub struct EngineService {
     created: u64,
     default_max_tokens: usize,
     chat_template: ChatTemplate,
+    /// Stop generation when any of these token ids is produced (the model's
+    /// EOS set). Empty means run to `max_tokens`.
+    eos_tokens: Vec<u32>,
+    /// Maximum context (prompt + generated) the model/KV cache supports.
+    /// Requests are clamped to fit; `usize::MAX` disables the guard.
+    max_context: usize,
 }
 
 impl EngineService {
@@ -126,6 +132,8 @@ impl EngineService {
             created,
             default_max_tokens,
             chat_template: ChatTemplate::default(),
+            eos_tokens: Vec::new(),
+            max_context: usize::MAX,
         })
     }
 
@@ -138,12 +146,32 @@ impl EngineService {
         self
     }
 
+    /// Set the EOS token id(s): generation stops (and the token is dropped from
+    /// the output) when the model produces any of them. Defaults to empty (run
+    /// to length).
+    pub fn with_eos_tokens(mut self: Arc<Self>, eos_tokens: Vec<u32>) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.eos_tokens = eos_tokens;
+        }
+        self
+    }
+
+    /// Set the maximum context (prompt + generated tokens). Requests whose
+    /// prompt already fills it are rejected; `max_tokens` is otherwise clamped to
+    /// the remaining budget. Defaults to `usize::MAX` (no limit).
+    pub fn with_context_window(mut self: Arc<Self>, max_context: usize) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.max_context = max_context;
+        }
+        self
+    }
+
     /// Submit a request; returns a channel that yields its tokens then `Done`.
     fn submit(
         &self,
         prompt: Vec<u32>,
         max_new: usize,
-        eos: Option<u32>,
+        eos: Vec<u32>,
         sampler: Sampler,
     ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
@@ -517,25 +545,57 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
             }
             ("POST", "/v1/chat/completions") => handle_chat(&engine, req),
             ("POST", "/v1/messages") => handle_messages(&engine, req),
+            ("POST", "/v1/messages/count_tokens") => handle_count_tokens(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
             _ => Response::json(405, error_json("method not allowed")),
         }
     })
 }
 
+/// Why generation ended. Mapped to each API's own reason field.
+enum Finish {
+    /// Model emitted the EOS token → OpenAI `stop` / Anthropic `end_turn`.
+    Eos,
+    /// A stop sequence was hit; carries the matched sequence when known.
+    Stop(Option<String>),
+    /// Hit the `max_tokens` cap → OpenAI `length` / Anthropic `max_tokens`.
+    Length,
+}
+
+/// Clamp a requested `max_tokens` to the context budget left after the prompt,
+/// or return an error message if the prompt already fills the window.
+fn fit_max_tokens(engine: &EngineService, prompt_len: usize, requested: usize) -> Result<usize, String> {
+    if prompt_len >= engine.max_context {
+        return Err(format!(
+            "prompt is {prompt_len} tokens but the context window is {}",
+            engine.max_context
+        ));
+    }
+    let budget = engine.max_context - prompt_len;
+    Ok(requested.min(budget).max(1))
+}
+
+/// The stop sequence with the earliest occurrence in `text`, if any.
+fn matched_stop<'a>(text: &str, stops: &'a [String]) -> Option<&'a String> {
+    stops
+        .iter()
+        .filter_map(|s| text.find(s.as_str()).map(|pos| (pos, s)))
+        .min_by_key(|(pos, _)| *pos)
+        .map(|(_, s)| s)
+}
+
 /// A collected non-streaming completion.
 struct Generated {
     text: String,
-    /// True if a stop sequence was hit (vs. running to `max_tokens`).
-    stopped: bool,
+    finish: Finish,
     prompt_tokens: usize,
     completion_tokens: usize,
     spec: Option<AcceptanceStats>,
 }
 
-/// Run one request to completion, ending early at the first stop sequence and
-/// truncating the decoded text before it. Shared by the OpenAI and Anthropic
-/// non-streaming handlers.
+/// Run one request to completion, ending at the EOS token, the first stop
+/// sequence, or `max_tokens`. Shared by the OpenAI and Anthropic non-streaming
+/// handlers.
 fn collect_completion(
     engine: &Arc<EngineService>,
     ids: Vec<u32>,
@@ -544,12 +604,19 @@ fn collect_completion(
     stops: &[String],
 ) -> Generated {
     let prompt_tokens = ids.len();
-    let rx = engine.submit(ids, max_tokens, None, sampler);
+    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
     let mut tokens = Vec::new();
     let mut spec = None;
+    let mut hit_eos = false;
     for ev in rx {
         match ev {
             TokenEvent::Next(t) => {
+                // The scheduler emits EOS inclusively as the final token; drop it
+                // from the visible output and mark a natural stop.
+                if engine.eos_tokens.contains(&t) {
+                    hit_eos = true;
+                    break;
+                }
                 tokens.push(t);
                 if !stops.is_empty() {
                     let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
@@ -564,19 +631,25 @@ fn collect_completion(
             }
         }
     }
+    let completion_tokens = tokens.len();
     let mut text = engine.tokenizer.decode(&tokens).unwrap_or_default();
-    let stopped = match earliest_stop(&text, stops) {
-        Some(cut) => {
-            text.truncate(cut);
-            true
+    let finish = if hit_eos {
+        Finish::Eos
+    } else {
+        match matched_stop(&text, stops) {
+            Some(s) => {
+                let s = s.clone();
+                text.truncate(text.find(&s).unwrap_or(text.len()));
+                Finish::Stop(Some(s))
+            }
+            None => Finish::Length,
         }
-        None => false,
     };
     Generated {
         text,
-        stopped,
+        finish,
         prompt_tokens,
-        completion_tokens: tokens.len(),
+        completion_tokens,
         spec,
     }
 }
@@ -594,7 +667,11 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Ok(ids) => ids,
         Err(e) => return Response::json(400, error_json(&e)),
     };
-    let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    let requested = parsed.max_tokens.unwrap_or(engine.default_max_tokens);
+    let max_tokens = match fit_max_tokens(engine, ids.len(), requested) {
+        Ok(m) => m,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
@@ -611,7 +688,10 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             choices: vec![Choice {
                 index: 0,
                 message: RespMessage { role: "assistant", content: g.text },
-                finish_reason: if g.stopped { "stop" } else { "length" },
+                finish_reason: match g.finish {
+                    Finish::Length => "length",
+                    _ => "stop",
+                },
             }],
             usage: Usage {
                 prompt_tokens: g.prompt_tokens,
@@ -707,34 +787,81 @@ struct MessagesResponse {
     usage: AnthropicUsage,
 }
 
-fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
-    let parsed: MessagesRequest = match serde_json::from_slice(&req.body) {
-        Ok(r) => r,
-        Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
-    };
-    if parsed.messages.is_empty() {
-        return Response::json(400, error_json("messages must not be empty"));
-    }
+/// Anthropic error envelope: `{"type":"error","error":{"type","message"}}`.
+fn anthropic_error_json(message: &str) -> Vec<u8> {
+    format!(
+        r#"{{"type":"error","error":{{"type":"invalid_request_error","message":{message:?}}}}}"#
+    )
+    .into_bytes()
+}
 
-    // Fold `system` + messages into the shared chat template. The Anthropic
-    // `system` field becomes a leading system-role message.
-    let mut messages: Vec<ChatMessage> = Vec::with_capacity(parsed.messages.len() + 1);
-    if let Some(sys) = &parsed.system {
+/// Fold Anthropic `system` + `messages` into the rendered prompt string. The
+/// `system` field becomes a leading system-role message.
+fn anthropic_prompt(
+    engine: &EngineService,
+    system: &Option<AnthropicContent>,
+    msgs: &[AnthropicMessage],
+) -> String {
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(msgs.len() + 1);
+    if let Some(sys) = system {
         let text = sys.to_text();
         if !text.is_empty() {
             messages.push(ChatMessage { role: "system".into(), content: text });
         }
     }
-    for m in &parsed.messages {
+    for m in msgs {
         messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
     }
-    let prompt = engine.chat_template.apply(&messages);
+    engine.chat_template.apply(&messages)
+}
+
+#[derive(Deserialize)]
+struct CountTokensRequest {
+    messages: Vec<AnthropicMessage>,
+    #[serde(default)]
+    system: Option<AnthropicContent>,
+}
+
+/// `POST /v1/messages/count_tokens`: report how many input tokens the request
+/// would consume, without generating.
+fn handle_count_tokens(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: CountTokensRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, anthropic_error_json(&format!("invalid request: {e}"))),
+    };
+    if parsed.messages.is_empty() {
+        return Response::json(400, anthropic_error_json("messages must not be empty"));
+    }
+    let prompt = anthropic_prompt(engine, &parsed.system, &parsed.messages);
+    match engine.encode_prompt(&prompt) {
+        Ok(ids) => {
+            let body = serde_json::json!({ "input_tokens": ids.len() });
+            Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
+        }
+        Err(e) => Response::json(400, anthropic_error_json(&e)),
+    }
+}
+
+fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: MessagesRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, anthropic_error_json(&format!("invalid request: {e}"))),
+    };
+    if parsed.messages.is_empty() {
+        return Response::json(400, anthropic_error_json("messages must not be empty"));
+    }
+
+    let prompt = anthropic_prompt(engine, &parsed.system, &parsed.messages);
     let ids = match engine.encode_prompt(&prompt) {
         Ok(ids) => ids,
-        Err(e) => return Response::json(400, error_json(&e)),
+        Err(e) => return Response::json(400, anthropic_error_json(&e)),
     };
 
-    let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    let requested = parsed.max_tokens.unwrap_or(engine.default_max_tokens);
+    let max_tokens = match fit_max_tokens(engine, ids.len(), requested) {
+        Ok(m) => m,
+        Err(e) => return Response::json(400, anthropic_error_json(&e)),
+    };
     let id = engine.next_id.load(Ordering::Relaxed);
     let sampler = match parsed.temperature {
         Some(t) if t > 0.0 => Sampler::TopPK {
@@ -764,9 +891,15 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
         role: "assistant",
         model,
         content: vec![TextBlock { kind: "text", text: g.text }],
-        // No EOS handling on this path, so natural end == hit max_tokens.
-        stop_reason: if g.stopped { "stop_sequence" } else { "max_tokens" },
-        stop_sequence: None,
+        stop_reason: match g.finish {
+            Finish::Eos => "end_turn",
+            Finish::Stop(_) => "stop_sequence",
+            Finish::Length => "max_tokens",
+        },
+        stop_sequence: match g.finish {
+            Finish::Stop(s) => s,
+            _ => None,
+        },
         usage: AnthropicUsage {
             input_tokens: g.prompt_tokens,
             output_tokens: g.completion_tokens,
@@ -814,6 +947,7 @@ fn stream_messages(
             "index": 0,
             "content_block": {"type": "text", "text": ""},
         }))?;
+        send(w, "ping", serde_json::json!({"type": "ping"}))?;
 
         let mut completion_tokens = 0usize;
         // Stop-aware emission mirrors stream_chat: accumulate ids, re-decode, and
@@ -822,10 +956,15 @@ fn stream_messages(
         let mut sent_chars = 0usize;
         let mut stop_reason = "max_tokens";
         let mut stop_sequence: Option<String> = None;
-        let rx = engine.submit(ids, max_tokens, None, sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
+                    // EOS is emitted inclusively; end the turn without showing it.
+                    if engine.eos_tokens.contains(&t) {
+                        stop_reason = "end_turn";
+                        break;
+                    }
                     completion_tokens += 1;
                     acc_ids.push(t);
                     let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
@@ -841,9 +980,9 @@ fn stream_messages(
                             "delta": {"type": "text_delta", "text": delta},
                         }))?;
                     }
-                    if let Some(c) = cut {
+                    if cut.is_some() {
                         stop_reason = "stop_sequence";
-                        stop_sequence = stops.iter().find(|s| full[..].find(s.as_str()) == Some(c)).cloned();
+                        stop_sequence = matched_stop(&full, &stops).cloned();
                         break;
                     }
                 }
@@ -901,10 +1040,15 @@ fn stream_chat(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, None, sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
+                    // EOS is emitted inclusively; stop without showing it.
+                    if engine.eos_tokens.contains(&t) {
+                        finish = "stop";
+                        break;
+                    }
                     completion_tokens += 1;
                     if stops.is_empty() {
                         // Fast path: emit each token's piece directly.

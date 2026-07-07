@@ -138,7 +138,7 @@ fn speculative_scheduler_matches_greedy_across_requests() {
     // max_batch = 2 forces staggered admission while speculating.
     let mut sched = BatchScheduler::with_speculative(&target, &draft, 2, 4);
     for (id, prompt, n) in &requests {
-        sched.submit(*id, prompt.clone(), *n, None).unwrap();
+        sched.submit(*id, prompt.clone(), *n, vec![]).unwrap();
     }
     let mut results = sched.run().unwrap();
     results.sort_by_key(|f| f.id);
@@ -162,7 +162,7 @@ fn speculative_scheduler_respects_eos() {
     let eos = two[1];
 
     let mut sched = BatchScheduler::with_speculative(&target, &draft, 4, 4);
-    sched.submit(1, vec![1, 2], 10, Some(eos)).unwrap();
+    sched.submit(1, vec![1, 2], 10, vec![eos]).unwrap();
     let results = sched.run().unwrap();
 
     assert_eq!(results.len(), 1);

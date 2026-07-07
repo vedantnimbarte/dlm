@@ -34,7 +34,8 @@ struct Pending {
     id: u64,
     prompt: Vec<u32>,
     max_new_tokens: usize,
-    eos: Option<u32>,
+    /// Stop when any of these token ids is produced; empty means run to length.
+    eos: Vec<u32>,
     /// Sampler for the plain (non-speculative) path. Ignored when the scheduler
     /// speculates — speculative decoding is greedy-exact by construction.
     sampler: Sampler,
@@ -52,7 +53,7 @@ struct Active<'a, K: ComputeKernel> {
     id: u64,
     decoder: Decoder<'a, K>,
     remaining: usize,
-    eos: Option<u32>,
+    eos: Vec<u32>,
 }
 
 /// A completed request.
@@ -152,13 +153,14 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         (self.proposed, self.accepted)
     }
 
-    /// Queue a request (greedy decoding). Errors on an empty prompt.
+    /// Queue a request (greedy decoding). Errors on an empty prompt. `eos` lists
+    /// the token ids that stop generation (empty = run to length).
     pub fn submit(
         &mut self,
         id: u64,
         prompt: Vec<u32>,
         max_new_tokens: usize,
-        eos: Option<u32>,
+        eos: Vec<u32>,
     ) -> Result<()> {
         self.submit_sampled(id, prompt, max_new_tokens, eos, Sampler::Greedy)
     }
@@ -171,7 +173,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         id: u64,
         prompt: Vec<u32>,
         max_new_tokens: usize,
-        eos: Option<u32>,
+        eos: Vec<u32>,
         sampler: Sampler,
     ) -> Result<()> {
         if prompt.is_empty() {
@@ -250,7 +252,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             for token in emitted {
                 tick.produced.push((a.id, token));
                 a.remaining -= 1;
-                if a.remaining == 0 || Some(token) == a.eos {
+                if a.remaining == 0 || a.eos.contains(&token) {
                     done = true;
                     break;
                 }
