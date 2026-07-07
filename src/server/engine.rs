@@ -235,7 +235,13 @@ fn engine_loop<K: ComputeKernel>(
             Ok(tick) => {
                 for (id, token) in tick.produced {
                     if let Some(s) = sinks.get(&id) {
-                        let _ = s.send(TokenEvent::Next(token));
+                        // A failed send means the client dropped the receiver
+                        // (disconnected or finished early); stop wasting compute
+                        // on it by retiring the slot.
+                        if s.send(TokenEvent::Next(token)).is_err() {
+                            sinks.remove(&id);
+                            sched.abort(id);
+                        }
                     }
                 }
                 for id in tick.finished {

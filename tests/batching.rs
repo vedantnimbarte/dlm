@@ -127,3 +127,17 @@ fn eos_stops_a_request_early() {
     assert_eq!(*results[0].tokens.last().unwrap(), first);
     assert!(results[0].tokens.len() < 10);
 }
+
+#[test]
+fn abort_retires_an_active_request() {
+    let generator = build_generator();
+    let mut sched = BatchScheduler::new(&generator, 4);
+    sched.submit(1, vec![1], 100, vec![]).unwrap();
+    sched.step().unwrap(); // admit + produce one token
+    assert_eq!(sched.active_len(), 1);
+
+    assert!(sched.abort(1)); // client gone → retire the slot
+    assert_eq!(sched.active_len(), 0);
+    assert!(!sched.has_work());
+    assert!(!sched.abort(1)); // already gone → no-op
+}

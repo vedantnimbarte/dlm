@@ -189,6 +189,16 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         Ok(())
     }
 
+    /// Abandon a request (e.g. the client disconnected): drop it from the
+    /// pending queue and retire its in-flight slot, freeing its KV state. No-op
+    /// if the id is unknown. Returns true if anything was removed.
+    pub fn abort(&mut self, id: u64) -> bool {
+        let before = self.pending.len() + self.active.len();
+        self.pending.retain(|p| p.id != id);
+        self.active.retain(|a| a.id != id);
+        before != self.pending.len() + self.active.len()
+    }
+
     /// Whether any request is pending or in flight.
     pub fn has_work(&self) -> bool {
         !self.pending.is_empty() || !self.active.is_empty()
