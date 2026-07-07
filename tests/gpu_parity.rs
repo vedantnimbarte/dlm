@@ -10,7 +10,21 @@
 #![cfg(feature = "cuda-kernels")]
 
 use dlm::cache::{KvCacheConfig, PagedKvCache};
-use dlm::forward::{BlockConfig, CpuKernel, ForwardOrchestrator, GpuKernel, LayerTensors};
+use dlm::forward::{
+    BlockConfig, ComputeKernel, CpuKernel, ForwardOrchestrator, GpuKernel, KvLayerCache,
+    LayerSource, LayerTensors, StreamingGpuKernel,
+};
+
+/// An in-memory layer source for the streaming GPU kernel.
+struct VecSource(Vec<LayerTensors>);
+impl LayerSource for VecSource {
+    fn num_layers(&self) -> u32 {
+        self.0.len() as u32
+    }
+    fn load_layer(&self, layer: u32) -> dlm::Result<LayerTensors> {
+        Ok(self.0[layer as usize].clone())
+    }
+}
 
 /// Deterministic SplitMix64 for reproducible synthetic weights.
 struct Rng(u64);
@@ -107,4 +121,60 @@ fn gpu_run_block_matches_cpu() {
             assert_eq!(orch_cpu.layer_kv_len(l), orch_gpu.layer_kv_len(l));
         }
     }
+}
+
+fn small_cfg() -> BlockConfig {
+    BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+    }
+}
+
+#[test]
+fn streaming_gpu_matches_resident() {
+    let cfg = small_cfg();
+    let num_layers = 6u32;
+    let layers = random_layers(&cfg, num_layers, 0xBEEF);
+
+    // Resident GPU (all layers) vs streaming GPU (window 2 of 6, prefetch on).
+    let resident = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers), 64, 2).unwrap();
+
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_res = ForwardOrchestrator::new(resident, PagedKvCache::new(kv_cfg, 32), false);
+    let mut orch_str = ForwardOrchestrator::new(streaming, PagedKvCache::new(kv_cfg, 32), false);
+
+    let mut h_res: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.02 - 0.3).collect();
+    let mut h_str = h_res.clone();
+    for step in 0..4 {
+        orch_res.decode_token(&mut h_res).unwrap();
+        orch_str.decode_token(&mut h_str).unwrap();
+        let max_diff = h_res.iter().zip(&h_str).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        // Same kernel + weights, only the *timing* of the upload differs.
+        assert!(max_diff < 1e-4, "step {step}: streaming GPU diverged by {max_diff}");
+    }
+}
+
+#[test]
+fn streaming_gpu_worker_prefetches() {
+    let cfg = small_cfg();
+    let k = StreamingGpuKernel::new(cfg, VecSource(random_layers(&cfg, 4, 3)), 64, 4).unwrap();
+    let mut h: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.01).collect();
+    let mut kv = KvLayerCache::new(cfg.kv_dim());
+
+    // Compute layer 0 → requests a prefetch of layer 1; nothing else competes, so
+    // the worker uploads it uncontended.
+    k.run_block(0, &mut h, &mut kv, 0).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(k.stats().prefetched >= 1, "GPU worker should prefetch a layer: {:?}", k.stats());
 }
