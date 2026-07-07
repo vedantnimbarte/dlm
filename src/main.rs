@@ -788,6 +788,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
     println!("  openai     : POST /v1/chat/completions (stream), GET /v1/models");
     println!("  anthropic  : POST /v1/messages (stream), POST /v1/messages/count_tokens");
+    println!("  ops        : GET /metrics (Prometheus), GET /health");
     if eos_tokens.is_empty() {
         println!("  stop       : max_tokens only (no eos_token_id in config; pass --eos-token)");
     } else {

@@ -95,6 +95,15 @@ fn post(addr: SocketAddr, path: &str, body: &str) -> String {
     resp
 }
 
+fn get(addr: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let raw = format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(raw.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    resp
+}
+
 #[test]
 fn non_streaming_chat_through_batched_engine() {
     let addr = start_server();
@@ -265,6 +274,24 @@ fn messages_errors_use_anthropic_shape() {
     assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
     assert!(resp.contains(r#""type":"error""#), "{resp}");
     assert!(resp.contains(r#""invalid_request_error""#), "{resp}");
+}
+
+#[test]
+fn metrics_endpoint_counts_completions() {
+    let addr = start_server();
+    // Baseline: zero requests before any traffic.
+    let m0 = get(addr, "/metrics");
+    assert!(m0.contains("dlm_requests_total 0"), "{m0}");
+    assert!(m0.contains("# TYPE dlm_requests_total counter"), "{m0}");
+
+    // Drive one completion, then the counters should advance.
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4}"#;
+    let resp = post(addr, "/v1/chat/completions", body);
+    assert!(resp.contains(r#""completion_tokens":4"#), "{resp}");
+
+    let m1 = get(addr, "/metrics");
+    assert!(m1.contains("dlm_requests_total 1"), "{m1}");
+    assert!(m1.contains("dlm_completion_tokens_total 4"), "{m1}");
 }
 
 #[test]
