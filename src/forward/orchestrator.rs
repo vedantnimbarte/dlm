@@ -23,6 +23,23 @@ use crate::forward::kernel::ComputeKernel;
 /// The single sequence this orchestrator drives (budget accounting id).
 const SEQ_ID: u64 = 0;
 
+/// A cloneable snapshot of an orchestrator's KV history at a token boundary, so
+/// another sequence that shares this prefix can resume from it instead of
+/// re-running the prefix through the model. The KV tensors live here (not in the
+/// kernel), so a clone fully captures the sequence state.
+#[derive(Debug, Clone)]
+pub struct KvSnapshot {
+    kv_layers: Vec<KvLayerCache>,
+    position: usize,
+}
+
+impl KvSnapshot {
+    /// Number of tokens already decoded into this snapshot.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+}
+
 /// Drives one sequence's autoregressive forward pass over a compute kernel.
 pub struct ForwardOrchestrator<K: ComputeKernel> {
     kernel: K,
@@ -48,6 +65,40 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
             budget,
             position: 0,
         }
+    }
+
+    /// Snapshot the current KV history so another sequence sharing this prefix
+    /// can [`resume`](Self::resume) from it.
+    pub fn snapshot(&self) -> KvSnapshot {
+        KvSnapshot {
+            kv_layers: self.kv_layers.clone(),
+            position: self.position,
+        }
+    }
+
+    /// Build an orchestrator resuming from `snapshot`'s KV history and position,
+    /// reserving matching budget from `budget`. The caller prefills any suffix
+    /// tokens that follow the snapshot via [`decode_token`](Self::decode_token).
+    /// Errors if `snapshot` was taken on a differently-shaped model.
+    pub fn resume(kernel: K, mut budget: PagedKvCache, snapshot: KvSnapshot) -> Result<Self> {
+        if snapshot.kv_layers.len() != kernel.num_layers() as usize {
+            return Err(DlmError::InvalidConfig(format!(
+                "snapshot has {} layers but the model has {}",
+                snapshot.kv_layers.len(),
+                kernel.num_layers()
+            )));
+        }
+        // Reserve KV budget matching the tokens already in the snapshot so the
+        // pool accounting stays consistent with the restored history.
+        if snapshot.position > 0 {
+            budget.append_tokens(SEQ_ID, snapshot.position as u64)?;
+        }
+        Ok(Self {
+            kernel,
+            kv_layers: snapshot.kv_layers,
+            budget,
+            position: snapshot.position,
+        })
     }
 
     /// Advance the sequence by one token, updating `hidden` in place through

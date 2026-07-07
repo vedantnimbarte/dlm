@@ -20,7 +20,7 @@ pub use cpu::{decode_block, BlockConfig, CpuKernel, KvLayerCache, LayerTensors};
 pub use gpu::GpuKernel;
 pub use kernel::{ComputeKernel, StubKernel};
 pub use multigpu::PipelineParallelKernel;
-pub use orchestrator::ForwardOrchestrator;
+pub use orchestrator::{ForwardOrchestrator, KvSnapshot};
 pub use streaming::{LayerSource, StreamStats, StreamingKernel};
 #[cfg(feature = "cuda-kernels")]
 pub use streaming_gpu::StreamingGpuKernel;

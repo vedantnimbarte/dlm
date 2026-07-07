@@ -390,9 +390,47 @@ impl<K: ComputeKernel> Generator<K> {
             seen: prompt.iter().copied().collect(),
         })
     }
+
+    /// Resume generation from a prior session's [`KvSnapshot`], prefilling only
+    /// the `suffix` tokens that follow the snapshotted prefix. The result is
+    /// identical to [`start_session`](Self::start_session) on the full
+    /// `prefix + suffix` prompt, but skips re-running the shared prefix — the
+    /// basis for cross-request prefix caching. `suffix` must be non-empty (the
+    /// session needs a last hidden state to produce the first token).
+    pub fn resume_session(
+        &self,
+        snapshot: crate::forward::KvSnapshot,
+        suffix: &[u32],
+        sampler: Sampler,
+    ) -> Result<GenerationSession<'_, K>> {
+        if suffix.is_empty() {
+            return Err(DlmError::InvalidConfig("resume suffix must be non-empty".into()));
+        }
+        let budget = PagedKvCache::new(self.kv_config, self.kv_total_blocks);
+        let mut orchestrator = ForwardOrchestrator::resume(&self.kernel, budget, snapshot)?;
+        let mut hidden = vec![0.0f32; self.hidden_size];
+        for &token in suffix {
+            hidden = self.embed(token)?;
+            orchestrator.decode_token(&mut hidden)?;
+        }
+        Ok(GenerationSession {
+            generator: self,
+            orchestrator,
+            last_hidden: hidden,
+            rng: SplitMix64::new(sampler.seed()),
+            sampler,
+        })
+    }
 }
 
 impl<K: ComputeKernel> GenerationSession<'_, K> {
+    /// Snapshot this session's KV history (e.g. right after prefilling a prompt)
+    /// so a later prompt sharing this prefix can
+    /// [`resume`](Generator::resume_session) from it.
+    pub fn snapshot(&self) -> crate::forward::KvSnapshot {
+        self.orchestrator.snapshot()
+    }
+
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
         let mut logits = self.generator.logits(&self.last_hidden);
@@ -531,6 +569,72 @@ mod tests {
         let base = gen.generate(&[0], &cfg(1.0)).unwrap();
         let penalized = gen.generate(&[0], &cfg(10.0)).unwrap();
         assert_ne!(base, penalized, "repetition_penalty should change the sequence");
+    }
+
+    /// A small random-weight generator with real attention, so output depends
+    /// on the KV history (unlike the zero-weight counting model).
+    fn attention_generator() -> Generator<CpuKernel> {
+        let (vocab, hidden) = (16usize, 16usize);
+        let cfg = BlockConfig {
+            hidden_size: hidden,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 4,
+            intermediate_size: 32,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+        };
+        let mut r = SplitMix64::new(42);
+        let mut vec = |n: usize| -> Vec<f32> {
+            (0..n).map(|_| r.next_f32() * 0.1 - 0.05).collect()
+        };
+        let layers = vec![LayerTensors {
+            q_proj: vec(cfg.q_dim() * hidden),
+            k_proj: vec(cfg.kv_dim() * hidden),
+            v_proj: vec(cfg.kv_dim() * hidden),
+            o_proj: vec(hidden * cfg.q_dim()),
+            gate_proj: vec(cfg.intermediate_size * hidden),
+            up_proj: vec(cfg.intermediate_size * hidden),
+            down_proj: vec(hidden * cfg.intermediate_size),
+            input_layernorm: std::vec::from_elem(1.0, hidden),
+            post_attention_layernorm: std::vec::from_elem(1.0, hidden),
+        }];
+        let kernel = CpuKernel::new(cfg, layers).unwrap();
+        Generator::new(
+            kernel,
+            vec(vocab * hidden),
+            std::vec::from_elem(1.0, hidden),
+            vec(vocab * hidden),
+            vocab,
+            1e-5,
+            KvCacheConfig { num_layers: 1, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+            64,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resume_from_snapshot_matches_full_prefill() {
+        let gen = attention_generator();
+        let prefix = [1u32, 2, 3];
+        let suffix = [4u32, 5];
+        let full_prompt = [1u32, 2, 3, 4, 5];
+        let n = 6;
+
+        // Full prefill of the whole prompt.
+        let mut full = gen.start_session(&full_prompt, Sampler::Greedy).unwrap();
+        let tokens_full: Vec<u32> = (0..n).map(|_| full.step().unwrap()).collect();
+
+        // Snapshot after the prefix, resume prefilling only the suffix.
+        let prefix_sess = gen.start_session(&prefix, Sampler::Greedy).unwrap();
+        let snap = prefix_sess.snapshot();
+        assert_eq!(snap.position(), prefix.len());
+        let mut resumed = gen.resume_session(snap, &suffix, Sampler::Greedy).unwrap();
+        let tokens_resumed: Vec<u32> = (0..n).map(|_| resumed.step().unwrap()).collect();
+
+        // Resuming from the shared prefix is bit-for-bit identical to prefilling
+        // the full prompt — the correctness property a prefix cache relies on.
+        assert_eq!(tokens_full, tokens_resumed);
     }
 
     #[test]
