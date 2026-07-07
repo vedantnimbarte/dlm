@@ -24,17 +24,23 @@ arm64) and installs it to `~/.local/bin`. No clone, no build, no Rust toolchain:
 curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/Flip/main/install.sh | sh
 ```
 
+On **Linux x86-64 with an NVIDIA GPU** the installer picks the **CUDA (GPU)
+build** automatically, and it runs on the GPU by default — pass `--device cpu` to
+any command to force CPU. Everywhere else it installs the portable **CPU build**.
+Force the CPU build with `FLIP_CPU=1 curl … | sh`. (The GPU build links the CUDA
+runtime; if it can't load, the installer falls back to the CPU build on its own.)
+
 Then:
 
 ```sh
-flip doctor          # check your machine + run a self-test
-flip --help          # subcommands: serve, generate, profile, tokenize, doctor
+flip search llama-3.2   # find models on the Hugging Face hub
+flip pull <org/model>   # download one locally (no hf CLI needed)
+flip doctor             # check your machine + run a self-test
+flip --help             # subcommands: search, pull, serve, generate, profile, tokenize, doctor
 ```
 
-Set `FLIP_INSTALL_DIR` to change the location. Prefer building from source, or
-want the GPU build? See [Build & run locally](#build--run-locally) and
-[Building for GPU](#building-for-gpu-nvidia--amd) — the prebuilt binary is the CPU
-build (runs anywhere); GPU support (`--features cuda-kernels`) is source-only.
+Set `FLIP_INSTALL_DIR` to change the location. To build the GPU binary yourself,
+see [Building for GPU](#building-for-gpu-nvidia--amd).
 
 Rust users can also `cargo install --git https://github.com/vedantnimbarte/Flip`
 (builds from source).
@@ -154,6 +160,8 @@ The binary exposes these subcommands:
 
 ```bash
 cargo run -- --help          # top-level help
+cargo run -- search llama    # search the Hugging Face hub for models
+cargo run -- pull <org/model># download a model locally (via curl, no hf CLI)
 cargo run -- profile         # profile a sample 70B-class model (no GPU needed)
 cargo run -- serve --help    # full serve flag list (specs §4)
 cargo run -- generate --help # end-to-end CPU generation on a synthetic model
@@ -257,12 +265,14 @@ otherwise a raw byte tokenizer:
 cargo run -- generate --model-path /path/to/small-model --text "Hello"
 ```
 
-By default generation runs on the CPU. On a `cuda-kernels` build, `--device gpu`
-runs the same model through `GpuKernel` instead (the CLI errors with a clear
-message if the binary wasn't built with the feature):
+On a `cuda-kernels` build generation runs on the **GPU by default** (`GpuKernel`);
+`--device cpu` forces the CPU kernel, and if no GPU is usable flip warns and falls
+back to CPU on its own. A CPU-only build defaults to CPU, and an explicit
+`--device gpu` there errors with a clear message:
 
 ```bash
-cargo run --features cuda-kernels -- generate --model-path /path/to/small-model --device gpu
+cargo run --features cuda-kernels -- generate --model-path /path/to/small-model              # GPU
+cargo run --features cuda-kernels -- generate --model-path /path/to/small-model --device cpu # force CPU
 ```
 
 The standalone `tokenize` subcommand shows the encoder round-trip:

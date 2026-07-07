@@ -32,7 +32,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       # Builds the default (CPU) feature set — runs on any machine with no GPU
-      # toolchain. GPU builds (--features cuda-kernels) are source-only.
+      # toolchain.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: flip
@@ -40,5 +40,30 @@ jobs:
           # Version-independent asset name so install.sh can use the
           # `releases/latest/download/` redirect.
           archive: flip-$target
+          tar: unix
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # GPU (CUDA) build — Linux x86-64 only. install.sh downloads this
+  # `-cuda` asset when it detects an NVIDIA GPU. Building needs nvcc (to compile
+  # src/gpu/kernels.cu) but no GPU; the binary links the CUDA runtime, so it only
+  # runs on machines with the CUDA runtime + an NVIDIA driver.
+  build-cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.5.0"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: flip
+          target: x86_64-unknown-linux-gnu
+          features: cuda-kernels
+          archive: flip-$target-cuda
           tar: unix
           token: ${{ secrets.GITHUB_TOKEN }}

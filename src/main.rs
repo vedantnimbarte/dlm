@@ -284,13 +284,14 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         }
     }
 
-    println!("device       : {:?}", args.device);
+    let device = resolve_device(args.device);
+    println!("device       : {device:?}");
     if let Some(text) = &args.text {
         println!("prompt text  : {text:?}");
     }
     println!("prompt ids   : {prompt_ids:?}");
 
-    generate_on_device(parts, args.device, &prompt_ids, &gen_cfg, tokenizer.as_ref())?;
+    generate_on_device(parts, device, &prompt_ids, &gen_cfg, tokenizer.as_ref())?;
 
     if is_synthetic {
         println!();
@@ -504,13 +505,22 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             Ok(())
         }
         DistributedMode::Standalone | DistributedMode::Master => {
-            // Multi-GPU is exclusive; --stream and --device may combine
-            // (--stream --device gpu = stream a window through VRAM).
-            if !args.multi_gpu_ids.is_empty() && (args.stream || args.device == Device::Gpu) {
+            // Multi-GPU already implies GPUs and overrides --device, so only
+            // --stream conflicts with it.
+            if !args.multi_gpu_ids.is_empty() && args.stream {
                 return Err(FlipError::InvalidConfig(
-                    "--multi-gpu-ids cannot combine with --stream or --device gpu".into(),
+                    "--multi-gpu-ids cannot combine with --stream".into(),
                 ));
             }
+
+            // Resolve the compute device once: honor an explicit CPU choice, and
+            // for GPU fall back to CPU with a warning if no device is usable.
+            // Multi-GPU ignores this (it drives the listed GPUs directly).
+            let device = if args.multi_gpu_ids.is_empty() {
+                resolve_device(args.device)
+            } else {
+                args.device
+            };
 
             // Streaming path: keep only a window of layers resident and stream the
             // rest from disk, so a model can exceed the resident budget. Streams to
@@ -523,12 +533,12 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 }
                 let window = resident_window(&config, &args);
                 println!();
-                let dest = if args.device == Device::Gpu { "VRAM" } else { "host RAM" };
+                let dest = if device == Device::Gpu { "VRAM" } else { "host RAM" };
                 println!(
                     "streaming    : {window} / {} layers resident in {dest}, rest streamed from disk",
                     config.num_layers,
                 );
-                if args.device == Device::Gpu {
+                if device == Device::Gpu {
                     return serve_streaming_gpu(store, &config, &args, window, &listen);
                 }
                 let generator =
@@ -575,7 +585,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     .map(|p| p.into_pipeline_parallel_generator(&ids[..1]))
                     .transpose()?;
                 start_batched_server(generator, draft, &args, &config, &listen)
-            } else if args.device == Device::Gpu {
+            } else if device == Device::Gpu {
                 serve_on_gpu(parts, draft_parts, &args, &config, &listen)
             } else {
                 let generator = parts.into_cpu_generator()?;
@@ -583,6 +593,34 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 start_batched_server(generator, draft, &args, &config, &listen)
             }
         }
+    }
+}
+
+/// Resolve the effective compute device. `cpu` is honored as-is. `gpu` is
+/// honored only if the binary was built with the device kernels AND a GPU
+/// actually responds; otherwise flip warns and falls back to CPU so a run never
+/// dies just because no GPU is present. On a CPU-only build, an explicit
+/// `--device gpu` passes through and the downstream `not(cuda-kernels)` arm
+/// reports the clearer "requires --features cuda-kernels" error.
+fn resolve_device(requested: Device) -> Device {
+    if requested == Device::Cpu {
+        return Device::Cpu;
+    }
+    #[cfg(feature = "cuda-kernels")]
+    {
+        if gpu::mem_get_info().is_ok() {
+            Device::Gpu
+        } else {
+            eprintln!(
+                "warning: --device gpu requested but no usable GPU found; \
+                 running on CPU (pass --device cpu to silence)"
+            );
+            Device::Cpu
+        }
+    }
+    #[cfg(not(feature = "cuda-kernels"))]
+    {
+        Device::Gpu
     }
 }
 

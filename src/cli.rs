@@ -73,6 +73,18 @@ pub enum Device {
     Gpu,
 }
 
+impl Device {
+    /// Compile-time default device: GPU when the binary is built with the device
+    /// compute kernels (`--features cuda-kernels`), else CPU. So a GPU build runs
+    /// on the GPU by default and a CPU-only build never surprises the user by
+    /// asking for hardware it can't drive.
+    pub const DEFAULT: Device = if cfg!(feature = "cuda-kernels") {
+        Device::Gpu
+    } else {
+        Device::Cpu
+    };
+}
+
 /// On-disk weight precision (`--quant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum QuantArg {
@@ -139,9 +151,11 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     pub multi_gpu_ids: Vec<u32>,
 
-    /// Compute device for the serving engine. `gpu` requires a `cuda-kernels`
-    /// build. Ignored when `--multi-gpu-ids` or `--stream` is set.
-    #[arg(long, value_enum, default_value_t = Device::Cpu)]
+    /// Compute device for the serving engine. Defaults to `gpu` on a
+    /// `cuda-kernels` build (else `cpu`); pass `--device cpu` to force CPU.
+    /// Ignored when `--multi-gpu-ids` is set. If `gpu` is chosen but no device is
+    /// usable, flip warns and falls back to CPU.
+    #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
 
     /// Stream transformer layers from disk instead of holding them all resident,
@@ -261,8 +275,10 @@ pub struct GenerateArgs {
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
 
-    /// Compute device. `gpu` requires a `cuda-kernels` build.
-    #[arg(long, value_enum, default_value_t = Device::Cpu)]
+    /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`);
+    /// pass `--device cpu` to force CPU. Falls back to CPU with a warning if no
+    /// GPU is usable.
+    #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
 }
 
