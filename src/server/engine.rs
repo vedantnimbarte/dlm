@@ -309,10 +309,12 @@ fn enqueue<K: ComputeKernel>(
 
 // ── OpenAI request/response shapes ──────────────────────────────────────────
 
+/// A chat message (`role` + `content`), shared by the local and distributed
+/// serving paths.
 #[derive(Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
 /// OpenAI `stop`: either a single string or a list of them.
@@ -503,7 +505,7 @@ impl ChatTemplate {
     }
 
     /// Render `messages` into the prompt string for this template.
-    fn apply(&self, messages: &[ChatMessage]) -> String {
+    pub fn apply(&self, messages: &[ChatMessage]) -> String {
         let mut p = String::new();
         match self {
             ChatTemplate::Plain => {

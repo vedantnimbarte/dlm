@@ -368,6 +368,19 @@ fn run_generation<K: ComputeKernel>(
     Ok(())
 }
 
+/// Load the tokenizer a served model ships (HF `tokenizer.json` or GPT-2
+/// `vocab.json`+`merges.txt`), falling back to a raw byte tokenizer.
+fn serve_tokenizer(model_path: &Path) -> Result<BpeTokenizer> {
+    let has_hf = model_path.join("tokenizer.json").exists();
+    let has_gpt2 =
+        model_path.join("vocab.json").exists() && model_path.join("merges.txt").exists();
+    if has_hf || has_gpt2 {
+        BpeTokenizer::from_dir(model_path)
+    } else {
+        Ok(BpeTokenizer::bytes_only())
+    }
+}
+
 /// Pick a tokenizer for `generate`: explicit `--tokenizer`, else the model
 /// directory if it ships one, else a raw byte tokenizer.
 fn resolve_tokenizer(args: &GenerateArgs) -> Result<BpeTokenizer> {
@@ -527,6 +540,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             println!("worker node  : listening on {listen} ({} layers)", config.num_layers);
             worker.serve(listener)?; // blocks
             Ok(())
+        }
+        DistributedMode::Master if !args.worker_nodes.is_empty() => {
+            serve_distributed(store, &config, &args, &listen)
         }
         DistributedMode::Standalone | DistributedMode::Master => {
             // Multi-GPU already implies GPUs and overrides --device, so only
@@ -718,6 +734,70 @@ fn serve_streaming_gpu(
     ))
 }
 
+/// Master mode: partition the model's layers across the configured worker nodes
+/// and serve a (non-streaming, greedy) OpenAI-compatible endpoint backed by a
+/// pipeline-parallel [`Coordinator`](dlm::distributed::Coordinator). A shard
+/// whose worker is unreachable falls back to running locally.
+fn serve_distributed(
+    store: MmapStore,
+    config: &ModelConfig,
+    args: &ServeArgs,
+    listen: &str,
+) -> Result<()> {
+    let parts = dlm::loader::load_model_parts(&store, config, args.context_length)?;
+    let shards = dlm::distributed::partition_layers(
+        config.num_layers as usize,
+        args.worker_nodes.len(),
+    );
+    let routes: Vec<dlm::distributed::ShardRoute> = shards
+        .iter()
+        .zip(&args.worker_nodes)
+        .map(|(shard, addr)| dlm::distributed::ShardRoute {
+            shard: *shard,
+            worker_addr: Some(addr.clone()),
+        })
+        .collect();
+
+    let coordinator = dlm::distributed::Coordinator::new(
+        parts.cfg,
+        parts.layers,
+        parts.embedding,
+        parts.final_norm,
+        parts.lm_head,
+        config.vocab_size as usize,
+        routes,
+    )?;
+
+    let template = dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
+        DlmError::InvalidConfig(format!(
+            "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
+            args.chat_template
+        ))
+    })?;
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let engine = std::sync::Arc::new(dlm::server::DistributedEngine::new(
+        coordinator,
+        serve_tokenizer(&args.model_path)?,
+        template,
+        config.vocab_size as usize,
+        "dlm",
+        128,
+        created,
+    ));
+
+    let server = dlm::server::HttpServer::bind(listen)?;
+    println!();
+    println!("serving      : distributed (pipeline) API on http://{listen}");
+    println!("  master     : {} shard(s) across {} worker(s)", shards.len(), args.worker_nodes.len());
+    println!("  endpoints  : POST /v1/chat/completions (non-streaming, greedy), GET /v1/models");
+    println!("  note       : distributed mode trades streaming/sampling/batching for");
+    println!("               spanning the model across nodes; a dead worker runs locally.");
+    server.serve(dlm::server::distributed::router(engine)) // blocks
+}
+
 /// Build the batched (optionally speculative) streaming engine over any compute
 /// kernel `K` and serve the OpenAI-compatible API. Generic so the CPU and
 /// multi-GPU pipeline kernels share one server path.
@@ -728,14 +808,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     config: &ModelConfig,
     listen: &str,
 ) -> Result<()> {
-    let has_hf_tokenizer = args.model_path.join("tokenizer.json").exists();
-    let has_gpt2_tokenizer = args.model_path.join("vocab.json").exists()
-        && args.model_path.join("merges.txt").exists();
-    let tokenizer = if has_hf_tokenizer || has_gpt2_tokenizer {
-        BpeTokenizer::from_dir(&args.model_path)?
-    } else {
-        BpeTokenizer::bytes_only()
-    };
+    let tokenizer = serve_tokenizer(&args.model_path)?;
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -801,11 +874,6 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     }
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
-    }
-    if args.distributed_mode == DistributedMode::Master && !args.worker_nodes.is_empty() {
-        println!("  note       : master mode — {} worker(s) configured; the server", args.worker_nodes.len());
-        println!("               currently runs the model locally (distributed routing available");
-        println!("               via dlm::distributed::Coordinator).");
     }
     let router = dlm::server::engine::secured_router(engine, args.api_key.clone());
     server.serve(router) // blocks
