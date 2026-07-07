@@ -340,6 +340,8 @@ fn metrics_reports_streaming_stats() {
     assert!(m1.contains("dlm_stream_layer_prefetched_total"), "{m1}");
     // Window of 2 over 4 layers → evictions must have happened.
     assert!(m1.contains("dlm_stream_layer_evictions_total"), "{m1}");
+    // Window 2 → default prefetch depth 1 (clamped to window-1).
+    assert!(m1.contains("dlm_stream_prefetch_depth 1"), "{m1}");
 }
 
 #[test]
