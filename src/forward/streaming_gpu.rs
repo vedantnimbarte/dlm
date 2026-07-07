@@ -21,10 +21,13 @@
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
-use crate::forward::streaming::LayerSource;
+use crate::forward::streaming::{LayerSource, StreamStats};
 use crate::gpu::device::{synchronize, DeviceBuffer};
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 extern "C" {
     // Same device entry point as `forward::gpu` (see `src/gpu/kernels.cu`).
@@ -91,11 +94,17 @@ struct GpuKv {
     values: DeviceBuffer,
 }
 
-/// A bounded LRU of device-resident weight sets (front of `order` = least recent).
+/// A bounded LRU of device-resident weight sets (front of `order` = least
+/// recent). Weights are `Arc`ed so the compute thread can hold a layer for the
+/// kernel launch without keeping the cache locked, letting the prefetch worker
+/// upload the next layer in parallel.
 struct WeightLru {
     capacity: usize,
-    map: HashMap<u32, GpuWeights>,
+    map: HashMap<u32, Arc<GpuWeights>>,
     order: VecDeque<u32>,
+    /// Layers currently being loaded (compute or worker); de-dupes double loads.
+    loading: HashSet<u32>,
+    stats: StreamStats,
 }
 
 impl WeightLru {
@@ -104,6 +113,8 @@ impl WeightLru {
             capacity: capacity.max(1),
             map: HashMap::new(),
             order: VecDeque::new(),
+            loading: HashSet::new(),
+            stats: StreamStats::default(),
         }
     }
 
@@ -114,10 +125,11 @@ impl WeightLru {
         self.order.push_back(layer);
     }
 
-    fn insert(&mut self, layer: u32, weights: GpuWeights) {
+    fn insert(&mut self, layer: u32, weights: Arc<GpuWeights>) {
         while self.map.len() >= self.capacity {
             if let Some(evict) = self.order.pop_front() {
-                self.map.remove(&evict); // frees the VRAM buffers via Drop
+                self.map.remove(&evict); // frees the VRAM buffers via Drop (if last Arc)
+                self.stats.evictions += 1;
             } else {
                 break;
             }
@@ -127,21 +139,84 @@ impl WeightLru {
     }
 }
 
-/// A GPU [`ComputeKernel`] that streams a window of layer weights through VRAM
-/// while keeping per-layer KV resident.
-pub struct StreamingGpuKernel<S: LayerSource> {
+/// State shared between the compute thread and the prefetch worker.
+struct GpuShared<S: LayerSource> {
     cfg: BlockConfig,
     source: S,
+    weights: Mutex<WeightLru>,
+    ready: Condvar,
+}
+
+impl<S: LayerSource> GpuShared<S> {
+    /// Ensure `layer`'s weights are VRAM-resident, loading (host) + uploading
+    /// (VRAM) without holding the cache lock if absent. Same-layer callers
+    /// de-dupe on a `loading` set + condvar. `by_worker` tags a prefetch.
+    fn ensure(&self, layer: u32, by_worker: bool) -> Result<Arc<GpuWeights>> {
+        let mut cache = self.weights.lock().unwrap();
+        loop {
+            if let Some(w) = cache.map.get(&layer) {
+                let w = Arc::clone(w);
+                cache.touch(layer);
+                return Ok(w);
+            }
+            if cache.loading.contains(&layer) {
+                cache = self.ready.wait(cache).unwrap();
+                continue;
+            }
+            cache.loading.insert(layer);
+            drop(cache);
+            // Expensive part — host load (disk + dequant) then VRAM upload — runs
+            // with the lock released, so it overlaps the compute thread.
+            let uploaded = self
+                .source
+                .load_layer(layer)
+                .and_then(|t| GpuWeights::upload(&t).map(Arc::new));
+            let mut cache = self.weights.lock().unwrap();
+            cache.loading.remove(&layer);
+            self.ready.notify_all();
+            let w = uploaded?;
+            cache.insert(layer, Arc::clone(&w));
+            if by_worker {
+                cache.stats.prefetched += 1;
+            }
+            return Ok(w);
+        }
+    }
+
+    /// Compute-path fetch: records hit/miss then ensures residency.
+    fn fetch(&self, layer: u32) -> Result<Arc<GpuWeights>> {
+        {
+            let mut cache = self.weights.lock().unwrap();
+            if let Some(w) = cache.map.get(&layer) {
+                let w = Arc::clone(w);
+                cache.stats.hits += 1;
+                cache.touch(layer);
+                return Ok(w);
+            }
+            cache.stats.misses += 1;
+        }
+        self.ensure(layer, false)
+    }
+}
+
+/// A GPU [`ComputeKernel`] that streams a window of layer weights through VRAM
+/// while keeping per-layer KV resident. A background worker **uploads the next
+/// layer's weights to VRAM while the current block computes**, so the host load
+/// (disk read + dequant) is hidden behind GPU compute.
+pub struct StreamingGpuKernel<S: LayerSource + 'static> {
+    shared: Arc<GpuShared<S>>,
     num_layers: u32,
     kv_capacity_tokens: usize,
     kv: Vec<GpuKv>,
-    weights: Mutex<WeightLru>,
+    prefetch_tx: Option<Sender<u32>>,
+    worker: Option<JoinHandle<()>>,
+    stopped: Arc<AtomicBool>,
 }
 
-impl<S: LayerSource> StreamingGpuKernel<S> {
+impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     /// Build a streaming GPU kernel: allocate per-layer KV for up to
     /// `max_kv_tokens` positions and stream weights keeping at most
-    /// `resident_layers` sets in VRAM.
+    /// `resident_layers` sets in VRAM, prefetching one layer ahead.
     pub fn new(
         cfg: BlockConfig,
         source: S,
@@ -158,28 +233,70 @@ impl<S: LayerSource> StreamingGpuKernel<S> {
                 values: DeviceBuffer::new(kv_buffer_len)?,
             });
         }
-        Ok(Self {
+        let shared = Arc::new(GpuShared {
             cfg,
             source,
+            weights: Mutex::new(WeightLru::new(resident_layers)),
+            ready: Condvar::new(),
+        });
+        let (tx, rx) = channel::<u32>();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let shared = Arc::clone(&shared);
+            let stopped = Arc::clone(&stopped);
+            std::thread::spawn(move || {
+                while let Ok(layer) = rx.recv() {
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = shared.ensure(layer, true); // best-effort
+                }
+            })
+        };
+        Ok(Self {
+            shared,
             num_layers,
             kv_capacity_tokens: cap,
             kv,
-            weights: Mutex::new(WeightLru::new(resident_layers)),
+            prefetch_tx: Some(tx),
+            worker: Some(worker),
+            stopped,
         })
+    }
+
+    /// Streaming cache stats (hits/misses/evictions/prefetched).
+    pub fn stats(&self) -> StreamStats {
+        let mut s = self.shared.weights.lock().unwrap().stats;
+        s.depth = 1;
+        s
     }
 }
 
-impl<S: LayerSource> ComputeKernel for StreamingGpuKernel<S> {
+impl<S: LayerSource + 'static> Drop for StreamingGpuKernel<S> {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.prefetch_tx.take();
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
     fn num_layers(&self) -> u32 {
         self.num_layers
     }
 
     fn hidden_size(&self) -> usize {
-        self.cfg.hidden_size
+        self.shared.cfg.hidden_size
     }
 
     fn kv_dim(&self) -> usize {
-        self.cfg.kv_dim()
+        self.shared.cfg.kv_dim()
+    }
+
+    fn stream_stats(&self) -> Option<StreamStats> {
+        Some(self.stats())
     }
 
     fn run_block(
@@ -189,7 +306,8 @@ impl<S: LayerSource> ComputeKernel for StreamingGpuKernel<S> {
         kv: &mut KvLayerCache,
         position: usize,
     ) -> Result<()> {
-        let kv_dim = self.cfg.kv_dim();
+        let kv_dim = self.shared.cfg.kv_dim();
+        let cfg = &self.shared.cfg;
         let num_positions = kv.len();
         if num_positions >= self.kv_capacity_tokens {
             return Err(DlmError::InvalidConfig(format!(
@@ -198,15 +316,13 @@ impl<S: LayerSource> ComputeKernel for StreamingGpuKernel<S> {
             )));
         }
 
-        // Ensure this layer's weights are resident, streaming them in on a miss.
-        let mut cache = self.weights.lock().unwrap();
-        if cache.map.contains_key(&layer) {
-            cache.touch(layer);
-        } else {
-            let tensors = self.source.load_layer(layer)?;
-            cache.insert(layer, GpuWeights::upload(&tensors)?);
+        // Ensure this layer's weights are resident (Arc keeps them alive through
+        // the launch even if the worker evicts them from the window).
+        let w = self.shared.fetch(layer)?;
+        // Kick off the next layer's upload so it overlaps this block's compute.
+        if let Some(tx) = &self.prefetch_tx {
+            let _ = tx.send((layer + 1) % self.num_layers);
         }
-        let w = cache.map.get(&layer).expect("just inserted/looked up");
         let dkv = &self.kv[layer as usize];
 
         // Only the hidden vector crosses the bus per layer; weights are already
@@ -217,15 +333,15 @@ impl<S: LayerSource> ComputeKernel for StreamingGpuKernel<S> {
         // expects; the KV buffers have capacity for `num_positions + 1`.
         let code = unsafe {
             dlm_decode_block(
-                self.cfg.hidden_size as i32,
-                self.cfg.q_dim() as i32,
+                cfg.hidden_size as i32,
+                cfg.q_dim() as i32,
                 kv_dim as i32,
-                self.cfg.num_heads as i32,
-                self.cfg.num_kv_heads as i32,
-                self.cfg.head_dim as i32,
-                self.cfg.intermediate_size as i32,
-                self.cfg.rope_theta,
-                self.cfg.rms_eps,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.intermediate_size as i32,
+                cfg.rope_theta,
+                cfg.rms_eps,
                 w.q_proj.as_ptr(),
                 w.k_proj.as_ptr(),
                 w.v_proj.as_ptr(),

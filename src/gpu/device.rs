@@ -80,6 +80,13 @@ impl Drop for DeviceBuffer {
 // only handed to CUDA APIs. It is safe to move across threads.
 unsafe impl Send for DeviceBuffer {}
 
+// SAFETY: the buffer is a device pointer + length; `&self` methods either read
+// (`as_ptr`, `download`) or issue synchronous CUDA copies, and the CUDA runtime
+// is itself thread-safe (one process-shared primary context). The streaming GPU
+// kernel shares resident *weight* buffers read-only across the compute thread
+// and the prefetch worker; no two threads mutate the same buffer.
+unsafe impl Sync for DeviceBuffer {}
+
 /// Block until all queued device work finishes.
 pub fn synchronize() -> Result<()> {
     ffi_cuda::synchronize()
