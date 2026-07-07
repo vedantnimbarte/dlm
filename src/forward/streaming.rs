@@ -49,6 +49,9 @@ pub struct StreamStats {
     pub misses: u64,
     pub evictions: u64,
     pub prefetched: u64,
+    /// The prefetch depth in effect now (the live auto-tuned value under
+    /// `--auto-prefetch`, else the fixed depth). A gauge, not a counter.
+    pub depth: u32,
 }
 
 /// A bounded LRU of materialized layers (front of `order` = least recent).
@@ -281,9 +284,12 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
         need.clamp(1, max)
     }
 
-    /// Cache stats (hits/misses/evictions/prefetched) accumulated so far.
+    /// Cache stats (hits/misses/evictions/prefetched) plus the current prefetch
+    /// depth. The counters accumulate in the cache; `depth` is filled live.
     pub fn stats(&self) -> StreamStats {
-        self.shared.cache.lock().unwrap().stats
+        let mut s = self.shared.cache.lock().unwrap().stats;
+        s.depth = self.current_prefetch_depth();
+        s
     }
 
     /// Number of layers currently held resident.

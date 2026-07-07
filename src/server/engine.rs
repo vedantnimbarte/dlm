@@ -55,6 +55,7 @@ struct StreamMetrics {
     misses: AtomicU64,
     evictions: AtomicU64,
     prefetched: AtomicU64,
+    depth: AtomicU64,
 }
 
 impl StreamMetrics {
@@ -64,6 +65,7 @@ impl StreamMetrics {
         self.misses.store(s.misses, Ordering::Relaxed);
         self.evictions.store(s.evictions, Ordering::Relaxed);
         self.prefetched.store(s.prefetched, Ordering::Relaxed);
+        self.depth.store(s.depth as u64, Ordering::Relaxed);
     }
 }
 
@@ -638,11 +640,15 @@ fn metrics_text(engine: &EngineService) -> String {
              dlm_stream_layer_evictions_total {}\n\
              # HELP dlm_stream_layer_prefetched_total Layers loaded ahead by the prefetch worker.\n\
              # TYPE dlm_stream_layer_prefetched_total counter\n\
-             dlm_stream_layer_prefetched_total {}\n",
+             dlm_stream_layer_prefetched_total {}\n\
+             # HELP dlm_stream_prefetch_depth Layers prefetched ahead (live; auto-tuned under --auto-prefetch).\n\
+             # TYPE dlm_stream_prefetch_depth gauge\n\
+             dlm_stream_prefetch_depth {}\n",
             s.hits.load(Ordering::Relaxed),
             s.misses.load(Ordering::Relaxed),
             s.evictions.load(Ordering::Relaxed),
             s.prefetched.load(Ordering::Relaxed),
+            s.depth.load(Ordering::Relaxed),
         ));
     }
     out
