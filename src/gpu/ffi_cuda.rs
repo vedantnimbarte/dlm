@@ -38,6 +38,7 @@ extern "C" {
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> cudaError_t;
     fn cudaFree(ptr: *mut c_void) -> cudaError_t;
     fn cudaStreamCreate(stream: *mut cudaStream_t) -> cudaError_t;
+    fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: c_uint) -> cudaError_t;
     fn cudaStreamDestroy(stream: cudaStream_t) -> cudaError_t;
     fn cudaStreamSynchronize(stream: cudaStream_t) -> cudaError_t;
     fn cudaMemcpyAsync(
@@ -172,6 +173,56 @@ pub(super) fn synchronize() -> Result<()> {
             api: "cudaDeviceSynchronize",
             code,
         });
+    }
+    Ok(())
+}
+
+/// `cudaStreamNonBlocking`: the stream does not implicitly synchronize with the
+/// legacy default (null) stream, so its work overlaps null-stream kernels.
+const CUDA_STREAM_NON_BLOCKING: c_uint = 0x01;
+
+/// Create a non-blocking stream (overlaps the default-stream compute).
+pub(super) fn stream_create_nonblocking() -> Result<cudaStream_t> {
+    let mut s: cudaStream_t = std::ptr::null_mut();
+    // SAFETY: `s` is a valid out-pointer.
+    let code = unsafe { cudaStreamCreateWithFlags(&mut s, CUDA_STREAM_NON_BLOCKING) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu { api: "cudaStreamCreateWithFlags", code });
+    }
+    Ok(s)
+}
+
+/// Destroy a stream created by [`stream_create_nonblocking`].
+pub(super) fn stream_destroy(stream: cudaStream_t) {
+    // SAFETY: `stream` was returned by a create call and is not used again.
+    unsafe {
+        cudaStreamDestroy(stream);
+    }
+}
+
+/// Block until `stream`'s queued work completes.
+pub(super) fn stream_synchronize(stream: cudaStream_t) -> Result<()> {
+    // SAFETY: `stream` is a valid stream handle.
+    let code = unsafe { cudaStreamSynchronize(stream) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu { api: "cudaStreamSynchronize", code });
+    }
+    Ok(())
+}
+
+/// Enqueue an async host→device copy on `stream`. `src` must be page-locked for
+/// the copy to actually run asynchronously (else CUDA falls back to sync).
+pub(super) fn copy_h2d_async(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+    stream: cudaStream_t,
+) -> Result<()> {
+    // SAFETY: caller guarantees `bytes` valid on both sides; `src` is pinned.
+    let code =
+        unsafe { cudaMemcpyAsync(dst, src, bytes, CUDA_MEMCPY_HOST_TO_DEVICE, stream) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu { api: "cudaMemcpyAsync(H2D)", code });
     }
     Ok(())
 }

@@ -22,7 +22,8 @@ use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
 use crate::forward::streaming::{LayerSource, StreamStats};
-use crate::gpu::device::{synchronize, DeviceBuffer};
+use crate::gpu::device::{synchronize_default, DeviceBuffer, Stream};
+use crate::memory::PinnedBuffer;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -73,17 +74,75 @@ struct GpuWeights {
 }
 
 impl GpuWeights {
-    fn upload(t: &LayerTensors) -> Result<Self> {
+    /// The layer's nine weight tensors, in a fixed order (for staging/upload).
+    fn tensors(t: &LayerTensors) -> [&[f32]; 9] {
+        [
+            &t.q_proj,
+            &t.k_proj,
+            &t.v_proj,
+            &t.o_proj,
+            &t.gate_proj,
+            &t.up_proj,
+            &t.down_proj,
+            &t.input_layernorm,
+            &t.post_attention_layernorm,
+        ]
+    }
+
+    /// Total `f32` elements across a layer's weights (to size the staging buffer).
+    fn f32_count(cfg: &BlockConfig) -> usize {
+        let h = cfg.hidden_size;
+        cfg.q_dim() * h            // q
+            + cfg.kv_dim() * h * 2 // k, v
+            + h * cfg.q_dim()      // o
+            + cfg.intermediate_size * h * 2 // gate, up
+            + h * cfg.intermediate_size // down
+            + h * 2 // two norms
+    }
+
+    /// Upload a layer's weights to VRAM **asynchronously** via `stream`: stage all
+    /// tensors into the page-locked `staging` buffer, enqueue a copy per buffer on
+    /// the (non-blocking) copy stream, then wait for it. Because the copy runs on
+    /// its own stream, it overlaps kernels on the default stream — the caller's
+    /// wait doesn't stop the GPU. On return the uploads are complete and `staging`
+    /// is free to reuse.
+    fn upload_async(t: &LayerTensors, stream: &Stream, staging: &mut PinnedBuffer) -> Result<Self> {
+        let tensors = Self::tensors(t);
+        // Phase 1: stage all tensors into pinned memory, recording layout.
+        let mut layout: Vec<(usize, usize)> = Vec::with_capacity(9); // (byte offset, f32 len)
+        {
+            let dst = staging.as_mut_slice();
+            let mut byte_off = 0usize;
+            for s in tensors {
+                let bytes = std::mem::size_of_val(s);
+                let src = unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, bytes) };
+                dst[byte_off..byte_off + bytes].copy_from_slice(src);
+                layout.push((byte_off, s.len()));
+                byte_off += bytes;
+            }
+        }
+        // Phase 2: allocate device buffers and enqueue async copies from staging.
+        let base = staging.as_ptr();
+        let mut bufs: Vec<DeviceBuffer> = Vec::with_capacity(9);
+        for &(off, len) in &layout {
+            let buf = DeviceBuffer::new(len.max(1))?;
+            let pinned = unsafe { base.add(off) } as *const f32;
+            buf.upload_async(pinned, stream)?;
+            bufs.push(buf);
+        }
+        // Wait for the copies (staging becomes reusable; weights are ready).
+        stream.synchronize()?;
+        let mut it = bufs.into_iter();
         Ok(Self {
-            q_proj: DeviceBuffer::from_slice(&t.q_proj)?,
-            k_proj: DeviceBuffer::from_slice(&t.k_proj)?,
-            v_proj: DeviceBuffer::from_slice(&t.v_proj)?,
-            o_proj: DeviceBuffer::from_slice(&t.o_proj)?,
-            gate_proj: DeviceBuffer::from_slice(&t.gate_proj)?,
-            up_proj: DeviceBuffer::from_slice(&t.up_proj)?,
-            down_proj: DeviceBuffer::from_slice(&t.down_proj)?,
-            input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
-            post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
+            q_proj: it.next().unwrap(),
+            k_proj: it.next().unwrap(),
+            v_proj: it.next().unwrap(),
+            o_proj: it.next().unwrap(),
+            gate_proj: it.next().unwrap(),
+            up_proj: it.next().unwrap(),
+            down_proj: it.next().unwrap(),
+            input_layernorm: it.next().unwrap(),
+            post_attention_layernorm: it.next().unwrap(),
         })
     }
 }
@@ -145,6 +204,11 @@ struct GpuShared<S: LayerSource> {
     source: S,
     weights: Mutex<WeightLru>,
     ready: Condvar,
+    /// Dedicated non-blocking stream for weight uploads (overlaps compute).
+    copy_stream: Stream,
+    /// Page-locked staging buffer for async H2D. Guarded so concurrent uploaders
+    /// (worker + a compute-path miss) don't clobber it mid-transfer.
+    staging: Mutex<PinnedBuffer>,
 }
 
 impl<S: LayerSource> GpuShared<S> {
@@ -165,12 +229,14 @@ impl<S: LayerSource> GpuShared<S> {
             }
             cache.loading.insert(layer);
             drop(cache);
-            // Expensive part — host load (disk + dequant) then VRAM upload — runs
-            // with the lock released, so it overlaps the compute thread.
-            let uploaded = self
-                .source
-                .load_layer(layer)
-                .and_then(|t| GpuWeights::upload(&t).map(Arc::new));
+            // Expensive part — host load (disk + dequant) then async VRAM upload —
+            // runs with the cache lock released, so it overlaps the compute thread.
+            // The upload is enqueued on the non-blocking copy stream, so the PCIe
+            // transfer itself overlaps the default-stream kernel.
+            let uploaded = self.source.load_layer(layer).and_then(|t| {
+                let mut staging = self.staging.lock().unwrap();
+                GpuWeights::upload_async(&t, &self.copy_stream, &mut staging).map(Arc::new)
+            });
             let mut cache = self.weights.lock().unwrap();
             cache.loading.remove(&layer);
             self.ready.notify_all();
@@ -233,11 +299,15 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 values: DeviceBuffer::new(kv_buffer_len)?,
             });
         }
+        // Page-locked staging sized to one layer's weights (all layers same size).
+        let staging_bytes = GpuWeights::f32_count(&cfg) * std::mem::size_of::<f32>();
         let shared = Arc::new(GpuShared {
             cfg,
             source,
             weights: Mutex::new(WeightLru::new(resident_layers)),
             ready: Condvar::new(),
+            copy_stream: Stream::new_nonblocking()?,
+            staging: Mutex::new(PinnedBuffer::with_len(staging_bytes)?),
         });
         let (tx, rx) = channel::<u32>();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -364,7 +434,9 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 code,
             });
         }
-        synchronize()?;
+        // Wait only for the default (compute) stream, not the whole device, so an
+        // in-flight weight upload on the copy stream keeps overlapping.
+        synchronize_default()?;
         d_hidden.download(hidden)?;
 
         // Keep the orchestrator's length bookkeeping in step (real K/V is in VRAM).

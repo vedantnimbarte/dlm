@@ -87,6 +87,64 @@ unsafe impl Send for DeviceBuffer {}
 // and the prefetch worker; no two threads mutate the same buffer.
 unsafe impl Sync for DeviceBuffer {}
 
+/// A non-blocking CUDA stream: its work overlaps kernels on the default (null)
+/// stream. Used as a dedicated *copy* stream so weight uploads run concurrently
+/// with compute.
+pub struct Stream {
+    raw: ffi_cuda::cudaStream_t,
+}
+
+impl Stream {
+    /// Create a non-blocking stream.
+    pub fn new_nonblocking() -> Result<Self> {
+        Ok(Self { raw: ffi_cuda::stream_create_nonblocking()? })
+    }
+
+    /// Block the calling thread until this stream's queued work completes. The
+    /// GPU still runs this stream concurrently with the default stream; only the
+    /// caller waits.
+    pub fn synchronize(&self) -> Result<()> {
+        ffi_cuda::stream_synchronize(self.raw)
+    }
+
+    fn raw(&self) -> ffi_cuda::cudaStream_t {
+        self.raw
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        ffi_cuda::stream_destroy(self.raw);
+    }
+}
+
+// SAFETY: a CUDA stream handle is an opaque pointer into the thread-safe CUDA
+// runtime; enqueuing/synchronizing from any thread is supported.
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+impl DeviceBuffer {
+    /// Enqueue an async host→device copy on `stream`. `src` must point at
+    /// page-locked host memory of `self.len` `f32`s for the copy to run truly
+    /// asynchronously; the caller must not overwrite `src` until `stream` is
+    /// synchronized.
+    pub fn upload_async(&self, src: *const f32, stream: &Stream) -> Result<()> {
+        ffi_cuda::copy_h2d_async(
+            self.ptr,
+            src as *const c_void,
+            self.len * std::mem::size_of::<f32>(),
+            stream.raw(),
+        )
+    }
+}
+
+/// Block until the default (null) stream — the one kernels launch on —
+/// completes. Unlike [`synchronize`], does *not* wait on other streams, so an
+/// in-flight copy on a non-blocking [`Stream`] keeps running.
+pub fn synchronize_default() -> Result<()> {
+    ffi_cuda::stream_synchronize(std::ptr::null_mut())
+}
+
 /// Block until all queued device work finishes.
 pub fn synchronize() -> Result<()> {
     ffi_cuda::synchronize()
