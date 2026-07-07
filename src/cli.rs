@@ -30,6 +30,37 @@ pub enum Command {
     /// Run environment diagnostics + a self-check (GPU availability, CPU
     /// inference, and — on a `cuda-kernels` build — a CPU-vs-GPU parity check).
     Doctor(DoctorArgs),
+    /// Search the Hugging Face hub for models (safetensors, most-downloaded).
+    Search(SearchArgs),
+    /// Download a model from the Hugging Face hub into a local directory.
+    Pull(PullArgs),
+}
+
+/// Arguments for `flip search`.
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Search terms (e.g. `llama-3.2`). Omit to list the top models overall.
+    #[arg(default_value = "")]
+    pub query: String,
+
+    /// Maximum results to show.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+/// Arguments for `flip pull`.
+#[derive(Debug, Args)]
+pub struct PullArgs {
+    /// Repo id (`org/model`); a full HF URL is also accepted.
+    pub repo: String,
+
+    /// Destination directory. Defaults to `./models/<model>`.
+    #[arg(long, value_name = "DIR")]
+    pub local_dir: Option<PathBuf>,
+
+    /// HF access token for gated/private models (or set `$HF_TOKEN`).
+    #[arg(long, value_name = "TOK")]
+    pub token: Option<String>,
 }
 
 /// Arguments for `flip doctor`.

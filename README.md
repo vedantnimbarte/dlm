@@ -161,6 +161,22 @@ cargo run -- tokenize --help # byte-level BPE encode/decode round-trip
 cargo run -- doctor          # check machine (GPU/VRAM) + run an inference self-test
 ```
 
+**`search` / `pull`** — find and download models straight from the
+[Hugging Face hub](https://huggingface.co), no `hf` CLI or manual file-grabbing
+needed. `pull` shells out to `curl` (built into Linux, macOS, and Windows 10/11)
+to fetch only the files flip loads (`config.json`, `*.safetensors`, tokenizer):
+
+```bash
+cargo run -- search llama-3.2                 # most-downloaded matches, safetensors only
+cargo run -- pull Qwen/Qwen2.5-0.5B-Instruct  # → ./models/Qwen2.5-0.5B-Instruct
+cargo run -- serve --model-path ./models/Qwen2.5-0.5B-Instruct
+```
+
+A full HF URL works in place of the `org/model` id. Use `--local-dir` to change
+where it lands, and `--token` (or `$HF_TOKEN`) for gated/private repos. Only
+safetensors checkpoints load — GGUF/PyTorch-only repos are rejected with a clear
+message.
+
 **`profile`** — with no `--model-path` it profiles a representative
 Llama-3-70B-class model against a simulated 16 GB card:
 
