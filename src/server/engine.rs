@@ -516,6 +516,7 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
                 Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
             }
             ("POST", "/v1/chat/completions") => handle_chat(&engine, req),
+            ("POST", "/v1/messages") => handle_messages(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
             _ => Response::json(405, error_json("method not allowed")),
         }
@@ -621,6 +622,162 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
     }
+}
+
+// ── Anthropic Messages API shapes (`POST /v1/messages`) ─────────────────────
+
+/// Anthropic message/system content: either a plain string or a list of blocks.
+/// Only text blocks carry content we render; other block types contribute their
+/// `text` field (usually empty) and are otherwise ignored.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AnthropicContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+#[derive(Deserialize)]
+struct ContentBlock {
+    #[serde(default)]
+    text: String,
+}
+
+impl AnthropicContent {
+    fn to_text(&self) -> String {
+        match self {
+            AnthropicContent::Text(s) => s.clone(),
+            AnthropicContent::Blocks(bs) => {
+                bs.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("")
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AnthropicMessage {
+    role: String,
+    content: AnthropicContent,
+}
+
+#[derive(Deserialize)]
+struct MessagesRequest {
+    #[serde(default)]
+    model: Option<String>,
+    messages: Vec<AnthropicMessage>,
+    /// Required by Anthropic; we still default it to the server's max if absent.
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    system: Option<AnthropicContent>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    stop_sequences: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct TextBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct AnthropicUsage {
+    input_tokens: usize,
+    output_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct MessagesResponse {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'static str,
+    model: String,
+    content: Vec<TextBlock>,
+    stop_reason: &'static str,
+    stop_sequence: Option<String>,
+    usage: AnthropicUsage,
+}
+
+fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: MessagesRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
+    };
+    if parsed.messages.is_empty() {
+        return Response::json(400, error_json("messages must not be empty"));
+    }
+    // ponytail: streaming /v1/messages needs Anthropic's own SSE event
+    // sequence (message_start / content_block_delta / …), not OpenAI chunks.
+    // Add that when a client needs streamed Anthropic responses.
+    if parsed.stream {
+        return Response::json(
+            400,
+            error_json("streaming is not yet supported on /v1/messages; set stream=false"),
+        );
+    }
+
+    // Fold `system` + messages into the shared chat template. The Anthropic
+    // `system` field becomes a leading system-role message.
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(parsed.messages.len() + 1);
+    if let Some(sys) = &parsed.system {
+        let text = sys.to_text();
+        if !text.is_empty() {
+            messages.push(ChatMessage { role: "system".into(), content: text });
+        }
+    }
+    for m in &parsed.messages {
+        messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
+    }
+    let prompt = engine.chat_template.apply(&messages);
+    let ids = match engine.encode_prompt(&prompt) {
+        Ok(ids) => ids,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+
+    let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    let id = engine.next_id.load(Ordering::Relaxed);
+    let sampler = match parsed.temperature {
+        Some(t) if t > 0.0 => Sampler::TopPK {
+            temperature: t,
+            top_p: parsed.top_p.unwrap_or(1.0),
+            top_k: parsed.top_k.unwrap_or(0),
+            seed: id,
+        },
+        _ => Sampler::Greedy,
+    };
+    let stops: Vec<String> = parsed
+        .stop_sequences
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
+
+    let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+    let body = MessagesResponse {
+        id: format!("msg-{id}"),
+        kind: "message",
+        role: "assistant",
+        model,
+        content: vec![TextBlock { kind: "text", text: g.text }],
+        // No EOS handling on this path, so natural end == hit max_tokens.
+        stop_reason: if g.stopped { "stop_sequence" } else { "max_tokens" },
+        stop_sequence: None,
+        usage: AnthropicUsage {
+            input_tokens: g.prompt_tokens,
+            output_tokens: g.completion_tokens,
+        },
+    };
+    Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
 }
 
 /// Stream a chat completion as Server-Sent Events.
@@ -756,5 +913,37 @@ mod tests {
         );
         assert_eq!(earliest_stop("abcXYdef", &["XY".into(), "de".into()]), Some(3));
         assert_eq!(earliest_stop("abc", &["z".into()]), None);
+    }
+
+    #[test]
+    fn anthropic_content_string_or_blocks() {
+        let s: AnthropicContent = serde_json::from_str(r#""hello""#).unwrap();
+        assert_eq!(s.to_text(), "hello");
+
+        let b: AnthropicContent =
+            serde_json::from_str(r#"[{"type":"text","text":"a"},{"type":"text","text":"b"}]"#)
+                .unwrap();
+        assert_eq!(b.to_text(), "ab");
+    }
+
+    #[test]
+    fn anthropic_request_folds_system_and_messages() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"model":"m","max_tokens":16,"system":"be terse",
+                "messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.max_tokens, Some(16));
+
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(ChatMessage { role: "system".into(), content: sys.to_text() });
+        }
+        for m in &req.messages {
+            messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
+        }
+        let prompt = ChatTemplate::Plain.apply(&messages);
+        assert!(prompt.starts_with("system: be terse\nuser: hi\n"), "{prompt}");
+        assert!(prompt.ends_with("assistant:"), "{prompt}");
     }
 }
