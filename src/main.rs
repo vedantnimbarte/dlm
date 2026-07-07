@@ -840,6 +840,13 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         None => config.eos_token_ids.clone(),
     };
 
+    // Optional int8 KV cache — half the KV memory, small approximation.
+    let (generator, draft) = if args.quantize_kv {
+        (generator.with_quantized_kv(), draft.map(|d| d.with_quantized_kv()))
+    } else {
+        (generator, draft)
+    };
+
     // Batched, streaming engine: a background scheduler interleaves concurrent
     // requests a token at a time. With a draft model it decodes speculatively
     // (draft proposes, target verifies).
@@ -885,6 +892,9 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     }
     if args.prefix_cache_size > 0 && !speculative {
         println!("  prefix     : KV cache up to {} prompt prefixes", args.prefix_cache_size);
+    }
+    if args.quantize_kv {
+        println!("  kv cache   : int8 (≈half memory, approximate)");
     }
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");

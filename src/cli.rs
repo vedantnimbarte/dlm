@@ -211,6 +211,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub auto_prefetch: bool,
 
+    /// Store the KV cache int8-quantized: about half the KV memory (which can
+    /// exceed the weights at long context), at a small approximation.
+    #[arg(long, default_value_t = false)]
+    pub quantize_kv: bool,
+
     /// Cluster role.
     #[arg(long, value_enum, default_value_t = DistributedMode::Standalone)]
     pub distributed_mode: DistributedMode,

@@ -118,17 +118,68 @@ impl LayerTensors {
 #[derive(Debug, Clone, Default)]
 pub struct KvLayerCache {
     kv_dim: usize,
-    keys: Vec<f32>,
-    values: Vec<f32>,
+    store: KvStore,
+}
+
+/// How a layer's K/V history is stored. `Full` keeps exact `f32`; `Int8`
+/// symmetric-quantizes each token's key and value to `i8` with a per-token
+/// scale, halving the KV memory at the cost of a small, well-bounded rounding
+/// error (dequantized on the fly during attention).
+#[derive(Debug, Clone)]
+enum KvStore {
+    Full {
+        keys: Vec<f32>,
+        values: Vec<f32>,
+    },
+    Int8 {
+        keys: Vec<i8>,
+        key_scales: Vec<f32>,
+        values: Vec<i8>,
+        value_scales: Vec<f32>,
+    },
+}
+
+impl Default for KvStore {
+    fn default() -> Self {
+        KvStore::Full { keys: Vec::new(), values: Vec::new() }
+    }
+}
+
+/// Symmetric per-vector int8 quantization: `scale = max|x| / 127`, `q = round(x /
+/// scale)`. Returns all-zero codes with a zero scale for an all-zero input.
+fn quantize_i8(x: &[f32]) -> (Vec<i8>, f32) {
+    let max = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let scale = max / 127.0;
+    if scale <= 0.0 {
+        return (vec![0i8; x.len()], 0.0);
+    }
+    let q = x
+        .iter()
+        .map(|&v| (v / scale).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    (q, scale)
 }
 
 impl KvLayerCache {
-    /// Empty history for a layer whose K/V width is `kv_dim`.
+    /// Empty (exact `f32`) history for a layer whose K/V width is `kv_dim`.
     pub fn new(kv_dim: usize) -> Self {
         Self {
             kv_dim,
-            keys: Vec::new(),
-            values: Vec::new(),
+            store: KvStore::Full { keys: Vec::new(), values: Vec::new() },
+        }
+    }
+
+    /// Empty int8-quantized history — half the memory of [`new`](Self::new),
+    /// approximate. Interchangeable everywhere a `KvLayerCache` is used.
+    pub fn new_quantized(kv_dim: usize) -> Self {
+        Self {
+            kv_dim,
+            store: KvStore::Int8 {
+                keys: Vec::new(),
+                key_scales: Vec::new(),
+                values: Vec::new(),
+                value_scales: Vec::new(),
+            },
         }
     }
 
@@ -139,12 +190,15 @@ impl KvLayerCache {
 
     /// Cached token positions.
     pub fn len(&self) -> usize {
-        self.keys.len() / self.kv_dim.max(1)
+        match &self.store {
+            KvStore::Full { keys, .. } => keys.len() / self.kv_dim.max(1),
+            KvStore::Int8 { key_scales, .. } => key_scales.len(),
+        }
     }
 
     /// True if empty.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.len() == 0
     }
 
     /// Append one position's key and value vectors.
@@ -155,27 +209,58 @@ impl KvLayerCache {
                 got: key.len().min(value.len()),
             });
         }
-        self.keys.extend_from_slice(key);
-        self.values.extend_from_slice(value);
+        match &mut self.store {
+            KvStore::Full { keys, values } => {
+                keys.extend_from_slice(key);
+                values.extend_from_slice(value);
+            }
+            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+                let (qk, ks) = quantize_i8(key);
+                let (qv, vs) = quantize_i8(value);
+                keys.extend_from_slice(&qk);
+                key_scales.push(ks);
+                values.extend_from_slice(&qv);
+                value_scales.push(vs);
+            }
+        }
         Ok(())
     }
 
-    /// All cached keys, flat `[positions * kv_dim]` (for uploading to a device).
-    pub fn keys(&self) -> &[f32] {
-        &self.keys
+    /// Dot of `q` with position `pos`'s key head (dequantized inline for int8).
+    fn key_head_dot(&self, pos: usize, kv_head: usize, d: usize, q: &[f32]) -> f32 {
+        let base = pos * self.kv_dim + kv_head * d;
+        match &self.store {
+            KvStore::Full { keys, .. } => q
+                .iter()
+                .zip(&keys[base..base + d])
+                .map(|(&a, &b)| a * b)
+                .sum(),
+            KvStore::Int8 { keys, key_scales, .. } => {
+                let s = key_scales[pos];
+                q.iter()
+                    .zip(&keys[base..base + d])
+                    .map(|(&a, &b)| a * (b as f32 * s))
+                    .sum()
+            }
+        }
     }
 
-    /// All cached values, flat `[positions * kv_dim]`.
-    pub fn values(&self) -> &[f32] {
-        &self.values
-    }
-
-    fn key_at(&self, pos: usize) -> &[f32] {
-        &self.keys[pos * self.kv_dim..(pos + 1) * self.kv_dim]
-    }
-
-    fn value_at(&self, pos: usize) -> &[f32] {
-        &self.values[pos * self.kv_dim..(pos + 1) * self.kv_dim]
+    /// Add `w × value_head(pos)` into `out` (dequantized inline for int8).
+    fn value_head_accumulate(&self, pos: usize, kv_head: usize, d: usize, w: f32, out: &mut [f32]) {
+        let base = pos * self.kv_dim + kv_head * d;
+        match &self.store {
+            KvStore::Full { values, .. } => {
+                for (o, &vv) in out.iter_mut().zip(&values[base..base + d]) {
+                    *o += w * vv;
+                }
+            }
+            KvStore::Int8 { values, value_scales, .. } => {
+                let s = value_scales[pos];
+                for (o, &vv) in out.iter_mut().zip(&values[base..base + d]) {
+                    *o += w * (vv as f32 * s);
+                }
+            }
+        }
     }
 }
 
@@ -258,18 +343,14 @@ fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
         // Scores over every cached position, then softmax.
         let mut scores = vec![0.0f32; positions];
         for (p, score) in scores.iter_mut().enumerate() {
-            let kh = &kv.key_at(p)[kv_head * d..(kv_head + 1) * d];
-            *score = qh.iter().zip(kh).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+            *score = kv.key_head_dot(p, kv_head, d, qh) * scale;
         }
         softmax_inplace(&mut scores);
 
         // Weighted sum of values → this head's context.
         let out = &mut context[h * d..(h + 1) * d];
         for (p, &w) in scores.iter().enumerate() {
-            let vh = &kv.value_at(p)[kv_head * d..(kv_head + 1) * d];
-            for (o, &vv) in out.iter_mut().zip(vh) {
-                *o += w * vv;
-            }
+            kv.value_head_accumulate(p, kv_head, d, w, out);
         }
     }
     context
@@ -486,6 +567,45 @@ mod tests {
         // Zero projections ⇒ both residual deltas are zero ⇒ output == input.
         approx(&out, &hidden, 1e-6);
         assert_eq!(kv.len(), 1);
+    }
+
+    #[test]
+    fn quantize_i8_round_trips_within_a_quantum() {
+        let x = [0.0f32, 0.5, -1.0, 3.0, -2.5, 0.1];
+        let (q, s) = quantize_i8(&x);
+        for (&orig, &code) in x.iter().zip(&q) {
+            let deq = code as f32 * s;
+            assert!((orig - deq).abs() <= s, "{orig} vs {deq}, scale {s}");
+        }
+        // All-zero input → zero scale, all-zero codes.
+        let (qz, sz) = quantize_i8(&[0.0, 0.0]);
+        assert_eq!(sz, 0.0);
+        assert!(qz.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn int8_kv_attention_close_to_full() {
+        let cfg = BlockConfig {
+            hidden_size: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            intermediate_size: 8,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+        };
+        let mut full = KvLayerCache::new(cfg.kv_dim());
+        let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
+        for p in 0..5usize {
+            let k: Vec<f32> = (0..cfg.kv_dim()).map(|i| ((p + i) % 7) as f32 * 0.3 - 1.0).collect();
+            let v: Vec<f32> = (0..cfg.kv_dim()).map(|i| ((p * 2 + i) % 5) as f32 * 0.5).collect();
+            full.append(&k, &v).unwrap();
+            quant.append(&k, &v).unwrap();
+        }
+        assert_eq!(full.len(), quant.len());
+        let q: Vec<f32> = (0..cfg.q_dim()).map(|i| (i % 3) as f32 * 0.2).collect();
+        // int8 KV attention stays well within a small tolerance of exact f32.
+        approx(&attention(&cfg, &q, &full), &attention(&cfg, &q, &quant), 0.05);
     }
 
     #[test]

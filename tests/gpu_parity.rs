@@ -79,8 +79,8 @@ fn gpu_run_block_matches_cpu() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_cpu = ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16));
-    let mut orch_gpu = ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16));
+    let mut orch_cpu = ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), false);
+    let mut orch_gpu = ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16), false);
 
     // Same starting hidden state, decoded autoregressively on both.
     let mut hidden_cpu: Vec<f32> = (0..cfg.hidden_size)
