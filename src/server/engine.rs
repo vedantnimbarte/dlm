@@ -470,13 +470,16 @@ fn error_json(message: &str) -> Vec<u8> {
     format!(r#"{{"error":{{"message":{message:?},"type":"invalid_request_error"}}}}"#).into_bytes()
 }
 
-/// True if the request carries `Authorization: Bearer <key>` matching `key`.
+/// True if the request carries a matching key via `Authorization: Bearer <key>`
+/// (OpenAI style) or `x-api-key: <key>` (Anthropic style).
 fn authorized(req: &Request, key: &str) -> bool {
-    req.headers
+    let bearer = req
+        .headers
         .get("authorization")
         .and_then(|h| h.strip_prefix("Bearer "))
-        .map(|t| t.trim() == key)
-        .unwrap_or(false)
+        .map(str::trim);
+    let api_key = req.headers.get("x-api-key").map(|h| h.trim());
+    bearer == Some(key) || api_key == Some(key)
 }
 
 /// Wrap [`router`] with bearer-token auth: when `api_key` is set, `/v1/*`
