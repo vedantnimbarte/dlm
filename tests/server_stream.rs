@@ -38,6 +38,10 @@ fn build_generator() -> Generator<CpuKernel> {
 }
 
 fn start_server() -> SocketAddr {
+    start_server_with_eos(None)
+}
+
+fn start_server_with_eos(eos: Option<u32>) -> SocketAddr {
     let engine = EngineService::start(
         build_generator(),
         BpeTokenizer::bytes_only(),
@@ -46,7 +50,8 @@ fn start_server() -> SocketAddr {
         16,
         0,
         4, // max batch
-    );
+    )
+    .with_eos_token(eos);
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     std::thread::spawn(move || server.serve(router(engine)).unwrap());
@@ -172,6 +177,33 @@ fn streaming_messages_emits_anthropic_sse_events() {
     // Ran to max_tokens (no stop sequence), so stop_reason reflects that.
     assert!(resp.contains(r#""stop_reason":"max_tokens""#), "{resp}");
     assert!(resp.contains(r#""output_tokens":4"#), "{resp}");
+}
+
+#[test]
+fn eos_token_ends_the_turn() {
+    use dlm::generate::{GenerationConfig, Sampler};
+    // The server renders the Plain template into this exact prompt.
+    let prompt = BpeTokenizer::bytes_only().encode("user: Hi\nassistant:").unwrap();
+    let first = build_generator()
+        .generate(
+            &prompt,
+            &GenerationConfig { max_new_tokens: 1, eos_token: None, sampler: Sampler::Greedy },
+        )
+        .unwrap()[0];
+
+    // With that first token set as EOS, generation stops immediately: the token
+    // is dropped from the output and the turn ends naturally.
+    let addr = start_server_with_eos(Some(first));
+    let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":16}"#;
+    let resp = post(addr, "/v1/messages", body);
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(resp.contains(r#""stop_reason":"end_turn""#), "{resp}");
+    assert!(resp.contains(r#""output_tokens":0"#), "{resp}");
+
+    // Same over the streaming path.
+    let sbody = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":16,"stream":true}"#;
+    let sresp = post(addr, "/v1/messages", sbody);
+    assert!(sresp.contains(r#""stop_reason":"end_turn""#), "{sresp}");
 }
 
 #[test]

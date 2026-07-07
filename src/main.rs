@@ -772,7 +772,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             8, // max concurrent batch
         ),
     }
-    .with_chat_template(template);
+    .with_chat_template(template)
+    .with_eos_token(args.eos_token);
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     let mode = if speculative { "batched + speculative" } else { "batched" };

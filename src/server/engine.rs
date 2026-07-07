@@ -47,6 +47,8 @@ pub struct EngineService {
     created: u64,
     default_max_tokens: usize,
     chat_template: ChatTemplate,
+    /// Stop generation when this token id is produced (the model's EOS).
+    eos_token: Option<u32>,
 }
 
 impl EngineService {
@@ -126,6 +128,7 @@ impl EngineService {
             created,
             default_max_tokens,
             chat_template: ChatTemplate::default(),
+            eos_token: None,
         })
     }
 
@@ -134,6 +137,15 @@ impl EngineService {
     pub fn with_chat_template(mut self: Arc<Self>, template: ChatTemplate) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
             inner.chat_template = template;
+        }
+        self
+    }
+
+    /// Set the EOS token id: generation stops (and the token is dropped from the
+    /// output) when the model produces it. Defaults to `None` (run to length).
+    pub fn with_eos_token(mut self: Arc<Self>, eos_token: Option<u32>) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.eos_token = eos_token;
         }
         self
     }
@@ -523,19 +535,37 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
     })
 }
 
+/// Why generation ended. Mapped to each API's own reason field.
+enum Finish {
+    /// Model emitted the EOS token → OpenAI `stop` / Anthropic `end_turn`.
+    Eos,
+    /// A stop sequence was hit; carries the matched sequence when known.
+    Stop(Option<String>),
+    /// Hit the `max_tokens` cap → OpenAI `length` / Anthropic `max_tokens`.
+    Length,
+}
+
+/// The stop sequence with the earliest occurrence in `text`, if any.
+fn matched_stop<'a>(text: &str, stops: &'a [String]) -> Option<&'a String> {
+    stops
+        .iter()
+        .filter_map(|s| text.find(s.as_str()).map(|pos| (pos, s)))
+        .min_by_key(|(pos, _)| *pos)
+        .map(|(_, s)| s)
+}
+
 /// A collected non-streaming completion.
 struct Generated {
     text: String,
-    /// True if a stop sequence was hit (vs. running to `max_tokens`).
-    stopped: bool,
+    finish: Finish,
     prompt_tokens: usize,
     completion_tokens: usize,
     spec: Option<AcceptanceStats>,
 }
 
-/// Run one request to completion, ending early at the first stop sequence and
-/// truncating the decoded text before it. Shared by the OpenAI and Anthropic
-/// non-streaming handlers.
+/// Run one request to completion, ending at the EOS token, the first stop
+/// sequence, or `max_tokens`. Shared by the OpenAI and Anthropic non-streaming
+/// handlers.
 fn collect_completion(
     engine: &Arc<EngineService>,
     ids: Vec<u32>,
@@ -544,12 +574,20 @@ fn collect_completion(
     stops: &[String],
 ) -> Generated {
     let prompt_tokens = ids.len();
-    let rx = engine.submit(ids, max_tokens, None, sampler);
+    let eos = engine.eos_token;
+    let rx = engine.submit(ids, max_tokens, eos, sampler);
     let mut tokens = Vec::new();
     let mut spec = None;
+    let mut hit_eos = false;
     for ev in rx {
         match ev {
             TokenEvent::Next(t) => {
+                // The scheduler emits EOS inclusively as the final token; drop it
+                // from the visible output and mark a natural stop.
+                if Some(t) == eos {
+                    hit_eos = true;
+                    break;
+                }
                 tokens.push(t);
                 if !stops.is_empty() {
                     let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
@@ -564,19 +602,25 @@ fn collect_completion(
             }
         }
     }
+    let completion_tokens = tokens.len();
     let mut text = engine.tokenizer.decode(&tokens).unwrap_or_default();
-    let stopped = match earliest_stop(&text, stops) {
-        Some(cut) => {
-            text.truncate(cut);
-            true
+    let finish = if hit_eos {
+        Finish::Eos
+    } else {
+        match matched_stop(&text, stops) {
+            Some(s) => {
+                let s = s.clone();
+                text.truncate(text.find(&s).unwrap_or(text.len()));
+                Finish::Stop(Some(s))
+            }
+            None => Finish::Length,
         }
-        None => false,
     };
     Generated {
         text,
-        stopped,
+        finish,
         prompt_tokens,
-        completion_tokens: tokens.len(),
+        completion_tokens,
         spec,
     }
 }
@@ -611,7 +655,10 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             choices: vec![Choice {
                 index: 0,
                 message: RespMessage { role: "assistant", content: g.text },
-                finish_reason: if g.stopped { "stop" } else { "length" },
+                finish_reason: match g.finish {
+                    Finish::Length => "length",
+                    _ => "stop",
+                },
             }],
             usage: Usage {
                 prompt_tokens: g.prompt_tokens,
@@ -764,9 +811,15 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
         role: "assistant",
         model,
         content: vec![TextBlock { kind: "text", text: g.text }],
-        // No EOS handling on this path, so natural end == hit max_tokens.
-        stop_reason: if g.stopped { "stop_sequence" } else { "max_tokens" },
-        stop_sequence: None,
+        stop_reason: match g.finish {
+            Finish::Eos => "end_turn",
+            Finish::Stop(_) => "stop_sequence",
+            Finish::Length => "max_tokens",
+        },
+        stop_sequence: match g.finish {
+            Finish::Stop(s) => s,
+            _ => None,
+        },
         usage: AnthropicUsage {
             input_tokens: g.prompt_tokens,
             output_tokens: g.completion_tokens,
@@ -815,6 +868,7 @@ fn stream_messages(
             "content_block": {"type": "text", "text": ""},
         }))?;
 
+        let eos = engine.eos_token;
         let mut completion_tokens = 0usize;
         // Stop-aware emission mirrors stream_chat: accumulate ids, re-decode, and
         // emit only the newly-visible suffix up to any stop sequence.
@@ -822,10 +876,15 @@ fn stream_messages(
         let mut sent_chars = 0usize;
         let mut stop_reason = "max_tokens";
         let mut stop_sequence: Option<String> = None;
-        let rx = engine.submit(ids, max_tokens, None, sampler);
+        let rx = engine.submit(ids, max_tokens, eos, sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
+                    // EOS is emitted inclusively; end the turn without showing it.
+                    if Some(t) == eos {
+                        stop_reason = "end_turn";
+                        break;
+                    }
                     completion_tokens += 1;
                     acc_ids.push(t);
                     let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
@@ -841,9 +900,9 @@ fn stream_messages(
                             "delta": {"type": "text_delta", "text": delta},
                         }))?;
                     }
-                    if let Some(c) = cut {
+                    if cut.is_some() {
                         stop_reason = "stop_sequence";
-                        stop_sequence = stops.iter().find(|s| full[..].find(s.as_str()) == Some(c)).cloned();
+                        stop_sequence = matched_stop(&full, &stops).cloned();
                         break;
                     }
                 }
@@ -901,10 +960,16 @@ fn stream_chat(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, None, sampler);
+        let eos = engine.eos_token;
+        let rx = engine.submit(ids, max_tokens, eos, sampler);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
+                    // EOS is emitted inclusively; stop without showing it.
+                    if Some(t) == eos {
+                        finish = "stop";
+                        break;
+                    }
                     completion_tokens += 1;
                     if stops.is_empty() {
                         // Fast path: emit each token's piece directly.
