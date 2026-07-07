@@ -57,6 +57,9 @@ pub enum FlipError {
     #[error("distributed/network error: {0}")]
     Network(String),
 
+    #[error("model hub error: {0}")]
+    Hub(String),
+
     #[error("host memory allocation failed for {bytes} bytes (align {align})")]
     HostAlloc { bytes: usize, align: usize },
 

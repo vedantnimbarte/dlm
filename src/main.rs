@@ -10,8 +10,8 @@
 use clap::Parser;
 use flip::cache::{KvCacheConfig, PagedKvCache};
 use flip::cli::{
-    Cli, Command, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs, ServeArgs,
-    TokenizeArgs,
+    Cli, Command, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs, PullArgs,
+    SearchArgs, ServeArgs, TokenizeArgs,
 };
 use flip::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
 use flip::generate::{GenerationConfig, Generator, Sampler};
@@ -36,7 +36,31 @@ fn main() -> Result<()> {
         Command::Generate(args) => run_generate(args),
         Command::Tokenize(args) => run_tokenize(args),
         Command::Doctor(args) => run_doctor(args),
+        Command::Search(args) => run_search(args),
+        Command::Pull(args) => run_pull(args),
     }
+}
+
+/// `flip search` — query the Hugging Face hub and print matching models.
+fn run_search(args: SearchArgs) -> Result<()> {
+    let hits = flip::hub::search(&args.query, args.limit)?;
+    if hits.is_empty() {
+        println!("no models found for {:?}", args.query);
+        return Ok(());
+    }
+    for h in &hits {
+        let task = h.task.as_deref().unwrap_or("-");
+        println!("{:<55} ⭳ {:<10} ♥ {:<6} {}", h.id, h.downloads, h.likes, task);
+    }
+    println!("\npull one with:  flip pull <id>");
+    Ok(())
+}
+
+/// `flip pull` — download a model's loadable files from the Hugging Face hub.
+fn run_pull(args: PullArgs) -> Result<()> {
+    let token = args.token.or_else(|| std::env::var("HF_TOKEN").ok());
+    flip::hub::pull(&args.repo, args.local_dir, token.as_deref())?;
+    Ok(())
 }
 
 /// `flip doctor` — environment diagnostics + a self-check. Reports the GPU
