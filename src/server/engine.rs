@@ -50,6 +50,9 @@ pub struct EngineService {
     /// Stop generation when any of these token ids is produced (the model's
     /// EOS set). Empty means run to `max_tokens`.
     eos_tokens: Vec<u32>,
+    /// Maximum context (prompt + generated) the model/KV cache supports.
+    /// Requests are clamped to fit; `usize::MAX` disables the guard.
+    max_context: usize,
 }
 
 impl EngineService {
@@ -130,6 +133,7 @@ impl EngineService {
             default_max_tokens,
             chat_template: ChatTemplate::default(),
             eos_tokens: Vec::new(),
+            max_context: usize::MAX,
         })
     }
 
@@ -148,6 +152,16 @@ impl EngineService {
     pub fn with_eos_tokens(mut self: Arc<Self>, eos_tokens: Vec<u32>) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
             inner.eos_tokens = eos_tokens;
+        }
+        self
+    }
+
+    /// Set the maximum context (prompt + generated tokens). Requests whose
+    /// prompt already fills it are rejected; `max_tokens` is otherwise clamped to
+    /// the remaining budget. Defaults to `usize::MAX` (no limit).
+    pub fn with_context_window(mut self: Arc<Self>, max_context: usize) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.max_context = max_context;
         }
         self
     }
@@ -548,6 +562,19 @@ enum Finish {
     Length,
 }
 
+/// Clamp a requested `max_tokens` to the context budget left after the prompt,
+/// or return an error message if the prompt already fills the window.
+fn fit_max_tokens(engine: &EngineService, prompt_len: usize, requested: usize) -> Result<usize, String> {
+    if prompt_len >= engine.max_context {
+        return Err(format!(
+            "prompt is {prompt_len} tokens but the context window is {}",
+            engine.max_context
+        ));
+    }
+    let budget = engine.max_context - prompt_len;
+    Ok(requested.min(budget).max(1))
+}
+
 /// The stop sequence with the earliest occurrence in `text`, if any.
 fn matched_stop<'a>(text: &str, stops: &'a [String]) -> Option<&'a String> {
     stops
@@ -640,7 +667,11 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Ok(ids) => ids,
         Err(e) => return Response::json(400, error_json(&e)),
     };
-    let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    let requested = parsed.max_tokens.unwrap_or(engine.default_max_tokens);
+    let max_tokens = match fit_max_tokens(engine, ids.len(), requested) {
+        Ok(m) => m,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
@@ -826,7 +857,11 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
         Err(e) => return Response::json(400, anthropic_error_json(&e)),
     };
 
-    let max_tokens = parsed.max_tokens.unwrap_or(engine.default_max_tokens).max(1);
+    let requested = parsed.max_tokens.unwrap_or(engine.default_max_tokens);
+    let max_tokens = match fit_max_tokens(engine, ids.len(), requested) {
+        Ok(m) => m,
+        Err(e) => return Response::json(400, anthropic_error_json(&e)),
+    };
     let id = engine.next_id.load(Ordering::Relaxed);
     let sampler = match parsed.temperature {
         Some(t) if t > 0.0 => Sampler::TopPK {

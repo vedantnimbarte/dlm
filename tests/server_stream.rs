@@ -38,10 +38,14 @@ fn build_generator() -> Generator<CpuKernel> {
 }
 
 fn start_server() -> SocketAddr {
-    start_server_with_eos(vec![])
+    start_server_cfg(vec![], usize::MAX)
 }
 
 fn start_server_with_eos(eos: Vec<u32>) -> SocketAddr {
+    start_server_cfg(eos, usize::MAX)
+}
+
+fn start_server_cfg(eos: Vec<u32>, max_context: usize) -> SocketAddr {
     let engine = EngineService::start(
         build_generator(),
         BpeTokenizer::bytes_only(),
@@ -51,7 +55,8 @@ fn start_server_with_eos(eos: Vec<u32>) -> SocketAddr {
         0,
         4, // max batch
     )
-    .with_eos_tokens(eos);
+    .with_eos_tokens(eos)
+    .with_context_window(max_context);
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     std::thread::spawn(move || server.serve(router(engine)).unwrap());
@@ -223,6 +228,24 @@ fn any_eos_in_the_set_ends_the_turn() {
     let resp = post(addr, "/v1/messages", body);
     assert!(resp.contains(r#""stop_reason":"end_turn""#), "{resp}");
     assert!(resp.contains(r#""output_tokens":0"#), "{resp}");
+}
+
+#[test]
+fn context_window_guards_and_clamps() {
+    // "user: Hi\nassistant:" prompt length under the byte tokenizer.
+    let prompt_len = BpeTokenizer::bytes_only().encode("user: Hi\nassistant:").unwrap().len();
+
+    // Prompt already exceeds the window → 400 (Anthropic error shape).
+    let tight = start_server_cfg(vec![], prompt_len - 1);
+    let resp = post(tight, "/v1/messages", r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":8}"#);
+    assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+    assert!(resp.contains("context window"), "{resp}");
+
+    // Room for only 2 more tokens → max_tokens clamped to the budget.
+    let clamped = start_server_cfg(vec![], prompt_len + 2);
+    let resp = post(clamped, "/v1/messages", r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":16}"#);
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(resp.contains(r#""output_tokens":2"#), "{resp}");
 }
 
 #[test]

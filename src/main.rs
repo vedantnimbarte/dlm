@@ -780,7 +780,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         ),
     }
     .with_chat_template(template)
-    .with_eos_tokens(eos_tokens.clone());
+    .with_eos_tokens(eos_tokens.clone())
+    .with_context_window(args.context_length as usize);
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     let mode = if speculative { "batched + speculative" } else { "batched" };
@@ -790,7 +791,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     if eos_tokens.is_empty() {
         println!("  stop       : max_tokens only (no eos_token_id in config; pass --eos-token)");
     } else {
-        println!("  stop       : eos {eos_tokens:?} + max_tokens");
+        println!("  stop       : eos {eos_tokens:?} + max_tokens, context {} tokens", args.context_length);
     }
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
