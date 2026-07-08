@@ -45,6 +45,12 @@ see [Building for GPU](#building-for-gpu-nvidia--amd).
 Rust users can also `cargo install --git https://github.com/vedantnimbarte/dlm`
 (builds from source).
 
+To uninstall (removes the binary; respects `DLM_INSTALL_DIR`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.sh | sh
+```
+
 ---
 
 ## Table of contents
