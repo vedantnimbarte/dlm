@@ -45,6 +45,13 @@ see [Building for GPU](#building-for-gpu-nvidia--amd).
 Rust users can also `cargo install --git https://github.com/vedantnimbarte/dlm`
 (builds from source).
 
+Shell completions (bash/zsh/fish/elvish/powershell) — `dlm completions <shell>`
+prints a script to stdout. E.g. for bash:
+
+```sh
+dlm completions bash > ~/.local/share/bash-completion/completions/dlm
+```
+
 To update to the latest release (just reinstalls; same env as install):
 
 ```sh

@@ -31,6 +31,7 @@ cuda-kernels = ["cuda"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 memmap2 = "0.9"
 # pinned to 0.14.1: the last release whose MSRV matches this crate's rust-version (1.75).
 prost = "=0.14.1"

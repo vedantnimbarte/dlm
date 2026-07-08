@@ -7,11 +7,11 @@
 //!   engine. The inference/serving loop itself is Phase 3; this validates the
 //!   config and runs the planning pipeline so the setup is verifiable today.
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
-    Cli, Command, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs, PullArgs,
-    SearchArgs, ServeArgs, TokenizeArgs,
+    Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs,
+    PullArgs, SearchArgs, ServeArgs, TokenizeArgs,
 };
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
@@ -38,7 +38,14 @@ fn main() -> Result<()> {
         Command::Doctor(args) => run_doctor(args),
         Command::Search(args) => run_search(args),
         Command::Pull(args) => run_pull(args),
+        Command::Completions(args) => run_completions(args),
     }
+}
+
+/// `dlm completions <shell>` — print a completion script to stdout.
+fn run_completions(args: CompletionsArgs) -> Result<()> {
+    clap_complete::generate(args.shell, &mut Cli::command(), "dlm", &mut std::io::stdout());
+    Ok(())
 }
 
 /// `dlm search` — query the Hugging Face hub and print matching models.

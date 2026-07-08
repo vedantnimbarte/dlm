@@ -34,6 +34,16 @@ pub enum Command {
     Search(SearchArgs),
     /// Download a model from the Hugging Face hub into a local directory.
     Pull(PullArgs),
+    /// Print a shell completion script to stdout (e.g. `dlm completions bash`).
+    Completions(CompletionsArgs),
+}
+
+/// Arguments for `dlm completions`.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 /// Arguments for `dlm search`.
