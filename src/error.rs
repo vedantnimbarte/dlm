@@ -51,6 +51,9 @@ pub enum DlmError {
     #[error("invalid quantized tensor layout: {0}")]
     QuantLayout(String),
 
+    #[error("unsupported quantized checkpoint: {0}")]
+    UnsupportedQuant(String),
+
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
 

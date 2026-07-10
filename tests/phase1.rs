@@ -185,6 +185,28 @@ fn parses_eos_token_id_as_scalar_or_array() {
 }
 
 #[test]
+fn rejects_unsupported_quant_formats() {
+    let base = r#""hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":128"#;
+    let with_quant =
+        |q: &str| format!("{{{base},\"quantization_config\":{q}}}");
+    let parse = |json: String| ModelConfig::from_json_bytes(json.as_bytes(), QuantScheme::Fp16);
+
+    // AWQ — permuted nibble order, not decodable → refused, not silently wrong.
+    assert!(parse(with_quant(r#"{"quant_method":"awq","bits":4}"#)).is_err());
+    // GPTQ act-order — column permutation via g_idx not applied → refused.
+    assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":4,"desc_act":true}"#)).is_err());
+    // 8-bit quant — dequantizer is 4-bit only → refused.
+    assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":8}"#)).is_err());
+    // Unknown method → refused conservatively.
+    assert!(parse(with_quant(r#"{"quant_method":"squeezellm"}"#)).is_err());
+
+    // Canonical 4-bit GPTQ (no act-order) — the case the dequantizer handles.
+    assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":4,"desc_act":false}"#)).is_ok());
+    // No quantization_config at all — plain fp16, always fine.
+    assert!(parse(format!("{{{base}}}")).is_ok());
+}
+
+#[test]
 fn profiler_uses_catalog_sizes_and_pinned_overhead() {
     let tmp = tempfile::tempdir().unwrap();
     // 4 layers of 100 bytes each, plus 500 bytes of pinned tensors.

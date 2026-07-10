@@ -54,6 +54,60 @@ struct RawConfig {
     /// Llama-3 lists `<|eot_id|>` and `<|end_of_text|>`).
     #[serde(default)]
     eos_token_id: Option<EosField>,
+    /// Quantization metadata for GPTQ/AWQ checkpoints, when present. Used only
+    /// to reject formats the dequantizer would otherwise mis-decode silently.
+    #[serde(default)]
+    quantization_config: Option<QuantizationConfig>,
+}
+
+/// The subset of HF's `quantization_config` block dlm needs to decide whether it
+/// can dequantize a checkpoint correctly. The dequantizer models canonical 4-bit
+/// GPTQ (sequential nibble order, no act-order); anything else is refused up front
+/// rather than producing plausible-looking garbage.
+#[derive(Debug, Deserialize)]
+struct QuantizationConfig {
+    #[serde(default)]
+    quant_method: Option<String>,
+    #[serde(default)]
+    bits: Option<u32>,
+    /// GPTQ act-order: when true, columns are permuted via `g_idx` at pack time.
+    #[serde(default)]
+    desc_act: Option<bool>,
+}
+
+/// Refuse quantized checkpoints the dequantizer can't decode correctly, with a
+/// message naming the working alternative. Silent wrong output is worse than a
+/// clear error — see [`crate::quant`] for what the canonical path handles.
+fn check_quant_supported(q: &QuantizationConfig) -> Result<()> {
+    let method = q.quant_method.as_deref().unwrap_or("").to_ascii_lowercase();
+    if let Some(bits) = q.bits {
+        if bits != 4 {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "{bits}-bit {method} checkpoint; dlm dequantizes 4-bit only. \
+                 Use an fp16 or 4-bit GPTQ (desc_act=false) checkpoint."
+            )));
+        }
+    }
+    match method.as_str() {
+        // Canonical GPTQ without act-order is what the dequantizer models.
+        "gptq" if q.desc_act != Some(true) => Ok(()),
+        "gptq" => Err(DlmError::UnsupportedQuant(
+            "GPTQ act-order (desc_act=true) reorders columns via g_idx, which dlm \
+             does not apply. Use a desc_act=false GPTQ or fp16 checkpoint."
+                .into(),
+        )),
+        "awq" => Err(DlmError::UnsupportedQuant(
+            "AWQ uses a permuted nibble order dlm does not yet unpack. Use a GPTQ \
+             (desc_act=false) or fp16 checkpoint."
+                .into(),
+        )),
+        // No method declared: fall through to the canonical GPTQ triplet path.
+        "" => Ok(()),
+        other => Err(DlmError::UnsupportedQuant(format!(
+            "unrecognized quant_method {other:?}; dlm supports canonical 4-bit \
+             GPTQ (desc_act=false) and fp16. Use one of those."
+        ))),
+    }
 }
 
 /// `eos_token_id` as it appears in `config.json`: one id or a list of them.
@@ -119,6 +173,11 @@ impl ModelConfig {
             context: "config.json".to_string(),
             source,
         })?;
+
+        // Reject quant formats the dequantizer would silently mis-decode.
+        if let Some(qc) = &raw.quantization_config {
+            check_quant_supported(qc)?;
+        }
 
         let config = ModelConfig {
             hidden_size: raw.hidden_size,
