@@ -493,7 +493,9 @@ mod tests {
             panic!("expected generate");
         };
         assert_eq!(a.text.as_deref(), Some("hello"));
-        assert_eq!(a.device, Device::Cpu); // default
+        // Default flips to Gpu when built with device kernels; assert the same
+        // compile-time constant the parser uses, not a hard-coded Cpu.
+        assert_eq!(a.device, Device::DEFAULT); // default
     }
 
     #[test]

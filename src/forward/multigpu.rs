@@ -114,6 +114,16 @@ mod tests {
     /// inner kernel's, so wrapped output is identical to running it unwrapped.
     #[test]
     fn wrapped_output_matches_unwrapped() {
+        // Routes layers across device ids 0 and 1. Under the real CUDA/HIP
+        // backend that needs a second physical GPU; if set_device(1) fails
+        // there isn't one, so skip rather than fail. Off-GPU set_device is a
+        // no-op, so this probe passes and the test runs as before. The pure
+        // partition logic is covered hardware-free by partitions_layers_across_gpus.
+        if crate::gpu::set_device(1).is_err() {
+            return;
+        }
+        let _ = crate::gpu::set_device(0);
+
         let bare = StubKernel::new(6, 8, 2);
         let wrapped = PipelineParallelKernel::new(StubKernel::new(6, 8, 2), &[0, 1]).unwrap();
 
