@@ -33,6 +33,12 @@ case "$arch" in
   *) err "unsupported architecture '$arch'" ;;
 esac
 
+# No prebuilt Intel-Mac binary (GitHub retired the macOS Intel CI image). Apple
+# Silicon and Linux are covered; Intel Macs build from source.
+if [ "$os" = "Darwin" ] && [ "$arch_part" = "x86_64" ]; then
+  err "Intel Macs have no prebuilt binary. Use an Apple Silicon Mac or Linux, or build from source: cargo install --git https://github.com/$REPO"
+fi
+
 target="${arch_part}-${os_part}"
 cpu_asset="${BIN}-${target}.tar.gz"
 

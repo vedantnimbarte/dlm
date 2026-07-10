@@ -17,8 +17,9 @@ ability to run models many times larger than the card.
 
 ## Install
 
-One line — downloads a prebuilt binary for your platform (Linux/macOS, x86-64 or
-arm64) and installs it to `~/.local/bin`. No clone, no build, no Rust toolchain:
+One line — downloads a prebuilt binary for your platform (Linux x86-64/arm64,
+macOS Apple Silicon) and installs it to `~/.local/bin`. No clone, no build, no
+Rust toolchain. (Intel Macs: build from source with `cargo install`.)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/install.sh | sh
