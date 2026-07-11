@@ -674,6 +674,7 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
                 Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
             }
             ("POST", "/v1/chat/completions") => handle_chat(&engine, req),
+            ("POST", "/v1/completions") => handle_completion(&engine, req),
             ("POST", "/v1/messages") => handle_messages(&engine, req),
             ("POST", "/v1/messages/count_tokens") => handle_count_tokens(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
@@ -843,6 +844,226 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
     }
+}
+
+// ── OpenAI legacy completions (`POST /v1/completions`) ──────────────────────
+
+/// Request body for `/v1/completions`. Same sampling knobs as chat, but a raw
+/// `prompt` string instead of `messages` — no chat template is applied.
+#[derive(Deserialize)]
+struct CompletionRequest {
+    #[serde(default)]
+    model: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stop: Option<Stop>,
+}
+
+#[derive(Serialize)]
+struct CompletionChoice {
+    index: usize,
+    text: String,
+    finish_reason: &'static str,
+    /// Always null — dlm doesn't emit logprobs, but clients expect the field.
+    logprobs: Option<()>,
+}
+#[derive(Serialize)]
+struct CompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChoice>,
+    usage: Usage,
+}
+#[derive(Serialize)]
+struct CompletionChunkChoice {
+    index: usize,
+    text: String,
+    finish_reason: Option<&'static str>,
+}
+#[derive(Serialize)]
+struct CompletionChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
+}
+
+fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: CompletionRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
+    };
+    if parsed.prompt.is_empty() {
+        return Response::json(400, error_json("prompt must not be empty"));
+    }
+    let ids = match engine.encode_prompt(&parsed.prompt) {
+        Ok(ids) => ids,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    let requested = parsed.max_tokens.unwrap_or(engine.default_max_tokens);
+    let max_tokens = match fit_max_tokens(engine, ids.len(), requested) {
+        Ok(m) => m,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    let id = engine.next_id.load(Ordering::Relaxed);
+    let sampler = match parsed.temperature {
+        Some(t) if t > 0.0 => Sampler::TopPK {
+            temperature: t,
+            top_p: parsed.top_p.unwrap_or(1.0),
+            top_k: parsed.top_k.unwrap_or(0),
+            min_p: parsed.min_p.unwrap_or(0.0),
+            repetition_penalty: parsed.repetition_penalty.unwrap_or(1.0),
+            seed: parsed.seed.unwrap_or(id),
+        },
+        _ => Sampler::Greedy,
+    };
+    let stops = normalize_stop(parsed.stop);
+    let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
+
+    if parsed.stream {
+        stream_completion(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
+    } else {
+        let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+        let body = CompletionResponse {
+            id: format!("cmpl-{id}"),
+            object: "text_completion",
+            created: engine.created,
+            model,
+            choices: vec![CompletionChoice {
+                index: 0,
+                text: g.text,
+                finish_reason: match g.finish {
+                    Finish::Length => "length",
+                    _ => "stop",
+                },
+                logprobs: None,
+            }],
+            usage: Usage {
+                prompt_tokens: g.prompt_tokens,
+                completion_tokens: g.completion_tokens,
+                total_tokens: g.prompt_tokens + g.completion_tokens,
+                speculative: g.spec.map(SpeculativeUsage::from),
+            },
+        };
+        Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
+    }
+}
+
+/// Stream a `/v1/completions` response as SSE `text_completion` chunks. Mirrors
+/// [`stream_chat`] but carries the token piece in `text` and has no role chunk.
+fn stream_completion(
+    engine: Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    model: String,
+    sampler: Sampler,
+    stops: Vec<String>,
+) -> Response {
+    Response::stream(200, "text/event-stream", move |w| {
+        let id = format!("cmpl-{}", engine.next_id.load(Ordering::Relaxed));
+        let created = engine.created;
+        let send_chunk = |w: &mut dyn std::io::Write, text: String, finish: Option<&'static str>| -> std::io::Result<()> {
+            let chunk = CompletionChunk {
+                id: id.clone(),
+                object: "text_completion",
+                created,
+                model: model.clone(),
+                choices: vec![CompletionChunkChoice { index: 0, text, finish_reason: finish }],
+                usage: None,
+            };
+            let json = serde_json::to_string(&chunk).unwrap_or_default();
+            write!(w, "data: {json}\n\n")?;
+            w.flush()
+        };
+
+        let prompt_tokens = ids.len();
+        let mut completion_tokens = 0usize;
+        let mut spec = None;
+        let mut acc_ids: Vec<u32> = Vec::new();
+        let mut sent_chars = 0usize;
+        let mut finish = "length";
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+        for ev in rx {
+            match ev {
+                TokenEvent::Next(t) => {
+                    if engine.eos_tokens.contains(&t) {
+                        finish = "stop";
+                        break;
+                    }
+                    completion_tokens += 1;
+                    if stops.is_empty() {
+                        let piece = engine.tokenizer.decode(&[t]).unwrap_or_default();
+                        send_chunk(w, piece, None)?;
+                    } else {
+                        acc_ids.push(t);
+                        let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
+                        let cut = earliest_stop(&full, &stops);
+                        let visible = &full[..cut.unwrap_or(full.len())];
+                        let vis_chars = visible.chars().count();
+                        if vis_chars > sent_chars {
+                            let delta: String = visible.chars().skip(sent_chars).collect();
+                            sent_chars = vis_chars;
+                            send_chunk(w, delta, None)?;
+                        }
+                        if cut.is_some() {
+                            finish = "stop";
+                            break;
+                        }
+                    }
+                }
+                TokenEvent::Done(stats) => {
+                    spec = stats;
+                    break;
+                }
+            }
+        }
+        engine.record(prompt_tokens, completion_tokens);
+
+        send_chunk(w, String::new(), Some(finish))?;
+
+        if let Some(stats) = spec {
+            let chunk = CompletionChunk {
+                id: id.clone(),
+                object: "text_completion",
+                created,
+                model: model.clone(),
+                choices: vec![],
+                usage: Some(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    speculative: Some(stats.into()),
+                }),
+            };
+            let json = serde_json::to_string(&chunk).unwrap_or_default();
+            write!(w, "data: {json}\n\n")?;
+            w.flush()?;
+        }
+
+        write!(w, "data: [DONE]\n\n")?;
+        w.flush()
+    })
 }
 
 // ── Anthropic Messages API shapes (`POST /v1/messages`) ─────────────────────

@@ -8,9 +8,13 @@
 fn main() {
     if std::env::var("CARGO_FEATURE_CUDA").is_ok() {
         if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
-            // Windows toolkit ships libs under lib\x64; Linux under lib64.
+            // Toolkit layout varies: NVIDIA .run/Windows → lib64 / lib\x64;
+            // distro packages (CUDA_PATH=/usr) → multiarch lib/<triple> or lib.
             println!("cargo:rustc-link-search=native={cuda_path}/lib64");
             println!("cargo:rustc-link-search=native={cuda_path}/lib/x64");
+            println!("cargo:rustc-link-search=native={cuda_path}/lib/x86_64-linux-gnu");
+            println!("cargo:rustc-link-search=native={cuda_path}/lib/aarch64-linux-gnu");
+            println!("cargo:rustc-link-search=native={cuda_path}/lib");
         }
         println!("cargo:rustc-link-lib=dylib=cudart");
     }
