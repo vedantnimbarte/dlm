@@ -71,7 +71,10 @@ download() {
 # that far. Skipped only if the machine has no sha256 tool at all.
 verify() {
   a="$1"
-  sum_url="https://github.com/${REPO}/releases/latest/download/${a}.sha256"
+  # The checksum asset is named after the archive *stem*, with no archive
+  # extension: `dlm-<target>.sha256`, not `dlm-<target>.tar.gz.sha256`.
+  stem="${a%.tar.gz}"
+  sum_url="https://github.com/${REPO}/releases/latest/download/${stem}.sha256"
   if command -v sha256sum >/dev/null 2>&1; then
     hash=$(sha256sum "$tmp/$a" | cut -d' ' -f1)
   elif command -v shasum >/dev/null 2>&1; then
@@ -81,9 +84,10 @@ verify() {
     return 0
   fi
 
-  download "$sum_url" "$tmp/$a.sha256"
-  # The published file is "<hash>  <filename>"; take the hash field.
-  want=$(cut -d' ' -f1 <"$tmp/$a.sha256")
+  download "$sum_url" "$tmp/$stem.sha256"
+  # The published file is "<hash>  <filename>" (or "<hash> *<filename>" when it
+  # was produced in binary mode); the hash is the first whitespace-separated field.
+  want=$(awk '{print $1; exit}' <"$tmp/$stem.sha256")
   [ -n "$want" ] || err "empty checksum file for $a"
   [ "$hash" = "$want" ] || err "checksum mismatch for $a
   expected: $want

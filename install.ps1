@@ -34,17 +34,19 @@ try {
     try { Invoke-WebRequest -Uri "$base/$asset" -OutFile $zip -UseBasicParsing }
     catch { Die "download failed: $base/$asset ($($_.Exception.Message))" }
 
-    # Verify the checksum before extracting and running anything.
-    $sumFile = "$zip.sha256"
-    try {
-        Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile $sumFile -UseBasicParsing
-        $want = ((Get-Content $sumFile -Raw).Trim() -split '\s+')[0]
-        $have = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-        if ($want.ToLower() -ne $have) {
-            Die "checksum mismatch for ${asset}: expected $want, got $have. The download was corrupted or tampered with."
-        }
-    } catch [System.Net.WebException] {
-        Write-Warning "no published checksum for $asset - skipping verification"
+    # Verify the checksum before extracting and running anything. The checksum
+    # asset is named after the archive *stem* — `dlm-<target>.sha256`, with no
+    # `.zip` — and its body is "<hash> *<filename>".
+    $stem = [IO.Path]::GetFileNameWithoutExtension($asset)
+    $sumFile = Join-Path $tmp "$stem.sha256"
+    try { Invoke-WebRequest -Uri "$base/$stem.sha256" -OutFile $sumFile -UseBasicParsing }
+    catch { Die "could not fetch checksum $base/$stem.sha256 ($($_.Exception.Message))" }
+
+    $want = ((Get-Content $sumFile -Raw).Trim().Split()[0]).ToLower()
+    $have = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if (-not $want) { Die "empty checksum file for $asset" }
+    if ($want -ne $have) {
+        Die "checksum mismatch for ${asset}: expected $want, got $have. The download was corrupted or tampered with."
     }
 
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
