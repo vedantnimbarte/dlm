@@ -6,8 +6,16 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  # Unit + integration tests on both first-class platforms. dlm is pure std, so
+  # Windows is not a special case — but it was never actually exercised in CI,
+  # and the only OS-specific code (page size, mmap hints, the nvcc host-compiler
+  # probe) lives exactly where an untested platform would break.
+  test-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -16,3 +24,67 @@ jobs:
         run: cargo build --verbose
       - name: Test
         run: cargo test --verbose
+
+  # The load-bearing check: run a REAL checkpoint and assert the output means
+  # something. Every self-consistency test in the suite (streaming vs resident,
+  # GPU vs CPU, speculative vs greedy) stayed green while the engine emitted
+  # multilingual token soup, because none of them looked at the content. This
+  # job is what makes "the forward pass is correct" a claim CI can defend.
+  real-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch a small real checkpoint (Qwen2.5-0.5B-Instruct)
+        run: |
+          mkdir -p models
+          base="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main"
+          for f in config.json generation_config.json tokenizer.json model.safetensors; do
+            curl -fsSL "$base/$f" -o "models/$f"
+          done
+      - name: Assert the model actually answers correctly
+        run: cargo test --release --test real_model -- --nocapture
+
+  # Type-check the CUDA FFI without a GPU. nvcc is absent here, so build.rs skips
+  # device-code compilation — `cargo check` still validates the Rust side of the
+  # kernel signatures, which is what silently drifted before (two `extern` blocks
+  # declaring `dlm_decode_block` with different ABIs).
+  cuda-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check cuda-kernels FFI
+        run: cargo check --features cuda-kernels --all-targets
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Single aggregate gate. `main`'s branch protection requires a status check
+  # named exactly `test`; a matrix job reports as `test (ubuntu-latest)` etc., so
+  # without this the required context would never appear and every PR would wedge.
+  # Depending on all legs also means the one required check now gates the whole
+  # suite rather than a single Linux run.
+  test:
+    if: always()
+    needs: [test-matrix, real-model, cuda-check, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job did not succeed
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "upstream results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "a required job failed"; exit 1; }
+          done
+          echo "all required jobs passed"

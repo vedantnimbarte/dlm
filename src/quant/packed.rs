@@ -210,7 +210,7 @@ mod tests {
 
         let (qweight, qzeros, scales) = pack_gptq_4bit(&dense, &cfg).unwrap();
         assert_eq!(qweight.len(), (16 / 8) * 8);
-        assert_eq!(qzeros.len(), (16 / 8) * (8 / 8));
+        assert_eq!(qzeros.len(), 16 / 8); // groups × (out/8) = 2 × 1
         assert_eq!(scales.len(), (16 / 8) * 8);
 
         let deq = dequantize_gptq_4bit(&qweight, &qzeros, &scales, &cfg).unwrap();

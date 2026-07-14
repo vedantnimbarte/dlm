@@ -55,17 +55,47 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# Download + extract the named asset into $tmp; sets $tmp/$BIN. Fatal on failure.
-fetch() {
-  a="$1"
-  u="https://github.com/${REPO}/releases/latest/download/${a}"
+# GET $1 into file $2. Fatal on any HTTP or network error.
+download() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$u" -o "$tmp/$a" || err "download failed: $u"
+    curl -fsSL "$1" -o "$2" || err "download failed: $1"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp/$a" "$u" || err "download failed: $u"
+    wget -qO "$2" "$1" || err "download failed: $1"
   else
     err "need curl or wget installed"
   fi
+}
+
+# Verify $tmp/$1 against its published .sha256. The archive is extracted and the
+# binary executed moments later, so a corrupted or tampered asset must not get
+# that far. Skipped only if the machine has no sha256 tool at all.
+verify() {
+  a="$1"
+  sum_url="https://github.com/${REPO}/releases/latest/download/${a}.sha256"
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash=$(sha256sum "$tmp/$a" | cut -d' ' -f1)
+  elif command -v shasum >/dev/null 2>&1; then
+    hash=$(shasum -a 256 "$tmp/$a" | cut -d' ' -f1)
+  else
+    info "warning: no sha256sum/shasum — skipping checksum verification"
+    return 0
+  fi
+
+  download "$sum_url" "$tmp/$a.sha256"
+  # The published file is "<hash>  <filename>"; take the hash field.
+  want=$(cut -d' ' -f1 <"$tmp/$a.sha256")
+  [ -n "$want" ] || err "empty checksum file for $a"
+  [ "$hash" = "$want" ] || err "checksum mismatch for $a
+  expected: $want
+  actual:   $hash
+This means the download was corrupted or tampered with. Aborting."
+}
+
+# Download + verify + extract the named asset into $tmp; sets $tmp/$BIN.
+fetch() {
+  a="$1"
+  download "https://github.com/${REPO}/releases/latest/download/${a}" "$tmp/$a"
+  verify "$a"
   tar -xzf "$tmp/$a" -C "$tmp" || err "extract failed — is there a published release for ${a}?"
   [ -f "$tmp/$BIN" ] || err "binary '$BIN' not found in ${a}"
 }

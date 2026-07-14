@@ -578,27 +578,44 @@ fn error_json(message: &str) -> Vec<u8> {
     format!(r#"{{"error":{{"message":{message:?},"type":"invalid_request_error"}}}}"#).into_bytes()
 }
 
-/// True if the request carries a matching key via `Authorization: Bearer <key>`
-/// (OpenAI style) or `x-api-key: <key>` (Anthropic style).
-fn authorized(req: &Request, key: &str) -> bool {
-    let bearer = req
-        .headers
-        .get("authorization")
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(str::trim);
-    let api_key = req.headers.get("x-api-key").map(|h| h.trim());
-    bearer == Some(key) || api_key == Some(key)
+/// Constant-time byte comparison, so a wrong key can't be recovered by timing
+/// how long the check takes to fail.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Wrap [`router`] with bearer-token auth: when `api_key` is set, `/v1/*`
-/// requests must carry a matching `Authorization: Bearer` header (health and
-/// root stay open). With `api_key = None` this is exactly [`router`].
+/// True if the request carries a matching key via `Authorization: Bearer <key>`
+/// (OpenAI style) or `x-api-key: <key>` (Anthropic style). The scheme name is
+/// matched case-insensitively, as RFC 7235 requires.
+fn authorized(req: &Request, key: &str) -> bool {
+    let bearer = req.headers.get("authorization").and_then(|h| {
+        let (scheme, value) = h.split_once(' ')?;
+        scheme.eq_ignore_ascii_case("bearer").then(|| value.trim())
+    });
+    let api_key = req.headers.get("x-api-key").map(|h| h.trim());
+    bearer.is_some_and(|b| secret_eq(b, key)) || api_key.is_some_and(|k| secret_eq(k, key))
+}
+
+/// Paths that stay open when an API key is configured: a liveness probe and the
+/// root banner. Everything else — including `/metrics`, which leaks request and
+/// token counts — requires the key.
+fn is_public_path(path: &str) -> bool {
+    matches!(path, "/" | "/health" | "/healthz")
+}
+
+/// Wrap [`router`] with bearer-token auth: when `api_key` is set, every request
+/// except [`is_public_path`] must carry a matching key. With `api_key = None`
+/// this is exactly [`router`].
 pub fn secured_router(engine: Arc<EngineService>, api_key: Option<String>) -> Handler {
     let inner = router(engine);
     match api_key {
         None => inner,
         Some(key) => Arc::new(move |req: &Request| {
-            if req.path.starts_with("/v1/") && !authorized(req, &key) {
+            if !is_public_path(&req.path) && !authorized(req, &key) {
                 return Response::json(401, error_json("missing or invalid API key"));
             }
             inner(req)
@@ -1012,24 +1029,25 @@ fn stream_completion(
                         break;
                     }
                     completion_tokens += 1;
-                    if stops.is_empty() {
-                        let piece = engine.tokenizer.decode(&[t]).unwrap_or_default();
-                        send_chunk(w, piece, None)?;
-                    } else {
-                        acc_ids.push(t);
-                        let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
-                        let cut = earliest_stop(&full, &stops);
-                        let visible = &full[..cut.unwrap_or(full.len())];
-                        let vis_chars = visible.chars().count();
-                        if vis_chars > sent_chars {
-                            let delta: String = visible.chars().skip(sent_chars).collect();
-                            sent_chars = vis_chars;
-                            send_chunk(w, delta, None)?;
-                        }
-                        if cut.is_some() {
-                            finish = "stop";
-                            break;
-                        }
+                    // Always decode the accumulated ids, never the token alone.
+                    // Byte-level BPE splits one UTF-8 character (emoji, CJK,
+                    // accents) across several tokens, so decoding a fragment in
+                    // isolation lossily renders it as U+FFFD. Decoding the run
+                    // and emitting the newly-completed characters is correct for
+                    // both the stop-sequence and the no-stop case.
+                    acc_ids.push(t);
+                    let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
+                    let cut = earliest_stop(&full, &stops);
+                    let visible = &full[..cut.unwrap_or(full.len())];
+                    let vis_chars = visible.chars().count();
+                    if vis_chars > sent_chars {
+                        let delta: String = visible.chars().skip(sent_chars).collect();
+                        sent_chars = vis_chars;
+                        send_chunk(w, delta, None)?;
+                    }
+                    if cut.is_some() {
+                        finish = "stop";
+                        break;
                     }
                 }
                 TokenEvent::Done(stats) => {
@@ -1419,13 +1437,12 @@ fn stream_chat(
                         break;
                     }
                     completion_tokens += 1;
-                    if stops.is_empty() {
-                        // Fast path: emit each token's piece directly.
-                        let piece = engine.tokenizer.decode(&[t]).unwrap_or_default();
-                        send_chunk(w, Delta { role: None, content: Some(piece) }, None)?;
-                    } else {
-                        // Stop-aware path: emit the newly-visible suffix up to any
-                        // stop sequence, then finish.
+                    {
+                        // Decode the accumulated run, never a lone token: byte-level
+                        // BPE splits one UTF-8 character (emoji, CJK, accents) across
+                        // several tokens, and decoding a fragment by itself renders it
+                        // as U+FFFD. Emitting newly-completed characters from the full
+                        // decode is correct with or without stop sequences.
                         acc_ids.push(t);
                         let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
                         let cut = earliest_stop(&full, &stops);

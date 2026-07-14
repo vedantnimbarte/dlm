@@ -40,7 +40,7 @@ fn coordinator() -> Coordinator {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     };
     let mut r = Rng::new(9);
     let layers: Vec<LayerTensors> = (0..num_layers)
@@ -53,7 +53,7 @@ fn coordinator() -> Coordinator {
             up_proj: r.vec(cfg.intermediate_size * hidden),
             down_proj: r.vec(hidden * cfg.intermediate_size),
             input_layernorm: vec![1.0; hidden],
-            post_attention_layernorm: vec![1.0; hidden],
+            post_attention_layernorm: vec![1.0; hidden], ..Default::default()
         })
         .collect();
 

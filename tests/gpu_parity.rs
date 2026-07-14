@@ -63,7 +63,7 @@ fn random_layers(cfg: &BlockConfig, num_layers: u32, seed: u64) -> Vec<LayerTens
             up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
             down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, s),
             input_layernorm: vec![1.0; cfg.hidden_size],
-            post_attention_layernorm: vec![1.0; cfg.hidden_size],
+            post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
         })
         .collect()
 }
@@ -77,7 +77,7 @@ fn gpu_run_block_matches_cpu() {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     };
     let num_layers = 2u32;
 
@@ -123,6 +123,110 @@ fn gpu_run_block_matches_cpu() {
     }
 }
 
+/// Decode a few tokens on both kernels from the same start state and assert the
+/// GPU tracks the CPU oracle.
+fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32, what: &str) {
+    let num_layers = layers.len() as u32;
+    let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+    let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
+
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu =
+        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_gpu =
+        ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+
+    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| ((i % 17) as f32) * 0.03 - 0.25)
+        .collect();
+    let mut h_gpu = h_cpu.clone();
+
+    for step in 0..3 {
+        orch_cpu.decode_token(&mut h_cpu).unwrap();
+        orch_gpu.decode_token(&mut h_gpu).unwrap();
+        let max_diff = h_cpu
+            .iter()
+            .zip(&h_gpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < tol,
+            "{what}: step {step}: GPU diverged from CPU by {max_diff}"
+        );
+    }
+}
+
+/// Every real model has `hidden_size >= 2048`. The RMSNorm kernel used to launch
+/// `<<<1, hidden_size>>>`, which exceeds CUDA's 1024 threads-per-block cap and
+/// fails to launch — so the GPU path could never have run an actual checkpoint.
+/// This pins the strided/block-reduction launch at a realistic width.
+#[test]
+fn gpu_matches_cpu_at_realistic_hidden_size() {
+    let cfg = BlockConfig {
+        hidden_size: 2048, // > 1024: the old kernel could not launch at all
+        num_heads: 16,
+        num_kv_heads: 4,
+        head_dim: 128,
+        intermediate_size: 512,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+    };
+    let layers = random_layers(&cfg, 2, 0xA11CE);
+    assert_gpu_matches_cpu(cfg, layers, 2e-3, "hidden_size=2048");
+}
+
+/// Qwen2-style Q/K/V biases must be applied on device exactly as on the CPU.
+#[test]
+fn gpu_matches_cpu_with_qkv_biases() {
+    let cfg = BlockConfig {
+        hidden_size: 64,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 16,
+        intermediate_size: 128,
+        rope_theta: 1_000_000.0,
+        rms_eps: 1e-6,
+        rope_scaling: None,
+    };
+    let mut rng = Rng::new(0xB1A5);
+    let mut layers = random_layers(&cfg, 2, 0xB1A5);
+    for l in layers.iter_mut() {
+        l.q_bias = Some(rng.vec(cfg.q_dim(), 0.1));
+        l.k_bias = Some(rng.vec(cfg.kv_dim(), 0.1));
+        l.v_bias = Some(rng.vec(cfg.kv_dim(), 0.1));
+    }
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "qkv biases");
+}
+
+/// Llama-3 RoPE scaling: the device reads the host-computed `inv_freq`, so the
+/// scaled frequencies must reach the GPU rather than the plain theta powers.
+#[test]
+fn gpu_matches_cpu_with_llama3_rope_scaling() {
+    let cfg = BlockConfig {
+        hidden_size: 64,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 16,
+        intermediate_size: 128,
+        rope_theta: 500_000.0,
+        rms_eps: 1e-5,
+        rope_scaling: Some(dlm::forward::RopeScaling::Llama3 {
+            factor: 8.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position: 8192.0,
+        }),
+    };
+    let layers = random_layers(&cfg, 2, 0x5CA1E);
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "llama3 rope scaling");
+}
+
 fn small_cfg() -> BlockConfig {
     BlockConfig {
         hidden_size: 32,
@@ -131,7 +235,7 @@ fn small_cfg() -> BlockConfig {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     }
 }
 

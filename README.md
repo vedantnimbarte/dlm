@@ -17,19 +17,31 @@ ability to run models many times larger than the card.
 
 ## Install
 
-One line — downloads a prebuilt binary for your platform (Linux x86-64/arm64,
-macOS Apple Silicon) and installs it to `~/.local/bin`. No clone, no build, no
-Rust toolchain. (Intel Macs: build from source with `cargo install`.)
+One line — downloads a prebuilt binary for your platform and installs it. No
+clone, no build, no Rust toolchain. Every download is checksum-verified against a
+published `.sha256` before it is unpacked or run.
+
+**Linux / macOS** (installs to `~/.local/bin`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/install.sh | sh
 ```
 
+**Windows** (installs to `%LOCALAPPDATA%\Programs\dlm` and adds it to PATH):
+
+```powershell
+irm https://raw.githubusercontent.com/vedantnimbarte/dlm/main/install.ps1 | iex
+```
+
+Prebuilt targets: Linux x86-64/arm64, macOS Apple Silicon, Windows x86-64. (Intel
+Macs: build from source with `cargo install`.)
+
 On **Linux x86-64 with an NVIDIA GPU** the installer picks the **CUDA (GPU)
 build** automatically, and it runs on the GPU by default — pass `--device cpu` to
-any command to force CPU. Everywhere else it installs the portable **CPU build**.
-Force the CPU build with `DLM_CPU=1 curl … | sh`. (The GPU build links the CUDA
-runtime; if it can't load, the installer falls back to the CPU build on its own.)
+`serve` or `generate` to force CPU. Everywhere else it installs the portable
+**CPU build**. Force the CPU build with `DLM_CPU=1 curl … | sh`. (The GPU build
+links the CUDA runtime; if it can't load, the installer falls back to the CPU
+build on its own.)
 
 Then:
 
@@ -37,7 +49,7 @@ Then:
 dlm search llama-3.2   # find models on the Hugging Face hub
 dlm pull <org/model>   # download one locally (no hf CLI needed)
 dlm doctor             # check your machine + run a self-test
-dlm --help             # subcommands: search, pull, serve, generate, profile, tokenize, doctor
+dlm --help             # search, pull, serve, generate, profile, tokenize, doctor, completions
 ```
 
 Set `DLM_INSTALL_DIR` to change the location. To build the GPU binary yourself,
@@ -319,12 +331,38 @@ cargo run -- tokenize --text "Hello, world!"
 # round-trip : "Hello, world!" (ok)
 ```
 
-The loader handles both float (`.weight` in F32/F16/BF16) and **GPTQ-style 4-bit
-quantized** (`.qweight`/`.qzeros`/`.scales`) projections, dequantizing the latter
-into dense weights on load. (The int32 packing, grouping, and transpose are
-round-trip-tested; matching a specific exporter byte-for-byte — AWQ's nibble
-permutation, GPTQ's zero-point bias — would need real fixtures, noted in
-[`src/quant/packed.rs`](src/quant/packed.rs).)
+### Supported models
+
+dlm implements the **Llama-style decoder block** and reads the standard
+`model.layers.{i}.{self_attn,mlp}.*` tensor names. That covers:
+
+| Family | Status |
+|---|---|
+| Llama 2 / 3 / 3.1 / 3.2 | supported (incl. `llama3` RoPE scaling, GQA, tied embeddings) |
+| Mistral | supported |
+| Qwen2 / Qwen2.5 | supported (incl. the Q/K/V attention biases) |
+| Mixtral / any MoE | **not supported** — errors on the missing expert tensors |
+| GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
+| Gemma, Qwen3 | **not supported** — they need norm variants dlm does not implement |
+
+An unsupported architecture fails with a clear `UnknownTensor` error at load
+rather than producing garbage. A config declaring a `rope_scaling` type dlm does
+not implement is likewise **refused**, not silently ignored — the model was
+*trained* with that scaling, so running without it yields fluent nonsense.
+
+The loader handles **float checkpoints** (`.weight` in F32/F16/BF16). Attention
+biases (`q_proj.bias`/`k_proj.bias`/`v_proj.bias`, which Qwen2 ships and Llama does
+not) are loaded when present, and `rope_scaling` (`linear`, `llama3`) is applied
+when the config declares it.
+
+**Quantized checkpoints (GPTQ/AWQ) are refused, not silently mis-loaded.** The
+4-bit dequantizer in [`src/quant/packed.rs`](src/quant/packed.rs) is round-trip
+tested against dlm's own packer, but has never been validated against a real
+export — and exporters disagree on the zero-point convention (AutoGPTQ stores
+`zero - 1`) and on act-order column permutation. Getting either wrong yields
+*plausible-looking but incorrect* weights, which is a far worse failure than an
+honest error. Use an fp16/bf16 checkpoint. (Re-enabling this needs a real GPTQ
+fixture plus a parity test — the code is still there behind the refusal.)
 
 ## Running the tests
 
@@ -464,8 +502,9 @@ inference engine):
     (all layers resident in VRAM; requires a `cuda-kernels` build).
   - `--stream --device gpu` — stream a window of layer weights **through VRAM**
     ([`src/forward/streaming_gpu.rs`](src/forward/streaming_gpu.rs)) while KV stays
-    resident: run a model larger than VRAM on the GPU. **Experimental —
-    compile-checked but not yet validated on real GPU hardware.**
+    resident: run a model larger than VRAM on the GPU. Validated on hardware
+    against the CPU oracle ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)); the
+    streamed window is bit-comparable to a fully-resident GPU run.
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
 
   Two orthogonal memory knobs apply to any kernel:
@@ -479,9 +518,14 @@ inference engine):
   **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a
   live CPU-vs-GPU parity probe; pass `--model-path` to check a checkpoint loads and
-  tokenizes. This is how you validate the GPU paths on real hardware (there is no
-  GPU in CI, so `--device gpu`, `--stream --device gpu`, and `--multi-gpu-ids` are
-  compile-checked only until run through `dlm doctor` / a real serve on a GPU box).
+  tokenizes.
+
+  GPU paths are validated against the CPU oracle in
+  [`tests/gpu_parity.rs`](tests/gpu_parity.rs) (resident, streamed, and
+  pipeline-parallel kernels, including a realistic `hidden_size` and the Q/K/V-bias
+  and RoPE-scaling paths). CI has no GPU, so those tests only run on a machine with
+  one — `cargo test --features cuda-kernels` on a CUDA box is the check to run
+  before trusting a GPU release; CI type-checks the FFI on every push.
 - **Speculative decoding** ([`src/speculative.rs`](src/speculative.rs)) — a cheap
   draft model proposes `gamma` tokens, the target verifies them; accepted tokens
   advance in bulk. With greedy sampling the output is provably **identical** to

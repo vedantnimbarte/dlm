@@ -5,6 +5,7 @@
 //! Fields mirror the subset of `config.json` that `dlm` consumes in Phase 1.
 
 use crate::error::{DlmError, Result};
+use crate::forward::cpu::RopeScaling;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -50,6 +51,15 @@ struct RawConfig {
     rope_theta: Option<f32>,
     #[serde(default)]
     rms_norm_eps: Option<f32>,
+    /// Explicit per-head dimension. Most models omit it (it is then
+    /// `hidden_size / num_attention_heads`), but some declare a `head_dim` that
+    /// is *not* that quotient, and assuming the quotient loads them mis-shaped.
+    #[serde(default)]
+    head_dim: Option<u32>,
+    /// RoPE frequency scaling. Long-context models are trained with this; it is
+    /// not optional decoration, and ignoring it corrupts every position.
+    #[serde(default)]
+    rope_scaling: Option<RawRopeScaling>,
     /// EOS token id(s). HF configs use either a single int or an array (e.g.
     /// Llama-3 lists `<|eot_id|>` and `<|end_of_text|>`).
     #[serde(default)]
@@ -70,9 +80,6 @@ struct QuantizationConfig {
     quant_method: Option<String>,
     #[serde(default)]
     bits: Option<u32>,
-    /// GPTQ act-order: when true, columns are permuted via `g_idx` at pack time.
-    #[serde(default)]
-    desc_act: Option<bool>,
 }
 
 /// Refuse quantized checkpoints the dequantizer can't decode correctly, with a
@@ -89,23 +96,75 @@ fn check_quant_supported(q: &QuantizationConfig) -> Result<()> {
         }
     }
     match method.as_str() {
-        // Canonical GPTQ without act-order is what the dequantizer models.
-        "gptq" if q.desc_act != Some(true) => Ok(()),
+        // GPTQ is refused until the dequantizer is validated against a real
+        // checkpoint. The unpacking/grouping/transpose logic is only round-trip
+        // tested against dlm's own packer, and real exporters differ in at least
+        // one way that silently corrupts weights: AutoGPTQ stores `zero - 1` in
+        // `qzeros`, so `(q - z) * scale` is off by one scale step per element.
+        // Wrong-but-plausible weights produce fluent nonsense, which is the worst
+        // possible failure — so refuse rather than guess. Re-enable once a real
+        // GPTQ fixture is checked in and a parity test passes.
         "gptq" => Err(DlmError::UnsupportedQuant(
-            "GPTQ act-order (desc_act=true) reorders columns via g_idx, which dlm \
-             does not apply. Use a desc_act=false GPTQ or fp16 checkpoint."
+            "GPTQ checkpoints are not supported yet: dlm's 4-bit dequantizer has not been \
+             validated against a real GPTQ export (zero-point convention and act-order \
+             reordering both differ between exporters, and getting either wrong yields \
+             plausible-looking but incorrect output). Use an fp16/bf16 checkpoint."
                 .into(),
         )),
         "awq" => Err(DlmError::UnsupportedQuant(
-            "AWQ uses a permuted nibble order dlm does not yet unpack. Use a GPTQ \
-             (desc_act=false) or fp16 checkpoint."
+            "AWQ uses a permuted nibble order dlm does not unpack. Use an fp16/bf16 \
+             checkpoint."
                 .into(),
         )),
-        // No method declared: fall through to the canonical GPTQ triplet path.
+        // No method declared: nothing to refuse (a plain float checkpoint).
         "" => Ok(()),
         other => Err(DlmError::UnsupportedQuant(format!(
-            "unrecognized quant_method {other:?}; dlm supports canonical 4-bit \
-             GPTQ (desc_act=false) and fp16. Use one of those."
+            "unrecognized quant_method {other:?}; dlm currently loads fp16/bf16 \
+             checkpoints. Use one of those."
+        ))),
+    }
+}
+
+/// Raw `rope_scaling` block. HF spells the discriminant `rope_type` on newer
+/// configs and `type` on older ones; accept either.
+#[derive(Debug, Deserialize)]
+struct RawRopeScaling {
+    #[serde(default, alias = "type")]
+    rope_type: Option<String>,
+    #[serde(default)]
+    factor: Option<f32>,
+    #[serde(default)]
+    low_freq_factor: Option<f32>,
+    #[serde(default)]
+    high_freq_factor: Option<f32>,
+    #[serde(default)]
+    original_max_position_embeddings: Option<u32>,
+}
+
+/// Convert a declared `rope_scaling` block into the [`RopeScaling`] the block
+/// kernel applies.
+///
+/// A scaling type we do not implement is a hard error, never a silent skip: the
+/// model was *trained* with that scaling, so ignoring it yields fluent-looking
+/// garbage rather than an obvious failure. An explicit refusal is the only safe
+/// behavior — see the `dlm` README on supported architectures.
+fn parse_rope_scaling(r: &RawRopeScaling) -> Result<Option<RopeScaling>> {
+    let kind = r.rope_type.as_deref().unwrap_or("").to_ascii_lowercase();
+    let factor = r.factor.unwrap_or(1.0);
+    match kind.as_str() {
+        // `default`/absent means "no scaling" — plain RoPE.
+        "" | "default" => Ok(None),
+        "linear" => Ok(Some(RopeScaling::Linear { factor })),
+        "llama3" => Ok(Some(RopeScaling::Llama3 {
+            factor,
+            low_freq_factor: r.low_freq_factor.unwrap_or(1.0),
+            high_freq_factor: r.high_freq_factor.unwrap_or(4.0),
+            original_max_position: r.original_max_position_embeddings.unwrap_or(8192) as f32,
+        })),
+        other => Err(DlmError::InvalidConfig(format!(
+            "rope_scaling type {other:?} is not implemented; dlm supports \"linear\" and \
+             \"llama3\". Running this model without its trained RoPE scaling would produce \
+             incoherent output, so it is refused rather than silently mis-run."
         ))),
     }
 }
@@ -143,13 +202,19 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     /// RMSNorm epsilon (default 1e-5).
     pub rms_eps: f32,
+    /// RoPE frequency scaling declared by the model, if any.
+    pub rope_scaling: Option<RopeScaling>,
+    /// Explicit per-head dim when the config declares one; otherwise `None` and
+    /// [`head_dim`](Self::head_dim) falls back to `hidden_size / num_heads`.
+    pub explicit_head_dim: Option<u32>,
     /// On-disk weight precision.
     pub quant: QuantScheme,
 }
 
 impl ModelConfig {
     /// Load and validate a `config.json` from a model directory or file path.
-    /// If `path` is a directory, `config.json` inside it is used.
+    /// If `path` is a directory, `config.json` inside it is used — and any
+    /// `generation_config.json` beside it is merged in (see [`merge_generation_config`]).
     pub fn from_path(path: impl AsRef<Path>, quant: QuantScheme) -> Result<Self> {
         let path = path.as_ref();
         let config_path = if path.is_dir() {
@@ -163,7 +228,48 @@ impl ModelConfig {
             source,
         })?;
 
-        Self::from_json_bytes(&bytes, quant)
+        let mut config = Self::from_json_bytes(&bytes, quant)?;
+
+        // HuggingFace treats `generation_config.json` as authoritative for
+        // generation parameters, and models routinely declare a *larger* EOS set
+        // there than in config.json. Qwen2.5 lists only `<|im_end|>` in
+        // config.json but both `<|im_end|>` and `<|endoftext|>` in the generation
+        // config — miss the second and the model never stops: it emits the token,
+        // generation runs on to the token limit, and the special token itself
+        // leaks into the reply.
+        if let Some(dir) = config_path.parent() {
+            let gen_path = dir.join("generation_config.json");
+            if let Ok(gen_bytes) = std::fs::read(&gen_path) {
+                config.merge_generation_config(&gen_bytes)?;
+            }
+        }
+        Ok(config)
+    }
+
+    /// Merge a `generation_config.json` over this config: union the EOS ids it
+    /// declares into [`eos_token_ids`](Self::eos_token_ids). Stopping on any of
+    /// them is correct, so a union (rather than a replace) is the safe merge.
+    pub fn merge_generation_config(&mut self, bytes: &[u8]) -> Result<()> {
+        #[derive(Deserialize)]
+        struct GenConfig {
+            #[serde(default)]
+            eos_token_id: Option<EosField>,
+        }
+        let gen: GenConfig = serde_json::from_slice(bytes).map_err(|source| DlmError::Json {
+            context: "generation_config.json".to_string(),
+            source,
+        })?;
+        let extra = match gen.eos_token_id {
+            Some(EosField::One(id)) => vec![id],
+            Some(EosField::Many(ids)) => ids,
+            None => Vec::new(),
+        };
+        for id in extra {
+            if !self.eos_token_ids.contains(&id) {
+                self.eos_token_ids.push(id);
+            }
+        }
+        Ok(())
     }
 
     /// Parse a config from raw JSON bytes. Separated from [`from_path`] so it
@@ -197,6 +303,11 @@ impl ModelConfig {
             },
             rope_theta: raw.rope_theta.unwrap_or(10000.0),
             rms_eps: raw.rms_norm_eps.unwrap_or(1e-5),
+            rope_scaling: match &raw.rope_scaling {
+                Some(r) => parse_rope_scaling(r)?,
+                None => None,
+            },
+            explicit_head_dim: raw.head_dim,
             quant,
         };
 
@@ -218,18 +329,28 @@ impl ModelConfig {
         if self.hidden_size == 0 {
             return Err(DlmError::InvalidConfig("hidden_size must be > 0".into()));
         }
-        if self.hidden_size % self.num_attention_heads != 0 {
+        // Only the derived head_dim needs the divisibility guarantee; a config
+        // that states head_dim outright is free to break the quotient relation.
+        if self.explicit_head_dim.is_none() && self.hidden_size % self.num_attention_heads != 0 {
             return Err(DlmError::InvalidConfig(format!(
                 "hidden_size ({}) is not divisible by num_attention_heads ({})",
                 self.hidden_size, self.num_attention_heads
             )));
         }
+        if self.head_dim() % 2 != 0 {
+            return Err(DlmError::InvalidConfig(format!(
+                "head_dim ({}) must be even (RoPE rotates dimension pairs)",
+                self.head_dim()
+            )));
+        }
         Ok(())
     }
 
-    /// Per-head dimension (`hidden_size / num_attention_heads`).
+    /// Per-head dimension: the config's explicit `head_dim` when it declares one,
+    /// else `hidden_size / num_attention_heads`.
     pub fn head_dim(&self) -> u32 {
-        self.hidden_size / self.num_attention_heads
+        self.explicit_head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     /// Rough total parameter count for the whole model, used to estimate the

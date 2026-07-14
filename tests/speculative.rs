@@ -36,7 +36,7 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     };
     let mut rng = Rng::new(seed);
     let s = 0.05;
@@ -49,7 +49,7 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
         up_proj: rng.vec(cfg.intermediate_size * hidden, s),
         down_proj: rng.vec(hidden * cfg.intermediate_size, s),
         input_layernorm: vec![1.0; hidden],
-        post_attention_layernorm: vec![1.0; hidden],
+        post_attention_layernorm: vec![1.0; hidden], ..Default::default()
     }];
     let kernel = CpuKernel::new(cfg, layers).unwrap();
     let embedding = rng.vec(vocab * hidden, s);

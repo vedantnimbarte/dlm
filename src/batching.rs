@@ -333,8 +333,10 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// completed this tick (for streaming).
     pub fn step(&mut self) -> Result<Tick> {
         let zero_finished = self.admit()?;
-        let mut tick = Tick::default();
-        tick.finished = zero_finished;
+        let mut tick = Tick {
+            finished: zero_finished,
+            ..Default::default()
+        };
         let mut still_active = Vec::with_capacity(self.active.len());
         for mut a in self.active.drain(..) {
             // Plain slots yield one token; speculative slots yield a whole

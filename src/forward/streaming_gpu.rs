@@ -30,35 +30,10 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-extern "C" {
-    // Same device entry point as `forward::gpu` (see `src/gpu/kernels.cu`).
-    #[allow(clippy::too_many_arguments)]
-    fn dlm_decode_block(
-        hidden_size: i32,
-        q_dim: i32,
-        kv_dim: i32,
-        num_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        inter: i32,
-        rope_theta: f32,
-        rms_eps: f32,
-        q_proj: *const f32,
-        k_proj: *const f32,
-        v_proj: *const f32,
-        o_proj: *const f32,
-        gate_proj: *const f32,
-        up_proj: *const f32,
-        down_proj: *const f32,
-        in_norm: *const f32,
-        post_norm: *const f32,
-        x: *mut f32,
-        kv_keys: *mut f32,
-        kv_values: *mut f32,
-        num_positions: i32,
-        position: i32,
-    ) -> i32;
-}
+// The device entry point is declared once in `forward::gpu` and imported here.
+// Restating the `extern` block let this path keep calling the old ABI after the
+// kernel signature changed — a silent mismatch the compiler only warns about.
+use crate::forward::gpu::{bias_ptr, dlm_decode_block, upload_bias};
 
 /// One layer's weight buffers, resident in VRAM (no KV — that lives in `GpuKv`).
 struct GpuWeights {
@@ -71,6 +46,11 @@ struct GpuWeights {
     down_proj: DeviceBuffer,
     input_layernorm: DeviceBuffer,
     post_attention_layernorm: DeviceBuffer,
+    /// Attention biases (Qwen2 et al.). Uploaded synchronously — a few KB each,
+    /// so they don't warrant a slot in the async staging layout.
+    q_bias: Option<DeviceBuffer>,
+    k_bias: Option<DeviceBuffer>,
+    v_bias: Option<DeviceBuffer>,
 }
 
 impl GpuWeights {
@@ -143,6 +123,9 @@ impl GpuWeights {
             down_proj: it.next().unwrap(),
             input_layernorm: it.next().unwrap(),
             post_attention_layernorm: it.next().unwrap(),
+            q_bias: upload_bias(t.q_bias.as_ref())?,
+            k_bias: upload_bias(t.k_bias.as_ref())?,
+            v_bias: upload_bias(t.v_bias.as_ref())?,
         })
     }
 }
@@ -273,6 +256,9 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     shared: Arc<GpuShared<S>>,
     num_layers: u32,
     kv_capacity_tokens: usize,
+    /// RoPE inverse frequencies (see [`GpuKernel`](crate::forward::GpuKernel)):
+    /// computed once by the shared host function, resident for the kernel's life.
+    inv_freq: DeviceBuffer,
     kv: Vec<GpuKv>,
     prefetch_tx: Option<Sender<u32>>,
     worker: Option<JoinHandle<()>>,
@@ -323,10 +309,16 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 }
             })
         };
+        let inv_freq = DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
+            cfg.head_dim,
+            cfg.rope_theta,
+            cfg.rope_scaling,
+        ))?;
         Ok(Self {
             shared,
             num_layers,
             kv_capacity_tokens: cap,
+            inv_freq,
             kv,
             prefetch_tx: Some(tx),
             worker: Some(worker),
@@ -410,7 +402,6 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 cfg.num_kv_heads as i32,
                 cfg.head_dim as i32,
                 cfg.intermediate_size as i32,
-                cfg.rope_theta,
                 cfg.rms_eps,
                 w.q_proj.as_ptr(),
                 w.k_proj.as_ptr(),
@@ -421,6 +412,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 w.down_proj.as_ptr(),
                 w.input_layernorm.as_ptr(),
                 w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                self.inv_freq.as_ptr(),
                 d_hidden.as_mut_ptr(),
                 dkv.keys.as_mut_ptr(),
                 dkv.values.as_mut_ptr(),

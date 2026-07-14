@@ -22,8 +22,28 @@
 use crate::error::{DlmError, Result};
 use crate::forward::kernel::ComputeKernel;
 
+/// RoPE frequency scaling, as declared by `rope_scaling` in `config.json`.
+///
+/// Modern long-context models are *trained* with a scaled RoPE; ignoring it does
+/// not merely truncate context, it makes every position's rotation wrong and the
+/// output incoherent. Unsupported scaling types are rejected at config-parse time
+/// rather than silently dropped (see [`crate::model::ModelConfig`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RopeScaling {
+    /// Llama-3 piecewise frequency correction (`rope_type: "llama3"`).
+    Llama3 {
+        factor: f32,
+        low_freq_factor: f32,
+        high_freq_factor: f32,
+        original_max_position: f32,
+    },
+    /// Linear position interpolation (`rope_type: "linear"`): every frequency is
+    /// divided by `factor`.
+    Linear { factor: f32 },
+}
+
 /// Shape + hyperparameters of one decoder block.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BlockConfig {
     /// Residual-stream width (`d_model`).
     pub hidden_size: usize,
@@ -39,6 +59,8 @@ pub struct BlockConfig {
     pub rope_theta: f32,
     /// RMSNorm epsilon.
     pub rms_eps: f32,
+    /// RoPE frequency scaling, when the model declares one.
+    pub rope_scaling: Option<RopeScaling>,
 }
 
 impl BlockConfig {
@@ -59,7 +81,12 @@ impl BlockConfig {
 }
 
 /// Dense weight matrices for one block (row-major `[out, in]`).
-#[derive(Debug, Clone)]
+///
+/// The Q/K/V biases are `Option` because the Llama/Mistral families have none,
+/// while Qwen2 ships one per attention projection. Dropping a bias the checkpoint
+/// declares yields wrong attention and incoherent text with no error, so the
+/// loader reads them whenever they are present.
+#[derive(Debug, Clone, Default)]
 pub struct LayerTensors {
     pub q_proj: Vec<f32>,   // [q_dim, hidden]
     pub k_proj: Vec<f32>,   // [kv_dim, hidden]
@@ -70,6 +97,10 @@ pub struct LayerTensors {
     pub down_proj: Vec<f32>, // [hidden, intermediate]
     pub input_layernorm: Vec<f32>,          // [hidden]
     pub post_attention_layernorm: Vec<f32>, // [hidden]
+    /// Attention projection biases (Qwen2 et al.); `None` for Llama/Mistral.
+    pub q_bias: Option<Vec<f32>>, // [q_dim]
+    pub k_bias: Option<Vec<f32>>, // [kv_dim]
+    pub v_bias: Option<Vec<f32>>, // [kv_dim]
 }
 
 impl LayerTensors {
@@ -86,6 +117,21 @@ impl LayerTensors {
             ("input_layernorm", self.input_layernorm.len(), cfg.hidden_size),
             ("post_attention_layernorm", self.post_attention_layernorm.len(), cfg.hidden_size),
         ];
+        let bias_checks = [
+            ("q_bias", self.q_bias.as_ref(), cfg.q_dim()),
+            ("k_bias", self.k_bias.as_ref(), cfg.kv_dim()),
+            ("v_bias", self.v_bias.as_ref(), cfg.kv_dim()),
+        ];
+        for (name, bias, expected) in bias_checks {
+            if let Some(b) = bias {
+                if b.len() != expected {
+                    return Err(DlmError::QuantLayout(format!(
+                        "{name}: expected {expected} elements, got {}",
+                        b.len()
+                    )));
+                }
+            }
+        }
         for (name, got, expected) in checks {
             if got != expected {
                 return Err(DlmError::QuantLayout(format!(
@@ -109,6 +155,7 @@ impl LayerTensors {
             down_proj: vec![0.0; cfg.hidden_size * cfg.intermediate_size],
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size],
+            ..Default::default()
         }
     }
 }
@@ -388,20 +435,76 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// The RoPE inverse frequencies for one head: `head_dim / 2` values, with any
+/// declared [`RopeScaling`] already folded in.
+///
+/// This is the **single source of truth** for RoPE frequencies. The CPU block
+/// calls it per block; the GPU kernel uploads its output once and indexes the
+/// resulting device array — so the two paths cannot drift apart, and a new
+/// scaling type is implemented in exactly one place.
+pub fn rope_inv_freqs(head_dim: usize, theta: f32, scaling: Option<RopeScaling>) -> Vec<f32> {
+    (0..head_dim / 2)
+        .map(|i| {
+            let base = theta.powf(-2.0 * i as f32 / head_dim as f32);
+            match scaling {
+                None => base,
+                Some(RopeScaling::Linear { factor }) => base / factor,
+                Some(RopeScaling::Llama3 {
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position,
+                }) => {
+                    // HF `_compute_llama3_parameters`: leave high-frequency
+                    // (short-wavelength) components alone, divide low-frequency
+                    // ones by `factor`, and smoothly blend in between.
+                    let wavelen = 2.0 * std::f32::consts::PI / base;
+                    let low_wavelen = original_max_position / low_freq_factor;
+                    let high_wavelen = original_max_position / high_freq_factor;
+                    if wavelen > low_wavelen {
+                        base / factor
+                    } else if wavelen < high_wavelen {
+                        base
+                    } else {
+                        let smooth = (original_max_position / wavelen - low_freq_factor)
+                            / (high_freq_factor - low_freq_factor);
+                        (1.0 - smooth) * base / factor + smooth * base
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
 /// Apply rotary position embedding in place to a `[num_heads × head_dim]`
-/// vector at absolute `position` (NeoX split-half convention).
-fn rope_inplace(vec: &mut [f32], num_heads: usize, head_dim: usize, position: usize, theta: f32) {
+/// vector at absolute `position` (NeoX split-half convention), using
+/// precomputed [`rope_inv_freqs`].
+fn rope_inplace(
+    vec: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    position: usize,
+    inv_freq: &[f32],
+) {
     let half = head_dim / 2;
     for h in 0..num_heads {
         let base = h * head_dim;
         for i in 0..half {
-            let freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
-            let angle = position as f32 * freq;
+            let angle = position as f32 * inv_freq[i];
             let (sin, cos) = angle.sin_cos();
             let a = vec[base + i];
             let b = vec[base + i + half];
             vec[base + i] = a * cos - b * sin;
             vec[base + i + half] = a * sin + b * cos;
+        }
+    }
+}
+
+/// Add a projection bias in place, when the checkpoint declares one.
+fn add_bias(v: &mut [f32], bias: Option<&Vec<f32>>) {
+    if let Some(b) = bias {
+        for (x, &bb) in v.iter_mut().zip(b) {
+            *x += bb;
         }
     }
 }
@@ -457,10 +560,15 @@ pub fn decode_block(
     let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
     let mut q = matvec(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
     let mut k = matvec(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
-    let v = matvec(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
+    let mut v = matvec(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
 
-    rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, cfg.rope_theta);
-    rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, cfg.rope_theta);
+    add_bias(&mut q, w.q_bias.as_ref());
+    add_bias(&mut k, w.k_bias.as_ref());
+    add_bias(&mut v, w.v_bias.as_ref());
+
+    let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
+    rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, &inv_freq);
+    rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, &inv_freq);
 
     kv.append(&k, &v)?;
     let ctx = attention(cfg, &q, kv);
@@ -580,16 +688,102 @@ mod tests {
 
     #[test]
     fn rope_preserves_norm_and_is_identity_at_zero() {
+        let inv = rope_inv_freqs(4, 10000.0, None);
         let mut v = vec![1.0, 2.0, 3.0, 4.0];
         let before: f32 = v.iter().map(|x| x * x).sum();
-        rope_inplace(&mut v, 1, 4, 5, 10000.0);
+        rope_inplace(&mut v, 1, 4, 5, &inv);
         let after: f32 = v.iter().map(|x| x * x).sum();
         assert!((before - after).abs() < 1e-3, "rotation preserves norm");
 
         // Position 0 → no rotation.
         let mut w = vec![1.0, 2.0, 3.0, 4.0];
-        rope_inplace(&mut w, 1, 4, 0, 10000.0);
+        rope_inplace(&mut w, 1, 4, 0, &inv);
         approx(&w, &[1.0, 2.0, 3.0, 4.0], 1e-6);
+    }
+
+    #[test]
+    fn unscaled_inv_freqs_are_the_plain_theta_powers() {
+        let inv = rope_inv_freqs(8, 10000.0, None);
+        // freq_i = theta^(-2i/head_dim)
+        approx(
+            &inv,
+            &[1.0, 10000f32.powf(-0.25), 10000f32.powf(-0.5), 10000f32.powf(-0.75)],
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn linear_rope_scaling_divides_every_frequency() {
+        let plain = rope_inv_freqs(8, 10000.0, None);
+        let scaled = rope_inv_freqs(8, 10000.0, Some(RopeScaling::Linear { factor: 4.0 }));
+        let expect: Vec<f32> = plain.iter().map(|f| f / 4.0).collect();
+        approx(&scaled, &expect, 1e-9);
+    }
+
+    #[test]
+    fn llama3_rope_scaling_is_piecewise_in_wavelength() {
+        // Llama-3.1/3.2 defaults.
+        let s = RopeScaling::Llama3 {
+            factor: 8.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position: 8192.0,
+        };
+        let plain = rope_inv_freqs(128, 500000.0, None);
+        let scaled = rope_inv_freqs(128, 500000.0, Some(s));
+
+        for (&p, &sc) in plain.iter().zip(&scaled) {
+            let wavelen = 2.0 * std::f32::consts::PI / p;
+            if wavelen < 8192.0 / 4.0 {
+                // High frequency (short wavelength) → untouched.
+                assert!((sc - p).abs() < 1e-9, "high-freq changed: {p} -> {sc}");
+            } else if wavelen > 8192.0 / 1.0 {
+                // Low frequency (long wavelength) → fully divided by `factor`.
+                assert!((sc - p / 8.0).abs() < 1e-9, "low-freq wrong: {p} -> {sc}");
+            } else {
+                // Mid band → strictly between the two extremes.
+                assert!(sc >= p / 8.0 - 1e-9 && sc <= p + 1e-9, "mid-band out of range");
+            }
+        }
+        // Scaling must actually change something, or the test proves nothing.
+        assert!(plain.iter().zip(&scaled).any(|(&p, &s)| (p - s).abs() > 1e-9));
+    }
+
+    #[test]
+    fn qkv_bias_shifts_the_block_output() {
+        // A bias the loader drops is silent wrong output — pin that it is applied.
+        let cfg = BlockConfig {
+            hidden_size: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 6,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+        };
+        let hidden = vec![1.5, -2.0, 0.5, 3.0];
+
+        // Zero weights ⇒ identity. Adding a V bias alone feeds a nonzero value
+        // through attention → o_proj, but o_proj is zero, so still identity;
+        // give o_proj an identity-ish row so the bias can reach the output.
+        let mut w = LayerTensors::zeros(&cfg);
+        w.o_proj = vec![0.0; cfg.hidden_size * cfg.q_dim()];
+        for i in 0..cfg.hidden_size.min(cfg.q_dim()) {
+            w.o_proj[i * cfg.q_dim() + i] = 1.0;
+        }
+
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let base = decode_block(&cfg, &w, &hidden, &mut kv, 0).unwrap();
+
+        w.v_bias = Some(vec![1.0; cfg.kv_dim()]);
+        let mut kv2 = KvLayerCache::new(cfg.kv_dim());
+        let biased = decode_block(&cfg, &w, &hidden, &mut kv2, 0).unwrap();
+
+        assert!(
+            base.iter().zip(&biased).any(|(a, b)| (a - b).abs() > 1e-6),
+            "v_bias had no effect on the block output — bias is being dropped"
+        );
     }
 
     #[test]
@@ -601,7 +795,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5,
+            rms_eps: 1e-5, rope_scaling: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
@@ -619,7 +813,7 @@ mod tests {
             head_dim: 1,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5,
+            rms_eps: 1e-5, rope_scaling: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
@@ -637,7 +831,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 6,
             rope_theta: 10000.0,
-            rms_eps: 1e-5,
+            rms_eps: 1e-5, rope_scaling: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -671,7 +865,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5,
+            rms_eps: 1e-5, rope_scaling: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
@@ -712,7 +906,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5,
+            rms_eps: 1e-5, rope_scaling: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
@@ -737,7 +931,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5,
+            rms_eps: 1e-5, rope_scaling: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
