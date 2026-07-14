@@ -25,9 +25,13 @@ extern "C" {
     /// One decode block on the device (see `src/gpu/kernels.cu`). Returns a
     /// `cudaError_t` (0 == success). All pointers are device pointers; `kv_keys`
     /// and `kv_values` are persistent buffers written in place at slot
-    /// `num_positions`.
+    /// `num_positions`. `q_bias`/`k_bias`/`v_bias` may be null.
+    ///
+    /// Declared **once**, here: the streaming GPU kernel imports this rather than
+    /// restating it. Two `extern` declarations of one symbol let the signatures
+    /// drift apart silently, which is undefined behavior at the call site.
     #[allow(clippy::too_many_arguments)]
-    fn dlm_decode_block(
+    pub(crate) fn dlm_decode_block(
         hidden_size: i32,
         q_dim: i32,
         kv_dim: i32,
@@ -35,7 +39,6 @@ extern "C" {
         num_kv_heads: i32,
         head_dim: i32,
         inter: i32,
-        rope_theta: f32,
         rms_eps: f32,
         q_proj: *const f32,
         k_proj: *const f32,
@@ -46,12 +49,33 @@ extern "C" {
         down_proj: *const f32,
         in_norm: *const f32,
         post_norm: *const f32,
+        q_bias: *const f32,
+        k_bias: *const f32,
+        v_bias: *const f32,
+        inv_freq: *const f32,
         x: *mut f32,
         kv_keys: *mut f32,
         kv_values: *mut f32,
         num_positions: i32,
         position: i32,
     ) -> i32;
+}
+
+/// Upload an optional bias, or `None` when the checkpoint has none. The kernel
+/// takes a NULL pointer to mean "no bias".
+///
+/// Biases are a few KB against a layer's several MB of matrices, so they go up
+/// synchronously rather than through the streaming path's pinned staging buffer.
+pub(crate) fn upload_bias(bias: Option<&Vec<f32>>) -> Result<Option<DeviceBuffer>> {
+    match bias {
+        Some(b) => Ok(Some(DeviceBuffer::from_slice(b)?)),
+        None => Ok(None),
+    }
+}
+
+/// Device pointer for an optional buffer — NULL when absent.
+pub(crate) fn bias_ptr(b: &Option<DeviceBuffer>) -> *const f32 {
+    b.as_ref().map_or(std::ptr::null(), |d| d.as_ptr())
 }
 
 /// One layer's weights plus its persistent K/V history, resident in VRAM.
@@ -65,6 +89,9 @@ struct GpuLayer {
     down_proj: DeviceBuffer,
     input_layernorm: DeviceBuffer,
     post_attention_layernorm: DeviceBuffer,
+    q_bias: Option<DeviceBuffer>,
+    k_bias: Option<DeviceBuffer>,
+    v_bias: Option<DeviceBuffer>,
     kv_keys: DeviceBuffer,
     kv_values: DeviceBuffer,
 }
@@ -81,6 +108,9 @@ impl GpuLayer {
             down_proj: DeviceBuffer::from_slice(&t.down_proj)?,
             input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
             post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
+            q_bias: upload_bias(t.q_bias.as_ref())?,
+            k_bias: upload_bias(t.k_bias.as_ref())?,
+            v_bias: upload_bias(t.v_bias.as_ref())?,
             kv_keys: DeviceBuffer::new(kv_buffer_len)?,
             kv_values: DeviceBuffer::new(kv_buffer_len)?,
         })
@@ -91,6 +121,10 @@ impl GpuLayer {
 pub struct GpuKernel {
     cfg: BlockConfig,
     layers: Vec<GpuLayer>,
+    /// RoPE inverse frequencies, computed once by the same host function the CPU
+    /// oracle uses ([`rope_inv_freqs`]) and kept resident so the kernel indexes
+    /// it instead of recomputing (and possibly diverging from) the formula.
+    inv_freq: DeviceBuffer,
     /// Max tokens the per-layer KV buffers can hold.
     kv_capacity_tokens: usize,
 }
@@ -106,9 +140,15 @@ impl GpuKernel {
             layer.validate(&cfg)?;
             gpu_layers.push(GpuLayer::upload(layer, kv_buffer_len)?);
         }
+        let inv_freq = DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
+            cfg.head_dim,
+            cfg.rope_theta,
+            cfg.rope_scaling,
+        ))?;
         Ok(Self {
             cfg,
             layers: gpu_layers,
+            inv_freq,
             kv_capacity_tokens: cap,
         })
     }
@@ -163,7 +203,6 @@ impl ComputeKernel for GpuKernel {
                 self.cfg.num_kv_heads as i32,
                 self.cfg.head_dim as i32,
                 self.cfg.intermediate_size as i32,
-                self.cfg.rope_theta,
                 self.cfg.rms_eps,
                 w.q_proj.as_ptr(),
                 w.k_proj.as_ptr(),
@@ -174,6 +213,10 @@ impl ComputeKernel for GpuKernel {
                 w.down_proj.as_ptr(),
                 w.input_layernorm.as_ptr(),
                 w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                self.inv_freq.as_ptr(),
                 d_hidden.as_mut_ptr(),
                 w.kv_keys.as_mut_ptr(),
                 w.kv_values.as_mut_ptr(),

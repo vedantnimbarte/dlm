@@ -108,7 +108,7 @@ fn tiny_cfg() -> BlockConfig {
         head_dim: 4,
         intermediate_size: 16,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     }
 }
 
@@ -167,7 +167,7 @@ fn gpu_parity_probe() -> Result<f32> {
         up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, s),
         down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, s),
         input_layernorm: vec![1.0; cfg.hidden_size],
-        post_attention_layernorm: vec![1.0; cfg.hidden_size],
+        post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
     };
     let cpu = CpuKernel::new(cfg, vec![layer.clone()])?;
     let gpu = GpuKernel::new(cfg, vec![layer], 8)?;
@@ -395,9 +395,10 @@ fn resolve_tokenizer(args: &GenerateArgs) -> Result<BpeTokenizer> {
         return BpeTokenizer::from_dir(dir);
     }
     if let Some(dir) = &args.model_path {
-        if dir.join("vocab.json").exists() && dir.join("merges.txt").exists() {
-            return BpeTokenizer::from_dir(dir);
-        }
+        // Same rule as `serve`: an HF `tokenizer.json` counts. Checking only for
+        // the GPT-2 pair here silently fell back to the byte tokenizer for every
+        // modern model, feeding raw bytes in as token ids.
+        return serve_tokenizer(dir);
     }
     Ok(BpeTokenizer::bytes_only())
 }
@@ -428,7 +429,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         head_dim,
         intermediate_size: args.intermediate_size,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     };
 
     // Small random weights (RMSNorm keeps activations bounded).
@@ -444,7 +445,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
             up_proj: rng.vec(cfg.intermediate_size * cfg.hidden_size, scale),
             down_proj: rng.vec(cfg.hidden_size * cfg.intermediate_size, scale),
             input_layernorm: vec![1.0; cfg.hidden_size],
-            post_attention_layernorm: vec![1.0; cfg.hidden_size],
+            post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
         })
         .collect();
 

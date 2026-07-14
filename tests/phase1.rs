@@ -200,9 +200,14 @@ fn rejects_unsupported_quant_formats() {
     // Unknown method → refused conservatively.
     assert!(parse(with_quant(r#"{"quant_method":"squeezellm"}"#)).is_err());
 
-    // Canonical 4-bit GPTQ (no act-order) — the case the dequantizer handles.
-    assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":4,"desc_act":false}"#)).is_ok());
-    // No quantization_config at all — plain fp16, always fine.
+    // Plain 4-bit GPTQ is refused *too*, until the dequantizer is validated
+    // against a real GPTQ export. It is only round-trip tested against dlm's own
+    // packer, and exporters disagree on the zero-point convention (AutoGPTQ
+    // stores `zero - 1`). A wrong zero-point yields fluent, confident nonsense —
+    // strictly worse than an honest refusal.
+    assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":4,"desc_act":false}"#)).is_err());
+
+    // No quantization_config at all — plain fp16/bf16, the supported path.
     assert!(parse(format!("{{{base}}}")).is_ok());
 }
 
@@ -672,8 +677,13 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// A checkpoint carrying packed 4-bit tensors must be **refused at load**, even
+/// when `config.json` declares no `quantization_config` (so the config-level gate
+/// never fires). dlm's dequantizer is validated only against its own packer, and
+/// a wrong zero-point convention would silently produce plausible-but-incorrect
+/// weights. Refusing is the safe behavior until a real GPTQ fixture exists.
 #[test]
-fn loader_materializes_gptq_quantized_projection() {
+fn loader_refuses_packed_4bit_projection() {
     use dlm::quant::{pack_gptq_4bit, PackedQuantConfig};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -687,7 +697,7 @@ fn loader_materializes_gptq_quantized_projection() {
     let pcfg = PackedQuantConfig { in_features: h, out_features: q_dim, group_size: h };
     let (qweight, qzeros, scales) = pack_gptq_4bit(&dense_in_by_out, &pcfg).unwrap();
 
-    let mut entries: Vec<(String, &str, Vec<u8>, usize)> = vec![
+    let entries: Vec<(String, &str, Vec<u8>, usize)> = vec![
         ("model.embed_tokens.weight".into(), "F32", f32_bytes(&fill(vocab * h)), vocab * h),
         // q_proj as a GPTQ-quantized triplet.
         ("model.layers.0.self_attn.q_proj.qweight".into(), "I32", i32_bytes(&qweight), qweight.len()),
@@ -705,7 +715,7 @@ fn loader_materializes_gptq_quantized_projection() {
         ("model.norm.weight".into(), "F32", f32_bytes(&vec![1.0; h]), h),
         ("lm_head.weight".into(), "F32", f32_bytes(&fill(vocab * h)), vocab * h),
     ];
-    write_typed_model(tmp.path(), &mut entries);
+    write_typed_model(tmp.path(), &entries);
 
     let config_json = format!(
         r#"{{"hidden_size":{h},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"num_hidden_layers":1,"vocab_size":{vocab},"intermediate_size":{inter}}}"#
@@ -713,13 +723,16 @@ fn loader_materializes_gptq_quantized_projection() {
     let config = ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Int4).unwrap();
     let store = MmapStore::open_dir(tmp.path()).unwrap();
 
-    // Loads and runs — the quantized q_proj is dequantized into LayerTensors.
-    let generator = dlm::loader::load_generator(&store, &config, 8).unwrap();
-    let out = generator
-        .generate(&[1, 2], &dlm::generate::GenerationConfig { max_new_tokens: 3, eos_token: None, sampler: dlm::generate::Sampler::Greedy })
-        .unwrap();
-    assert_eq!(out.len(), 3);
-    assert!(out.iter().all(|&t| (t as usize) < vocab));
+    // Refused with a clear error rather than dequantized through an unvalidated
+    // path. Silent garbage is the failure mode this guards against.
+    let msg = match dlm::loader::load_generator(&store, &config, 8) {
+        Ok(_) => panic!("packed 4-bit checkpoint was loaded instead of refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("4-bit") || msg.contains("GPTQ") || msg.contains("fp16"),
+        "expected a clear packed-4-bit refusal, got: {msg}"
+    );
 }
 
 #[test]
@@ -743,9 +756,11 @@ fn loader_ties_lm_head_to_embedding_when_absent() {
     ];
     write_f32_model(tmp.path(), &tensors);
 
-    // hidden=4, heads=4 → head_dim 1, kv-heads default 4, intermediate=4.
+    // hidden=4, heads=2 → head_dim 2, kv-heads default 2, intermediate=4.
+    // (head_dim must be even: RoPE rotates dimension *pairs*, so an odd head_dim
+    // would leave the last element unrotated — the config validator rejects it.)
     let config_json = format!(
-        r#"{{"hidden_size":{h},"num_attention_heads":4,"num_hidden_layers":1,"vocab_size":{vocab},"intermediate_size":{h}}}"#
+        r#"{{"hidden_size":{h},"num_attention_heads":2,"num_hidden_layers":1,"vocab_size":{vocab},"intermediate_size":{h}}}"#
     );
     let config = ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Fp16).unwrap();
     let store = MmapStore::open_dir(tmp.path()).unwrap();
@@ -798,7 +813,7 @@ fn orchestrator_runs_real_cpu_block_autoregressively() {
         head_dim: 2,
         intermediate_size: 6,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     };
     // Two zero-weight (identity) layers → hidden passes through unchanged.
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg); 2]).unwrap();

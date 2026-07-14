@@ -127,9 +127,29 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
 }
 
 fn is_wanted(f: &str) -> bool {
-    f.ends_with(".safetensors")
-        || f.ends_with(".safetensors.index.json")
-        || KEEP_EXACT.contains(&f)
+    is_safe_relative_path(f)
+        && (f.ends_with(".safetensors")
+            || f.ends_with(".safetensors.index.json")
+            || KEEP_EXACT.contains(&f))
+}
+
+/// Reject filenames from the hub API that would escape the destination directory.
+///
+/// `rfilename` is attacker-controlled data (anyone can publish a repo). Joining it
+/// blindly is an arbitrary-file-write: `Path::join` with an absolute path *discards*
+/// the base entirely, and `..` components walk out of it. A name only ever needs to
+/// be a plain relative path, so require exactly that.
+fn is_safe_relative_path(f: &str) -> bool {
+    use std::path::{Component, Path};
+
+    if f.is_empty() || f.contains('\\') || f.contains('\0') {
+        return false;
+    }
+    // Rejects "/etc/x", "C:\x", "../x", "a/../../x" — and, on Windows, the
+    // drive-relative and UNC forms `Path` also treats as non-normal.
+    Path::new(f)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// GET a URL and return the body, failing clearly if curl is missing or the
@@ -220,6 +240,26 @@ mod tests {
         assert!(is_wanted("tokenizer.json"));
         assert!(!is_wanted("model.gguf"));
         assert!(!is_wanted("pytorch_model.bin"));
+    }
+
+    #[test]
+    fn rejects_filenames_that_escape_the_destination() {
+        // `rfilename` comes from the hub API — i.e. from whoever published the
+        // repo. Each of these ends in an accepted suffix, so only the path check
+        // stands between them and an arbitrary file write.
+        for evil in [
+            "../../../../etc/cron.d/x.safetensors",
+            "/etc/cron.d/x.safetensors",
+            "a/../../b.safetensors",
+            r"..\..\x.safetensors",
+            r"C:\Windows\Temp\x.safetensors",
+            "",
+        ] {
+            assert!(!is_wanted(evil), "should have rejected {evil:?}");
+        }
+        // Plain relative paths, including subdirectories, stay allowed.
+        assert!(is_wanted("model.safetensors"));
+        assert!(is_safe_relative_path("subdir/model.safetensors"));
         assert!(!is_wanted("README.md"));
     }
 

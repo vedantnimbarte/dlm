@@ -47,12 +47,29 @@ fn compile_cuda_kernels() {
         .unwrap_or_else(|_| "nvcc".to_string());
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let lib_path = format!("{out_dir}/libdlm_kernels.a");
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
-    let status = std::process::Command::new(&nvcc)
-        .args(["-O3", "-Xcompiler", "-fPIC", "-lib", "src/gpu/kernels.cu", "-o"])
-        .arg(&lib_path)
-        .status();
+    // MSVC produces `dlm_kernels.lib` and has no `-fPIC` (position-independent
+    // code is the only mode); passing it through -Xcompiler makes cl.exe fail.
+    let lib_path = if windows {
+        format!("{out_dir}/dlm_kernels.lib")
+    } else {
+        format!("{out_dir}/libdlm_kernels.a")
+    };
+
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.arg("-O3");
+    if windows {
+        // nvcc shells out to the MSVC host compiler and requires cl.exe on PATH.
+        // rustc finds link.exe through its own MSVC probe, so a working Rust build
+        // does NOT imply cl.exe is on PATH — point nvcc at it explicitly.
+        if let Some(dir) = find_msvc_bin() {
+            cmd.arg("-ccbin").arg(dir);
+        }
+    } else {
+        cmd.args(["-Xcompiler", "-fPIC"]);
+    }
+    let status = cmd.args(["-lib", "src/gpu/kernels.cu", "-o"]).arg(&lib_path).status();
 
     match status {
         Ok(s) if s.success() => {
@@ -66,4 +83,44 @@ fn compile_cuda_kernels() {
             println!("cargo:warning=cuda-kernels enabled but nvcc was not found; skipping device-code compilation (cargo check still type-checks the FFI)");
         }
     }
+}
+
+/// Directory holding the MSVC `cl.exe`, located through the Visual Studio
+/// installer's `vswhere`. Returns `None` when VS is absent or cl.exe is already
+/// resolvable, in which case nvcc's own PATH lookup applies.
+#[cfg(windows)]
+fn find_msvc_bin() -> Option<std::path::PathBuf> {
+    let program_files =
+        std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+    let vswhere =
+        std::path::Path::new(&program_files).join("Microsoft Visual Studio/Installer/vswhere.exe");
+
+    let out = std::process::Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+    let root = String::from_utf8(out.stdout).ok()?;
+    let msvc = std::path::Path::new(root.trim()).join("VC/Tools/MSVC");
+
+    // Pick the highest installed toolset version.
+    let mut versions: Vec<_> = std::fs::read_dir(&msvc)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    versions.sort();
+    let bin = versions.last()?.join("bin/Hostx64/x64");
+    bin.join("cl.exe").exists().then_some(bin)
+}
+
+#[cfg(not(windows))]
+fn find_msvc_bin() -> Option<std::path::PathBuf> {
+    None
 }

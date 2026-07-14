@@ -20,8 +20,7 @@ use crate::forward::{
 };
 use crate::generate::Generator;
 use crate::model::ModelConfig;
-use crate::quant::{dequantize_gptq_4bit, PackedQuantConfig};
-use crate::storage::{bytes_to_f32, bytes_to_i32, MmapStore};
+use crate::storage::{bytes_to_f32, MmapStore};
 
 /// Read a named tensor as `f32`, verifying it has exactly `expected_len` elements.
 fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec<f32>> {
@@ -43,13 +42,6 @@ fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     bytes_to_f32(shard.tensor_bytes(name)?, info.dtype)
 }
 
-/// Read an integer tensor of unknown length (packed `qweight`/`qzeros`).
-fn load_ints(store: &MmapStore, name: &str) -> Result<Vec<i32>> {
-    let (shard, info) = store
-        .locate(name)
-        .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
-    bytes_to_i32(shard.tensor_bytes(name)?, info.dtype)
-}
 
 /// Load a linear layer's weight as dense row-major `[out, in]`, transparently
 /// handling both float (`{base}.weight`) and GPTQ-style quantized
@@ -66,37 +58,33 @@ fn load_linear(
         return load_tensor(store, &weight_name, out_features * in_features);
     }
 
-    // GPTQ-style quantized triplet.
-    let qweight_name = format!("{base}.qweight");
-    if store.locate(&qweight_name).is_some() {
-        let qweight = load_ints(store, &qweight_name)?;
-        let qzeros = load_ints(store, &format!("{base}.qzeros"))?;
-        let scales = load_floats(store, &format!("{base}.scales"))?;
-
-        // Infer the group size from the scales shape ([in/group_size, out]).
-        if scales.is_empty() || scales.len() % out_features != 0 {
-            return Err(DlmError::QuantLayout(format!(
-                "{base}.scales length {} is not a multiple of out_features {out_features}",
-                scales.len()
-            )));
-        }
-        let num_groups = scales.len() / out_features;
-        if num_groups == 0 || in_features % num_groups != 0 {
-            return Err(DlmError::QuantLayout(format!(
-                "{base}: {num_groups} groups do not divide in_features {in_features}"
-            )));
-        }
-        let cfg = PackedQuantConfig {
-            in_features,
-            out_features,
-            group_size: in_features / num_groups,
-        };
-        return dequantize_gptq_4bit(&qweight, &qzeros, &scales, &cfg);
+    // A packed 4-bit checkpoint. `config.json` normally declares this and is
+    // refused up front (see `check_quant_supported`), but a checkpoint can carry
+    // `qweight` with no `quantization_config` at all — refuse here too rather
+    // than run it through an unvalidated dequantizer and emit fluent nonsense.
+    if store.locate(&format!("{base}.qweight")).is_some() {
+        return Err(DlmError::UnsupportedQuant(format!(
+            "{base} is a packed 4-bit (GPTQ/AWQ) tensor; dlm's dequantizer is not yet \
+             validated against real quantized exports. Use an fp16/bf16 checkpoint."
+        )));
     }
 
     Err(DlmError::UnknownTensor(format!(
         "{base}.weight or {base}.qweight"
     )))
+}
+
+/// Read a linear layer's bias (`{base}.bias`) when the checkpoint ships one.
+///
+/// Llama/Mistral have no attention biases; Qwen2 does. Returning `None` for an
+/// absent bias is correct, but silently *ignoring* one that exists produces wrong
+/// attention and incoherent output, so every caller that has a bias slot uses this.
+fn load_bias(store: &MmapStore, base: &str, out_features: usize) -> Result<Option<Vec<f32>>> {
+    let name = format!("{base}.bias");
+    if store.locate(&name).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(load_tensor(store, &name, out_features)?))
 }
 
 /// A model materialized to host `f32` weights, ready to wrap in a compute kernel
@@ -191,6 +179,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         intermediate_size: config.intermediate_size as usize,
         rope_theta: config.rope_theta,
         rms_eps: config.rms_eps,
+        rope_scaling: config.rope_scaling,
     }
 }
 
@@ -222,6 +211,10 @@ pub(crate) fn load_layer_tensors(
             &name("post_attention_layernorm.weight"),
             hidden,
         )?,
+        // Present on Qwen2 and friends, absent on Llama/Mistral.
+        q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
+        k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
+        v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
     };
     tensors.validate(cfg)?;
     Ok(tensors)

@@ -10,7 +10,9 @@ use crate::error::{DlmError, Result};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A parsed HTTP request.
 #[derive(Debug, Clone)]
@@ -28,13 +30,16 @@ impl Request {
     }
 }
 
+/// Writes a streaming body straight to the socket (SSE), returning when done.
+pub type StreamWriter = Box<dyn FnOnce(&mut dyn Write) -> std::io::Result<()> + Send>;
+
 /// A response body: either a complete buffer or a streaming writer (for SSE).
 pub enum Body {
     /// A complete, length-known body.
     Full(Vec<u8>),
     /// A streaming body: the closure writes directly to the socket and returns
     /// when the stream is complete. Sent without `Content-Length`.
-    Stream(Box<dyn FnOnce(&mut dyn Write) -> std::io::Result<()> + Send>),
+    Stream(StreamWriter),
 }
 
 /// An HTTP response.
@@ -81,6 +86,30 @@ impl Response {
 /// rejected before allocating, so a malicious header can't exhaust memory.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum length of the request line or any single header line (8 KiB).
+///
+/// `BufReader::read_line` grows its `String` until it sees a newline, so without
+/// this a client that streams endless bytes and never sends `\n` drives unbounded
+/// allocation and OOMs the whole process — not just its own connection.
+const MAX_LINE_BYTES: u64 = 8 * 1024;
+
+/// Maximum number of header lines accepted on one request.
+const MAX_HEADERS: usize = 100;
+
+/// How long a connection may stall without progress before it is dropped.
+///
+/// Without a read timeout, a client that opens a socket and sends nothing (or
+/// promises a body it never delivers) pins a thread forever — the classic
+/// slowloris. Each stalled connection costs a thread, so a handful of idle
+/// sockets would otherwise take the server down.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of connections served concurrently.
+///
+/// The accept loop previously spawned an unbounded thread per connection. The
+/// cap turns "spawn until the OS refuses" into backpressure.
+const MAX_CONNECTIONS: usize = 256;
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -88,6 +117,7 @@ fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        411 => "Length Required",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
@@ -121,27 +151,64 @@ impl HttpServer {
     }
 
     /// Serve forever, dispatching each connection to `handler` on its own thread.
+    ///
+    /// Concurrency is capped at [`MAX_CONNECTIONS`]; past that, `accept` simply
+    /// waits for a slot rather than spawning threads without bound.
     pub fn serve(self, handler: Handler) -> Result<()> {
+        let live = Arc::new(AtomicUsize::new(0));
         for stream in self.listener.incoming() {
             let Ok(stream) = stream else { continue };
+
+            // Backpressure: shed the connection rather than spawn past the cap.
+            if live.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                drop(stream);
+                continue;
+            }
+            live.fetch_add(1, Ordering::Relaxed);
+
             let handler = Arc::clone(&handler);
+            let live = Arc::clone(&live);
             std::thread::spawn(move || {
                 if let Err(_e) = handle_connection(stream, handler) {
                     // Per-connection errors are non-fatal; drop the connection.
                 }
+                live.fetch_sub(1, Ordering::Relaxed);
             });
         }
         Ok(())
     }
 }
 
+/// Read one CRLF-terminated line, refusing to buffer more than [`MAX_LINE_BYTES`].
+///
+/// Returns `Ok(None)` at clean EOF. An over-long line is an error (the connection
+/// is dropped) rather than an unbounded allocation.
+fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut String) -> std::io::Result<Option<()>> {
+    buf.clear();
+    let n = reader.take(MAX_LINE_BYTES).read_line(buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if n as u64 >= MAX_LINE_BYTES && !buf.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "header line exceeds limit",
+        ));
+    }
+    Ok(Some(()))
+}
+
 /// Parse one request, run the handler, write one response, close.
 fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()> {
+    // A stalled peer must not pin this thread forever.
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
     let mut reader = BufReader::new(stream);
 
     // Request line: METHOD PATH VERSION
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
+    if read_line_capped(&mut reader, &mut request_line)?.is_none() {
         return Ok(());
     }
     let mut parts = request_line.split_whitespace();
@@ -150,17 +217,35 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
 
     // Headers until a blank line.
     let mut headers = HashMap::new();
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        if read_line_capped(&mut reader, &mut line)?.is_none() {
             break;
         }
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
             break;
         }
+        if headers.len() >= MAX_HEADERS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "too many headers",
+            ));
+        }
         if let Some((k, v)) = trimmed.split_once(':') {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+
+    // dlm speaks HTTP/1.0-style single-shot requests and reads bodies by
+    // Content-Length. A chunked body would otherwise be silently read as empty
+    // and fail JSON parsing with a misleading 400 — say what is actually wrong.
+    if let Some(te) = headers.get("transfer-encoding") {
+        if te.to_ascii_lowercase().contains("chunked") {
+            return write_response(
+                reader.get_mut(),
+                Response::json(411, br#"{"error":{"message":"chunked transfer-encoding is not supported; send Content-Length","type":"invalid_request_error"}}"#.to_vec()),
+            );
         }
     }
 
@@ -175,9 +260,21 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
             Response::json(413, br#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#.to_vec()),
         );
     }
-    let mut body = vec![0u8; content_length];
+    // Read incrementally instead of pre-allocating the *declared* length: a
+    // client could otherwise claim 16 MiB, send one byte, and hold that much
+    // memory (times every open connection) without ever completing the request.
+    let mut body = Vec::new();
     if content_length > 0 {
-        reader.read_exact(&mut body)?;
+        reader
+            .by_ref()
+            .take(content_length as u64)
+            .read_to_end(&mut body)?;
+        if body.len() != content_length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "body shorter than Content-Length",
+            ));
+        }
     }
 
     let request = Request {

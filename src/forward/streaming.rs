@@ -379,7 +379,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 16,
             rope_theta: 10000.0,
-            rms_eps: 1e-5,
+            rms_eps: 1e-5, rope_scaling: None,
         }
     }
 
@@ -398,7 +398,7 @@ mod tests {
                     up_proj: vec![s; c.intermediate_size * c.hidden_size],
                     down_proj: vec![s; c.hidden_size * c.intermediate_size],
                     input_layernorm: vec![1.0; c.hidden_size],
-                    post_attention_layernorm: vec![1.0; c.hidden_size],
+                    post_attention_layernorm: vec![1.0; c.hidden_size], ..Default::default()
                 }
             })
             .collect()

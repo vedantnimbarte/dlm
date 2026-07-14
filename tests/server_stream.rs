@@ -18,7 +18,7 @@ fn build_generator() -> Generator<CpuKernel> {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     };
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
     let fill = |n: usize, off: usize| -> Vec<f32> {
@@ -289,7 +289,7 @@ fn start_streaming_server() -> SocketAddr {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5,
+        rms_eps: 1e-5, rope_scaling: None,
     };
     struct Src {
         cfg: BlockConfig,
