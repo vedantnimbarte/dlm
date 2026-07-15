@@ -23,7 +23,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Profile a model and print the VRAM plan + streaming schedule (no server).
     Profile(ProfileArgs),
-    /// Run the end-to-end CPU generation loop on a synthetic model (demo).
+    /// Run the end-to-end CPU generation loop on a synthetic model (demo). To run
+    /// a real model — including VRAM-streaming on the GPU — use `serve` instead.
     Generate(GenerateArgs),
     /// Tokenize text with a byte-level BPE tokenizer (round-trip check).
     Tokenize(TokenizeArgs),
@@ -229,7 +230,8 @@ pub struct ServeArgs {
 
     /// Stream transformer layers from disk instead of holding them all resident,
     /// keeping only a bounded window in memory — lets a model exceed the resident
-    /// budget. Runs on the CPU kernel.
+    /// budget. Streams into VRAM on `--device gpu` (GPU compute) and into host RAM
+    /// on `--device cpu` (CPU compute).
     #[arg(long, default_value_t = false)]
     pub stream: bool,
 
