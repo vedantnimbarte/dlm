@@ -17,9 +17,13 @@ jobs:
       - name: Show default MSVC
         run: |
           Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory | Select-Object Name
-      - uses: Jimver/cuda-toolkit@v0.2.19
+      # CUDA 13.2 is the first release whose nvcc frontend supports the runner's
+      # MSVC 195x (VS 2026 / toolset 14.5x). CUDA 12.5's cudafe++ segfaults on it
+      # (ACCESS_VIOLATION) — the runner ships only the newest MSVC, so pinning an
+      # older toolkit is not an option. v0.2.35 is the first action tag with 13.2.
+      - uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: "12.5.0"
+          cuda: "13.2.0"
           method: network
           sub-packages: '["nvcc", "cudart"]'
       - name: Build cuda-static
