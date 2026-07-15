@@ -397,9 +397,29 @@ pub(crate) fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec
     debug_assert_eq!(w.len(), out_dim * in_dim);
     debug_assert_eq!(x.len(), in_dim);
     let mut y = vec![0.0f32; out_dim];
-    for (o, slot) in y.iter_mut().enumerate() {
-        let row = &w[o * in_dim..(o + 1) * in_dim];
-        *slot = row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum();
+    let dot = |row: &[f32]| -> f32 { row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum() };
+
+    // The LM head is [vocab≈128k, hidden] — ~1 GB streamed per token — and
+    // single-threaded it dominates decode latency (the GPU path still computes
+    // logits on the CPU). Output rows are independent, so split them across cores.
+    // ponytail: parallelize only large GEMVs; small per-layer projections aren't
+    // worth the thread hop. Threshold in MACs, not a tuned constant.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads > 1 && out_dim.saturating_mul(in_dim) >= (1 << 20) {
+        let rows_per = out_dim.div_ceil(threads);
+        std::thread::scope(|s| {
+            for (wrows, yrows) in w.chunks(rows_per * in_dim).zip(y.chunks_mut(rows_per)) {
+                s.spawn(move || {
+                    for (o, slot) in yrows.iter_mut().enumerate() {
+                        *slot = dot(&wrows[o * in_dim..(o + 1) * in_dim]);
+                    }
+                });
+            }
+        });
+    } else {
+        for (o, slot) in y.iter_mut().enumerate() {
+            *slot = dot(&w[o * in_dim..(o + 1) * in_dim]);
+        }
     }
     y
 }

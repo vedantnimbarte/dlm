@@ -47,17 +47,37 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* out, int n
 }
 
 // Row-major [out_dim, in_dim] matrix times vector, plus an optional bias.
-// One thread per output row. `bias` may be NULL (Llama/Mistral have no attention
-// bias; Qwen2 does — dropping it silently corrupts attention).
+// Threads per block for the GEMV reduction; power of two for the tree reduction.
+#define MATVEC_THREADS 256
+
+// out[o] = dot(W[o], x) (+ bias[o]). `bias` may be NULL (Llama/Mistral have no
+// attention bias; Qwen2 does — dropping it silently corrupts attention).
+//
+// One BLOCK per output row. Threads in the block stride over the (contiguous)
+// weight row, so consecutive lanes read consecutive addresses — coalesced global
+// loads — then tree-reduce the partial dot products in shared memory. Launch
+// <<<out_dim, MATVEC_THREADS>>>.
+//
+// The previous version used one THREAD per output with a sequential row walk:
+// adjacent threads touched addresses `in_dim` floats apart, so every 32-lane warp
+// load pulled a full cache line to use one float — ~1/32 of memory bandwidth on a
+// bandwidth-bound GEMV. This is the dominant cost of the decode stack; coalescing
+// it is the single biggest kernel speedup.
 __global__ void matvec_kernel(const float* W, const float* x, const float* bias, float* out,
                               int out_dim, int in_dim) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.x;
     if (o >= out_dim) return;
-    float s = 0.0f;
     const float* row = W + (long)o * in_dim;
-    for (int i = 0; i < in_dim; ++i) s += row[i] * x[i];
-    if (bias) s += bias[o];
-    out[o] = s;
+    __shared__ float partial[MATVEC_THREADS];
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) s += row[i] * x[i];
+    partial[threadIdx.x] = s;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[o] = partial[0] + (bias ? bias[o] : 0.0f);
 }
 
 // In-place rotary embedding over [num_heads * head_dim]. One thread per rotated pair.
@@ -143,6 +163,35 @@ __global__ void copy_kernel(const float* src, float* dst, int n) {
 
 static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 
+// Persistent scratch buffers for the decode block. cudaMalloc/cudaFree are
+// synchronizing driver calls (each flushes the queue and stalls the pipeline —
+// especially under the Windows WDDM driver). The previous code malloc'd and
+// freed all 11 scratch buffers on EVERY call — i.e. 11 malloc + 11 free per
+// layer per token, ~352 serializing driver calls per token for a 16-layer model
+// — which left the GPU idle ~99% of the time and made the GPU path barely beat
+// CPU. The scratch sizes are fixed by model geometry, so allocate once and reuse
+// across every layer and token; realloc only if a later call needs a bigger
+// buffer.
+// thread_local so each inference thread owns its scratch: the multi-GPU path runs
+// one thread per device (each with its own CUDA context), and the test harness
+// runs cases in parallel threads — a single global would race and corrupt
+// buffers across them. Per-thread scratch is allocated on that thread's current
+// device and reclaimed by the driver at process exit.
+enum { SCRATCH_N = 11 };
+static thread_local float* g_scratch[SCRATCH_N] = {0};
+static thread_local int g_scratch_cap[SCRATCH_N] = {0}; // capacity in floats
+
+// Ensure scratch slot `i` holds at least `n` floats; (re)allocates only on growth.
+static cudaError_t scratch_ensure(int i, int n) {
+    if (g_scratch_cap[i] >= n) return cudaSuccess;
+    if (g_scratch[i]) cudaFree(g_scratch[i]);
+    g_scratch[i] = 0;
+    g_scratch_cap[i] = 0;
+    cudaError_t e = cudaMalloc(&g_scratch[i], (size_t)n * sizeof(float));
+    if (e == cudaSuccess) g_scratch_cap[i] = n;
+    return e;
+}
+
 // `kv_keys` / `kv_values` are **persistent** device buffers (capacity
 // max_positions * kv_dim) owned by the caller across the whole sequence. This
 // call writes the new token's K/V into slot `num_positions` in place and attends
@@ -163,32 +212,34 @@ extern "C" int dlm_decode_block(
     const int B = 256;
     int total_pos = num_positions + 1;
 
-    float *normed = 0, *q = 0, *k = 0, *v = 0, *ctx = 0, *attn_out = 0, *normed2 = 0;
-    float *gate = 0, *up = 0, *inter_buf = 0, *down = 0;
-
-    // Any cudaMalloc can fail (OOM is the common case on a small card); bail out
-    // with the real error instead of launching kernels on NULL pointers.
+    // Persistent scratch (allocated once, reused). Any cudaMalloc can fail (OOM is
+    // the common case on a small card); bail out with the real error instead of
+    // launching kernels on NULL pointers.
     cudaError_t e = cudaSuccess;
-    #define DLM_ALLOC(p, n) if (e == cudaSuccess) { e = cudaMalloc(&(p), (n) * sizeof(float)); }
-    DLM_ALLOC(normed, hidden_size)
-    DLM_ALLOC(q, q_dim)
-    DLM_ALLOC(k, kv_dim)
-    DLM_ALLOC(v, kv_dim)
-    DLM_ALLOC(ctx, q_dim)
-    DLM_ALLOC(attn_out, hidden_size)
-    DLM_ALLOC(normed2, hidden_size)
-    DLM_ALLOC(gate, inter)
-    DLM_ALLOC(up, inter)
-    DLM_ALLOC(inter_buf, inter)
-    DLM_ALLOC(down, hidden_size)
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(0, hidden_size)
+    DLM_ALLOC(1, q_dim)
+    DLM_ALLOC(2, kv_dim)
+    DLM_ALLOC(3, kv_dim)
+    DLM_ALLOC(4, q_dim)
+    DLM_ALLOC(5, hidden_size)
+    DLM_ALLOC(6, hidden_size)
+    DLM_ALLOC(7, inter)
+    DLM_ALLOC(8, inter)
+    DLM_ALLOC(9, inter)
+    DLM_ALLOC(10, hidden_size)
     #undef DLM_ALLOC
+    float *normed = g_scratch[0], *q = g_scratch[1], *k = g_scratch[2];
+    float *v = g_scratch[3], *ctx = g_scratch[4], *attn_out = g_scratch[5];
+    float *normed2 = g_scratch[6], *gate = g_scratch[7], *up = g_scratch[8];
+    float *inter_buf = g_scratch[9], *down = g_scratch[10];
 
     if (e == cudaSuccess) {
         // Attention sublayer.
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
-        matvec_kernel<<<grid_for(q_dim, B), B>>>(q_proj, normed, q_bias, q, q_dim, hidden_size);
-        matvec_kernel<<<grid_for(kv_dim, B), B>>>(k_proj, normed, k_bias, k, kv_dim, hidden_size);
-        matvec_kernel<<<grid_for(kv_dim, B), B>>>(v_proj, normed, v_bias, v, kv_dim, hidden_size);
+        matvec_kernel<<<q_dim, MATVEC_THREADS>>>(q_proj, normed, q_bias, q, q_dim, hidden_size);
+        matvec_kernel<<<kv_dim, MATVEC_THREADS>>>(k_proj, normed, k_bias, k, kv_dim, hidden_size);
+        matvec_kernel<<<kv_dim, MATVEC_THREADS>>>(v_proj, normed, v_bias, v, kv_dim, hidden_size);
         rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
 
@@ -198,24 +249,29 @@ extern "C" int dlm_decode_block(
 
         // Attend over history + this token, reading the persistent buffers directly.
         attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos);
-        matvec_kernel<<<grid_for(hidden_size, B), B>>>(o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim);
+        matvec_kernel<<<hidden_size, MATVEC_THREADS>>>(o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
         // MLP sublayer (SwiGLU).
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);
-        matvec_kernel<<<grid_for(inter, B), B>>>(gate_proj, normed2, (const float*)0, gate, inter, hidden_size);
-        matvec_kernel<<<grid_for(inter, B), B>>>(up_proj, normed2, (const float*)0, up, inter, hidden_size);
+        matvec_kernel<<<inter, MATVEC_THREADS>>>(gate_proj, normed2, (const float*)0, gate, inter, hidden_size);
+        matvec_kernel<<<inter, MATVEC_THREADS>>>(up_proj, normed2, (const float*)0, up, inter, hidden_size);
         swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter);
-        matvec_kernel<<<grid_for(hidden_size, B), B>>>(down_proj, inter_buf, (const float*)0, down, hidden_size, inter);
+        matvec_kernel<<<hidden_size, MATVEC_THREADS>>>(down_proj, inter_buf, (const float*)0, down, hidden_size, inter);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
-        e = cudaDeviceSynchronize();
-        if (e == cudaSuccess) e = cudaGetLastError();
+        // No blocking cudaDeviceSynchronize here: all kernels run on the in-order
+        // default stream, so consecutive decode blocks (and the layers within one)
+        // execute in order without a host round-trip. The caller synchronizes once
+        // when it needs the result on the host (the D2H copy of the hidden vector
+        // after the last layer). A per-block sync here cost ~30ms/layer of pure
+        // host-idle stall — the dominant term in per-token latency. We still check
+        // cudaGetLastError() to catch launch-time (config) errors synchronously;
+        // execution errors surface at the caller's next synchronizing copy.
+        e = cudaGetLastError();
     }
 
-    cudaFree(normed); cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(ctx);
-    cudaFree(attn_out); cudaFree(normed2); cudaFree(gate); cudaFree(up);
-    cudaFree(inter_buf); cudaFree(down);
-
+    // Scratch is persistent — not freed here. It is reused across every layer and
+    // token and reclaimed by the driver at process exit.
     return (int)e;
 }

@@ -19,7 +19,7 @@
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
-use crate::gpu::device::{synchronize, DeviceBuffer};
+use crate::gpu::device::DeviceBuffer;
 
 extern "C" {
     /// One decode block on the device (see `src/gpu/kernels.cu`). Returns a
@@ -127,6 +127,12 @@ pub struct GpuKernel {
     inv_freq: DeviceBuffer,
     /// Max tokens the per-layer KV buffers can hold.
     kv_capacity_tokens: usize,
+    /// Persistent device buffer for the hidden vector, reused across every layer
+    /// and token. `run_block` uploads the host hidden into it and downloads the
+    /// result back — reusing one allocation instead of cudaMalloc/cudaFree per
+    /// layer (a synchronizing driver call in the hot path). Sound because a given
+    /// kernel instance is driven by a single inference thread, one layer at a time.
+    d_hidden: DeviceBuffer,
 }
 
 impl GpuKernel {
@@ -145,11 +151,13 @@ impl GpuKernel {
             cfg.rope_theta,
             cfg.rope_scaling,
         ))?;
+        let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         Ok(Self {
             cfg,
             layers: gpu_layers,
             inv_freq,
             kv_capacity_tokens: cap,
+            d_hidden,
         })
     }
 }
@@ -189,8 +197,18 @@ impl ComputeKernel for GpuKernel {
             )));
         }
 
-        // Only the hidden vector crosses the bus; KV lives in VRAM.
-        let d_hidden = DeviceBuffer::from_slice(hidden)?;
+        // The hidden state stays resident on the device for the whole layer stack:
+        // upload the host vector once before the first layer, chain every layer
+        // through the same persistent buffer on the (in-order) default stream, and
+        // download once after the last layer. The orchestrator never reads `hidden`
+        // between layers, so the per-layer host round-trip + sync it used to do
+        // was pure overhead — ~2/3 of the per-token GPU time on a 16-layer model.
+        let is_first = layer == 0;
+        let is_last = layer as usize == self.layers.len() - 1;
+        let d_hidden = &self.d_hidden;
+        if is_first {
+            d_hidden.upload(hidden)?;
+        }
 
         // SAFETY: all pointers are live device allocations of the sizes the
         // kernel expects; kv buffers have capacity for `num_positions + 1`.
@@ -230,8 +248,12 @@ impl ComputeKernel for GpuKernel {
                 code,
             });
         }
-        synchronize()?;
-        d_hidden.download(hidden)?;
+        // `download` is a blocking cudaMemcpy(D2H), so it already waits for the
+        // stack's kernels — no separate synchronize() needed. Only the last layer
+        // brings the result back to the host.
+        if is_last {
+            d_hidden.download(hidden)?;
+        }
 
         // Keep the orchestrator's length bookkeeping in step. The real K/V is in
         // VRAM; these host placeholders are never read on the GPU path.
