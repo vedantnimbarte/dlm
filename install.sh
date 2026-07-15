@@ -116,6 +116,21 @@ fetch() {
   [ -f "$tmp/$BIN" ] || err "binary '$BIN' not found in ${a}"
 }
 
+# If we picked the GPU build but it isn't published in this release (e.g. its CI
+# build failed while the CPU build succeeded), fall back to CPU rather than
+# aborting on a 404 — the user still gets a working install.
+asset_exists() {
+  url="https://github.com/${REPO}/releases/latest/download/$1"
+  if command -v curl >/dev/null 2>&1; then curl -fsIL -o /dev/null "$url"
+  elif command -v wget >/dev/null 2>&1; then wget -q --spider "$url"
+  else return 0; fi
+}
+if [ "$asset" != "$cpu_asset" ] && ! asset_exists "$asset"; then
+  info "GPU build not published in this release — falling back to the CPU build."
+  asset="$cpu_asset"
+  kind="CPU"
+fi
+
 info "Installing ${BIN} (${target}, ${kind} build)…"
 fetch "$asset"
 

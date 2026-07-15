@@ -78,16 +78,24 @@ try {
 
     $exe = $null
     if ($useGpu) {
+        # If the GPU asset isn't published in this release (e.g. its CI build
+        # failed while CPU succeeded), fall back to CPU instead of aborting.
         try { $exe = Get-Asset $gpuAsset }
-        catch { Die "download/verify failed for the GPU build: $($_.Exception.Message)" }
-        # Embeds the CUDA runtime but still needs a usable NVIDIA driver. If it
-        # won't start, fall back to CPU so we never install a binary that can't run.
-        & $exe.FullName --version *>$null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "GPU build won't start here (NVIDIA driver missing or too old?) - falling back to the CPU build."
-            Write-Host "Update your NVIDIA driver and re-run to get the GPU build."
+        catch {
+            Write-Host "GPU build unavailable ($($_.Exception.Message)) - falling back to the CPU build."
             $useGpu = $false
             $kind = 'CPU'
+        }
+        # Embeds the CUDA runtime but still needs a usable NVIDIA driver. If it
+        # won't start, fall back to CPU so we never install a binary that can't run.
+        if ($useGpu) {
+            & $exe.FullName --version *>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "GPU build won't start here (NVIDIA driver missing or too old?) - falling back to the CPU build."
+                Write-Host "Update your NVIDIA driver and re-run to get the GPU build."
+                $useGpu = $false
+                $kind = 'CPU'
+            }
         }
     }
     if (-not $useGpu) {

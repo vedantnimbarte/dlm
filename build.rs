@@ -75,6 +75,11 @@ fn compile_cuda_kernels() {
 
     let mut cmd = std::process::Command::new(&nvcc);
     cmd.arg("-O3");
+    // nvcc hard-errors when the host compiler is newer than the CUDA release
+    // officially knows about (e.g. CUDA 12.5's nvcc vs MSVC 14.5x / VS 18 on the
+    // Windows CI runner). kernels.cu is plain CUDA C with no STL surface, so the
+    // version guard is spurious here — waive it so a newer toolchain still builds.
+    cmd.arg("--allow-unsupported-compiler");
     if windows {
         // nvcc shells out to the MSVC host compiler and requires cl.exe on PATH.
         // rustc finds link.exe through its own MSVC probe, so a working Rust build
