@@ -28,6 +28,12 @@ rocm = []
 # (the device `run_block`). Implies `cuda`; requires the CUDA toolkit (nvcc) at
 # build time. `cargo check` type-checks the Rust FFI without nvcc.
 cuda-kernels = ["cuda"]
+# Same as `cuda-kernels`, but statically links the CUDA runtime (cudart_static)
+# into the binary instead of the shared cudart. The toolkit is needed only at
+# BUILD time; the resulting binary runs on any machine with just the NVIDIA
+# driver — no CUDA toolkit install required. Used for the redistributable
+# `-cuda-static` release asset.
+cuda-static = ["cuda-kernels"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

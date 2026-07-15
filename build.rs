@@ -6,6 +6,8 @@
 //! anywhere — the storage engine and VRAM math have no GPU dependency.
 
 fn main() {
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+
     if std::env::var("CARGO_FEATURE_CUDA").is_ok() {
         if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
             // Toolkit layout varies: NVIDIA .run/Windows → lib64 / lib\x64;
@@ -16,7 +18,21 @@ fn main() {
             println!("cargo:rustc-link-search=native={cuda_path}/lib/aarch64-linux-gnu");
             println!("cargo:rustc-link-search=native={cuda_path}/lib");
         }
-        println!("cargo:rustc-link-lib=dylib=cudart");
+        if std::env::var("CARGO_FEATURE_CUDA_STATIC").is_ok() {
+            // Static CUDA runtime: baked into the binary so it needs only the
+            // NVIDIA driver at runtime, not the toolkit. On Linux cudart_static
+            // pulls in culibos + the usual system libs; on Windows the import
+            // lib name is the same and the CRT covers the rest.
+            println!("cargo:rustc-link-lib=static=cudart_static");
+            if !windows {
+                println!("cargo:rustc-link-lib=static=culibos");
+                println!("cargo:rustc-link-lib=dylib=rt");
+                println!("cargo:rustc-link-lib=dylib=pthread");
+                println!("cargo:rustc-link-lib=dylib=dl");
+            }
+        } else {
+            println!("cargo:rustc-link-lib=dylib=cudart");
+        }
     }
 
     if std::env::var("CARGO_FEATURE_ROCM").is_ok() {

@@ -67,18 +67,30 @@ jobs:
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # GPU (CUDA) build — Linux x86-64 only. install.sh downloads this
-  # `-cuda` asset when it detects an NVIDIA GPU. Building needs nvcc (to compile
-  # src/gpu/kernels.cu) but no GPU; the binary links the CUDA runtime, so it only
-  # runs on machines with the CUDA runtime + an NVIDIA driver.
-  build-cuda:
+  # GPU (static-CUDA) builds — x86-64 Linux and Windows. The installers download
+  # the `-cuda-static` asset when they detect an NVIDIA GPU. Building needs the
+  # CUDA toolkit (nvcc to compile src/gpu/kernels.cu, cudart_static to link) but
+  # NO GPU. The runtime is statically embedded, so the binary runs on any machine
+  # with just the NVIDIA driver — no CUDA toolkit install required. We ship only
+  # this variant (not a dynamic one): it is a strict superset — it also runs where
+  # the toolkit is present. Users who specifically want a dynamic build can
+  # `cargo install --features cuda-kernels` from source.
+  build-cuda-static:
     needs: create-release
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
       - uses: Jimver/cuda-toolkit@v0.2.19
         with:
           cuda: "12.5.0"
@@ -87,10 +99,11 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: dlm
-          target: x86_64-unknown-linux-gnu
-          features: cuda-kernels
-          archive: dlm-$target-cuda
+          target: ${{ matrix.target }}
+          features: cuda-static
+          archive: dlm-$target-cuda-static
           tar: unix
+          zip: windows
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
