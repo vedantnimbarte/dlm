@@ -91,11 +91,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Jimver/cuda-toolkit@v0.2.19
+      # CUDA 13.2 is the first release whose nvcc frontend supports the runner's
+      # MSVC 195x (VS 2026); CUDA 12.5's cudafe++ segfaulted on it and the runners
+      # ship only the newest MSVC, so bumping the toolkit is the fix, not pinning an
+      # older compiler. Full toolkit (no sub-packages) because CUDA 13 no longer
+      # bundles crt/host_config.h in the ["nvcc","cudart"] subset. Linux also needs
+      # libstdc++ at link time now — handled in build.rs.
+      - uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: "12.5.0"
+          cuda: "13.2.0"
           method: network
-          sub-packages: '["nvcc", "cudart"]'
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: dlm

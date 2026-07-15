@@ -1,6 +1,6 @@
 [package]
 name = "dlm"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.75"
 description = "dlm (Dynamic LLM) — run massive LLMs on consumer GPUs by dynamically streaming transformer layers in and out of VRAM"
