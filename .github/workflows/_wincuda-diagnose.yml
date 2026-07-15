@@ -1,0 +1,26 @@
+name: wincuda-diagnose
+
+# TEMPORARY: reproduces the release's Windows static-CUDA build so the nvcc
+# toolchain issue can be diagnosed and fixed without re-tagging a release.
+# Delete this file once the fix lands in release.yml.
+on:
+  push:
+    branches: [ci/win-cuda-diagnose]
+  workflow_dispatch:
+
+jobs:
+  win-cuda:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Show default MSVC
+        run: |
+          Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory | Select-Object Name
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.5.0"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+      - name: Build cuda-static
+        run: cargo build --release --features cuda-static

@@ -90,15 +90,23 @@ fn compile_cuda_kernels() {
     } else {
         cmd.args(["-Xcompiler", "-fPIC"]);
     }
-    let status = cmd.args(["-lib", "src/gpu/kernels.cu", "-o"]).arg(&lib_path).status();
+    let output = cmd.args(["-lib", "src/gpu/kernels.cu", "-o"]).arg(&lib_path).output();
 
-    match status {
-        Ok(s) if s.success() => {
+    match output {
+        Ok(o) if o.status.success() => {
             println!("cargo:rustc-link-search=native={out_dir}");
             println!("cargo:rustc-link-lib=static=dlm_kernels");
         }
-        Ok(s) => {
-            println!("cargo:warning=nvcc failed to compile src/gpu/kernels.cu (exit {s}); GPU kernels will be unresolved at link time");
+        Ok(o) => {
+            // Surface nvcc's own diagnostics — the exit code alone can't tell a
+            // host-compiler/toolkit mismatch from a missing header or a bad flag.
+            for line in String::from_utf8_lossy(&o.stderr).lines() {
+                println!("cargo:warning=nvcc: {line}");
+            }
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                println!("cargo:warning=nvcc: {line}");
+            }
+            println!("cargo:warning=nvcc failed to compile src/gpu/kernels.cu (exit {}); GPU kernels will be unresolved at link time", o.status);
         }
         Err(_) => {
             println!("cargo:warning=cuda-kernels enabled but nvcc was not found; skipping device-code compilation (cargo check still type-checks the FFI)");
