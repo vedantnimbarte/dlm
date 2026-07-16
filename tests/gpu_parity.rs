@@ -189,7 +189,7 @@ fn gpu_matches_cpu_with_int4_weights() {
         .map(|mut l| {
             let q = |w: &dlm::forward::Weights| {
                 let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
-                dlm::forward::Weights::quantize_int4(&floats, dlm::forward::INT4_GROUP_SIZE).unwrap()
+                dlm::forward::Weights::quantize_int4(&floats, dlm::forward::QUANT_GROUP_SIZE).unwrap()
             };
             l.q_proj = q(&l.q_proj);
             l.k_proj = q(&l.k_proj);
@@ -202,6 +202,43 @@ fn gpu_matches_cpu_with_int4_weights() {
         })
         .collect();
     assert_gpu_matches_cpu(cfg, quantized, 2e-3, "int4 weights");
+}
+
+/// Same contract as the int4 case, one bit-width up: int8 codes must decode
+/// identically on device and host. Its blob shares the layout but packs one code
+/// per byte, so the offsets differ — a drift here reads scales from the wrong
+/// place and corrupts every weight.
+#[test]
+fn gpu_matches_cpu_with_int8_weights() {
+    let cfg = BlockConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 64,
+        intermediate_size: 512,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+    };
+    let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
+        .into_iter()
+        .map(|mut l| {
+            let q = |w: &dlm::forward::Weights| {
+                let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
+                dlm::forward::Weights::quantize_int8(&floats, dlm::forward::QUANT_GROUP_SIZE)
+                    .unwrap()
+            };
+            l.q_proj = q(&l.q_proj);
+            l.k_proj = q(&l.k_proj);
+            l.v_proj = q(&l.v_proj);
+            l.o_proj = q(&l.o_proj);
+            l.gate_proj = q(&l.gate_proj);
+            l.up_proj = q(&l.up_proj);
+            l.down_proj = q(&l.down_proj);
+            l
+        })
+        .collect();
+    assert_gpu_matches_cpu(cfg, quantized, 2e-3, "int8 weights");
 }
 
 /// Every real model has `hidden_size >= 2048`. The RMSNorm kernel used to launch

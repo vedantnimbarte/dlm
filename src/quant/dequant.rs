@@ -25,6 +25,9 @@ use crate::error::{DlmError, Result};
 /// Number of distinct 4-bit codes.
 const LEVELS: f32 = 15.0; // 2^4 - 1
 
+/// Number of distinct 8-bit codes.
+const LEVELS_INT8: f32 = 255.0; // 2^8 - 1
+
 /// A 4-bit group-affine quantized 1-D weight tensor.
 #[derive(Debug, Clone)]
 pub struct Quant4Tensor {
@@ -174,6 +177,31 @@ pub fn pack_codes(codes: &[u8]) -> Vec<u8> {
 /// quantization. Intended for tests and tooling; the inference path *consumes*
 /// already-quantized checkpoints rather than producing them.
 pub fn quantize_affine(values: &[f32], group_size: usize) -> Result<Quant4Tensor> {
+    let (codes, scales, zeros) = quantize_groups(values, group_size, LEVELS)?;
+    Quant4Tensor::new(pack_codes(&codes), scales, zeros, group_size, values.len())
+}
+
+/// Per-group asymmetric affine quantization to 8-bit codes: `(codes, scales,
+/// zeros)`, one code per element (no packing — a byte already holds one).
+///
+/// Same arithmetic as [`quantize_affine`], one bit-width up. int8's 256 levels
+/// track a group's range ~17x finer than int4's 16, so it costs half the shrink
+/// for a fraction of the error.
+pub fn quantize_affine_int8(
+    values: &[f32],
+    group_size: usize,
+) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
+    quantize_groups(values, group_size, LEVELS_INT8)
+}
+
+/// The shared group-affine core: split `values` into groups, and per group pick
+/// `scale`/`zero` spanning its min..max so `dequant(code) = (code - zero) * scale`.
+/// `levels` is the top code (15 for 4-bit, 255 for 8-bit).
+fn quantize_groups(
+    values: &[f32],
+    group_size: usize,
+    levels: f32,
+) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
     if group_size == 0 {
         return Err(DlmError::QuantLayout("group_size must be > 0".into()));
     }
@@ -195,19 +223,17 @@ pub fn quantize_affine(values: &[f32], group_size: usize) -> Result<Quant4Tensor
         let scale = if (max - min).abs() < f32::EPSILON {
             1.0
         } else {
-            (max - min) / LEVELS
+            (max - min) / levels
         };
         let zero = -min / scale; // dequant(code=0) = (0 - zero) * scale = min
 
         for (j, &v) in group.iter().enumerate() {
-            let code = ((v - min) / scale).round().clamp(0.0, LEVELS) as u8;
-            codes[start + j] = code;
+            codes[start + j] = ((v - min) / scale).round().clamp(0.0, levels) as u8;
         }
         scales.push(scale);
         zeros.push(zero);
     }
-
-    Quant4Tensor::new(pack_codes(&codes), scales, zeros, group_size, n)
+    Ok((codes, scales, zeros))
 }
 
 #[cfg(test)]

@@ -63,17 +63,18 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* out, int n
 #define DLM_W_BF16 1
 #define DLM_W_F16  2
 #define DLM_W_INT4 3
+#define DLM_W_INT8 4
 
-// Byte offsets inside a DLM_W_INT4 blob, mirroring `Int4Layout` in
+// Byte offsets inside a quantized blob, mirroring `QuantLayout` in
 // src/forward/cpu.rs — the two MUST agree.
-//   [codes: ceil(n/2) bytes][pad to 4][scales: g x f32][zeros: g x f32],  g = ceil(n/group)
-__device__ __forceinline__ long int4_scales_off(long n) {
-    long code_bytes = (n + 1) / 2;
+//   [codes][pad to 4][scales: g x f32][zeros: g x f32],  g = ceil(n/group)
+// Only the code width differs: int4 packs two per byte, int8 one.
+__device__ __forceinline__ long q_scales_off(long code_bytes) {
     return ((code_bytes + 3) / 4) * 4;   // f32 alignment
 }
-__device__ __forceinline__ long int4_zeros_off(long n, int group_size) {
+__device__ __forceinline__ long q_zeros_off(long code_bytes, long n, int group_size) {
     long groups = (n + group_size - 1) / group_size;
-    return int4_scales_off(n) + groups * 4;
+    return q_scales_off(code_bytes) + groups * 4;
 }
 
 // Decode weight element `i`. Specialized at compile time, so the inner loop has
@@ -104,8 +105,19 @@ __device__ __forceinline__ float load_w<DLM_W_INT4>(const void* W, long i, long 
     unsigned char byte = bytes[i >> 1];
     float code = (float)((i & 1) ? (byte >> 4) : (byte & 0x0F));
     long g = i / group_size;
-    const float* scales = (const float*)(bytes + int4_scales_off(n));
-    const float* zeros = (const float*)(bytes + int4_zeros_off(n, group_size));
+    long code_bytes = (n + 1) / 2;
+    const float* scales = (const float*)(bytes + q_scales_off(code_bytes));
+    const float* zeros = (const float*)(bytes + q_zeros_off(code_bytes, n, group_size));
+    return (code - zeros[g]) * scales[g];
+}
+// int8: one code per byte. Mirrors `int8_get` in src/forward/cpu.rs.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_INT8>(const void* W, long i, long n, int group_size) {
+    const unsigned char* bytes = (const unsigned char*)W;
+    float code = (float)bytes[i];
+    long g = i / group_size;
+    const float* scales = (const float*)(bytes + q_scales_off(n));
+    const float* zeros = (const float*)(bytes + q_zeros_off(n, n, group_size));
     return (code - zeros[g]) * scales[g];
 }
 
@@ -156,6 +168,10 @@ static void launch_matvec(int dt, const void* W, const float* x, const float* bi
             break;
         case DLM_W_INT4:
             matvec_kernel<DLM_W_INT4>
+                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
+            break;
+        case DLM_W_INT8:
+            matvec_kernel<DLM_W_INT8>
                 <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
             break;
         default:

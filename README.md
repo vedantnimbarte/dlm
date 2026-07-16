@@ -11,11 +11,18 @@ whole model at once, so your GPU can run LLMs several times larger than it could
 normally hold.
 
 Rather than keeping every weight in VRAM, `dlm` keeps only a small window of
-transformer blocks resident and continuously streams the next window in over the
-PCIe bus while the GPU computes the current one — trading a bit of speed for the
-ability to run models many times larger than the card. The smaller your card,
-the more it streams (and the slower it runs), but the model that wouldn't load
-at all now runs.
+transformer blocks resident and streams the rest in over the PCIe bus as the GPU
+works through them. The model that wouldn't load at all now runs — but streaming
+is **slow**, and honestly so: moving most of a model across the bus every token
+costs far more than the arithmetic does. The fewer layers fit, the more it
+streams and the slower it gets.
+
+So reach for [`--quant`](#weight-precision---quant) first. Quantizing the weights
+at load shrinks each layer 2–4x, which usually means **more of the model stays
+resident and streaming shrinks or stops entirely** — worth far more than any
+amount of making streaming itself faster. On a 4 GB card, a 3B model (which does
+not fit in 16-bit) goes from 0.024 tok/s streamed to **4.2 tok/s** fully resident
+at `--quant int4`. Streaming is the fallback for what still doesn't fit.
 
 It's not a 16 GB tool. It's for **anyone the VRAM wall has been telling "no"** —
 the 4 GB laptop GPU, the 6 GB gaming card, the 8 GB workstation — giving each of
@@ -119,29 +126,39 @@ curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.s
 │                      GPU VRAM                          │
 ├───────────────────┬───────────────────┬────────────────┤
 │   PINNED ZONE     │   STREAMING ZONE  │  CACHE ZONE    │
-│  • Embedding Block│  • Double-Buffer A│ • Paged KV     │
-│  • LM Head / Norm │  • Double-Buffer B│ • Intermediate │
-│  • Draft Model    │   (Asynchronous)  │   Residuals    │
+│  • Embedding Block│  • Resident window│ • Paged KV     │
+│  • LM Head / Norm │    of N layers    │ • Intermediate │
+│  • Draft Model    │    (LRU, async)   │   Residuals    │
 └───────────────────┴───────────────────┴────────────────┘
 ```
 
 - **Pinned Zone** — embedding, LM head, and norms stay resident permanently
   (moving them each step would thrash the PCIe bus).
-- **Streaming Zone** — two buffers (`A`/`B`). While `A` executes on the compute
-  stream, `B` DMAs the next window of layers in over PCIe, then they swap.
-- **Cache Zone** — PagedAttention KV cache + residual activations.
+- **Streaming Zone** — an LRU of `N` layers (`--resident-layers`, else the VRAM
+  plan's budget). A miss uploads that layer on a dedicated copy stream, so the
+  transfer overlaps compute on the default stream, and evicts the least-recently
+  used.
+- **Cache Zone** — PagedAttention KV cache + residual activations. KV for *all*
+  layers stays resident even as weights stream, so attention always sees full
+  history.
 
 The data path for a streamed layer:
 
 ```
-mmap weights ──► CPU-RAM cache ──► pinned staging buffer ──► streaming-zone buffer ──► compute
-   (NVMe)         (hot layers)       (page-locked host)          (VRAM)
+mmap weights ──► host RAM cache ──► pinned staging buffer ──► streaming-zone buffer ──► compute
+   (NVMe)        (--ram-cache-gb)     (page-locked host)          (VRAM)
 ```
 
-Memory-mapping skips the OS read-buffer copy; the tiered CPU-RAM cache keeps hot
-layers resident across token steps so they skip the disk read; and the
-page-locked (pinned) host buffer lets the PCIe controller DMA straight to VRAM
-asynchronously, so disk I/O and copies hide under GPU compute.
+Memory-mapping skips the OS read-buffer copy; the optional host-RAM cache
+(`--ram-cache-gb`, off by default) keeps materialized layers across token steps
+so a miss doesn't re-read and re-decode them; and the page-locked (pinned) host
+buffer lets the PCIe controller DMA into VRAM on the copy stream.
+
+Be clear-eyed about the limit: with a window smaller than the model, layers are
+touched in order and evicted long before they come round again, so the window
+does not really *cache* — its job is to overlap the next upload with the current
+compute. What streaming costs is bandwidth, and the only way to pay less is to
+send fewer bytes ([`--quant`](#weight-precision---quant)).
 
 The transformer math sits behind a block-level `ComputeKernel` trait (`run_block`
 runs one decoder block for one token), and a `ForwardOrchestrator` drives a
@@ -274,7 +291,8 @@ pipeline     : 4 steps, 2 overlapped (DMA hidden under compute)
 
 The sample assumes 16-bit weights, so a layer is 1.7 GiB and only 7 of 80 fit.
 `--quant int4` quantizes the weights at load, dropping a layer to 420 MiB so the
-same 16 GiB holds 29 — see [weight precision](#weight-precision---quant).
+same 16 GiB holds 29 (`int8`: 841 MiB, 14) — see
+[weight precision](#weight-precision---quant).
 
 Point it at a real model directory (containing `config.json` and
 `*.safetensors` shards) to map the actual weights and profile from measured
@@ -524,37 +542,48 @@ doubling VRAM, PCIe per streamed layer, and GEMV bandwidth.
 | `--quant` | bytes/param | what happens |
 | --- | --- | --- |
 | *(omitted)* | 2.0 / 4.0 | the checkpoint's own dtype — no conversion |
-| `int4` | 0.5 | quantized from the checkpoint at load (group-affine, groups of 128) |
+| `int4` | 0.5 | quantized at load — 4x smaller, coarsest (16 levels per group) |
+| `int8` | 1.0 | quantized at load — 2x smaller, 256 levels per group |
 | `fp16` / `f32` | 2.0 / 4.0 | accepted only if it *matches* the checkpoint |
-| `int8` | — | not implemented; errors |
 
-A scheme dlm cannot actually deliver is an error, not a silent no-op — `--quant`
-never describes weights that don't exist.
+Both quantized modes are group-affine in groups of 128:
+`w = (code − zero[g]) × scale[g]`, decoded in-register by the same kernel that
+reads the float dtypes. A scheme dlm cannot actually deliver is an error, not a
+silent no-op — `--quant` never describes weights that don't exist.
 
-**`--quant int4` is the lever that matters on a small card.** It shrinks a layer
-4x, so more of the model stays resident and each streamed layer costs a quarter
-as much to move. Often it removes streaming entirely, which is worth more than
-making streaming faster — on a 4 GB GTX 1650, Llama-3.2-3B (5.6 GiB of bf16
-layers, i.e. a model that does **not** fit):
+**Quantizing is the lever that matters on a small card.** A smaller layer means
+more of the model stays resident and each streamed layer costs less to move —
+often it removes streaming entirely, which is worth more than making streaming
+faster. On a 4 GB GTX 1650, Llama-3.2-3B (5.6 GiB of bf16 layers, i.e. a model
+that does **not** fit):
 
-| | resident | tok/s |
-| --- | --- | --- |
-| bf16, `--stream` | 5 / 28 layers | 0.024 |
-| `--quant int4` | all 28 (no streaming) | **4.2** |
+| | layer | resident | tok/s |
+| --- | --- | --- | --- |
+| bf16, `--stream` | 192 MiB | 5 / 28 | 0.024 |
+| `--quant int8` | 96 MiB | all 28 (no streaming) | **3.0** |
+| `--quant int4` | 48 MiB | all 28 (no streaming) | **4.2** |
 
-It is lossy — 4-bit group-affine rounding, without the calibration GPTQ/AWQ use —
-so check your model's output rather than assuming. Two caveats worth knowing:
+int4 is faster than int8 for the same reason it is smaller: the GEMV is
+bandwidth-bound, so halving the bytes read halves the work. Pick int8 when int4
+costs too much accuracy — its 256 levels per group track a weight's range ~17x
+finer than int4's 16 — and pick int4 when you need the model to fit at all.
+
+Both are lossy: group-affine rounding without the calibration GPTQ/AWQ use. So
+check your model's output rather than assuming. Three caveats worth knowing:
 
 - **Quantizing costs load time** (it runs over every weight) and reads the full
   16-bit tensors from disk regardless; the win is in VRAM and on the bus, not in
   what is read.
-- **`--stream --quant int4` currently re-quantizes a layer on every window miss**,
-  which is far slower than either flag alone. Pair it with `--ram-cache-gb` (which
-  caches the quantized layer), or prefer plain `--quant int4` when the model fits.
+- **`--stream` + a quantized `--quant` currently re-quantizes a layer on every
+  window miss**, which is far slower than either flag alone. Pair it with
+  `--ram-cache-gb` (which caches the quantized layer), or drop `--stream` — once
+  quantized, the model often no longer needs it.
+- **A quantized weight is still lossy even if it fits.** Verify on your own
+  prompts; a model that fits but answers worse is not obviously a win.
 
 Already-quantized checkpoints (GPTQ/AWQ `qweight` triplets) are a different
-thing and are still refused at load — `--quant int4` quantizes a *float*
-checkpoint itself.
+thing and are still refused at load — `--quant` quantizes a *float* checkpoint
+itself.
 
 ---
 
@@ -603,7 +632,7 @@ inference engine):
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
 
   Two orthogonal memory knobs apply to any kernel:
-  - `--quant {int4}` — see [weight precision](#weight-precision---quant) below.
+  - `--quant {int4,int8}` — see [weight precision](#weight-precision---quant) below.
   - `--kv-quant {none,int8,int4}` — quantize the KV cache to int8 (~½ the KV
     memory) or int4 (~¼, more error), trading precision for a longer context in
     the same budget. Defaults to exact `f32`. Independent of `--quant`: one sizes

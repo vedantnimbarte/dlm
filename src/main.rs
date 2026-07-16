@@ -747,13 +747,8 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
         return Ok(scheme);
     }
     match scheme {
-        // Quantized down from the checkpoint at load time.
-        QuantScheme::Int4 => Ok(scheme),
-        QuantScheme::Int8 => Err(DlmError::UnsupportedQuant(
-            "--quant int8 is not implemented; use --quant int4, or omit --quant to \
-             compute in the checkpoint's own precision"
-                .into(),
-        )),
+        // Quantized down from the checkpoint's floats at load time.
+        QuantScheme::Int4 | QuantScheme::Int8 => Ok(scheme),
         other => Err(DlmError::UnsupportedQuant(format!(
             "--quant {other:?} does not match the checkpoint's {native:?} weights, and dlm \
              does not convert between float widths; omit --quant to use {native:?}, or pass \

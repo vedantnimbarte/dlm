@@ -132,10 +132,10 @@ fn load_native(
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
     let bytes = shard.tensor_bytes(name)?;
-    // `--quant int4`: quantize down from the checkpoint's floats at load. Costs
-    // one f32 materialization here (transient, per tensor) and buys 4x less VRAM
-    // and PCIe per layer for the whole run.
-    if quant == QuantScheme::Int4 {
+    // `--quant int4`/`int8`: quantize down from the checkpoint's floats at load.
+    // Costs one f32 materialization here (transient, per tensor) and buys 4x/2x
+    // less VRAM and PCIe per layer for the whole run.
+    if matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
         let floats = bytes_to_f32(bytes, info.dtype)?;
         if floats.len() != expected_len {
             return Err(DlmError::InvalidConfig(format!(
@@ -143,7 +143,11 @@ fn load_native(
                 floats.len()
             )));
         }
-        return Weights::quantize_int4(&floats, crate::forward::INT4_GROUP_SIZE);
+        let group = crate::forward::QUANT_GROUP_SIZE;
+        return match quant {
+            QuantScheme::Int4 => Weights::quantize_int4(&floats, group),
+            _ => Weights::quantize_int8(&floats, group),
+        };
     }
     let w = match info.dtype {
         Dtype::F32 => Weights::F32(bytes_to_f32(bytes, info.dtype)?),

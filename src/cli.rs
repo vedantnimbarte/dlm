@@ -133,7 +133,9 @@ pub enum QuantArg {
     /// 4-bit group-affine (0.5 bytes/param). Quantized from the checkpoint at
     /// load: 4x less VRAM and PCIe per layer, at some accuracy cost.
     Int4,
-    /// 8-bit (1 byte/param) — NOT IMPLEMENTED; errors if requested.
+    /// 8-bit group-affine (1 byte/param). Quantized from the checkpoint at load:
+    /// 2x less VRAM and PCIe per layer. Half int4's shrink, but 256 levels per
+    /// group instead of 16 — the conservative choice if int4 costs accuracy.
     Int8,
     /// 16-bit FP16/BF16 (2 bytes/param). Accepted only if the checkpoint is
     /// already 16-bit; dlm does not convert between float widths.
@@ -201,8 +203,8 @@ pub struct ServeArgs {
     /// Weight precision the engine computes in. Defaults to the checkpoint's own
     /// dtype (bf16/f16 stay 16-bit, f32 stays f32) — dlm reads the weights it was
     /// given rather than assuming a quantization the file does not have. Pass
-    /// `--quant int4` to quantize down at load: 4x less VRAM and PCIe per layer
-    /// (so more layers stay resident and streaming shrinks), at some accuracy cost.
+    /// `--quant int4` (4x smaller) or `--quant int8` (2x, less error) to quantize
+    /// down at load, so more layers stay resident and streaming shrinks or stops.
     #[arg(long, value_enum)]
     pub quant: Option<QuantArg>,
 
@@ -314,8 +316,8 @@ pub struct ProfileArgs {
     /// Weight precision the engine computes in. Defaults to the checkpoint's own
     /// dtype (bf16/f16 stay 16-bit, f32 stays f32) — dlm reads the weights it was
     /// given rather than assuming a quantization the file does not have. Pass
-    /// `--quant int4` to quantize down at load: 4x less VRAM and PCIe per layer
-    /// (so more layers stay resident and streaming shrinks), at some accuracy cost.
+    /// `--quant int4` (4x smaller) or `--quant int8` (2x, less error) to quantize
+    /// down at load, so more layers stay resident and streaming shrinks or stops.
     #[arg(long, value_enum)]
     pub quant: Option<QuantArg>,
 
