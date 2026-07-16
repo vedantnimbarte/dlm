@@ -58,10 +58,36 @@ fn bytes_to_u16(bytes: &[u8], name: &str) -> Result<Vec<u16>> {
             bytes.len()
         )));
     }
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect())
+    let len = bytes.len() / 2;
+    #[cfg(target_endian = "little")]
+    {
+        // The checkpoint stores little-endian 16-bit words, so on a little-endian
+        // host its bytes already *are* the u16 bit patterns — copy them wholesale
+        // into an *uninitialized* buffer. Two things this avoids, both of which
+        // land on the streaming hot path (every layer is re-materialized on every
+        // VRAM miss): the element-wise `from_le_bytes` decode, which the compiler
+        // does not collapse into a memcpy (~2 GB/s vs ~10 GB/s), and `vec![0; n]`
+        // zeroing a buffer we immediately overwrite.
+        //
+        // SAFETY: capacity is `len` u16s = exactly `bytes.len()` bytes, so the
+        // copy stays in bounds; u16 is POD with no invalid bit patterns, so every
+        // byte pattern is a valid value and `set_len` exposes only initialized
+        // memory; source and destination are distinct allocations.
+        let mut v: Vec<u16> = Vec::with_capacity(len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr() as *mut u8, bytes.len());
+            v.set_len(len);
+        }
+        Ok(v)
+    }
+    #[cfg(target_endian = "big")]
+    {
+        let mut v = vec![0u16; len];
+        for (slot, c) in v.iter_mut().zip(bytes.chunks_exact(2)) {
+            *slot = u16::from_le_bytes([c[0], c[1]]);
+        }
+        Ok(v)
+    }
 }
 
 /// Read a weight matrix **in its native dtype, without converting it**.
