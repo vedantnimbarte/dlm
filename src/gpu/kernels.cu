@@ -62,24 +62,51 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* out, int n
 #define DLM_W_F32  0
 #define DLM_W_BF16 1
 #define DLM_W_F16  2
+#define DLM_W_INT4 3
+
+// Byte offsets inside a DLM_W_INT4 blob, mirroring `Int4Layout` in
+// src/forward/cpu.rs — the two MUST agree.
+//   [codes: ceil(n/2) bytes][pad to 4][scales: g x f32][zeros: g x f32],  g = ceil(n/group)
+__device__ __forceinline__ long int4_scales_off(long n) {
+    long code_bytes = (n + 1) / 2;
+    return ((code_bytes + 3) / 4) * 4;   // f32 alignment
+}
+__device__ __forceinline__ long int4_zeros_off(long n, int group_size) {
+    long groups = (n + group_size - 1) / group_size;
+    return int4_scales_off(n) + groups * 4;
+}
 
 // Decode weight element `i`. Specialized at compile time, so the inner loop has
 // no branch. bf16 is literally the high half of an f32 — a 16-bit shift, which
 // needs no hardware bf16 support (works on Turing and older).
+// `n` (element count) and `group_size` are only read by the INT4 specialization,
+// which needs them to find its per-group scales; the float arms ignore them.
 template <int DT>
-__device__ __forceinline__ float load_w(const void* W, long i);
+__device__ __forceinline__ float load_w(const void* W, long i, long n, int group_size);
 
 template <>
-__device__ __forceinline__ float load_w<DLM_W_F32>(const void* W, long i) {
+__device__ __forceinline__ float load_w<DLM_W_F32>(const void* W, long i, long, int) {
     return ((const float*)W)[i];
 }
 template <>
-__device__ __forceinline__ float load_w<DLM_W_BF16>(const void* W, long i) {
+__device__ __forceinline__ float load_w<DLM_W_BF16>(const void* W, long i, long, int) {
     return __int_as_float(((unsigned int)((const unsigned short*)W)[i]) << 16);
 }
 template <>
-__device__ __forceinline__ float load_w<DLM_W_F16>(const void* W, long i) {
+__device__ __forceinline__ float load_w<DLM_W_F16>(const void* W, long i, long, int) {
     return __half2float(((const __half*)W)[i]);
+}
+// dequant(code) = (code - zero) * scale, per group. Mirrors `int4_get` in
+// src/forward/cpu.rs; the CPU oracle and this must decode identically.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_INT4>(const void* W, long i, long n, int group_size) {
+    const unsigned char* bytes = (const unsigned char*)W;
+    unsigned char byte = bytes[i >> 1];
+    float code = (float)((i & 1) ? (byte >> 4) : (byte & 0x0F));
+    long g = i / group_size;
+    const float* scales = (const float*)(bytes + int4_scales_off(n));
+    const float* zeros = (const float*)(bytes + int4_zeros_off(n, group_size));
+    return (code - zeros[g]) * scales[g];
 }
 
 // out[o] = dot(W[o], x) (+ bias[o]). `bias` may be NULL (Llama/Mistral have no
@@ -97,13 +124,15 @@ __device__ __forceinline__ float load_w<DLM_W_F16>(const void* W, long i) {
 // it is the single biggest kernel speedup.
 template <int DT>
 __global__ void matvec_kernel(const void* W, const float* x, const float* bias, float* out,
-                              int out_dim, int in_dim) {
+                              int out_dim, int in_dim, int group_size) {
     int o = blockIdx.x;
     if (o >= out_dim) return;
     long base = (long)o * in_dim;
+    long n = (long)out_dim * in_dim;   // the tensor's element count (INT4 layout)
     __shared__ float partial[MATVEC_THREADS];
     float s = 0.0f;
-    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) s += load_w<DT>(W, base + i) * x[i];
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x)
+        s += load_w<DT>(W, base + i, n, group_size) * x[i];
     partial[threadIdx.x] = s;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -115,16 +144,23 @@ __global__ void matvec_kernel(const void* W, const float* x, const float* bias, 
 
 // Dispatch the GEMV on the runtime weight dtype (one block per output row).
 static void launch_matvec(int dt, const void* W, const float* x, const float* bias, float* out,
-                          int out_dim, int in_dim) {
+                          int out_dim, int in_dim, int group_size) {
     switch (dt) {
         case DLM_W_BF16:
-            matvec_kernel<DLM_W_BF16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim);
+            matvec_kernel<DLM_W_BF16>
+                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
             break;
         case DLM_W_F16:
-            matvec_kernel<DLM_W_F16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim);
+            matvec_kernel<DLM_W_F16>
+                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
+            break;
+        case DLM_W_INT4:
+            matvec_kernel<DLM_W_INT4>
+                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
             break;
         default:
-            matvec_kernel<DLM_W_F32><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim);
+            matvec_kernel<DLM_W_F32>
+                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
             break;
     }
 }
@@ -250,6 +286,7 @@ extern "C" int dlm_decode_block(
     int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
     int inter, float rms_eps,
     int w_dtype,                           // DLM_W_* tag for the projection weights
+    int w_group_size,                      // DLM_W_INT4 group size (ignored otherwise)
     const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
     const void* gate_proj, const void* up_proj, const void* down_proj,
     const float* in_norm, const float* post_norm,
@@ -287,9 +324,9 @@ extern "C" int dlm_decode_block(
     if (e == cudaSuccess) {
         // Attention sublayer.
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
-        launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size);
-        launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size);
-        launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size);
+        launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
+        launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
+        launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
         rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq);
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq);
 
@@ -299,15 +336,15 @@ extern "C" int dlm_decode_block(
 
         // Attend over history + this token, reading the persistent buffers directly.
         attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos);
-        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim);
+        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
         // MLP sublayer (SwiGLU).
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);
-        launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size);
-        launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size);
+        launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
+        launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size);
         swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter);
-        launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter);
+        launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
         // No blocking cudaDeviceSynchronize here: all kernels run on the in-order

@@ -67,6 +67,9 @@ fn write_checkpoint(dir: &std::path::Path) -> ModelConfig {
     let config_json = format!(
         r#"{{"hidden_size":{h},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"num_hidden_layers":{layers},"vocab_size":{vocab},"intermediate_size":{inter}}}"#
     );
+    // Write it out too, so the fixture is a checkpoint directory a caller can
+    // re-read at a different `QuantScheme` (as `ModelConfig::from_path` does).
+    std::fs::write(dir.join("config.json"), &config_json).unwrap();
     ModelConfig::from_json_bytes(config_json.as_bytes(), QuantScheme::Fp16).unwrap()
 }
 
@@ -91,11 +94,18 @@ fn planned_window_fits_free_vram_at_real_layer_size() {
     assert!(!catalog.is_empty(), "catalog should see the layers");
 
     let per_layer = catalog.max_layer_bytes();
-    let profiler = dlm::profiler::VramProfiler::new(128);
-    // Free VRAM deliberately too small for the whole model.
-    let free = per_layer * 3 + profiler.plan_with_free(&config, u64::MAX).kv_total_bytes;
+    // Zero the safety cushion: at its 1.5 GiB default it would swamp this tiny
+    // synthetic budget, saturate `usable` to 0, and pin the window at 1 layer —
+    // passing without ever exercising the arithmetic under test.
+    let profiler = dlm::profiler::VramProfiler::new(128).with_safety_margin_bytes(0);
+    // Room for the KV, the pinned zone, and exactly 3 of the 6 layers.
+    let free =
+        profiler.kv_total_bytes(&config) + catalog.pinned_bytes() + per_layer * 3;
 
-    let plan = profiler.plan_from_catalog(&config, &catalog, free);
+    // native == config.quant: no quantize-at-load rescale, so the catalog's
+    // measured block size is what the window is planned against.
+    let plan = profiler.plan_from_catalog(&config, &catalog, config.quant, free);
+    assert_eq!(plan.layers_to_load, 3, "should fit exactly 3 layers");
     assert!(
         plan.layers_to_load < config.num_layers,
         "window {} should be < {} layers when the model cannot fit",
@@ -115,6 +125,25 @@ fn planned_window_fits_free_vram_at_real_layer_size() {
     // the Int4 default), so there is no direction to pin. The invariant above is
     // the one that matters — whatever sizes a plan is built from, the window it
     // returns has to fit.
+
+    // `--quant int4` quantizes at load, so the layer that reaches VRAM is an
+    // eighth of this F32 checkpoint's on-disk bytes — the same budget must hold
+    // proportionally more of them. Planning from the on-disk size instead would
+    // strand most of the VRAM.
+    let int4_cfg = ModelConfig::from_path(tmp.path(), QuantScheme::Int4).unwrap();
+    let int4 = profiler.plan_from_catalog(&int4_cfg, &catalog, QuantScheme::F32, free);
+    assert!(
+        int4.per_layer_weight_bytes < plan.per_layer_weight_bytes,
+        "int4 layers ({}) must be smaller in VRAM than the F32 originals ({})",
+        int4.per_layer_weight_bytes,
+        plan.per_layer_weight_bytes
+    );
+    assert!(
+        int4.layers_to_load > plan.layers_to_load,
+        "int4 should fit more layers ({}) than F32 ({}) in the same budget",
+        int4.layers_to_load,
+        plan.layers_to_load
+    );
 }
 
 #[test]

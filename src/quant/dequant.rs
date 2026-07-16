@@ -96,6 +96,21 @@ impl Quant4Tensor {
         self.scales.len()
     }
 
+    /// The packed 4-bit codes, two per byte.
+    pub fn packed(&self) -> &[u8] {
+        &self.packed
+    }
+
+    /// Per-group scales.
+    pub fn scales(&self) -> &[f32] {
+        &self.scales
+    }
+
+    /// Per-group zero-points, in code space.
+    pub fn zeros(&self) -> &[f32] {
+        &self.zeros
+    }
+
     /// The 4-bit code at logical index `i` (`0..=15`).
     #[inline]
     pub fn code(&self, i: usize) -> u8 {

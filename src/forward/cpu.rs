@@ -99,7 +99,46 @@ pub enum Weights {
     Bf16(Vec<u16>),
     /// IEEE half bit patterns.
     F16(Vec<u16>),
+    /// 4-bit group-affine codes quantized from the checkpoint at load time
+    /// (`--quant int4`): a quarter of bf16's VRAM and PCIe per layer, so more
+    /// layers stay resident and a streamed layer costs 4x less to move.
+    ///
+    /// `blob` holds the whole tensor contiguously — codes, then the per-group
+    /// scales, then the per-group zero-points — so it uploads to the device as one
+    /// buffer and the kernel still takes a single pointer per matrix. See
+    /// [`Int4Layout`] for the offsets; element count and group size are all the
+    /// kernel needs to find the scales.
+    Int4 { blob: Vec<u8>, group_size: usize, num_elements: usize },
 }
+
+/// Byte offsets within a [`Weights::Int4`] blob.
+///
+/// Layout: `[codes: ceil(n/2) bytes][pad to 4][scales: g × f32][zeros: g × f32]`,
+/// where `g = ceil(n / group_size)`. Mirrored by `load_w<DLM_W_INT4>` in
+/// `src/gpu/kernels.cu` — the two must agree exactly.
+#[derive(Debug, Clone, Copy)]
+pub struct Int4Layout {
+    pub scales_off: usize,
+    pub zeros_off: usize,
+    pub num_groups: usize,
+    pub total_bytes: usize,
+}
+
+impl Int4Layout {
+    /// Offsets for `n` elements in groups of `group_size`.
+    pub fn new(n: usize, group_size: usize) -> Self {
+        let code_bytes = n.div_ceil(2);
+        let scales_off = code_bytes.div_ceil(4) * 4; // f32 alignment
+        let num_groups = n.div_ceil(group_size.max(1));
+        let zeros_off = scales_off + num_groups * 4;
+        Self { scales_off, zeros_off, num_groups, total_bytes: zeros_off + num_groups * 4 }
+    }
+}
+
+/// Weights-per-group for `--quant int4`. 128 is the GPTQ/AWQ convention: small
+/// enough that one scale tracks a local range well, large enough that the scale
+/// overhead stays ~3% of the codes.
+pub const INT4_GROUP_SIZE: usize = 128;
 
 impl Default for Weights {
     fn default() -> Self {
@@ -119,6 +158,7 @@ impl Weights {
         match self {
             Weights::F32(v) => v.len(),
             Weights::Bf16(v) | Weights::F16(v) => v.len(),
+            Weights::Int4 { num_elements, .. } => *num_elements,
         }
     }
 
@@ -144,6 +184,9 @@ impl Weights {
             Weights::F32(v) => v[i],
             Weights::Bf16(v) => bf16_to_f32(v[i]),
             Weights::F16(v) => crate::storage::f16_to_f32(v[i]),
+            Weights::Int4 { blob, group_size, num_elements } => {
+                int4_get(blob, *group_size, *num_elements, i)
+            }
         }
     }
 
@@ -152,7 +195,31 @@ impl Weights {
         match self {
             Weights::F32(v) => bytemuck_cast(v),
             Weights::Bf16(v) | Weights::F16(v) => bytemuck_cast(v),
+            Weights::Int4 { blob, .. } => blob,
         }
+    }
+
+    /// Group size for the int4 arm; `0` for the float arms (the kernel ignores it).
+    pub fn group_size(&self) -> usize {
+        match self {
+            Weights::Int4 { group_size, .. } => *group_size,
+            _ => 0,
+        }
+    }
+
+    /// Quantize float weights to 4-bit group-affine codes, packed into the blob
+    /// layout the kernel reads. Errors only on a zero group size.
+    pub fn quantize_int4(values: &[f32], group_size: usize) -> Result<Self> {
+        let q = crate::quant::quantize_affine(values, group_size)?;
+        let n = values.len();
+        let layout = Int4Layout::new(n, group_size);
+        let mut blob = vec![0u8; layout.total_bytes];
+        blob[..q.packed().len()].copy_from_slice(q.packed());
+        for (g, (&s, &z)) in q.scales().iter().zip(q.zeros()).enumerate() {
+            blob[layout.scales_off + g * 4..][..4].copy_from_slice(&s.to_le_bytes());
+            blob[layout.zeros_off + g * 4..][..4].copy_from_slice(&z.to_le_bytes());
+        }
+        Ok(Weights::Int4 { blob, group_size, num_elements: n })
     }
 
     /// Dtype tag handed to the CUDA kernel so it can decode elements in-register.
@@ -162,8 +229,24 @@ impl Weights {
             Weights::F32(_) => 0,
             Weights::Bf16(_) => 1,
             Weights::F16(_) => 2,
+            Weights::Int4 { .. } => 3,
         }
     }
+}
+
+/// Decode element `i` of an int4 blob: `(code - zero) * scale` for its group.
+/// The device mirror of this is `load_w<DLM_W_INT4>` in `src/gpu/kernels.cu`.
+#[inline(always)]
+fn int4_get(blob: &[u8], group_size: usize, num_elements: usize, i: usize) -> f32 {
+    let layout = Int4Layout::new(num_elements, group_size);
+    let byte = blob[i / 2];
+    let code = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 } as f32;
+    let g = i / group_size;
+    let at = |off: usize| -> f32 {
+        let b = &blob[off + g * 4..][..4];
+        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    };
+    (code - at(layout.zeros_off)) * at(layout.scales_off)
 }
 
 /// Reinterpret a POD slice as bytes. Safe: `T` is a plain numeric type with no
@@ -533,6 +616,14 @@ pub(crate) fn matvec_native(w: &Weights, x: &[f32], out_dim: usize, in_dim: usiz
                 .map(|(&h, &xj)| crate::storage::f16_to_f32(h) * xj)
                 .sum()
         }),
+        Weights::Int4 { blob, group_size, num_elements } => {
+            matvec_rows(out_dim, in_dim, x, |o, x| {
+                let base = o * in_dim;
+                (0..in_dim)
+                    .map(|j| int4_get(blob, *group_size, *num_elements, base + j) * x[j])
+                    .sum()
+            })
+        }
     }
 }
 

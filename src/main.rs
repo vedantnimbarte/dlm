@@ -12,7 +12,7 @@ use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs,
-    PullArgs, SearchArgs, ServeArgs, TokenizeArgs,
+    PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
 };
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
@@ -487,14 +487,23 @@ fn banner() {
 fn run_profile(args: ProfileArgs) -> Result<()> {
     banner();
 
-    let quant = args.quant.to_scheme();
     let (config, source) = match &args.model_path {
-        Some(dir) => (
-            ModelConfig::from_path(dir, quant)?,
-            format!("config.json in {}", dir.display()),
-        ),
+        Some(dir) => {
+            // Probe the real checkpoint so the plan is sized from the weights it
+            // actually has, not an assumed scheme.
+            let quant = match MmapStore::open_dir(dir) {
+                Ok(store) => resolve_quant(args.quant, &store)?,
+                // No mappable store (config-only dir): fall back to the request.
+                Err(_) => args.quant.map_or(QuantScheme::Fp16, |q| q.to_scheme()),
+            };
+            (
+                ModelConfig::from_path(dir, quant)?,
+                format!("config.json in {}", dir.display()),
+            )
+        }
         None => (
-            sample_70b_config(quant),
+            // Hypothetical model: nothing to probe, so honour the request.
+            sample_70b_config(args.quant.map_or(QuantScheme::Fp16, |q| q.to_scheme())),
             "built-in Llama-3-70B-class sample".to_string(),
         ),
     };
@@ -516,11 +525,16 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
 fn run_serve(args: ServeArgs) -> Result<()> {
     banner();
 
+    // Map the checkpoint first: the weight precision (and every plan derived from
+    // it) comes from the dtype the file actually holds.
+    let store = MmapStore::open_dir(&args.model_path)?;
+    let quant = resolve_quant(args.quant, &store)?;
+
     println!("serve config :");
     println!("  model      : {}", args.model_path.display());
     println!("  api        : http://{}:{}", args.host, args.port);
     println!("  context    : {} tokens", args.context_length);
-    println!("  quant      : {:?}", args.quant.to_scheme());
+    println!("  quant      : {quant:?}");
     println!("  mode       : {:?}", args.distributed_mode);
     if let Some(draft) = &args.draft_model_path {
         println!("  draft model: {} (gamma {})", draft.display(), args.draft_gamma);
@@ -533,11 +547,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     }
     println!();
 
-    let config = ModelConfig::from_path(&args.model_path, args.quant.to_scheme())?;
+    let config = ModelConfig::from_path(&args.model_path, quant)?;
     println!("model source : config.json in {}", args.model_path.display());
     print_geometry(&config);
-
-    let store = MmapStore::open_dir(&args.model_path)?;
     let listen = format!("{}:{}", args.host, args.port);
 
     match args.distributed_mode {
@@ -619,7 +631,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // be exact. Loaded as parts so it can take the same kernel as the target.
             let draft_parts = match &args.draft_model_path {
                 Some(dir) => {
-                    let dcfg = ModelConfig::from_path(dir, args.quant.to_scheme())?;
+                    let dcfg = ModelConfig::from_path(dir, quant)?;
                     if dcfg.vocab_size != config.vocab_size {
                         return Err(DlmError::InvalidConfig(format!(
                             "draft vocab {} != target vocab {}",
@@ -708,12 +720,46 @@ fn resident_window(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) ->
     let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
     let profiler = build_profiler(args.context_length, args.safety_margin_gb);
     let catalog = LayerCatalog::build(store);
+    let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
     let plan = if catalog.is_empty() {
         profiler.plan_with_free(config, free_bytes)
     } else {
-        profiler.plan_from_catalog(config, &catalog, free_bytes)
+        profiler.plan_from_catalog(config, &catalog, native, free_bytes)
     };
     (plan.layers_to_load as usize).max(1)
+}
+
+/// Resolve the weight precision: the explicit `--quant`, else the checkpoint's
+/// own dtype.
+///
+/// Only schemes the engine can actually deliver are accepted. `--quant` used to
+/// be planning-only metadata that defaulted to Int4 while the loader read bf16,
+/// so it silently described weights that did not exist and mis-sized every plan
+/// derived from it. Now it either matches the file, or names a quantization the
+/// loader really performs — anything else is an error rather than a no-op.
+fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<QuantScheme> {
+    let native = dlm::loader::checkpoint_scheme(store)?;
+    let Some(requested) = requested else {
+        return Ok(native);
+    };
+    let scheme = requested.to_scheme();
+    if scheme == native {
+        return Ok(scheme);
+    }
+    match scheme {
+        // Quantized down from the checkpoint at load time.
+        QuantScheme::Int4 => Ok(scheme),
+        QuantScheme::Int8 => Err(DlmError::UnsupportedQuant(
+            "--quant int8 is not implemented; use --quant int4, or omit --quant to \
+             compute in the checkpoint's own precision"
+                .into(),
+        )),
+        other => Err(DlmError::UnsupportedQuant(format!(
+            "--quant {other:?} does not match the checkpoint's {native:?} weights, and dlm \
+             does not convert between float widths; omit --quant to use {native:?}, or pass \
+             --quant int4 to quantize down"
+        ))),
+    }
 }
 
 /// Build a VRAM profiler, overriding the default safety cushion when the user
@@ -989,7 +1035,13 @@ fn report_plan(
     println!("free VRAM    : {free_source}");
 
     let plan = match catalog {
-        Some(cat) if !cat.is_empty() => profiler.plan_from_catalog(config, cat, free_bytes),
+        Some(cat) if !cat.is_empty() => {
+            let native = mapped
+                .as_ref()
+                .and_then(|(store, _)| dlm::loader::checkpoint_scheme(store).ok())
+                .unwrap_or(config.quant);
+            profiler.plan_from_catalog(config, cat, native, free_bytes)
+        }
         _ => profiler.plan_with_free(config, free_bytes),
     };
     print_plan(&plan);

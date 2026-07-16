@@ -240,7 +240,10 @@ fn profiler_uses_catalog_sizes_and_pinned_overhead() {
 
     // Give room for pinned(500) + exactly 2 layers (200) on top of KV.
     let free = kv + 500 + 200;
-    let plan = profiler.plan_from_catalog(&config, &catalog, free);
+    // native == config.quant: this catalog's bytes are already in the config's
+    // scheme, so no quantize-at-load rescaling applies and the measured block
+    // size passes through.
+    let plan = profiler.plan_from_catalog(&config, &catalog, config.quant, free);
 
     assert_eq!(plan.pinned_bytes, 500);
     assert_eq!(plan.per_layer_weight_bytes, 100); // measured max block

@@ -130,12 +130,15 @@ impl Device {
 /// On-disk weight precision (`--quant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum QuantArg {
-    /// 4-bit AWQ/GPTQ (0.5 bytes/param) — the default.
+    /// 4-bit group-affine (0.5 bytes/param). Quantized from the checkpoint at
+    /// load: 4x less VRAM and PCIe per layer, at some accuracy cost.
     Int4,
     /// 8-bit (1 byte/param).
     Int8,
-    /// 16-bit FP16/BF16 (2 bytes/param).
+    /// 16-bit FP16/BF16 (2 bytes/param) — the checkpoint's own precision.
     Fp16,
+    /// 32-bit F32 (4 bytes/param) — the checkpoint's own precision.
+    F32,
 }
 
 impl QuantArg {
@@ -145,6 +148,7 @@ impl QuantArg {
             QuantArg::Int4 => QuantScheme::Int4,
             QuantArg::Int8 => QuantScheme::Int8,
             QuantArg::Fp16 => QuantScheme::Fp16,
+            QuantArg::F32 => QuantScheme::F32,
         }
     }
 }
@@ -192,9 +196,13 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8192)]
     pub context_length: u32,
 
-    /// On-disk weight quantization.
-    #[arg(long, value_enum, default_value_t = QuantArg::Int4)]
-    pub quant: QuantArg,
+    /// Weight precision the engine computes in. Defaults to the checkpoint's own
+    /// dtype (bf16/f16 stay 16-bit, f32 stays f32) — dlm reads the weights it was
+    /// given rather than assuming a quantization the file does not have. Pass
+    /// `--quant int4` to quantize down at load: 4x less VRAM and PCIe per layer
+    /// (so more layers stay resident and streaming shrinks), at some accuracy cost.
+    #[arg(long, value_enum)]
+    pub quant: Option<QuantArg>,
 
     /// System-RAM budget (GiB) for the tiered layer cache between NVMe and GPU.
     #[arg(long, value_name = "GB")]
@@ -301,9 +309,13 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = 8192)]
     pub context_length: u32,
 
-    /// On-disk weight quantization.
-    #[arg(long, value_enum, default_value_t = QuantArg::Int4)]
-    pub quant: QuantArg,
+    /// Weight precision the engine computes in. Defaults to the checkpoint's own
+    /// dtype (bf16/f16 stay 16-bit, f32 stays f32) — dlm reads the weights it was
+    /// given rather than assuming a quantization the file does not have. Pass
+    /// `--quant int4` to quantize down at load: 4x less VRAM and PCIe per layer
+    /// (so more layers stay resident and streaming shrinks), at some accuracy cost.
+    #[arg(long, value_enum)]
+    pub quant: Option<QuantArg>,
 
     /// Manual upper VRAM cap in gigabytes. Overrides the live device query.
     #[arg(long, value_name = "GB")]
@@ -449,7 +461,8 @@ mod tests {
         assert_eq!(a.context_length, 8192);
         assert_eq!(a.port, 8000);
         assert_eq!(a.host, "127.0.0.1");
-        assert_eq!(a.quant, QuantArg::Int4);
+        // No default: the precision comes from the checkpoint's own dtype.
+        assert_eq!(a.quant, None);
         assert_eq!(a.distributed_mode, DistributedMode::Standalone);
         assert_eq!(a.draft_gamma, 4);
         assert!(a.multi_gpu_ids.is_empty());

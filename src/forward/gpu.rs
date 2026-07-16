@@ -42,6 +42,7 @@ extern "C" {
         inter: i32,
         rms_eps: f32,
         w_dtype: i32,
+        w_group_size: i32,
         q_proj: *const c_void,
         k_proj: *const c_void,
         v_proj: *const c_void,
@@ -98,6 +99,8 @@ struct GpuLayer {
     kv_values: DeviceBuffer,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
+    /// Group size for int4 weights; 0 for the float dtypes.
+    w_group_size: i32,
 }
 
 impl GpuLayer {
@@ -118,6 +121,7 @@ impl GpuLayer {
             kv_keys: DeviceBuffer::new(kv_buffer_len)?,
             kv_values: DeviceBuffer::new(kv_buffer_len)?,
             w_dtype: t.q_proj.dtype_code(),
+            w_group_size: t.q_proj.group_size() as i32,
         })
     }
 }
@@ -228,6 +232,7 @@ impl ComputeKernel for GpuKernel {
                 self.cfg.intermediate_size as i32,
                 self.cfg.rms_eps,
                 w.w_dtype,
+                w.w_group_size,
                 w.q_proj.as_ptr() as *const c_void,
                 w.k_proj.as_ptr() as *const c_void,
                 w.v_proj.as_ptr() as *const c_void,

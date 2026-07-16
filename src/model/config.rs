@@ -13,6 +13,8 @@ use std::path::Path;
 /// term in the VRAM math.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantScheme {
+    /// Full 32-bit weights (F32): 4 bytes per parameter.
+    F32,
     /// Full 16-bit weights (FP16 / BF16): 2 bytes per parameter.
     Fp16,
     /// 8-bit quantization: 1 byte per parameter.
@@ -26,6 +28,7 @@ impl QuantScheme {
     /// Returned as `f64` because 4-bit packing is a fractional 0.5.
     pub fn bytes_per_param(self) -> f64 {
         match self {
+            QuantScheme::F32 => 4.0,
             QuantScheme::Fp16 => 2.0,
             QuantScheme::Int8 => 1.0,
             QuantScheme::Int4 => 0.5,

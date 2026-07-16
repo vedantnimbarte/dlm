@@ -21,7 +21,7 @@
 
 use crate::error::Result;
 use crate::gpu;
-use crate::model::ModelConfig;
+use crate::model::{ModelConfig, QuantScheme};
 use crate::storage::LayerCatalog;
 
 /// Default safety cushion: 1.5 GiB, per `specs.md` §3.1 (`M_safety`).
@@ -146,15 +146,26 @@ impl VramProfiler {
     /// real largest-block weight for `M_layer_weight`, and the Pinned Zone's
     /// actual byte cost subtracted from free VRAM. Falls back to the config
     /// estimate for any figure the catalog can't supply (e.g. empty catalog).
+    /// `native` is the checkpoint's own weight scheme. It is *not* always
+    /// `config.quant`: with `--quant int4` against a bf16 file, the catalog
+    /// measures the 16-bit bytes on disk while the layer that lands in VRAM is a
+    /// quarter of that, having been quantized at load. Planning from the on-disk
+    /// size would then leave 4x the VRAM unused.
     pub fn plan_from_catalog(
         &self,
         config: &ModelConfig,
         catalog: &LayerCatalog,
+        native: QuantScheme,
         free_bytes: u64,
     ) -> VramPlan {
         let per_layer = match catalog.max_layer_bytes() {
             0 => self.per_layer_weight_bytes(config),
-            measured => measured,
+            // Scale the measured on-disk bytes to the precision the engine will
+            // actually hold the layer in.
+            measured => {
+                let ratio = config.quant.bytes_per_param() / native.bytes_per_param();
+                (measured as f64 * ratio).ceil() as u64
+            }
         };
         let num_layers = if catalog.num_layers() == 0 {
             config.num_layers

@@ -162,6 +162,48 @@ fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32,
     }
 }
 
+/// `--quant int4` weights must decode identically on device and on the CPU
+/// oracle.
+///
+/// Quantization loses accuracy against the *original* floats — that is the deal —
+/// but both kernels read the same codes and the same per-group scales, so they
+/// must agree with each other as tightly as the float paths do. A mismatch here
+/// means the device's blob layout (`load_w<DLM_W_INT4>`) has drifted from
+/// `Int4Layout`/`int4_get` on the host, which would silently corrupt weights
+/// rather than merely round them.
+#[test]
+fn gpu_matches_cpu_with_int4_weights() {
+    let cfg = BlockConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 64,
+        intermediate_size: 512,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+    };
+    // Quantize the same random weights both kernels would otherwise share.
+    let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
+        .into_iter()
+        .map(|mut l| {
+            let q = |w: &dlm::forward::Weights| {
+                let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
+                dlm::forward::Weights::quantize_int4(&floats, dlm::forward::INT4_GROUP_SIZE).unwrap()
+            };
+            l.q_proj = q(&l.q_proj);
+            l.k_proj = q(&l.k_proj);
+            l.v_proj = q(&l.v_proj);
+            l.o_proj = q(&l.o_proj);
+            l.gate_proj = q(&l.gate_proj);
+            l.up_proj = q(&l.up_proj);
+            l.down_proj = q(&l.down_proj);
+            l
+        })
+        .collect();
+    assert_gpu_matches_cpu(cfg, quantized, 2e-3, "int4 weights");
+}
+
 /// Every real model has `hidden_size >= 2048`. The RMSNorm kernel used to launch
 /// `<<<1, hidden_size>>>`, which exceeds CUDA's 1024 threads-per-block cap and
 /// fails to launch — so the GPU path could never have run an actual checkpoint.

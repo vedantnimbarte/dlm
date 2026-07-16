@@ -53,6 +53,8 @@ struct GpuWeights {
     v_bias: Option<DeviceBuffer>,
     /// Native dtype of the projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
+    /// Group size for int4 weights; 0 for the float dtypes.
+    w_group_size: i32,
 }
 
 impl GpuWeights {
@@ -137,6 +139,7 @@ impl GpuWeights {
             k_bias: upload_bias(t.k_bias.as_ref())?,
             v_bias: upload_bias(t.v_bias.as_ref())?,
             w_dtype: t.q_proj.dtype_code(),
+            w_group_size: t.q_proj.group_size() as i32,
         })
     }
 }
@@ -415,6 +418,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 cfg.intermediate_size as i32,
                 cfg.rms_eps,
                 w.w_dtype,
+                w.w_group_size,
                 w.q_proj.as_ptr() as *const std::ffi::c_void,
                 w.k_proj.as_ptr() as *const std::ffi::c_void,
                 w.v_proj.as_ptr() as *const std::ffi::c_void,

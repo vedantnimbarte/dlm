@@ -26,8 +26,34 @@ use crate::forward::{
     StreamingKernel, Weights,
 };
 use crate::generate::Generator;
-use crate::model::ModelConfig;
+use crate::model::{ModelConfig, QuantScheme};
 use crate::storage::{bytes_to_f32, Dtype, MmapStore};
+
+/// The [`QuantScheme`] matching a checkpoint's own weight dtype.
+///
+/// This is the honest default for `--quant`: dlm reads the weights the file
+/// actually contains. Assuming a scheme the checkpoint does not have (the old
+/// Int4 default, against bf16 weights) mis-sizes every plan derived from it by
+/// 4x. Probes a layer-0 projection — every weight matrix in a checkpoint shares
+/// one dtype — and falls back to the first weight tensor it can find.
+pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
+    let probe = ["model.layers.0.self_attn.q_proj.weight", "model.embed_tokens.weight"];
+    let dtype = probe
+        .iter()
+        .find_map(|n| store.locate(n).map(|(_, info)| info.dtype))
+        .ok_or_else(|| {
+            DlmError::UnknownTensor(
+                "no weight tensor found to probe the checkpoint's dtype".to_string(),
+            )
+        })?;
+    match dtype {
+        Dtype::F32 => Ok(QuantScheme::F32),
+        Dtype::F16 | Dtype::BF16 => Ok(QuantScheme::Fp16),
+        other => Err(DlmError::UnsupportedQuant(format!(
+            "checkpoint weights are {other:?}; dlm handles F32/F16/BF16"
+        ))),
+    }
+}
 
 /// Read a named tensor as `f32`, verifying it has exactly `expected_len` elements.
 fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec<f32>> {
@@ -96,11 +122,29 @@ fn bytes_to_u16(bytes: &[u8], name: &str) -> Result<Vec<u16>> {
 /// so materializing an upsized f32 copy here would be lossless (f32 exactly
 /// represents every f16/bf16 value) yet cost 2x host RAM, 2x PCIe per streamed
 /// layer, and 2x the bandwidth of the memory-bound GEMV. See [`Weights`].
-fn load_native(store: &MmapStore, name: &str, expected_len: usize) -> Result<Weights> {
+fn load_native(
+    store: &MmapStore,
+    name: &str,
+    expected_len: usize,
+    quant: QuantScheme,
+) -> Result<Weights> {
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
     let bytes = shard.tensor_bytes(name)?;
+    // `--quant int4`: quantize down from the checkpoint's floats at load. Costs
+    // one f32 materialization here (transient, per tensor) and buys 4x less VRAM
+    // and PCIe per layer for the whole run.
+    if quant == QuantScheme::Int4 {
+        let floats = bytes_to_f32(bytes, info.dtype)?;
+        if floats.len() != expected_len {
+            return Err(DlmError::InvalidConfig(format!(
+                "tensor {name:?}: expected {expected_len} elements, got {}",
+                floats.len()
+            )));
+        }
+        return Weights::quantize_int4(&floats, crate::forward::INT4_GROUP_SIZE);
+    }
     let w = match info.dtype {
         Dtype::F32 => Weights::F32(bytes_to_f32(bytes, info.dtype)?),
         Dtype::BF16 => Weights::Bf16(bytes_to_u16(bytes, name)?),
@@ -130,11 +174,12 @@ fn load_linear(
     base: &str,
     in_features: usize,
     out_features: usize,
+    quant: QuantScheme,
 ) -> Result<Weights> {
     // Float weight: already row-major [out, in].
     let weight_name = format!("{base}.weight");
     if store.locate(&weight_name).is_some() {
-        return load_native(store, &weight_name, out_features * in_features);
+        return load_native(store, &weight_name, out_features * in_features, quant);
     }
 
     // A packed 4-bit checkpoint. `config.json` normally declares this and is
@@ -269,6 +314,7 @@ pub(crate) fn load_layer_tensors(
     store: &MmapStore,
     cfg: &BlockConfig,
     layer: u32,
+    quant: QuantScheme,
 ) -> Result<LayerTensors> {
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
@@ -277,13 +323,13 @@ pub(crate) fn load_layer_tensors(
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     // load_linear takes (in_features, out_features) of the underlying Linear.
     let tensors = LayerTensors {
-        q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim)?,
-        k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim)?,
-        v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim)?,
-        o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden)?,
-        gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate)?,
-        up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate)?,
-        down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden)?,
+        q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant)?,
+        k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant)?,
+        v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant)?,
+        o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant)?,
+        gate_proj: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate, quant)?,
+        up_proj: load_linear(store, &name("mlp.up_proj"), hidden, intermediate, quant)?,
+        down_proj: load_linear(store, &name("mlp.down_proj"), intermediate, hidden, quant)?,
         input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
         post_attention_layernorm: load_tensor(
             store,
@@ -305,6 +351,8 @@ pub struct MmapLayerSource {
     store: MmapStore,
     cfg: BlockConfig,
     num_layers: u32,
+    /// Weight precision to materialize each layer in (see `--quant`).
+    quant: QuantScheme,
 }
 
 impl LayerSource for MmapLayerSource {
@@ -312,7 +360,7 @@ impl LayerSource for MmapLayerSource {
         self.num_layers
     }
     fn load_layer(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
-        load_layer_tensors(&self.store, &self.cfg, layer).map(std::sync::Arc::new)
+        load_layer_tensors(&self.store, &self.cfg, layer, self.quant).map(std::sync::Arc::new)
     }
 }
 
@@ -356,7 +404,7 @@ fn load_streaming_pieces(
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
     Ok(StreamingPieces {
-        source: MmapLayerSource { store, cfg, num_layers: config.num_layers },
+        source: MmapLayerSource { store, cfg, num_layers: config.num_layers, quant: config.quant },
         embedding,
         final_norm,
         lm_head,
@@ -453,7 +501,7 @@ pub fn load_model_parts(
 
     let mut layers = Vec::with_capacity(config.num_layers as usize);
     for i in 0..config.num_layers {
-        layers.push(load_layer_tensors(store, &cfg, i)?);
+        layers.push(load_layer_tensors(store, &cfg, i, config.quant)?);
     }
 
     let embedding = load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?;
