@@ -4,6 +4,13 @@
 
 # dlm
 
+<p align="center">
+  <strong><a href="https://vedantnimbarte.github.io/dlm-frontend/">Docs</a></strong> ·
+  <a href="https://vedantnimbarte.github.io/dlm-frontend/get-started/">Get started</a> ·
+  <a href="https://vedantnimbarte.github.io/dlm-frontend/calculator/">Can I run it?</a> ·
+  <a href="https://vedantnimbarte.github.io/dlm-frontend/docs/quantization/">Quantization</a>
+</p>
+
 **dlm (Dynamic LLM)** — a dynamic layer-streaming inference engine. **Run models
 bigger than your VRAM**, whatever card you have — 4 GB, 6 GB, 8 GB, 16 GB, or
 more. dlm streams transformer layers in and out of VRAM instead of loading the
@@ -302,9 +309,19 @@ layer sizes:
 cargo run -- profile --model-path /path/to/models/Llama-3-70B-Instruct
 ```
 
-**`serve`** — starts the **OpenAI-compatible HTTP API server** for a model. It
-exposes `POST /v1/chat/completions`, `POST /v1/completions`, and `GET /v1/models`
-so clients like Open WebUI can talk to `dlm` unchanged:
+**`serve`** — starts the HTTP API server for a model. It speaks **two dialects**,
+so clients like Open WebUI, the OpenAI SDKs, and the Anthropic SDKs all talk to
+`dlm` unchanged with nothing but a base-URL change:
+
+| Method | Path | |
+|---|---|---|
+| `POST` | `/v1/chat/completions` | OpenAI chat completion (SSE with `"stream": true`) |
+| `POST` | `/v1/completions` | OpenAI legacy completion on a raw `prompt` |
+| `GET` | `/v1/models` | lists the served model |
+| `POST` | `/v1/messages` | Anthropic Messages API (SSE with `"stream": true`) |
+| `POST` | `/v1/messages/count_tokens` | token count for an Anthropic-shaped request, no generation |
+| `GET` | `/metrics` | Prometheus counters (**needs the key** under `--api-key`) |
+| `GET` | `/health` (also `/`, `/healthz`) | liveness — the only routes that stay open |
 
 ```bash
 cargo run -- serve \
@@ -317,7 +334,18 @@ cargo run -- serve \
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"dlm","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
+
+# the same model over the Anthropic dialect:
+curl http://127.0.0.1:8000/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"dlm","max_tokens":128,"messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+On `/v1/messages`, a top-level `system` field is folded in as a leading system
+message, and `content` may be a string or a list of text blocks. Streaming
+follows the sequence Anthropic clients expect — `message_start`,
+`content_block_start`, a run of `content_block_delta`, `content_block_stop`,
+`message_delta`, `message_stop`.
 
 Concurrent requests are continuously batched by a background scheduler, and
 `"stream": true` streams the reply as Server-Sent Events.
@@ -592,19 +620,27 @@ itself.
 The Phase 3 serving and scaling components (all CPU-testable, driven by the same
 inference engine):
 
-- **OpenAI-compatible server** ([`src/server`](src/server)) — a dependency-free
-  HTTP/1.1 server exposing `/v1/chat/completions` (with `stream: true` SSE),
-  `/v1/completions`, `/v1/models`. Behind it, an `EngineService` runs a background
+- **OpenAI- and Anthropic-compatible server** ([`src/server`](src/server)) — a
+  dependency-free HTTP/1.1 server exposing `/v1/chat/completions`,
+  `/v1/completions` and `/v1/models` (OpenAI) plus `/v1/messages` and
+  `/v1/messages/count_tokens` (Anthropic), both dialects with `stream: true` SSE.
+  Behind it, an `EngineService` runs a background
   batching thread so concurrent requests are **continuously batched** and each can
   be **streamed** to the client token by token. Started by `dlm serve`.
-  Per-request **sampling** is honored: `temperature`, `top_p`, `top_k`, and `seed`
-  select temperature/nucleus/top-k sampling (temperature `0` → deterministic
-  greedy); `stop` sequences truncate the completion. **Real tokenizers** load from
+  Per-request **sampling** is honored on both dialects: `temperature`, `top_p`,
+  `top_k`, `min_p`, `repetition_penalty` and `seed` select the sampler
+  (temperature `0` → deterministic greedy); `stop` (OpenAI) / `stop_sequences`
+  (Anthropic) truncate the completion, and `--eos-token` overrides the
+  `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,
   and `--chat-template {plain,chatml,llama3}` renders chat messages in the model's
   trained format (control tokens become single ids via the special-token
-  vocabulary). Hardening: `--api-key` requires a bearer token on `/v1/*`, and the
-  request body is size-capped. `GET /metrics` exposes Prometheus counters
+  vocabulary). Hardening: `--api-key` requires a key on **every** route except
+  `/`, `/health` and `/healthz` — including `/metrics`, which leaks request and
+  token counts. Send it as either `Authorization: Bearer <key>` (OpenAI) or
+  `x-api-key: <key>` (Anthropic), so either SDK authenticates unchanged. The
+  request body is size-capped.
+  `GET /metrics` exposes Prometheus counters
   (requests, prompt/completion tokens, and — when streaming — layer cache
   hits/misses/evictions/prefetches and live prefetch depth). The engine picks its
   compute kernel from flags:
