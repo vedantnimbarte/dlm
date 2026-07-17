@@ -46,6 +46,36 @@ jobs:
       - name: Assert the model actually answers correctly
         run: cargo test --release --test real_model -- --nocapture
 
+  # The same load-bearing idea for GPTQ, which needs its own real export: the
+  # packing is round-trip testable against dlm's own packer while real exporters
+  # differ in ways that corrupt weights *plausibly* — AutoGPTQ stores `zero - 1`,
+  # and decoding with the stored zero yields fluent nonsense rather than an error.
+  # Only a real checkpoint that must still answer correctly catches that.
+  gptq-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch a small real GPTQ checkpoint (Qwen2.5-0.5B-Instruct-GPTQ-Int4)
+        run: |
+          dir=models/Qwen2.5-0.5B-GPTQ
+          mkdir -p "$dir"
+          base="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4/resolve/main"
+          for f in config.json generation_config.json tokenizer.json model.safetensors; do
+            curl -fsSL "$base/$f" -o "$dir/$f"
+          done
+      # The test skips (rather than fails) when the fixture is missing, so that a
+      # fresh clone still runs the suite. In CI that would turn a broken download
+      # into a green run that tested nothing — so require the fixture here.
+      - name: Require the fixture (a silent skip would prove nothing)
+        run: |
+          test -s models/Qwen2.5-0.5B-GPTQ/config.json
+          test -s models/Qwen2.5-0.5B-GPTQ/model.safetensors
+          test -s models/Qwen2.5-0.5B-GPTQ/tokenizer.json
+      - name: Assert the GPTQ export still decodes to weights that mean something
+        run: cargo test --release --test gptq_model -- --nocapture
+
   # Type-check the CUDA FFI without a GPU. nvcc is absent here, so build.rs skips
   # device-code compilation — `cargo check` still validates the Rust side of the
   # kernel signatures, which is what silently drifted before (two `extern` blocks
@@ -77,7 +107,7 @@ jobs:
   # suite rather than a single Linux run.
   test:
     if: always()
-    needs: [test-matrix, real-model, cuda-check, lint]
+    needs: [test-matrix, real-model, gptq-model, cuda-check, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job did not succeed
