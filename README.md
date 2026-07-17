@@ -270,7 +270,7 @@ cargo run -- profile
 Example output:
 
 ```
-dlm v0.1.0
+dlm v0.2.0
   gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
