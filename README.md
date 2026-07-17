@@ -121,6 +121,7 @@ curl -fsSL https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.s
 - [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
 - [Weight precision (`--quant`)](#weight-precision---quant)
 - [Distributed & scaling](#distributed--scaling)
+- [Contributing & license](#contributing--license)
 
 ---
 
@@ -762,3 +763,12 @@ let tokens = coord.generate(&prompt, 32)?;   // == local greedy; survives a dead
 > hand-rolled TCP protocol — are documented at their call sites; the scheduling,
 > protocol, routing, fault-tolerance, and correctness are all implemented and
 > verified here.
+
+---
+
+## Contributing & license
+
+- [Contributing guide](CONTRIBUTING.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md) — please report vulnerabilities privately
+- [License](LICENSE.md) — Apache-2.0
