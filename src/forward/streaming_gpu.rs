@@ -323,14 +323,48 @@ fn evict_index(order: &VecDeque<u32>, inserting: u32) -> Option<usize> {
     }
 }
 
+/// Router-selection history: how often each `(layer, expert)` has been picked so
+/// far this session. A token's exact experts aren't known until its router runs,
+/// but MoE routing is heavily skewed — a handful of experts per layer dominate —
+/// so the historically-hot set is a good prediction of the next token's needs.
+/// The prefetch worker uses [`hot`](ExpertHistory::hot) to warm those experts for
+/// the *next* layer while the current one computes, moving their load off the
+/// critical path (see [`GpuExpertCache`]).
+#[derive(Default)]
+struct ExpertHistory {
+    counts: HashMap<(u32, u32), u32>,
+}
+
+impl ExpertHistory {
+    /// Record that `expert` was routed to in `layer` for one token.
+    fn record(&mut self, layer: u32, expert: u32) {
+        *self.counts.entry((layer, expert)).or_insert(0) += 1;
+    }
+
+    /// The `n` most-selected experts in `layer`, most-frequent first. Ties break
+    /// on expert id for determinism (testability). Empty until the layer has run.
+    fn hot(&self, layer: u32, n: usize) -> Vec<u32> {
+        let mut v: Vec<(u32, u32)> = self
+            .counts
+            .iter()
+            .filter(|((l, _), _)| *l == layer)
+            .map(|((_, e), c)| (*e, *c))
+            .collect();
+        // Descending by count, then ascending by expert id.
+        v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.into_iter().take(n).map(|(e, _)| e).collect()
+    }
+}
+
 /// A bounded VRAM cache of routed MoE experts, keyed `(layer, expert)`.
 ///
 /// Unlike the layer window this is a **true LRU**: expert selection is
 /// data-dependent, not a cyclic scan, and consecutive decode tokens reuse the
 /// same experts heavily — so evicting the least-recently-used expert keeps the
-/// hot set resident. A miss streams the expert from the checkpoint on demand;
-/// there is no prefetch, because which experts a token needs isn't known until
-/// its router runs.
+/// hot set resident. A miss streams the expert from the checkpoint on demand. The
+/// prefetch worker additionally warms each layer's historically-hot experts ahead
+/// of compute (see [`ExpertHistory`]); a token's *exact* experts still aren't
+/// known until its router runs, so on-critical-path misses can still occur.
 struct GpuExpertCache {
     capacity: usize,
     map: HashMap<(u32, u32), Arc<GpuExpert>>,
@@ -392,6 +426,8 @@ struct GpuShared<S: LayerSource> {
     staging: Mutex<PinnedBuffer>,
     /// VRAM cache of routed MoE experts (empty/unused for dense models).
     experts: Mutex<GpuExpertCache>,
+    /// Router-selection history driving expert prefetch (unused for dense models).
+    history: Mutex<ExpertHistory>,
 }
 
 impl<S: LayerSource> GpuShared<S> {
@@ -476,6 +512,18 @@ impl<S: LayerSource> GpuShared<S> {
         cache.insert((layer, expert), Arc::clone(&gpu));
         Ok(gpu)
     }
+
+    /// Warm `layer`'s historically-hot experts into the VRAM cache, off the
+    /// compute critical path. Best-effort (errors ignored) and a no-op until the
+    /// layer has routing history. Warms up to `experts_per_tok` experts — the
+    /// count a token actually consumes — so prefetch doesn't churn the LRU.
+    fn prefetch_experts(&self, layer: u32) {
+        let Some(m) = self.cfg.moe else { return };
+        let hot = self.history.lock().unwrap().hot(layer, m.experts_per_tok as usize);
+        for e in hot {
+            let _ = self.ensure_expert(layer, e);
+        }
+    }
 }
 
 /// A GPU [`ComputeKernel`] that streams a window of layer weights through VRAM
@@ -545,6 +593,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             copy_stream: Stream::new_nonblocking()?,
             staging: Mutex::new(PinnedBuffer::with_len(staging_bytes)?),
             experts: Mutex::new(GpuExpertCache::new(expert_capacity)),
+            history: Mutex::new(ExpertHistory::default()),
         });
         let (tx, rx) = channel::<u32>();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -557,6 +606,9 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                         break;
                     }
                     let _ = shared.ensure(layer, true); // best-effort
+                    // Warm this layer's likely experts while it's still ahead of
+                    // compute; no-op for dense models and cold (unseen) layers.
+                    shared.prefetch_experts(layer);
                 }
             })
         };
@@ -676,8 +728,15 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         }
 
         // 3. Stream + apply each selected expert, scaled by its gate weight.
+        // ponytail: one kernel launch per selected expert (top-k, usually 2). A
+        // grouped/batched expert GEMM — all top-k gate/up/down in a single launch —
+        // would cut launch overhead, but a fused kernel has no CPU oracle to check
+        // against, so it's deferred to hardware where it can be parity-tested
+        // against this loop. This form stays op-for-op equal to the CPU `moe_ffn`.
         let inter = m.moe_intermediate_size as i32;
         for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+            // Feed the prefetch heuristic: next token's hot set predicts this one's.
+            self.shared.history.lock().unwrap().record(layer, e as u32);
             let expert = self.shared.ensure_expert(layer, e as u32)?;
             let code = unsafe {
                 dlm_apply_expert(
@@ -952,5 +1011,34 @@ mod tests {
         assert_eq!(evict_index(&VecDeque::new(), 0), None);
         let single: VecDeque<u32> = [7u32].into_iter().collect();
         assert_eq!(evict_index(&single, 7), None); // nothing else to evict
+    }
+
+    /// The prefetch heuristic ranks a layer's experts by how often they've been
+    /// routed to, most-frequent first, and keeps layers independent.
+    #[test]
+    fn expert_history_ranks_hot_experts_per_layer() {
+        let mut h = super::ExpertHistory::default();
+        // Layer 0: expert 5 picked 3×, expert 2 twice, expert 9 once.
+        for _ in 0..3 { h.record(0, 5); }
+        for _ in 0..2 { h.record(0, 2); }
+        h.record(0, 9);
+        // Layer 1: different hot set — must not bleed into layer 0.
+        h.record(1, 7);
+        h.record(1, 7);
+        h.record(1, 1);
+
+        assert_eq!(h.hot(0, 2), vec![5, 2], "top-2 by frequency, desc");
+        assert_eq!(h.hot(0, 10), vec![5, 2, 9], "n larger than the set returns all, ranked");
+        assert_eq!(h.hot(1, 2), vec![7, 1], "layer 1 is independent");
+        assert!(h.hot(3, 4).is_empty(), "an unseen layer has no hot experts");
+    }
+
+    /// Ties break on expert id so prefetch order is deterministic (testable).
+    #[test]
+    fn expert_history_breaks_ties_by_id() {
+        let mut h = super::ExpertHistory::default();
+        h.record(0, 8);
+        h.record(0, 3);
+        assert_eq!(h.hot(0, 2), vec![3, 8], "equal counts → ascending id");
     }
 }
