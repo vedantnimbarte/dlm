@@ -363,6 +363,31 @@ impl ModelParts {
         .with_embed_scale(embed_scale))
     }
 
+    /// Split the model's layers across `gpu_ids` and build a generator over a
+    /// **GPU** pipeline ([`MultiGpuKernel`]) — each device holds and computes its
+    /// own layer shard (real multi-GPU compute, not the CPU-backed
+    /// [`into_pipeline_parallel_generator`](Self::into_pipeline_parallel_generator)).
+    #[cfg(feature = "cuda-kernels")]
+    pub fn into_multi_gpu_generator(
+        self,
+        gpu_ids: &[u32],
+    ) -> Result<Generator<crate::forward::MultiGpuKernel>> {
+        let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
+        let embed_scale = self.embed_scale;
+        let kernel = crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
+        Ok(Generator::new(
+            kernel,
+            self.embedding,
+            self.final_norm,
+            self.lm_head,
+            self.vocab_size,
+            self.rms_eps,
+            self.kv_config,
+            self.kv_blocks,
+        )?
+        .with_embed_scale(embed_scale))
+    }
+
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
     /// parallelism, `specs.md` §3.3) and build a generator over the resulting
     /// [`PipelineParallelKernel`]. Off-GPU it runs on the CPU kernel with the

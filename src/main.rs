@@ -712,11 +712,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         ids[stage], shard.start, shard.end, shard.len(),
                     );
                 }
-                let generator = parts.into_pipeline_parallel_generator(&ids)?;
-                let draft = draft_parts
-                    .map(|p| p.into_pipeline_parallel_generator(&ids[..1]))
-                    .transpose()?;
-                start_batched_server(generator, draft, &args, &config, &listen)
+                serve_multi_gpu(parts, draft_parts, &ids, &args, &config, &listen)
             } else if device == Device::Gpu {
                 serve_on_gpu(parts, draft_parts, &args, &config, &listen)
             } else {
@@ -905,6 +901,40 @@ fn ensure_batch_kv_fits(
         )));
     }
     Ok(())
+}
+
+/// Serve a model split across `gpu_ids`. On a `cuda-kernels` build each device
+/// computes its own layer shard ([`MultiGpuKernel`]); otherwise it falls back to
+/// the CPU-backed pipeline (device-affinity plumbing that no-ops off-GPU), so the
+/// split path stays exercisable without hardware.
+#[cfg(feature = "cuda-kernels")]
+fn serve_multi_gpu(
+    parts: ModelParts,
+    draft_parts: Option<ModelParts>,
+    ids: &[u32],
+    args: &ServeArgs,
+    config: &ModelConfig,
+    listen: &str,
+) -> Result<()> {
+    println!("  compute    : gpu (each stage runs its shard on its device)");
+    let generator = parts.into_multi_gpu_generator(ids)?;
+    let draft = draft_parts.map(|p| p.into_multi_gpu_generator(&ids[..1])).transpose()?;
+    start_batched_server(generator, draft, args, config, listen)
+}
+
+#[cfg(not(feature = "cuda-kernels"))]
+fn serve_multi_gpu(
+    parts: ModelParts,
+    draft_parts: Option<ModelParts>,
+    ids: &[u32],
+    args: &ServeArgs,
+    config: &ModelConfig,
+    listen: &str,
+) -> Result<()> {
+    println!("  compute    : cpu (device split plumbing; build with --features cuda-kernels for GPU)");
+    let generator = parts.into_pipeline_parallel_generator(ids)?;
+    let draft = draft_parts.map(|p| p.into_pipeline_parallel_generator(&ids[..1])).transpose()?;
+    start_batched_server(generator, draft, args, config, listen)
 }
 
 /// Serve with the GPU kernel (all layers resident in VRAM). Feature-gated on

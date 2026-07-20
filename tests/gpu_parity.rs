@@ -250,6 +250,57 @@ fn gpu_sliding_window_matches_cpu() {
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "sliding-window");
 }
 
+/// Splitting a model across two GPUs ([`MultiGpuKernel`]) must produce the same
+/// output as running it on one — the device split only moves where each layer
+/// computes. Needs a second GPU; skips cleanly otherwise.
+#[test]
+fn gpu_multi_gpu_matches_single_device() {
+    if dlm::gpu::set_device(1).is_err() {
+        return; // no second GPU
+    }
+    let _ = dlm::gpu::set_device(0);
+    let cfg = BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: dlm::forward::Activation::Silu,
+        mla: None,
+    };
+    let num_layers = 4u32;
+    let layers = random_layers(&cfg, num_layers, 0x11CE);
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let start: Vec<f32> = (0..cfg.hidden_size).map(|i| (i as f32) * 0.03 - 0.5).collect();
+
+    let single = dlm::forward::GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    let mut orch = ForwardOrchestrator::new(single, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut h_single = start.clone();
+    for _ in 0..3 {
+        orch.decode_token(&mut h_single).unwrap();
+    }
+
+    let multi = dlm::forward::MultiGpuKernel::new(cfg, layers, &[0, 1], 64).unwrap();
+    let mut orch = ForwardOrchestrator::new(multi, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut h_multi = start;
+    for _ in 0..3 {
+        orch.decode_token(&mut h_multi).unwrap();
+    }
+
+    let max_diff = h_single.iter().zip(&h_multi).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_diff < 1e-4, "multi-gpu diverged from single-gpu by {max_diff}");
+}
+
 /// Multi-head Latent Attention (DeepSeek, dense FFN) must match the CPU oracle:
 /// the device `dlm_mla_attn` + `dlm_dense_ffn` reproduce `mla_attention_sublayer`
 /// (compressed-latent KV, on-the-fly reconstruction, decoupled RoPE).

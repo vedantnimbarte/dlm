@@ -521,3 +521,83 @@ impl ComputeKernel for GpuKernel {
         Ok(())
     }
 }
+
+/// GPU pipeline parallelism: one [`GpuKernel`] per device, each holding a
+/// contiguous shard of the model's layers on its own GPU. `run_block` selects the
+/// owning device (`cudaSetDevice`) and delegates with the shard-local layer index,
+/// so a stage's weights and KV live on its device and only the `hidden`-wide
+/// residual crosses the host between stages (the ring hand-off).
+///
+/// This is the real GPU multi-GPU path (the generic
+/// [`PipelineParallelKernel`](crate::forward::PipelineParallelKernel) wraps the
+/// *CPU* kernel with device-affinity plumbing for off-GPU testing).
+pub struct MultiGpuKernel {
+    stages: Vec<GpuKernel>,
+    devices: Vec<u32>,
+    /// Global layer index → (stage index, shard-local layer index).
+    layer_map: Vec<(usize, usize)>,
+}
+
+impl MultiGpuKernel {
+    /// Partition `layers` across `gpu_ids` into contiguous stages, uploading each
+    /// stage's shard to its device (earlier stages absorb the remainder).
+    pub fn new(
+        cfg: BlockConfig,
+        layers: Vec<LayerTensors>,
+        gpu_ids: &[u32],
+        max_kv_tokens: usize,
+    ) -> Result<Self> {
+        if gpu_ids.is_empty() {
+            return Err(DlmError::InvalidConfig(
+                "multi-gpu pipeline needs at least one gpu id".into(),
+            ));
+        }
+        let num_layers = layers.len();
+        let shards = crate::distributed::partition_layers(num_layers, gpu_ids.len());
+        let mut layers = layers;
+        let mut stages = Vec::with_capacity(shards.len());
+        let mut layer_map = vec![(0usize, 0usize); num_layers];
+        let mut offset = 0;
+        for (stage_idx, shard) in shards.iter().enumerate() {
+            let count = shard.end - shard.start;
+            let shard_layers: Vec<LayerTensors> = layers.drain(0..count).collect();
+            // Upload this shard onto its device (GpuKernel::new allocates on the
+            // current device, so set it first).
+            crate::gpu::set_device(gpu_ids[stage_idx])?;
+            stages.push(GpuKernel::new(cfg, shard_layers, max_kv_tokens)?);
+            for local in 0..count {
+                layer_map[offset + local] = (stage_idx, local);
+            }
+            offset += count;
+        }
+        Ok(Self { stages, devices: gpu_ids.to_vec(), layer_map })
+    }
+}
+
+impl ComputeKernel for MultiGpuKernel {
+    fn num_layers(&self) -> u32 {
+        self.layer_map.len() as u32
+    }
+
+    fn hidden_size(&self) -> usize {
+        self.stages[0].hidden_size()
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.stages[0].kv_dim()
+    }
+
+    fn run_block(
+        &self,
+        layer: u32,
+        hidden: &mut [f32],
+        kv: &mut KvLayerCache,
+        position: usize,
+    ) -> Result<()> {
+        let (stage, local) = self.layer_map[layer as usize];
+        // Make the owning GPU current, then run the layer there. The stage's KV
+        // (per-session, allocated on first touch) lands on this device.
+        crate::gpu::set_device(self.devices[stage])?;
+        self.stages[stage].run_block(local as u32, hidden, kv, position)
+    }
+}
