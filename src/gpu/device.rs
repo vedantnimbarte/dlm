@@ -1,10 +1,14 @@
 //! Owned device (VRAM) memory buffers.
 //!
-//! A thin RAII wrapper over `cudaMalloc`/`cudaFree` with synchronous host↔device
+//! A thin RAII wrapper over device malloc/free with synchronous host↔device
 //! copies, used by the GPU compute kernel to stage weights and activations in
-//! VRAM. Compiled only under the `cuda` feature.
+//! VRAM. Backend-neutral: it dispatches to the CUDA or HIP runtime depending on
+//! the enabled feature, so the whole GPU stack above it is vendor-agnostic.
 
-use super::ffi_cuda;
+#[cfg(feature = "cuda")]
+use super::ffi_cuda as backend;
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+use super::ffi_hip as backend;
 use crate::error::Result;
 use std::os::raw::c_void;
 
@@ -18,7 +22,7 @@ pub struct DeviceBuffer {
 impl DeviceBuffer {
     /// Allocate space for `len` `f32`s (uninitialized).
     pub fn new(len: usize) -> Result<Self> {
-        let ptr = ffi_cuda::device_malloc(len * std::mem::size_of::<f32>())?;
+        let ptr = backend::device_malloc(len * std::mem::size_of::<f32>())?;
         Ok(Self { ptr, len })
     }
 
@@ -40,7 +44,7 @@ impl DeviceBuffer {
     pub fn from_bytes(bytes: &[u8], len: usize) -> Result<Self> {
         let buf = Self::new_bytes(bytes.len(), len)?;
         if !bytes.is_empty() {
-            ffi_cuda::copy_h2d(buf.ptr, bytes.as_ptr() as *const c_void, bytes.len())?;
+            backend::copy_h2d(buf.ptr, bytes.as_ptr() as *const c_void, bytes.len())?;
         }
         Ok(buf)
     }
@@ -48,7 +52,7 @@ impl DeviceBuffer {
     /// Allocate `bytes` of device memory holding `len` logical elements
     /// (uninitialized). For weights whose byte length is not `len * 4`.
     pub fn new_bytes(bytes: usize, len: usize) -> Result<Self> {
-        let ptr = ffi_cuda::device_malloc(bytes.max(1))?;
+        let ptr = backend::device_malloc(bytes.max(1))?;
         Ok(Self { ptr, len })
     }
 
@@ -64,7 +68,7 @@ impl DeviceBuffer {
 
     /// Copy `data` from host into this buffer.
     pub fn upload(&self, data: &[f32]) -> Result<()> {
-        ffi_cuda::copy_h2d(
+        backend::copy_h2d(
             self.ptr,
             data.as_ptr() as *const c_void,
             std::mem::size_of_val(data),
@@ -73,7 +77,7 @@ impl DeviceBuffer {
 
     /// Copy this buffer's contents into `out` on the host.
     pub fn download(&self, out: &mut [f32]) -> Result<()> {
-        ffi_cuda::copy_d2h(
+        backend::copy_d2h(
             out.as_mut_ptr() as *mut c_void,
             self.ptr,
             std::mem::size_of_val(out),
@@ -93,7 +97,7 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        ffi_cuda::device_free(self.ptr);
+        backend::device_free(self.ptr);
     }
 }
 
@@ -112,30 +116,30 @@ unsafe impl Sync for DeviceBuffer {}
 /// stream. Used as a dedicated *copy* stream so weight uploads run concurrently
 /// with compute.
 pub struct Stream {
-    raw: ffi_cuda::cudaStream_t,
+    raw: backend::StreamRaw,
 }
 
 impl Stream {
     /// Create a non-blocking stream.
     pub fn new_nonblocking() -> Result<Self> {
-        Ok(Self { raw: ffi_cuda::stream_create_nonblocking()? })
+        Ok(Self { raw: backend::stream_create_nonblocking()? })
     }
 
     /// Block the calling thread until this stream's queued work completes. The
     /// GPU still runs this stream concurrently with the default stream; only the
     /// caller waits.
     pub fn synchronize(&self) -> Result<()> {
-        ffi_cuda::stream_synchronize(self.raw)
+        backend::stream_synchronize(self.raw)
     }
 
-    fn raw(&self) -> ffi_cuda::cudaStream_t {
+    fn raw(&self) -> backend::StreamRaw {
         self.raw
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        ffi_cuda::stream_destroy(self.raw);
+        backend::stream_destroy(self.raw);
     }
 }
 
@@ -150,7 +154,7 @@ impl DeviceBuffer {
     /// asynchronously; the caller must not overwrite `src` until `stream` is
     /// synchronized.
     pub fn upload_async(&self, src: *const f32, stream: &Stream) -> Result<()> {
-        ffi_cuda::copy_h2d_async(
+        backend::copy_h2d_async(
             self.ptr,
             src as *const c_void,
             self.len * std::mem::size_of::<f32>(),
@@ -167,7 +171,7 @@ impl DeviceBuffer {
         bytes: usize,
         stream: &Stream,
     ) -> Result<()> {
-        ffi_cuda::copy_h2d_async(self.ptr, src, bytes, stream.raw())
+        backend::copy_h2d_async(self.ptr, src, bytes, stream.raw())
     }
 }
 
@@ -175,10 +179,10 @@ impl DeviceBuffer {
 /// completes. Unlike [`synchronize`], does *not* wait on other streams, so an
 /// in-flight copy on a non-blocking [`Stream`] keeps running.
 pub fn synchronize_default() -> Result<()> {
-    ffi_cuda::stream_synchronize(std::ptr::null_mut())
+    backend::stream_synchronize(std::ptr::null_mut())
 }
 
 /// Block until all queued device work finishes.
 pub fn synchronize() -> Result<()> {
-    ffi_cuda::synchronize()
+    backend::synchronize()
 }

@@ -51,6 +51,11 @@ fn main() {
         println!("cargo:rerun-if-changed=src/gpu/kernels.cu");
     }
 
+    if std::env::var("CARGO_FEATURE_ROCM_KERNELS").is_ok() {
+        compile_hip_kernels();
+        println!("cargo:rerun-if-changed=src/gpu/kernels.cu");
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
@@ -114,6 +119,50 @@ fn compile_cuda_kernels() {
         }
         Err(_) => {
             println!("cargo:warning=cuda-kernels enabled but nvcc was not found; skipping device-code compilation (cargo check still type-checks the FFI)");
+        }
+    }
+}
+
+/// Compile `src/gpu/kernels.cu` into a static library with **hipcc** (AMD) and
+/// link it. The same source compiles under HIP — its CUDA runtime/fp16 includes
+/// map to the HIP equivalents via `#ifdef __HIP_PLATFORM_AMD__` guards in the
+/// file, so `hipcc -x cu` builds it directly.
+///
+/// Degrades gracefully like the nvcc path: a missing hipcc emits a warning and
+/// skips, so `cargo check --features rocm-kernels` type-checks the Rust FFI + HIP
+/// backend without the toolkit. Linking a running binary then requires hipcc.
+fn compile_hip_kernels() {
+    let hipcc = std::env::var("ROCM_PATH")
+        .map(|p| format!("{p}/bin/hipcc"))
+        .unwrap_or_else(|_| "hipcc".to_string());
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let lib_path = format!("{out_dir}/libdlm_kernels.a");
+
+    let output = std::process::Command::new(&hipcc)
+        .args(["-O3", "-fPIC", "-x", "cu", "-c", "src/gpu/kernels.cu", "-o"])
+        .arg(format!("{out_dir}/dlm_kernels.o"))
+        .output();
+    // hipcc has no `-lib`; archive the object into a static lib with `ar`.
+    let archived = matches!(&output, Ok(o) if o.status.success())
+        && std::process::Command::new("ar")
+            .args(["crs", &lib_path, &format!("{out_dir}/dlm_kernels.o")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+    match output {
+        Ok(o) if o.status.success() && archived => {
+            println!("cargo:rustc-link-search=native={out_dir}");
+            println!("cargo:rustc-link-lib=static=dlm_kernels");
+        }
+        Ok(o) => {
+            for line in String::from_utf8_lossy(&o.stderr).lines() {
+                println!("cargo:warning=hipcc: {line}");
+            }
+            println!("cargo:warning=hipcc failed to compile src/gpu/kernels.cu (exit {}); GPU kernels will be unresolved at link time", o.status);
+        }
+        Err(_) => {
+            println!("cargo:warning=rocm-kernels enabled but hipcc was not found; skipping device-code compilation (cargo check still type-checks the FFI)");
         }
     }
 }

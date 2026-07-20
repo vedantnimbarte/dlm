@@ -720,7 +720,7 @@ impl LayerTensors {
 /// Device-resident K/V history for one layer on the GPU path, owned by the
 /// session's [`KvLayerCache`] (not the kernel) so batched sessions never share
 /// KV. Allocated lazily on first GPU use.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[derive(Debug)]
 struct GpuKvHandle {
     keys: crate::gpu::device::DeviceBuffer,
@@ -740,7 +740,7 @@ pub struct KvLayerCache {
     store: KvStore,
     /// Device K/V for the GPU path; `None` until the first GPU `run_block` for
     /// this session+layer allocates it.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     gpu: Option<GpuKvHandle>,
 }
 
@@ -751,7 +751,7 @@ impl Clone for KvLayerCache {
             store: self.store.clone(),
             // GPU KV is per-session device memory; a clone (a KV snapshot for the
             // prefix cache) starts with none and re-allocates on next GPU use.
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
         }
     }
@@ -864,7 +864,7 @@ impl KvLayerCache {
         Self {
             kv_dim,
             store,
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
         }
     }
@@ -875,7 +875,7 @@ impl KvLayerCache {
     /// position and attends over. Because each session owns its own
     /// [`KvLayerCache`], batched sessions never collide in KV — the fix for
     /// running concurrent requests on the shared GPU kernel.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn gpu_kv(&mut self, capacity_tokens: usize) -> Result<(*mut f32, *mut f32)> {
         if self.gpu.is_none() {
             let len = capacity_tokens * self.kv_dim.max(1);

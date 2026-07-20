@@ -138,7 +138,7 @@ fn cpu_self_check() -> Result<usize> {
 
 /// GPU runtime probe: on a `cuda-kernels` build, run one block on both the CPU
 /// and GPU kernels and report the max divergence; otherwise note it was skipped.
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 fn gpu_self_check() {
     match gpu_parity_probe() {
         Ok(diff) => println!("  gpu parity   : ok (max |Δ| {diff:.2e} vs cpu)"),
@@ -146,14 +146,14 @@ fn gpu_self_check() {
     }
 }
 
-#[cfg(not(feature = "cuda-kernels"))]
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
 fn gpu_self_check() {
     println!("  gpu parity   : skipped (build with --features cuda-kernels)");
 }
 
 /// Build one layer, run it on CPU and GPU, return the max absolute difference.
 /// Errors if the GPU is unavailable at runtime (`GpuKernel::new` fails).
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 fn gpu_parity_probe() -> Result<f32> {
     use dlm::forward::{GpuKernel, KvLayerCache};
     let cfg = tiny_cfg();
@@ -344,12 +344,12 @@ fn generate_on_device(
             let generator = parts.into_cpu_generator()?;
             run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
         }
-        #[cfg(feature = "cuda-kernels")]
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
         Device::Gpu => {
             let generator = parts.into_gpu_generator()?;
             run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
         }
-        #[cfg(not(feature = "cuda-kernels"))]
+        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
     }
 }
@@ -751,7 +751,7 @@ fn resolve_device(requested: Device) -> Device {
     if requested == Device::Cpu {
         return Device::Cpu;
     }
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
     {
         if gpu::mem_get_info().is_ok() {
             Device::Gpu
@@ -763,7 +763,7 @@ fn resolve_device(requested: Device) -> Device {
             Device::Cpu
         }
     }
-    #[cfg(not(feature = "cuda-kernels"))]
+    #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
     {
         Device::Gpu
     }
@@ -907,7 +907,7 @@ fn ensure_batch_kv_fits(
 /// computes its own layer shard ([`MultiGpuKernel`]); otherwise it falls back to
 /// the CPU-backed pipeline (device-affinity plumbing that no-ops off-GPU), so the
 /// split path stays exercisable without hardware.
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 fn serve_multi_gpu(
     parts: ModelParts,
     draft_parts: Option<ModelParts>,
@@ -922,7 +922,7 @@ fn serve_multi_gpu(
     start_batched_server(generator, draft, args, config, listen)
 }
 
-#[cfg(not(feature = "cuda-kernels"))]
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
 fn serve_multi_gpu(
     parts: ModelParts,
     draft_parts: Option<ModelParts>,
@@ -939,7 +939,7 @@ fn serve_multi_gpu(
 
 /// Serve with the GPU kernel (all layers resident in VRAM). Feature-gated on
 /// `cuda-kernels`; the draft model, if any, is also placed on the GPU.
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 fn serve_on_gpu(
     parts: ModelParts,
     draft_parts: Option<ModelParts>,
@@ -968,7 +968,7 @@ fn serve_on_gpu(
     start_batched_server(generator, draft, args, config, listen)
 }
 
-#[cfg(not(feature = "cuda-kernels"))]
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
 fn serve_on_gpu(
     _parts: ModelParts,
     _draft_parts: Option<ModelParts>,
@@ -981,7 +981,7 @@ fn serve_on_gpu(
 
 /// Serve with `--stream --device gpu`: stream a window of layer weights through
 /// VRAM (`StreamingGpuKernel`). Experimental — unvalidated on hardware.
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 #[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
     store: MmapStore,
@@ -1005,7 +1005,7 @@ fn serve_streaming_gpu(
     start_batched_server(generator, None, args, config, listen)
 }
 
-#[cfg(not(feature = "cuda-kernels"))]
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
 #[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
     _store: MmapStore,

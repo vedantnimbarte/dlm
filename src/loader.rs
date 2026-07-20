@@ -345,7 +345,7 @@ impl ModelParts {
     }
 
     /// Upload every layer to VRAM and build a generator over the GPU kernel.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
     pub fn into_gpu_generator(self) -> Result<Generator<crate::forward::GpuKernel>> {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
@@ -367,7 +367,7 @@ impl ModelParts {
     /// **GPU** pipeline ([`MultiGpuKernel`]) — each device holds and computes its
     /// own layer shard (real multi-GPU compute, not the CPU-backed
     /// [`into_pipeline_parallel_generator`](Self::into_pipeline_parallel_generator)).
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
     pub fn into_multi_gpu_generator(
         self,
         gpu_ids: &[u32],
@@ -849,7 +849,7 @@ pub fn build_streaming_generator(
 /// weights through VRAM ([`StreamingGpuKernel`]) while KV stays resident.
 /// `ram_cache_bytes` bounds a host-RAM LRU of materialized layers so a VRAM miss
 /// doesn't re-read and re-materialize the layer every token (`0` disables it).
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub fn build_streaming_gpu_generator(
     store: MmapStore,
     config: &ModelConfig,

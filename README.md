@@ -511,13 +511,13 @@ The GPU path is vendor-neutral behind [`src/gpu`](src/gpu), selected by a Cargo
 feature. Everything above the backend (storage, profiler, pipeline) is identical
 across vendors.
 
-> **GPU compute status:** NVIDIA (CUDA) is the only backend with working compute
-> kernels today, and it is verified on real hardware against the CPU oracle
-> ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)). The `rocm` (AMD) feature
-> currently provides **memory management only** — VRAM query and pinned host
-> memory — and has **no compute kernels**, so on an AMD GPU inference falls back
-> to the CPU. **AMD GPU compute (a HIP port of `kernels.cu`) is planned, not yet
-> available.**
+> **GPU compute status:** The GPU stack is **backend-agnostic** — the same
+> kernels (`src/gpu/kernels.cu`) and orchestration run on **NVIDIA (CUDA)** via
+> `cuda-kernels` and **AMD (HIP)** via `rocm-kernels`; only the device runtime
+> (malloc/copy/streams) differs. CUDA is verified on real hardware against the CPU
+> oracle ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)). The HIP path type-checks
+> and compiles (`hipcc`), and needs the same parity run on an AMD card to be
+> declared verified — validate with `dlm doctor` before trusting output.
 
 | Feature | Vendor | Runtime | Env var |
 |---|---|---|---|

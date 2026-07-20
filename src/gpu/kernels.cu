@@ -15,8 +15,25 @@
 // under the `cuda-kernels` Cargo feature. Validated on device against the CPU
 // oracle by tests/gpu_parity.rs.
 
+// Backend-neutral device code: the same kernels compile under NVIDIA CUDA (nvcc)
+// and AMD HIP (hipcc). HIP mirrors the CUDA runtime API almost 1:1, so we map the
+// handful of `cuda*` runtime symbols this file uses to their `hip*` equivalents
+// when compiling for AMD. All the __global__ kernels and device intrinsics
+// (rsqrtf/expf/tanhf/__half2float/__syncthreads) are identical on both.
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaGetLastError hipGetLastError
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#endif
 #include <math.h>
 
 // Threads per block for the reduction kernels. Must be <= 1024 (the CUDA

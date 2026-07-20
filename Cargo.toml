@@ -34,6 +34,12 @@ cuda-kernels = ["cuda"]
 # driver — no CUDA toolkit install required. Used for the redistributable
 # `-cuda-static` release asset.
 cuda-static = ["cuda-kernels"]
+# AMD GPU compute kernels: compiles src/gpu/kernels.cu with hipcc and enables the
+# device `run_block` on ROCm. Implies `rocm`; requires the ROCm toolkit (hipcc) at
+# build time. `cargo check` type-checks the Rust FFI + HIP backend without hipcc.
+# The Rust GPU stack is backend-agnostic — the same kernels/orchestration run on
+# CUDA or HIP; only the device runtime differs.
+rocm-kernels = ["rocm"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

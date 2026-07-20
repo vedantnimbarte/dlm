@@ -17,6 +17,9 @@ pub const CUDA_SUCCESS: cudaError_t = 0;
 
 /// Opaque `cudaStream_t` handle.
 pub type cudaStream_t = *mut c_void;
+/// Backend-neutral stream handle (the vendor-agnostic `device` module names it
+/// `StreamRaw` regardless of backend).
+pub type StreamRaw = cudaStream_t;
 /// Opaque `cudaEvent_t` handle.
 pub type cudaEvent_t = *mut c_void;
 
