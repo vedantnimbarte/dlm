@@ -429,13 +429,24 @@ names. That covers:
 
 **MoE models** route each token through the top-k experts the router selects
 (softmax over all experts, then top-k, then renormalized — the Mixtral/Qwen
-recipe). On the GPU streaming path only the experts a token actually uses are
-pulled into VRAM, cached per `(layer, expert)` and reused across tokens — so a
-sparse model moves far less over PCIe than its total parameter count implies.
-Because expert choice is data-dependent it can't be prefetched like the layer
-cycle, so a cold expert still costs a stream; quantize (`--quant`) to keep the
-hot set resident. On CPU and host streaming, a layer's experts ride along with
-it. Expert weights honor `--quant` exactly like dense weights.
+recipe). **Both the GPU and the host (`--stream`) paths hold only a layer's
+*core* resident — attention, router, and the shared expert — and pull the top-k
+routed experts on demand**, cached per `(layer, expert)` and reused across
+tokens. So a sparse model keeps memory near its *active* parameter count, not its
+total: a Mixtral-8×7B layer inlines ~45 GB of experts, but only the two a token
+uses are materialized. On GPU the expert cache is a VRAM budget
+(`--expert-cache-gb`, defaulting to the VRAM left after the resident layer
+window) so a fine-grained (128-expert) model can't overrun the card; on the host
+it's a bounded RAM cache. Because expert choice is data-dependent it can't be
+prefetched like the layer cycle, so a cold expert still costs a load; quantize
+(`--quant`) to keep the hot set resident, and watch `dlm_stream_expert_*` in
+`/metrics` for the hit rate. Expert weights honor `--quant` like dense weights.
+
+Concurrent requests are continuously batched on every backend, including the GPU
+paths — each in-flight sequence owns its own KV history, so batched decoding is
+correct on the GPU as well as the CPU. KV lives in VRAM per sequence, so the KV
+footprint grows with the batch size; size `--context-length` and the batch for
+your card.
 
 An unsupported architecture fails with a clear `UnknownTensor` error at load
 rather than producing garbage. A config declaring a `rope_scaling` type dlm does

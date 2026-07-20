@@ -369,7 +369,9 @@ pub struct ExpertFfn {
 }
 
 impl ExpertFfn {
-    fn byte_size(&self) -> usize {
+    /// Approximate host bytes this expert's three matrices occupy in their native
+    /// dtype — used to budget the streamed-expert host cache.
+    pub fn byte_size(&self) -> usize {
         self.gate.as_bytes().len() + self.up.as_bytes().len() + self.down.as_bytes().len()
     }
 
@@ -484,6 +486,7 @@ impl LayerTensors {
 
     /// The MoE block (router + routed experts + optional shared expert), or an
     /// error if this layer is dense.
+    #[allow(clippy::type_complexity)] // a borrow-tuple of the four MoE parts; a struct would only add indirection
     pub fn moe(&self) -> Result<(&Weights, &[ExpertFfn], Option<&ExpertFfn>, Option<&Weights>)> {
         match &self.ffn {
             Ffn::Moe { router, experts, shared, shared_gate } => {
@@ -616,12 +619,44 @@ impl LayerTensors {
     }
 }
 
+/// Device-resident K/V history for one layer on the GPU path, owned by the
+/// session's [`KvLayerCache`] (not the kernel) so batched sessions never share
+/// KV. Allocated lazily on first GPU use.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct GpuKvHandle {
+    keys: crate::gpu::device::DeviceBuffer,
+    values: crate::gpu::device::DeviceBuffer,
+}
+
 /// Real f32 K/V history for one layer (what attention reads). The paged
 /// `PagedKvCache` tracks the block bookkeeping; this holds the actual vectors.
-#[derive(Debug, Clone, Default)]
+///
+/// On the GPU kernels the host `store` holds only zero placeholders for length
+/// bookkeeping; the real K/V lives in the device buffers of [`gpu`](Self::gpu),
+/// which are **per-session** so continuous batching keeps each sequence's history
+/// isolated (the kernel is shared across sessions, the KV is not).
+#[derive(Debug, Default)]
 pub struct KvLayerCache {
     kv_dim: usize,
     store: KvStore,
+    /// Device K/V for the GPU path; `None` until the first GPU `run_block` for
+    /// this session+layer allocates it.
+    #[cfg(feature = "cuda")]
+    gpu: Option<GpuKvHandle>,
+}
+
+impl Clone for KvLayerCache {
+    fn clone(&self) -> Self {
+        Self {
+            kv_dim: self.kv_dim,
+            store: self.store.clone(),
+            // GPU KV is per-session device memory; a clone (a KV snapshot for the
+            // prefix cache) starts with none and re-allocates on next GPU use.
+            #[cfg(feature = "cuda")]
+            gpu: None,
+        }
+    }
 }
 
 /// KV cache precision — a memory/quality knob. `None` is exact; the quantized
@@ -728,7 +763,31 @@ impl KvLayerCache {
                 value_scales: Vec::new(),
             },
         };
-        Self { kv_dim, store }
+        Self {
+            kv_dim,
+            store,
+            #[cfg(feature = "cuda")]
+            gpu: None,
+        }
+    }
+
+    /// Device K/V pointers for this session+layer on the GPU path, allocating the
+    /// per-session buffers (sized for `capacity_tokens`) on first use. Returns
+    /// `(keys, values)` device pointers the kernel writes in place at the current
+    /// position and attends over. Because each session owns its own
+    /// [`KvLayerCache`], batched sessions never collide in KV — the fix for
+    /// running concurrent requests on the shared GPU kernel.
+    #[cfg(feature = "cuda")]
+    pub fn gpu_kv(&mut self, capacity_tokens: usize) -> Result<(*mut f32, *mut f32)> {
+        if self.gpu.is_none() {
+            let len = capacity_tokens * self.kv_dim.max(1);
+            self.gpu = Some(GpuKvHandle {
+                keys: crate::gpu::device::DeviceBuffer::new(len)?,
+                values: crate::gpu::device::DeviceBuffer::new(len)?,
+            });
+        }
+        let h = self.gpu.as_ref().unwrap();
+        Ok((h.keys.as_mut_ptr(), h.values.as_mut_ptr()))
     }
 
     /// Empty (exact `f32`) history for a layer whose K/V width is `kv_dim`.
@@ -998,10 +1057,39 @@ pub(crate) fn route_topk(logits: &[f32], k: usize, norm: bool) -> Vec<(usize, f3
     chosen
 }
 
+/// Add the Qwen2-MoE shared expert's contribution into `out`, gated by its
+/// sigmoid (`sigmoid(shared_gate · x)`; ungated → weight 1). No-op when the
+/// model has no shared expert. Shared by the resident and streamed MoE paths.
+fn add_shared_expert(
+    out: &mut [f32],
+    shared: Option<&ExpertFfn>,
+    shared_gate: Option<&Weights>,
+    x: &[f32],
+    cfg: &BlockConfig,
+    m: &MoeConfig,
+) {
+    if let Some(s) = shared {
+        let hidden = cfg.hidden_size;
+        let si = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as usize;
+        let g = match shared_gate {
+            Some(gate) => {
+                let logit = matvec_native(gate, x, 1, hidden)[0];
+                1.0 / (1.0 + (-logit).exp())
+            }
+            None => 1.0,
+        };
+        let down = swiglu_ffn(s, x, hidden, si);
+        for (o, d) in out.iter_mut().zip(&down) {
+            *o += g * d;
+        }
+    }
+}
+
 /// The MoE feed-forward: route `x` (the post-attention-norm hidden) through the
 /// top-k experts, sum their SwiGLU outputs weighted by the gate, and add the
 /// shared expert (Qwen2-MoE) gated by its sigmoid. Returns the `hidden`-wide
-/// contribution to the residual.
+/// contribution to the residual. Experts are borrowed **resident** here (no
+/// per-token clone); the streamed host path uses [`moe_ffn_streaming`] instead.
 fn moe_ffn(
     router: &Weights,
     experts: &[ExpertFfn],
@@ -1029,21 +1117,47 @@ fn moe_ffn(
             *o += weight * d;
         }
     }
-    if let Some(s) = shared {
-        let si = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as usize;
-        // Sigmoid gate over the shared expert (Qwen2-MoE); ungated → weight 1.
-        let g = match shared_gate {
-            Some(gate) => {
-                let logit = matvec_native(gate, x, 1, hidden)[0];
-                1.0 / (1.0 + (-logit).exp())
-            }
-            None => 1.0,
-        };
-        let down = swiglu_ffn(s, x, hidden, si);
+    add_shared_expert(&mut out, shared, shared_gate, x, cfg, &m);
+    Ok(out)
+}
+
+/// The MoE feed-forward, fetching each routed expert **on demand** via
+/// `fetch_expert(e)` rather than requiring all experts resident — the CPU analog
+/// of the GPU per-`(layer, expert)` streaming path. This is what lets host
+/// streaming run a Mixtral/Qwen-MoE checkpoint without materializing every
+/// expert of every resident layer (which would blow host RAM). The router runs
+/// on the resident core; only the top-k experts a token selects are pulled.
+///
+/// Returns any expert `fetch_expert` fails on so the caller (host or GPU cache
+/// miss) can report the exact expert that couldn't be loaded.
+pub(crate) fn moe_ffn_streaming<F, E>(
+    router: &Weights,
+    shared: Option<&ExpertFfn>,
+    shared_gate: Option<&Weights>,
+    x: &[f32],
+    cfg: &BlockConfig,
+    mut fetch_expert: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(usize) -> Result<E>,
+    E: std::ops::Deref<Target = ExpertFfn>,
+{
+    let m = cfg.moe.ok_or_else(|| {
+        DlmError::QuantLayout("moe_ffn_streaming called on a layer without MoE config".into())
+    })?;
+    let hidden = cfg.hidden_size;
+    let inter = m.moe_intermediate_size as usize;
+    let logits = matvec_native(router, x, m.num_experts as usize, hidden);
+    let mut out = vec![0.0f32; hidden];
+    for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+        // `expert` may be an `Arc<ExpertFfn>` from a host cache — deref, don't clone.
+        let expert = fetch_expert(e)?;
+        let down = swiglu_ffn(&expert, x, hidden, inter);
         for (o, d) in out.iter_mut().zip(&down) {
-            *o += g * d;
+            *o += weight * d;
         }
     }
+    add_shared_expert(&mut out, shared, shared_gate, x, cfg, &m);
     Ok(out)
 }
 
@@ -1161,14 +1275,45 @@ pub fn decode_block(
     position: usize,
 ) -> Result<Vec<f32>> {
     w.validate(cfg)?;
+    let mut h1 = attention_sublayer(cfg, w, hidden, kv, position)?;
+
+    // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
+    let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
+    let ffn_out = match &w.ffn {
+        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size),
+        Ffn::Moe { router, experts, shared, shared_gate } => moe_ffn(
+            router,
+            experts,
+            shared.as_ref(),
+            shared_gate.as_ref(),
+            &normed2,
+            cfg,
+        )?,
+    };
+
+    for (h, d) in h1.iter_mut().zip(&ffn_out) {
+        *h += *d;
+    }
+    Ok(h1)
+}
+
+/// The attention sublayer: RMSNorm → Q/K/V (+bias) → RoPE → append K/V → GQA over
+/// history → output projection, folded into the residual. Returns the post-attn
+/// hidden `h1` (the FFN sublayer's input before its own norm). Shared by
+/// [`decode_block`] and [`decode_block_streaming_moe`] so the two can't drift.
+fn attention_sublayer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+) -> Result<Vec<f32>> {
     if hidden.len() != cfg.hidden_size {
         return Err(DlmError::ShapeMismatch {
             expected: cfg.hidden_size,
             got: hidden.len(),
         });
     }
-
-    // ── attention sublayer ──
     let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
     let mut q = matvec_native(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
     let mut k = matvec_native(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
@@ -1186,26 +1331,34 @@ pub fn decode_block(
     let ctx = attention(cfg, &q, kv);
     let attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
 
-    let mut h1: Vec<f32> = hidden
-        .iter()
-        .zip(&attn_out)
-        .map(|(&a, &b)| a + b)
-        .collect();
+    Ok(hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect())
+}
 
-    // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
+/// Run one decoder block whose layer is a **streamed MoE core** — attention +
+/// router + shared expert are resident in `w` (its `Ffn::Moe.experts` is empty),
+/// and each routed expert is pulled on demand through `fetch_expert`.
+///
+/// This is what makes host streaming viable for large MoE checkpoints: only the
+/// core stays resident per layer and only the top-k experts a token selects are
+/// materialized, instead of dragging every expert of every resident layer into
+/// RAM. Bit-for-bit equivalent to [`decode_block`] on the same weights when
+/// `fetch_expert` returns the same experts.
+pub fn decode_block_streaming_moe<F, E>(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+    fetch_expert: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(usize) -> Result<E>,
+    E: std::ops::Deref<Target = ExpertFfn>,
+{
+    let (router, _experts, shared, shared_gate) = w.moe()?;
+    let mut h1 = attention_sublayer(cfg, w, hidden, kv, position)?;
     let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
-    let ffn_out = match &w.ffn {
-        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size),
-        Ffn::Moe { router, experts, shared, shared_gate } => moe_ffn(
-            router,
-            experts,
-            shared.as_ref(),
-            shared_gate.as_ref(),
-            &normed2,
-            cfg,
-        )?,
-    };
-
+    let ffn_out = moe_ffn_streaming(router, shared, shared_gate, &normed2, cfg, fetch_expert)?;
     for (h, d) in h1.iter_mut().zip(&ffn_out) {
         *h += *d;
     }

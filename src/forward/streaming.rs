@@ -19,7 +19,9 @@
 //! [`CpuKernel`]: crate::forward::CpuKernel
 
 use crate::error::Result;
-use crate::forward::cpu::{decode_block, BlockConfig, KvLayerCache, LayerTensors};
+use crate::forward::cpu::{
+    decode_block, decode_block_streaming_moe, BlockConfig, ExpertFfn, KvLayerCache, LayerTensors,
+};
 use crate::forward::kernel::ComputeKernel;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -191,6 +193,12 @@ pub struct StreamStats {
     /// The prefetch depth in effect now (the live auto-tuned value under
     /// `--auto-prefetch`, else the fixed depth). A gauge, not a counter.
     pub depth: u32,
+    /// Routed-expert VRAM cache (GPU MoE streaming only; zero otherwise). On a
+    /// sparse model the expert hit rate is the throughput signal — a cold expert
+    /// costs a PCIe stream — so it is surfaced alongside the layer-window stats.
+    pub expert_hits: u64,
+    pub expert_misses: u64,
+    pub expert_evictions: u64,
 }
 
 /// A bounded LRU of materialized layers (front of `order` = least recent).
@@ -239,11 +247,66 @@ impl LayerLru {
     }
 }
 
+/// A bounded host-RAM LRU of routed MoE experts, keyed `(layer, expert)`.
+///
+/// Mirrors the GPU expert cache: expert choice is data-dependent (not a cyclic
+/// scan), so a **true LRU** keeps the hot set materialized while a miss re-loads
+/// the expert from the checkpoint. This is what makes host MoE practical — it
+/// bounds RAM to `window cores + this cache`, instead of every expert of every
+/// resident layer (a Mixtral-8x7B layer inlines ~45 GB of experts).
+struct HostExpertCache {
+    capacity: usize,
+    map: HashMap<(u32, u32), Arc<ExpertFfn>>,
+    order: VecDeque<(u32, u32)>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl HostExpertCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    fn touch(&mut self, key: (u32, u32)) {
+        if let Some(pos) = self.order.iter().position(|&k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    fn insert(&mut self, key: (u32, u32), expert: Arc<ExpertFfn>) {
+        while self.map.len() >= self.capacity {
+            let Some(evict) = self.order.pop_front() else { break };
+            if evict == key {
+                self.order.push_back(evict);
+                if self.order.len() <= 1 {
+                    break;
+                }
+                continue;
+            }
+            self.map.remove(&evict);
+            self.evictions += 1;
+        }
+        self.map.insert(key, expert);
+        self.order.push_back(key);
+    }
+}
+
 /// State shared between the compute thread and the prefetch worker.
 struct Shared<S: LayerSource> {
     cfg: BlockConfig,
     source: S,
     cache: Mutex<LayerLru>,
+    /// Routed-expert host cache (MoE only; unused/empty for dense models).
+    experts: Mutex<HostExpertCache>,
     /// Signaled when a layer finishes loading, so waiters can recheck.
     ready: Condvar,
     /// EWMA of a layer load's duration (ns), for auto prefetch depth.
@@ -281,7 +344,14 @@ impl<S: LayerSource> Shared<S> {
             cache.loading.insert(layer);
             drop(cache);
             let t = std::time::Instant::now();
-            let loaded = self.source.load_layer(layer);
+            // MoE: hold only the layer *core* resident (attention + router +
+            // shared expert); routed experts stream on demand via `ensure_expert`.
+            // Dense: the whole layer. Keeps host RAM at `window cores + expert$`.
+            let loaded = if self.cfg.moe.is_some() {
+                self.source.load_layer_core(layer)
+            } else {
+                self.source.load_layer(layer)
+            };
             ewma(&self.load_ns, t.elapsed().as_nanos() as u64);
             let mut cache = self.cache.lock().unwrap();
             cache.loading.remove(&layer);
@@ -309,6 +379,27 @@ impl<S: LayerSource> Shared<S> {
             cache.stats.misses += 1;
         }
         self.ensure(layer, false)
+    }
+
+    /// Materialize routed expert `(layer, expert)` for the streamed MoE path,
+    /// serving it from the host expert cache on a hit and loading it from the
+    /// checkpoint on a miss. Records hit/miss/eviction for `/metrics`.
+    fn ensure_expert(&self, layer: u32, expert: u32) -> Result<Arc<ExpertFfn>> {
+        {
+            let mut c = self.experts.lock().unwrap();
+            if let Some(e) = c.map.get(&(layer, expert)) {
+                let e = Arc::clone(e);
+                c.hits += 1;
+                c.touch((layer, expert));
+                return Ok(e);
+            }
+            c.misses += 1;
+        }
+        // Load without the lock; a rare concurrent double-load just loads twice.
+        let e = self.source.load_expert(layer, expert)?;
+        let mut c = self.experts.lock().unwrap();
+        c.insert((layer, expert), Arc::clone(&e));
+        Ok(e)
     }
 }
 
@@ -340,10 +431,19 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
     /// prefetching one layer ahead in the background.
     pub fn new(cfg: BlockConfig, source: S, resident_layers: usize) -> Self {
         let num_layers = source.num_layers();
+        // Host expert-cache size (MoE only): enough for a few tokens' reuse across
+        // the resident window, capped at the model's expert count. A count budget,
+        // like the GPU expert cache — host RAM is more forgiving than VRAM.
+        let expert_capacity = cfg.moe.map_or(1, |m| {
+            let per_tok = m.experts_per_tok as usize;
+            (per_tok * resident_layers.max(1) * 2)
+                .clamp(per_tok.max(1), m.num_experts as usize * resident_layers.max(1))
+        });
         let shared = Arc::new(Shared {
             cfg,
             source,
             cache: Mutex::new(LayerLru::new(resident_layers)),
+            experts: Mutex::new(HostExpertCache::new(expert_capacity)),
             ready: Condvar::new(),
             load_ns: AtomicU64::new(0),
             compute_ns: AtomicU64::new(0),
@@ -428,6 +528,10 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
     pub fn stats(&self) -> StreamStats {
         let mut s = self.shared.cache.lock().unwrap().stats;
         s.depth = self.current_prefetch_depth();
+        let ec = self.shared.experts.lock().unwrap();
+        s.expert_hits = ec.hits;
+        s.expert_misses = ec.misses;
+        s.expert_evictions = ec.evictions;
         s
     }
 
@@ -485,7 +589,21 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         }
         // Compute without holding the cache lock — the worker loads in parallel.
         let t = std::time::Instant::now();
-        let out = decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?;
+        let out = if self.shared.cfg.moe.is_some() {
+            // Streamed MoE: `tensors` is the resident core; pull each selected
+            // routed expert on demand through the host expert cache.
+            let shared = &self.shared;
+            decode_block_streaming_moe(
+                &shared.cfg,
+                &tensors,
+                hidden,
+                kv,
+                position,
+                |e| shared.ensure_expert(layer, e as u32),
+            )?
+        } else {
+            decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?
+        };
         if self.auto {
             ewma(&self.shared.compute_ns, t.elapsed().as_nanos() as u64);
         }

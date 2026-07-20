@@ -588,6 +588,26 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 args.device
             };
 
+            // Prefix caching stores a KV *snapshot* taken from the host-side
+            // KvLayerCache. On the GPU compute kernels the real K/V lives in VRAM
+            // and the host cache holds only length placeholders, so a resumed
+            // prefix would read empty history and silently emit wrong output —
+            // refuse it rather than mislead. (Multi-GPU runs the CPU kernel with
+            // per-device dispatch, so its host KV is real and prefix caching is
+            // fine there.)
+            if args.multi_gpu_ids.is_empty()
+                && device == Device::Gpu
+                && args.prefix_cache_size > 0
+            {
+                return Err(DlmError::InvalidConfig(
+                    "--prefix-cache-size is not supported with --device gpu: the prefix KV \
+                     snapshot is host-side, but the GPU keeps K/V in VRAM, so a resumed prefix \
+                     would read empty history and silently produce wrong output. Omit \
+                     --prefix-cache-size on the GPU."
+                        .into(),
+                ));
+            }
+
             // Streaming path: keep only a window of layers resident and stream the
             // rest from disk, so a model can exceed the resident budget. Streams to
             // host RAM (CPU) or into VRAM (--device gpu).
@@ -622,7 +642,17 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     );
                 }
                 if device == Device::Gpu {
-                    return serve_streaming_gpu(store, &config, &args, window, ram_cache, &listen);
+                    let expert_cache = resolve_expert_cache_bytes(&args, &config, &plan, window);
+                    if config.is_moe() {
+                        println!(
+                            "  expert$    : {:.1} MiB VRAM for routed experts{}",
+                            expert_cache as f64 / (1024.0 * 1024.0),
+                            if args.expert_cache_gb.is_some() { "" } else { " (default: VRAM left after the layer window)" },
+                        );
+                    }
+                    return serve_streaming_gpu(
+                        store, &config, &args, window, ram_cache, expert_cache, &listen,
+                    );
                 }
                 let generator = dlm::loader::build_streaming_generator(
                     store,
@@ -762,6 +792,29 @@ fn resident_window(plan: &VramPlan, args: &ServeArgs) -> usize {
         .max(1)
 }
 
+/// VRAM budget (bytes) for the routed-expert cache on the GPU MoE streaming path.
+///
+/// `--expert-cache-gb` overrides it; otherwise it defaults to the VRAM left over
+/// after the resident core window — so the expert cache and the layer window
+/// together stay inside the plan's `usable` VRAM instead of the cache growing by
+/// an unbounded expert *count* (which OOMs a 128-expert card). `0` for dense.
+fn resolve_expert_cache_bytes(
+    args: &ServeArgs,
+    config: &ModelConfig,
+    plan: &VramPlan,
+    window: usize,
+) -> usize {
+    if !config.is_moe() {
+        return 0;
+    }
+    if let Some(gb) = args.expert_cache_gb {
+        return (gb.max(0.0) * GIB as f64) as usize;
+    }
+    // Whatever usable VRAM the resident core window doesn't take.
+    let window_bytes = (window as u64).saturating_mul(plan.per_layer_weight_bytes);
+    plan.usable_bytes.saturating_sub(window_bytes) as usize
+}
+
 /// Resolve the weight precision: the explicit `--quant`, else the checkpoint's
 /// own dtype.
 ///
@@ -839,12 +892,14 @@ fn serve_on_gpu(
 /// Serve with `--stream --device gpu`: stream a window of layer weights through
 /// VRAM (`StreamingGpuKernel`). Experimental — unvalidated on hardware.
 #[cfg(feature = "cuda-kernels")]
+#[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
     store: MmapStore,
     config: &ModelConfig,
     args: &ServeArgs,
     window: usize,
     ram_cache: usize,
+    expert_cache: usize,
     listen: &str,
 ) -> Result<()> {
     println!("device       : gpu ({}) — VRAM layer streaming [experimental]", gpu::active_vendor().label());
@@ -855,17 +910,20 @@ fn serve_streaming_gpu(
             args.context_length,
             window,
             ram_cache,
+            expert_cache,
         )?;
     start_batched_server(generator, None, args, config, listen)
 }
 
 #[cfg(not(feature = "cuda-kernels"))]
+#[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
     _store: MmapStore,
     _config: &ModelConfig,
     _args: &ServeArgs,
     _window: usize,
     _ram_cache: usize,
+    _expert_cache: usize,
     _listen: &str,
 ) -> Result<()> {
     Err(gpu_compute_unavailable("--stream --device gpu"))

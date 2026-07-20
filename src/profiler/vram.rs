@@ -122,8 +122,18 @@ impl VramProfiler {
         self.kv_bytes_per_layer(config) * config.num_layers as u64
     }
 
-    /// Average bytes of one streamed transformer block (`M_layer_weight`).
+    /// Average bytes of one streamed transformer block (`M_layer_weight`) — the
+    /// unit that stays resident per layer in the streaming window.
+    ///
+    /// For an MoE model this is the layer **core** (attention + router + shared
+    /// expert + norms), *not* the whole layer: the routed experts stream into a
+    /// separate per-`(layer, expert)` cache budgeted apart, so planning the window
+    /// as if each unit held all its experts would size it many times too small.
     pub fn per_layer_weight_bytes(&self, config: &ModelConfig) -> u64 {
+        if config.is_moe() {
+            return (config.resident_layer_params() as f64 * config.quant.bytes_per_param())
+                .ceil() as u64;
+        }
         let model_total_bytes =
             config.estimated_total_params() as f64 * config.quant.bytes_per_param();
         (model_total_bytes / config.num_layers as f64).ceil() as u64
@@ -158,13 +168,21 @@ impl VramProfiler {
         native: QuantScheme,
         free_bytes: u64,
     ) -> VramPlan {
-        let per_layer = match catalog.max_layer_bytes() {
-            0 => self.per_layer_weight_bytes(config),
-            // Scale the measured on-disk bytes to the precision the engine will
-            // actually hold the layer in.
-            measured => {
-                let ratio = config.quant.bytes_per_param() / native.bytes_per_param();
-                (measured as f64 * ratio).ceil() as u64
+        let per_layer = if config.is_moe() {
+            // The catalog measures a layer's *full* bytes (all experts inline), but
+            // only the core stays resident on the MoE streaming path — experts
+            // stream into their own budgeted cache. Use the core geometry estimate,
+            // which the catalog can't separate out.
+            self.per_layer_weight_bytes(config)
+        } else {
+            match catalog.max_layer_bytes() {
+                0 => self.per_layer_weight_bytes(config),
+                // Scale the measured on-disk bytes to the precision the engine will
+                // actually hold the layer in.
+                measured => {
+                    let ratio = config.quant.bytes_per_param() / native.bytes_per_param();
+                    (measured as f64 * ratio).ceil() as u64
+                }
             }
         };
         let num_layers = if catalog.num_layers() == 0 {

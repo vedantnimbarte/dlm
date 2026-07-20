@@ -147,6 +147,15 @@ fn run_family(family: Family) {
         dlm::loader::build_streaming_generator(store_b, &config, 32, 2, 1, false, 64 << 20).unwrap();
     let out_streaming = streaming.generate(&prompt, &gen_cfg).unwrap();
     assert_eq!(out_streaming, out_resident, "streamed MoE diverged from resident");
+
+    // Prove the host path actually *streams* experts (loads the core, pulls the
+    // top-k on demand) rather than holding every expert resident — the fix that
+    // makes large MoE viable on CPU. A miss means an expert was fetched on demand.
+    let stats = streaming.stream_stats().expect("streaming kernel reports stats");
+    assert!(
+        stats.expert_misses > 0,
+        "expected routed experts to be streamed on demand, got {stats:?}"
+    );
 }
 
 #[test]
