@@ -3,5 +3,5 @@
 pub mod config;
 pub mod naming;
 
-pub use config::{ModelConfig, MoeConfig, MoeNaming, PackedQuant, QuantScheme};
+pub use config::{ModelConfig, MoeConfig, MoeNaming, PackedFormat, PackedQuant, QuantScheme};
 pub use naming::{classify, TensorRole};

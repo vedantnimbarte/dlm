@@ -125,11 +125,30 @@ struct QuantizationConfig {
     checkpoint_format: Option<String>,
 }
 
+/// Which packed-4-bit family a checkpoint uses, and its variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedFormat {
+    /// GPTQ. `act_order` (desc_act) scatters groups by `g_idx` — decoded to f32.
+    Gptq { act_order: bool },
+    /// AWQ (interleaved nibble order) — decoded to f32.
+    Awq,
+}
+
+impl PackedFormat {
+    /// True for the paths validated only by internal round-trip, not a real
+    /// export — the loader warns for these (act-order GPTQ and AWQ).
+    pub fn is_experimental(self) -> bool {
+        matches!(self, PackedFormat::Gptq { act_order: true } | PackedFormat::Awq)
+    }
+}
+
 /// A packed-quantized checkpoint dlm can decode, as declared by `config.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedQuant {
     /// Weights per quantization group along the input dimension.
     pub group_size: usize,
+    /// The packed family/variant (drives which unpacker the loader uses).
+    pub kind: PackedFormat,
 }
 
 /// Refuse quantized checkpoints the dequantizer can't decode correctly, with a
@@ -154,16 +173,18 @@ fn check_quant_supported(q: &QuantizationConfig) -> Result<Option<PackedQuant>> 
             )));
         }
     }
+    let group_size = q.group_size.unwrap_or(-1);
+    let need_group = || -> Result<usize> {
+        if group_size <= 0 {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "{method} checkpoint declares group_size {group_size}; dlm needs a positive \
+                 per-group size (whole-row grouping is not supported)."
+            )));
+        }
+        Ok(group_size as usize)
+    };
     match method.as_str() {
         "gptq" => {
-            // act-order permutes rows by `g_idx`; decoding without un-permuting
-            // silently scrambles every weight.
-            if q.desc_act == Some(true) {
-                return Err(DlmError::UnsupportedQuant(
-                    "GPTQ checkpoint uses desc_act (act-order): its rows are permuted by                      g_idx and dlm does not un-permute them. Use a desc_act=false GPTQ                      export, or an fp16/bf16 checkpoint."
-                        .into(),
-                ));
-            }
             // `gptq_v2` stores the true zero-point; classic `gptq` stores zero-1.
             // dlm's decoder assumes the classic convention (verified against a real
             // export) and has no v2 fixture to check the other against.
@@ -172,24 +193,28 @@ fn check_quant_supported(q: &QuantizationConfig) -> Result<Option<PackedQuant>> 
                 Some(ref f) if f == "gptq" => {}
                 Some(other) => {
                     return Err(DlmError::UnsupportedQuant(format!(
-                        "GPTQ checkpoint_format {other:?} is not supported; dlm decodes the                          classic `gptq` format, whose zero-point convention it has been                          validated against."
+                        "GPTQ checkpoint_format {other:?} is not supported; dlm decodes the \
+                         classic `gptq` format, whose zero-point convention it has been \
+                         validated against."
                     )))
                 }
             }
-            let group_size = q.group_size.unwrap_or(-1);
-            if group_size <= 0 {
-                return Err(DlmError::UnsupportedQuant(format!(
-                    "GPTQ checkpoint declares group_size {group_size}; dlm needs a positive                      per-group size (act-order/whole-row grouping is not supported)."
-                )));
-            }
-            Ok(Some(PackedQuant { group_size: group_size as usize }))
+            // act-order (desc_act) decodes to f32 via `g_idx`; the loader warns
+            // because that path is validated only by internal round-trip, not a
+            // real export.
+            let act_order = q.desc_act == Some(true);
+            Ok(Some(PackedQuant {
+                group_size: need_group()?,
+                kind: PackedFormat::Gptq { act_order },
+            }))
         }
-        "awq" => Err(DlmError::UnsupportedQuant(
-            "AWQ packs its nibbles in a permuted order dlm does not unpack, and no real AWQ              fixture has been validated against. Use a 4-bit GPTQ (desc_act=false) or              fp16/bf16 checkpoint."
-                .into(),
-        )),
+        "awq" => Ok(Some(PackedQuant {
+            group_size: need_group()?,
+            kind: PackedFormat::Awq,
+        })),
         other => Err(DlmError::UnsupportedQuant(format!(
-            "unrecognized quant_method {other:?}; dlm loads fp16/bf16 and 4-bit GPTQ              (desc_act=false) checkpoints."
+            "unrecognized quant_method {other:?}; dlm loads fp16/bf16, GPTQ, and AWQ 4-bit \
+             checkpoints."
         ))),
     }
 }

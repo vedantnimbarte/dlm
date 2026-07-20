@@ -230,6 +230,7 @@ fn load_gptq_linear(
     out_features: usize,
     pq: PackedQuant,
 ) -> Result<Weights> {
+    use crate::model::PackedFormat;
     let qweight = load_i32(store, &format!("{base}.qweight"))?;
     let qzeros = load_i32(store, &format!("{base}.qzeros"))?;
     let scales = load_floats(store, &format!("{base}.scales"))?;
@@ -238,8 +239,45 @@ fn load_gptq_linear(
         out_features,
         group_size: pq.group_size,
     };
-    let (codes, sc, ze) = crate::quant::unpack_gptq_4bit(&qweight, &qzeros, &scales, &cfg)?;
-    Weights::from_int4_parts(&codes, &sc, &ze, pq.group_size)
+    if pq.kind.is_experimental() {
+        warn_experimental_quant(pq.kind);
+    }
+    match pq.kind {
+        // Classic GPTQ: relabel the codes into dlm's int4 layout (keeps int4 VRAM).
+        PackedFormat::Gptq { act_order: false } => {
+            let (codes, sc, ze) = crate::quant::unpack_gptq_4bit(&qweight, &qzeros, &scales, &cfg)?;
+            Weights::from_int4_parts(&codes, &sc, &ze, pq.group_size)
+        }
+        // Act-order groups are scattered by g_idx; dequantize to f32 (dlm's flat
+        // int4 layout can't represent non-contiguous groups).
+        PackedFormat::Gptq { act_order: true } => {
+            let g_idx = load_i32(store, &format!("{base}.g_idx"))?;
+            let dense =
+                crate::quant::dequantize_gptq_4bit(&qweight, &qzeros, &scales, &cfg, Some(&g_idx))?;
+            Ok(Weights::from_f32(dense))
+        }
+        // AWQ: different nibble order + zero convention; dequantize to f32.
+        PackedFormat::Awq => {
+            let dense = crate::quant::dequantize_awq_4bit(&qweight, &qzeros, &scales, &cfg)?;
+            Ok(Weights::from_f32(dense))
+        }
+    }
+}
+
+/// Warn once (per process) that an experimental packed-quant path is in use — its
+/// decoding is validated only by internal round-trip, not against a real export,
+/// so a convention mismatch would produce plausible-but-wrong weights.
+fn warn_experimental_quant(kind: crate::model::PackedFormat) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: decoding an EXPERIMENTAL packed-quant format ({kind:?}). This path is \
+             validated only by dlm's internal round-trip, NOT against a reference export — a \
+             convention mismatch would yield plausible-but-wrong weights. Verify output with \
+             `dlm doctor` and your own prompts before trusting it."
+        );
+    });
 }
 
 /// Read an `i32` tensor (GPTQ packs its codes and zero-points as `int32`).

@@ -661,17 +661,24 @@ generally better than the same model through `--quant int4`, which rounds to
 nearest with no calibration. No `--quant` is needed (or accepted): the file's
 precision is already int4.
 
-Supported: **4-bit GPTQ with `desc_act: false`** and the classic `gptq`
-checkpoint format — the combination validated end-to-end against a real export
-([`tests/gptq_model.rs`](tests/gptq_model.rs)). These are refused by name rather
-than decoded on a guess, because a wrong assumption here yields weights that
-still generate fluent text that means nothing:
+Fully validated: **4-bit GPTQ with `desc_act: false`** and the classic `gptq`
+checkpoint format — validated end-to-end against a real export
+([`tests/gptq_model.rs`](tests/gptq_model.rs)), and relabeled straight into dlm's
+int4 layout.
+
+**Experimental (loud warning at load):** `desc_act: true` (act-order) GPTQ and
+**AWQ** now decode too, but **to f32** (act-order's `g_idx` groups and AWQ's
+nibble order don't fit dlm's flat int4 layout), and their conventions are checked
+only by dlm's internal round-trip, *not* against a real export. dlm accepts them
+with a warning — verify output with `dlm doctor` and your own prompts. Because
+they land as f32, they use ~8× the VRAM of an int4 layer; pair with `--quant int4`
+to re-shrink at some accuracy cost.
+
+Still refused:
 
 | refused | why |
 | --- | --- |
-| `desc_act: true` (act-order) | rows are permuted by `g_idx`; dlm does not un-permute them |
 | `checkpoint_format: gptq_v2` | stores the true zero-point; dlm decodes the classic `zero - 1` convention and has no v2 fixture to check against |
-| AWQ | packs nibbles in a permuted order dlm does not unpack |
 | non-4-bit | dlm decodes 4-bit only |
 
 ---
