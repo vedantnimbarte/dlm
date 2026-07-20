@@ -17,7 +17,7 @@ pub mod streaming_gpu;
 
 pub use cpu::{
     decode_block, rope_inv_freqs, Activation, BlockConfig, CpuKernel, ExpertFfn, Ffn, KvLayerCache,
-    KvQuant, LayerTensors, QuantLayout, RopeScaling, Weights, QUANT_GROUP_SIZE,
+    KvQuant, LayerTensors, MlaWeights, QuantLayout, RopeScaling, Weights, QUANT_GROUP_SIZE,
 };
 #[cfg(feature = "cuda-kernels")]
 pub use gpu::GpuKernel;

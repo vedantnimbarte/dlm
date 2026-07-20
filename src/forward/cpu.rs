@@ -21,7 +21,7 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::kernel::ComputeKernel;
-use crate::model::MoeConfig;
+use crate::model::{MlaConfig, MoeConfig};
 
 /// RoPE frequency scaling, as declared by `rope_scaling` in `config.json`.
 ///
@@ -85,6 +85,9 @@ pub struct BlockConfig {
     /// Gated-MLP activation: SiLU (SwiGLU) for Llama/Mistral/Qwen, GELU (GeGLU)
     /// for Gemma. Defaults to SiLU.
     pub activation: Activation,
+    /// Multi-head Latent Attention geometry (DeepSeek); `None` for standard
+    /// attention. When set, the attention sublayer takes the MLA path.
+    pub mla: Option<MlaConfig>,
 }
 
 impl BlockConfig {
@@ -93,9 +96,15 @@ impl BlockConfig {
         self.num_heads * self.head_dim
     }
 
-    /// Key/value projection output width (`num_kv_heads × head_dim`).
+    /// Per-token width the KV cache stores. Standard attention caches full K/V
+    /// (`num_kv_heads × head_dim`); **MLA** caches only the compressed latent plus
+    /// the shared decoupled-RoPE key (`kv_lora_rank + qk_rope_head_dim`), which is
+    /// the whole point of latent attention — a much smaller cache.
     pub fn kv_dim(&self) -> usize {
-        self.num_kv_heads * self.head_dim
+        match &self.mla {
+            Some(m) => (m.kv_lora_rank + m.qk_rope_head_dim) as usize,
+            None => self.num_kv_heads * self.head_dim,
+        }
     }
 
     /// Query heads per KV head (the GQA grouping factor).
@@ -463,6 +472,28 @@ pub struct LayerTensors {
     /// before RoPE. Qwen3 ships these (and drops the Qwen2 biases); `None` elsewhere.
     pub q_norm: Option<Vec<f32>>, // [head_dim]
     pub k_norm: Option<Vec<f32>>, // [head_dim]
+    /// Multi-head Latent Attention projections (DeepSeek). When set, the attention
+    /// sublayer takes the MLA path and `q_proj`/`k_proj`/`v_proj` are unused.
+    pub mla: Option<MlaWeights>,
+}
+
+/// Multi-head Latent Attention projection weights (DeepSeek). The layer's
+/// `o_proj` and `input_layernorm` are reused; these replace the standard q/k/v.
+#[derive(Debug, Clone, Default)]
+pub struct MlaWeights {
+    /// Query down-projection `[q_lora_rank, hidden]` + its RMSNorm `[q_lora_rank]`;
+    /// both `None` when the model projects Q straight from the hidden.
+    pub q_a_proj: Option<Weights>,
+    pub q_a_layernorm: Option<Vec<f32>>,
+    /// Query up-projection `[num_heads·qk_head_dim, q_lora_rank | hidden]`.
+    pub q_b_proj: Weights,
+    /// KV down-projection with the decoupled RoPE key
+    /// `[kv_lora_rank + qk_rope_head_dim, hidden]`.
+    pub kv_a_proj: Weights,
+    /// Compressed-latent RMSNorm `[kv_lora_rank]`.
+    pub kv_a_layernorm: Vec<f32>,
+    /// KV up-projection `[num_heads·(qk_nope_head_dim + v_head_dim), kv_lora_rank]`.
+    pub kv_b_proj: Weights,
 }
 
 impl LayerTensors {
@@ -523,6 +554,9 @@ impl LayerTensors {
 
     /// Validate every matrix against the config's expected dimensions.
     pub fn validate(&self, cfg: &BlockConfig) -> Result<()> {
+        if let Some(m) = &cfg.mla {
+            return self.validate_mla(cfg, m);
+        }
         let checks = [
             ("q_proj", self.q_proj.len(), cfg.q_dim() * cfg.hidden_size),
             ("k_proj", self.k_proj.len(), cfg.kv_dim() * cfg.hidden_size),
@@ -553,6 +587,44 @@ impl LayerTensors {
             if got != expected {
                 return Err(DlmError::QuantLayout(format!(
                     "LayerTensors.{name}: expected {expected} elements, got {got}"
+                )));
+            }
+        }
+        self.validate_ffn(cfg)?;
+        Ok(())
+    }
+
+    /// Validate the MLA projection weights against the latent-attention geometry
+    /// (`o_proj` is `[hidden, num_heads·v_head_dim]` here, not `[hidden, q_dim]`).
+    fn validate_mla(&self, cfg: &BlockConfig, m: &MlaConfig) -> Result<()> {
+        let mw = self.mla.as_ref().ok_or_else(|| {
+            DlmError::QuantLayout("layer configured for MLA but has no MLA weights".into())
+        })?;
+        let h = cfg.hidden_size;
+        let nh = cfg.num_heads;
+        let qk = m.qk_head_dim() as usize;
+        let latent = m.kv_lora_rank as usize;
+        let rope = m.qk_rope_head_dim as usize;
+        let vdim = m.v_head_dim as usize;
+        let q_in = m.q_lora_rank.map_or(h, |r| r as usize);
+        let mut checks = vec![
+            ("q_b_proj", mw.q_b_proj.len(), nh * qk * q_in),
+            ("kv_a_proj", mw.kv_a_proj.len(), (latent + rope) * h),
+            ("kv_a_layernorm", mw.kv_a_layernorm.len(), latent),
+            ("kv_b_proj", mw.kv_b_proj.len(), nh * (m.qk_nope_head_dim as usize + vdim) * latent),
+            ("o_proj", self.o_proj.len(), h * nh * vdim),
+            ("input_layernorm", self.input_layernorm.len(), h),
+            ("post_attention_layernorm", self.post_attention_layernorm.len(), h),
+        ];
+        if let Some(r) = m.q_lora_rank {
+            let r = r as usize;
+            checks.push(("q_a_proj", mw.q_a_proj.as_ref().map_or(0, |w| w.len()), r * h));
+            checks.push(("q_a_layernorm", mw.q_a_layernorm.as_ref().map_or(0, |v| v.len()), r));
+        }
+        for (name, got, expected) in checks {
+            if got != expected {
+                return Err(DlmError::QuantLayout(format!(
+                    "MLA {name}: expected {expected} elements, got {got}"
                 )));
             }
         }
@@ -877,6 +949,18 @@ impl KvLayerCache {
             }
         }
         Ok(())
+    }
+
+    /// The full `[kv_dim]` key vector cached at `pos` (exact `f32` store only).
+    /// MLA uses this to read the `[latent ; k_rope]` blob it packs into the key;
+    /// the quantized stores don't support it (MLA runs at exact KV precision).
+    pub fn position_key(&self, pos: usize) -> Result<&[f32]> {
+        match &self.store {
+            KvStore::Full { keys, .. } => Ok(&keys[pos * self.kv_dim..(pos + 1) * self.kv_dim]),
+            _ => Err(DlmError::InvalidConfig(
+                "MLA attention requires an exact (f32) KV cache".into(),
+            )),
+        }
     }
 
     /// Dot of `q` with position `pos`'s key head (dequantized inline for int8/4).
@@ -1392,6 +1476,108 @@ fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
 /// Run one decoder block for a single token at absolute `position`, appending to
 /// `kv` and returning the updated hidden state. This is the CPU oracle for the
 /// GPU `ComputeKernel`.
+/// The Multi-head Latent Attention sublayer (DeepSeek). Projects the query and a
+/// compressed KV latent from the hidden, applies decoupled RoPE to the rope
+/// sub-dimensions, caches `[latent ; k_rope]` per token, and attends by
+/// reconstructing per-head K/V from each cached latent. Returns the post-attention
+/// hidden `h1`. The layer's `o_proj` and `input_layernorm` are reused.
+///
+/// (Internal-consistency correct — validated CPU↔GPU — pending a real DeepSeek
+/// checkpoint; the mscale/mscale_all_dim distinction is collapsed to one factor.)
+fn mla_attention_sublayer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    mw: &MlaWeights,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+) -> Result<Vec<f32>> {
+    let m = cfg
+        .mla
+        .ok_or_else(|| DlmError::InvalidConfig("mla_attention on a non-MLA layer".into()))?;
+    let h = cfg.hidden_size;
+    let nh = cfg.num_heads;
+    let nope = m.qk_nope_head_dim as usize;
+    let rope = m.qk_rope_head_dim as usize;
+    let vdim = m.v_head_dim as usize;
+    let qk = nope + rope;
+    let latent = m.kv_lora_rank as usize;
+
+    let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
+
+    // Query: optional low-rank down-projection + norm, then up-projection to
+    // [num_heads · qk], or a direct projection from the hidden.
+    let mut q = match (&mw.q_a_proj, &mw.q_a_layernorm) {
+        (Some(qa), Some(qn)) => {
+            let r = m.q_lora_rank.ok_or_else(|| {
+                DlmError::InvalidConfig("q_a_proj present but q_lora_rank unset".into())
+            })? as usize;
+            let c = rmsnorm(&matvec_native(qa, &normed, r, h), qn, cfg.rms_eps);
+            matvec_native(&mw.q_b_proj, &c, nh * qk, r)
+        }
+        _ => matvec_native(&mw.q_b_proj, &normed, nh * qk, h),
+    };
+
+    // KV down-projection → [latent | k_pe]; norm the latent, RoPE the shared k_pe.
+    let kv_a = matvec_native(&mw.kv_a_proj, &normed, latent + rope, h);
+    let c_kv = rmsnorm(&kv_a[..latent], &mw.kv_a_layernorm, cfg.rms_eps);
+    let mut k_pe = kv_a[latent..].to_vec();
+
+    let inv_freq = rope_inv_freqs(rope, cfg.rope_theta, cfg.rope_scaling);
+    // MLA folds YaRN's temperature into the softmax scale (below), so the rope
+    // itself is unscaled (mscale = 1.0) — only the rope sub-dims rotate.
+    for hh in 0..nh {
+        let base = hh * qk + nope;
+        rope_inplace(&mut q[base..base + rope], 1, rope, position, &inv_freq, 1.0);
+    }
+    rope_inplace(&mut k_pe, 1, rope, position, &inv_freq, 1.0);
+
+    // Cache [c_kv ; k_pe] as this token's key (values unused on the MLA path).
+    let mut key = c_kv;
+    key.extend_from_slice(&k_pe);
+    kv.append(&key, &vec![0.0; latent + rope])?;
+
+    let positions = kv.len();
+    let mscale = rope_mscale(cfg.rope_scaling);
+    let scale = mscale * mscale / (qk as f32).sqrt();
+
+    // Reconstruct every cached position's per-head K/V from its latent once.
+    let kv_up_dim = nh * (nope + vdim);
+    let mut recon: Vec<Vec<f32>> = Vec::with_capacity(positions);
+    let mut k_rope_cache: Vec<Vec<f32>> = Vec::with_capacity(positions);
+    for p in 0..positions {
+        let pk = kv.position_key(p)?;
+        k_rope_cache.push(pk[latent..].to_vec());
+        recon.push(matvec_native(&mw.kv_b_proj, &pk[..latent], kv_up_dim, latent));
+    }
+
+    let mut context = vec![0.0f32; nh * vdim];
+    for hh in 0..nh {
+        let q_nope = &q[hh * qk..hh * qk + nope];
+        let q_rope = &q[hh * qk + nope..hh * qk + qk];
+        let mut scores = vec![0.0f32; positions];
+        for (p, score) in scores.iter_mut().enumerate() {
+            let base = hh * (nope + vdim);
+            let k_nope = &recon[p][base..base + nope];
+            let dot = q_nope.iter().zip(k_nope).map(|(a, b)| a * b).sum::<f32>()
+                + q_rope.iter().zip(&k_rope_cache[p]).map(|(a, b)| a * b).sum::<f32>();
+            *score = dot * scale;
+        }
+        softmax_inplace(&mut scores);
+        let out = &mut context[hh * vdim..(hh + 1) * vdim];
+        for (p, &wgt) in scores.iter().enumerate() {
+            let base = hh * (nope + vdim) + nope;
+            for (o, &vv) in out.iter_mut().zip(&recon[p][base..base + vdim]) {
+                *o += wgt * vv;
+            }
+        }
+    }
+
+    // Output projection [hidden, num_heads · v_head_dim], into the residual.
+    let attn_out = matvec_native(&w.o_proj, &context, h, nh * vdim);
+    Ok(hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect())
+}
+
 pub fn decode_block(
     cfg: &BlockConfig,
     w: &LayerTensors,
@@ -1400,7 +1586,10 @@ pub fn decode_block(
     position: usize,
 ) -> Result<Vec<f32>> {
     w.validate(cfg)?;
-    let mut h1 = attention_sublayer(cfg, w, hidden, kv, position)?;
+    let mut h1 = match &w.mla {
+        Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
+        None => attention_sublayer(cfg, w, hidden, kv, position)?,
+    };
 
     // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
     let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
@@ -1490,7 +1679,12 @@ where
     E: std::ops::Deref<Target = ExpertFfn>,
 {
     let (router, _experts, shared, shared_gate) = w.moe()?;
-    let mut h1 = attention_sublayer(cfg, w, hidden, kv, position)?;
+    // DeepSeek-V3 is MLA + MoE, so the streamed-MoE core takes the MLA attention
+    // path too when the layer declares it.
+    let mut h1 = match &w.mla {
+        Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
+        None => attention_sublayer(cfg, w, hidden, kv, position)?,
+    };
     let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
     let ffn_out = moe_ffn_streaming(router, shared, shared_gate, &normed2, cfg, fetch_expert)?;
     for (h, d) in h1.iter_mut().zip(&ffn_out) {
@@ -1573,7 +1767,7 @@ mod tests {
             rms_eps: 1e-5,
             rope_scaling: None,
             moe: None,
-            sliding_window: None, activation: Default::default(),
+            sliding_window: None, activation: Default::default(), mla: None,
         };
         // Four cached positions with distinct K/V.
         let fill = |from: usize| {
@@ -1752,7 +1946,7 @@ mod tests {
             intermediate_size: 6,
             rope_theta: 10000.0,
             rms_eps: 1e-5,
-            rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+            rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
         };
         let hidden = vec![1.5, -2.0, 0.5, 3.0];
 
@@ -1788,7 +1982,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
@@ -1806,7 +2000,7 @@ mod tests {
             head_dim: 1,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
@@ -1824,7 +2018,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 6,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1858,7 +2052,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
@@ -1899,7 +2093,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
@@ -1924,7 +2118,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1944,7 +2138,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             rope_scaling: None,
-            moe: Some(m), sliding_window: None, activation: Default::default(),
+            moe: Some(m), sliding_window: None, activation: Default::default(), mla: None,
         }
     }
 

@@ -414,6 +414,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         moe: config.moe,
         sliding_window: config.sliding_window.map(|w| w as usize),
         activation: config.activation,
+        mla: config.mla,
     }
 }
 
@@ -470,29 +471,95 @@ pub(crate) fn load_layer_tensors_opt(
         }),
         Some(_) => load_moe_ffn(store, cfg, layer, quant, packed, include_experts)?,
     };
-    let tensors = LayerTensors {
-        q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant, packed)?,
-        k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant, packed)?,
-        v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
-        o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
-        ffn,
-        input_layernorm: load_norm(store, &name("input_layernorm.weight"), hidden, norm_add_one)?,
-        post_attention_layernorm: load_norm(
-            store,
-            &name("post_attention_layernorm.weight"),
-            hidden,
-            norm_add_one,
-        )?,
-        // Present on Qwen2 and friends, absent on Llama/Mistral.
-        q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
-        k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
-        v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
-        // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3.
-        q_norm: load_optional(store, &name("self_attn.q_norm.weight"), cfg.head_dim)?,
-        k_norm: load_optional(store, &name("self_attn.k_norm.weight"), cfg.head_dim)?,
+    let input_layernorm = load_norm(store, &name("input_layernorm.weight"), hidden, norm_add_one)?;
+    let post_attention_layernorm =
+        load_norm(store, &name("post_attention_layernorm.weight"), hidden, norm_add_one)?;
+
+    // MLA (DeepSeek) replaces q/k/v with latent projections and a wider o_proj.
+    let tensors = if let Some(m) = &cfg.mla {
+        let vdim = m.v_head_dim as usize;
+        LayerTensors {
+            o_proj: load_linear(store, &name("self_attn.o_proj"), cfg.num_heads * vdim, hidden, quant, packed)?,
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
+            mla: Some(load_mla(store, cfg, m, layer, quant, packed, norm_add_one)?),
+            ..Default::default()
+        }
+    } else {
+        LayerTensors {
+            q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant, packed)?,
+            k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant, packed)?,
+            v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
+            o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
+            // Present on Qwen2 and friends, absent on Llama/Mistral.
+            q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
+            k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
+            v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
+            // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3.
+            q_norm: load_optional(store, &name("self_attn.q_norm.weight"), cfg.head_dim)?,
+            k_norm: load_optional(store, &name("self_attn.k_norm.weight"), cfg.head_dim)?,
+            mla: None,
+        }
     };
     tensors.validate(cfg)?;
     Ok(tensors)
+}
+
+/// Load a layer's MLA (DeepSeek) projection weights from the
+/// `self_attn.{q_a_proj,q_b_proj,kv_a_proj_with_mqa,kv_b_proj,...}` tensors.
+#[allow(clippy::too_many_arguments)]
+fn load_mla(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    m: &crate::model::MlaConfig,
+    layer: u32,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+    norm_add_one: bool,
+) -> Result<crate::forward::MlaWeights> {
+    let h = cfg.hidden_size;
+    let nh = cfg.num_heads;
+    let qk = m.qk_head_dim() as usize;
+    let latent = m.kv_lora_rank as usize;
+    let rope = m.qk_rope_head_dim as usize;
+    let vdim = m.v_head_dim as usize;
+    let name = |s: &str| format!("model.layers.{layer}.{s}");
+    // Query: low-rank (q_a_proj → norm → q_b_proj) when q_lora_rank is set, else
+    // a direct projection under the `q_proj` name.
+    let (q_a_proj, q_a_layernorm, q_b_proj) = match m.q_lora_rank {
+        Some(r) => {
+            let r = r as usize;
+            (
+                Some(load_linear(store, &name("self_attn.q_a_proj"), h, r, quant, packed)?),
+                Some(load_norm(store, &name("self_attn.q_a_layernorm.weight"), r, norm_add_one)?),
+                load_linear(store, &name("self_attn.q_b_proj"), r, nh * qk, quant, packed)?,
+            )
+        }
+        None => (
+            None,
+            None,
+            load_linear(store, &name("self_attn.q_proj"), h, nh * qk, quant, packed)?,
+        ),
+    };
+    Ok(crate::forward::MlaWeights {
+        q_a_proj,
+        q_a_layernorm,
+        q_b_proj,
+        kv_a_proj: load_linear(store, &name("self_attn.kv_a_proj_with_mqa"), h, latent + rope, quant, packed)?,
+        kv_a_layernorm: load_norm(store, &name("self_attn.kv_a_layernorm.weight"), latent, norm_add_one)?,
+        kv_b_proj: load_linear(
+            store,
+            &name("self_attn.kv_b_proj"),
+            latent,
+            nh * (m.qk_nope_head_dim as usize + vdim),
+            quant,
+            packed,
+        )?,
+    })
 }
 
 /// Tensor-name prefixes for one layer's MoE block, per family. `router` names the

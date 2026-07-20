@@ -99,6 +99,22 @@ struct RawConfig {
     /// Qwen exposes it as a flag.
     #[serde(default)]
     norm_topk_prob: Option<bool>,
+    // ── Multi-head Latent Attention (MLA, DeepSeek-V2/V3); absent otherwise. ──
+    /// Compressed KV latent width (the cache stores this per token, not full K/V).
+    #[serde(default)]
+    kv_lora_rank: Option<u32>,
+    /// Query down-projection rank; absent means Q is projected directly.
+    #[serde(default)]
+    q_lora_rank: Option<u32>,
+    /// Per-head query/key dim NOT carrying RoPE.
+    #[serde(default)]
+    qk_nope_head_dim: Option<u32>,
+    /// Per-head query/key dim carrying the decoupled RoPE.
+    #[serde(default)]
+    qk_rope_head_dim: Option<u32>,
+    /// Per-head value dim (may differ from the QK dim).
+    #[serde(default)]
+    v_head_dim: Option<u32>,
     /// Sliding-window attention span (Mistral). A query attends only the last
     /// `sliding_window` positions; absent/`null` means full causal attention.
     #[serde(default)]
@@ -283,6 +299,31 @@ fn parse_rope_scaling(r: &RawRopeScaling) -> Result<Option<RopeScaling>> {
     }
 }
 
+/// Derive validated [`MlaConfig`] from the raw config, or `None` for standard
+/// attention. `kv_lora_rank` marks a checkpoint as MLA (DeepSeek); once seen, the
+/// remaining latent-attention dims are required — a partial declaration is refused
+/// rather than guessed at.
+fn build_mla_config(raw: &RawConfig) -> Result<Option<MlaConfig>> {
+    let Some(kv_lora_rank) = raw.kv_lora_rank else {
+        return Ok(None);
+    };
+    let need = |v: Option<u32>, name: &str| -> Result<u32> {
+        v.ok_or_else(|| {
+            DlmError::InvalidConfig(format!(
+                "MLA checkpoint (kv_lora_rank set) is missing {name}; dlm will not guess \
+                 latent-attention dims."
+            ))
+        })
+    };
+    Ok(Some(MlaConfig {
+        q_lora_rank: raw.q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim: need(raw.qk_nope_head_dim, "qk_nope_head_dim")?,
+        qk_rope_head_dim: need(raw.qk_rope_head_dim, "qk_rope_head_dim")?,
+        v_head_dim: need(raw.v_head_dim, "v_head_dim")?,
+    }))
+}
+
 /// Derive validated [`MoeConfig`] from the raw config, or `None` for a dense
 /// model. Mixtral declares experts under `num_local_experts`, Qwen under
 /// `num_experts`; the presence of either marks the checkpoint MoE and also picks
@@ -368,6 +409,30 @@ pub struct MoeConfig {
     pub naming: MoeNaming,
 }
 
+/// Validated Multi-head Latent Attention geometry (DeepSeek-V2/V3). Present only
+/// on MLA checkpoints; the attention path caches a compressed latent per token
+/// (`kv_lora_rank` + `qk_rope_head_dim`) instead of full per-head K/V.
+#[derive(Debug, Clone, Copy)]
+pub struct MlaConfig {
+    /// Query down-projection rank; `None` projects Q directly from the hidden.
+    pub q_lora_rank: Option<u32>,
+    /// Compressed KV latent width (what the cache stores per token).
+    pub kv_lora_rank: u32,
+    /// Per-head query/key dim without RoPE.
+    pub qk_nope_head_dim: u32,
+    /// Per-head query/key dim carrying the decoupled RoPE.
+    pub qk_rope_head_dim: u32,
+    /// Per-head value dim.
+    pub v_head_dim: u32,
+}
+
+impl MlaConfig {
+    /// Total per-head query/key dim (`nope + rope`).
+    pub fn qk_head_dim(&self) -> u32 {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+}
+
 /// Validated model geometry consumed by the profiler and storage planner.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -407,6 +472,9 @@ pub struct ModelConfig {
     /// Mixture-of-Experts geometry when the checkpoint is sparse; `None` for a
     /// dense model, which keeps the single-FFN path unchanged.
     pub moe: Option<MoeConfig>,
+    /// Multi-head Latent Attention geometry (DeepSeek-V2/V3); `None` for standard
+    /// GQA/MHA attention.
+    pub mla: Option<MlaConfig>,
     /// Sliding-window attention span (Mistral); `None` is full causal attention.
     pub sliding_window: Option<u32>,
     /// Gemma applies RMSNorm as `(1 + weight)` rather than `weight`. When true the
@@ -503,6 +571,7 @@ impl ModelConfig {
         };
 
         let moe = build_moe_config(&raw)?;
+        let mla = build_mla_config(&raw)?;
 
         // Gemma architecture variants: (1+w) RMSNorm, embedding scaling, GeGLU.
         let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
@@ -549,6 +618,7 @@ impl ModelConfig {
             quant,
             packed_quant,
             moe,
+            mla,
             // A window >= the model's own max context is the same as full
             // attention; keep it as declared and let the kernel no-op it.
             sliding_window: raw.sliding_window.filter(|&w| w > 0),
@@ -574,6 +644,18 @@ impl ModelConfig {
         }
         if self.hidden_size == 0 {
             return Err(DlmError::InvalidConfig("hidden_size must be > 0".into()));
+        }
+        // MLA carries its own per-head dims (qk_nope/qk_rope/v), so the standard
+        // hidden÷heads and even-head-dim invariants don't apply; only the RoPE
+        // sub-dimension must be even.
+        if let Some(m) = &self.mla {
+            if m.qk_rope_head_dim % 2 != 0 {
+                return Err(DlmError::InvalidConfig(format!(
+                    "qk_rope_head_dim ({}) must be even (RoPE rotates dimension pairs)",
+                    m.qk_rope_head_dim
+                )));
+            }
+            return Ok(());
         }
         // Only the derived head_dim needs the divisibility guarantee; a config
         // that states head_dim outright is free to break the quotient relation.

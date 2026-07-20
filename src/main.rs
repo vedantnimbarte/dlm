@@ -109,7 +109,7 @@ fn tiny_cfg() -> BlockConfig {
         head_dim: 4,
         intermediate_size: 16,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
     }
 }
 
@@ -426,7 +426,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         head_dim,
         intermediate_size: args.intermediate_size,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
     };
 
     // Small random weights (RMSNorm keeps activations bounded).

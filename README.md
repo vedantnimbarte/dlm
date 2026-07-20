@@ -426,7 +426,7 @@ names. That covers:
 | Mixtral (and Mixtral-layout MoE) | supported — top-k routing over `block_sparse_moe.experts.*` |
 | Qwen2-MoE / Qwen3-MoE | supported — routed experts + optional sigmoid-gated shared expert |
 | GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
-| DeepSeek-V2/V3 (MLA) | **not supported** — needs multi-head latent attention dlm does not implement |
+| DeepSeek-V2/V3 (MLA) | **CPU only** — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN); GPU support pending |
 | Gemma2 | **not supported** — needs attention logit softcapping + alternating sliding-window layers |
 
 **MoE models** route each token through the top-k experts the router selects

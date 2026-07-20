@@ -856,7 +856,7 @@ fn orchestrator_runs_real_cpu_block_autoregressively() {
         head_dim: 2,
         intermediate_size: 6,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
     };
     // Two zero-weight (identity) layers → hidden passes through unchanged.
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg); 2]).unwrap();

@@ -222,6 +222,13 @@ impl GpuKernel {
     /// Upload a model's weights to the device and allocate per-layer KV history
     /// buffers sized for up to `max_kv_tokens` positions.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>, max_kv_tokens: usize) -> Result<Self> {
+        if cfg.mla.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "Multi-head Latent Attention (MLA / DeepSeek) is not yet supported on the GPU; \
+                 run MLA models on CPU (--device cpu)."
+                    .into(),
+            ));
+        }
         let cap = max_kv_tokens.max(1);
         let mut gpu_layers = Vec::with_capacity(layers.len());
         for layer in &layers {

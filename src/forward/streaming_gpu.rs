@@ -510,6 +510,13 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         resident_layers: usize,
         expert_cache_capacity: Option<usize>,
     ) -> Result<Self> {
+        if cfg.mla.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "Multi-head Latent Attention (MLA / DeepSeek) is not yet supported on the GPU; \
+                 run MLA models on CPU (--device cpu)."
+                    .into(),
+            ));
+        }
         let num_layers = source.num_layers();
         let cap = max_kv_tokens.max(1);
         // KV is per-session (owned by each sequence's KvLayerCache), so the kernel
