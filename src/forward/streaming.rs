@@ -80,6 +80,10 @@ pub trait LayerSource: Send + Sync {
 pub struct CachedLayerSource<S: LayerSource> {
     inner: S,
     state: Mutex<RamCache>,
+    /// A parallel byte-budgeted LRU of **dequantized experts**, so a GPU-streaming
+    /// VRAM eviction (or a host re-fetch) doesn't re-read and re-dequantize the
+    /// expert from the checkpoint — the costly part on `--quant int4`.
+    experts: Mutex<ExpertRamCache>,
 }
 
 /// LRU state for [`CachedLayerSource`].
@@ -93,11 +97,30 @@ struct RamCache {
     misses: u64,
 }
 
+/// Byte-budgeted LRU of materialized experts, keyed `(layer, expert)`.
+struct ExpertRamCache {
+    map: HashMap<(u32, u32), Arc<ExpertFfn>>,
+    order: VecDeque<(u32, u32)>,
+    bytes: usize,
+    budget: usize,
+    hits: u64,
+    misses: u64,
+}
+
 impl<S: LayerSource> CachedLayerSource<S> {
-    /// Wrap `inner`, caching up to `budget_bytes` of materialized layers.
+    /// Wrap `inner`, caching up to `budget_bytes` of materialized layers (and,
+    /// separately, up to `budget_bytes` of dequantized experts).
     pub fn new(inner: S, budget_bytes: usize) -> Self {
         Self {
             inner,
+            experts: Mutex::new(ExpertRamCache {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+                budget: budget_bytes,
+                hits: 0,
+                misses: 0,
+            }),
             state: Mutex::new(RamCache {
                 map: HashMap::new(),
                 order: VecDeque::new(),
@@ -109,9 +132,15 @@ impl<S: LayerSource> CachedLayerSource<S> {
         }
     }
 
-    /// `(hits, misses)` against the host-RAM cache.
+    /// `(hits, misses)` against the host-RAM layer cache.
     pub fn stats(&self) -> (u64, u64) {
         let s = self.state.lock().unwrap();
+        (s.hits, s.misses)
+    }
+
+    /// `(hits, misses)` against the host-RAM expert cache.
+    pub fn expert_stats(&self) -> (u64, u64) {
+        let s = self.experts.lock().unwrap();
         (s.hits, s.misses)
     }
 
@@ -169,15 +198,48 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
     }
 
     // MoE per-expert streaming forwards straight to the inner source. The GPU
-    // kernel keeps its own VRAM caches for cores and experts, so a second host-RAM
-    // tier here would only save re-dequant on a VRAM miss.
-    // ponytail: add a host-RAM expert cache if re-dequant on VRAM eviction shows up.
     fn load_layer_core(&self, layer: u32) -> Result<Arc<LayerTensors>> {
         self.inner.load_layer_core(layer)
     }
 
+    /// Serve a materialized expert from the host-RAM tier when cached, so a VRAM
+    /// eviction (GPU) or host re-fetch skips re-reading and re-dequantizing it.
     fn load_expert(&self, layer: u32, expert: u32) -> Result<Arc<crate::forward::ExpertFfn>> {
-        self.inner.load_expert(layer, expert)
+        let key = (layer, expert);
+        {
+            let mut s = self.experts.lock().unwrap();
+            if let Some(e) = s.map.get(&key) {
+                let e = Arc::clone(e);
+                s.hits += 1;
+                s.order.retain(|&k| k != key);
+                s.order.push_back(key);
+                return Ok(e);
+            }
+            s.misses += 1;
+        }
+        // Load with the lock released so concurrent loads overlap.
+        let e = self.inner.load_expert(layer, expert)?;
+        let mut s = self.experts.lock().unwrap();
+        if s.budget == 0 {
+            return Ok(e);
+        }
+        let size = e.byte_size();
+        if size <= s.budget && !s.map.contains_key(&key) {
+            while s.bytes + size > s.budget {
+                match s.order.pop_front() {
+                    Some(victim) => {
+                        if let Some(v) = s.map.remove(&victim) {
+                            s.bytes -= v.byte_size();
+                        }
+                    }
+                    None => break,
+                }
+            }
+            s.map.insert(key, Arc::clone(&e));
+            s.order.push_back(key);
+            s.bytes += size;
+        }
+        Ok(e)
     }
 }
 
@@ -652,6 +714,32 @@ mod tests {
             self.1.fetch_add(1, Ordering::Relaxed);
             Ok(Arc::new(self.0[layer as usize].clone()))
         }
+        fn load_expert(&self, _layer: u32, _expert: u32) -> Result<Arc<ExpertFfn>> {
+            // Count expert loads too, so the host expert-cache test can assert reuse.
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(ExpertFfn {
+                gate: Weights::from_f32(vec![0.1; 8]),
+                up: Weights::from_f32(vec![0.1; 8]),
+                down: Weights::from_f32(vec![0.1; 8]),
+            }))
+        }
+    }
+
+    #[test]
+    fn expert_ram_cache_serves_repeats_without_reloading() {
+        let src = CachedLayerSource::new(CountingSource(Vec::new(), AtomicU64::new(0)), 1 << 20);
+        let first = src.load_expert(0, 3).unwrap();
+        for _ in 0..5 {
+            assert!(Arc::ptr_eq(&first, &src.load_expert(0, 3).unwrap()));
+        }
+        assert_eq!(src.expert_stats(), (5, 1), "5 hits, 1 miss");
+        assert_eq!(src.inner_for_test().1.load(Ordering::Relaxed), 1, "loaded once");
+        // A zero budget disables caching (every call delegates).
+        let nocache = CachedLayerSource::new(CountingSource(Vec::new(), AtomicU64::new(0)), 0);
+        for _ in 0..3 {
+            nocache.load_expert(1, 0).unwrap();
+        }
+        assert_eq!(nocache.inner_for_test().1.load(Ordering::Relaxed), 3);
     }
 
     #[test]
