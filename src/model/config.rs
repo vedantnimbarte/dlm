@@ -40,6 +40,14 @@ impl QuantScheme {
 /// Kept private; callers get the validated [`ModelConfig`] instead.
 #[derive(Debug, Deserialize)]
 struct RawConfig {
+    /// HF architecture id (e.g. "llama", "gemma", "gemma2"). Drives the Gemma
+    /// norm/embed/activation variants.
+    #[serde(default)]
+    model_type: Option<String>,
+    /// Gated-MLP activation name (Gemma ships "gelu_pytorch_tanh"). Older configs
+    /// spell it `hidden_act`.
+    #[serde(default, alias = "hidden_act")]
+    hidden_activation: Option<String>,
     hidden_size: u32,
     num_attention_heads: u32,
     #[serde(default)]
@@ -356,6 +364,14 @@ pub struct ModelConfig {
     pub moe: Option<MoeConfig>,
     /// Sliding-window attention span (Mistral); `None` is full causal attention.
     pub sliding_window: Option<u32>,
+    /// Gemma applies RMSNorm as `(1 + weight)` rather than `weight`. When true the
+    /// loader bakes the `+1` into the norm weights so the kernels stay unchanged.
+    pub norm_add_one: bool,
+    /// Scalar applied to token embeddings after lookup (Gemma multiplies by
+    /// `sqrt(hidden_size)`); `None` leaves embeddings unscaled.
+    pub embed_scale: Option<f32>,
+    /// Gated-MLP activation (SiLU for most, GELU for Gemma).
+    pub activation: crate::forward::cpu::Activation,
 }
 
 impl ModelConfig {
@@ -443,6 +459,25 @@ impl ModelConfig {
 
         let moe = build_moe_config(&raw)?;
 
+        // Gemma architecture variants: (1+w) RMSNorm, embedding scaling, GeGLU.
+        let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
+        if model_type == "gemma2" {
+            return Err(DlmError::InvalidConfig(
+                "Gemma2 is not yet supported: it needs attention logit softcapping, \
+                 alternating sliding-window layers, and pre/post-FFN norms. Gemma (v1) works \
+                 and other norm variants are refused rather than silently mis-run."
+                    .into(),
+            ));
+        }
+        let is_gemma = model_type == "gemma";
+        let activation = match raw.hidden_activation.as_deref() {
+            Some(a) if a.to_ascii_lowercase().contains("gelu") => {
+                crate::forward::cpu::Activation::GeluTanh
+            }
+            None if is_gemma => crate::forward::cpu::Activation::GeluTanh,
+            _ => crate::forward::cpu::Activation::Silu,
+        };
+
         let config = ModelConfig {
             hidden_size: raw.hidden_size,
             num_attention_heads: raw.num_attention_heads,
@@ -472,6 +507,9 @@ impl ModelConfig {
             // A window >= the model's own max context is the same as full
             // attention; keep it as declared and let the kernel no-op it.
             sliding_window: raw.sliding_window.filter(|&w| w > 0),
+            norm_add_one: is_gemma,
+            embed_scale: is_gemma.then(|| (raw.hidden_size as f32).sqrt()),
+            activation,
         };
 
         config.validate()?;
@@ -639,6 +677,31 @@ mod tests {
         // Core = attn (q,o = h*h each; k,v full since MHA) + router (h*8) + 2 norms.
         let expected_core = 4 * h * h + h * 8 + 2 * h;
         assert_eq!(core, expected_core);
+    }
+
+    #[test]
+    fn gemma_sets_norm_embed_activation_and_refuses_gemma2() {
+        use crate::forward::cpu::Activation;
+        let gemma = br#"{"model_type":"gemma","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64,
+            "hidden_activation":"gelu_pytorch_tanh"}"#;
+        let c = ModelConfig::from_json_bytes(gemma, QuantScheme::Fp16).unwrap();
+        assert!(c.norm_add_one, "Gemma uses (1+w) RMSNorm");
+        assert_eq!(c.embed_scale, Some(4.0), "sqrt(hidden=16) = 4");
+        assert_eq!(c.activation, Activation::GeluTanh);
+
+        // Llama-style: no add-one, no embed scale, SiLU.
+        let llama = br#"{"model_type":"llama","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
+        let c = ModelConfig::from_json_bytes(llama, QuantScheme::Fp16).unwrap();
+        assert!(!c.norm_add_one);
+        assert_eq!(c.embed_scale, None);
+        assert_eq!(c.activation, Activation::Silu);
+
+        // Gemma2 is refused (needs softcap + alternating windows + extra norms).
+        let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
+        assert!(ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).is_err());
     }
 
     #[test]

@@ -275,13 +275,16 @@ pub struct ModelParts {
     pub rms_eps: f32,
     pub kv_config: KvCacheConfig,
     pub kv_blocks: u32,
+    /// Embedding scale (Gemma: `sqrt(hidden)`); `None` leaves embeddings unscaled.
+    pub embed_scale: Option<f32>,
 }
 
 impl ModelParts {
     /// Wrap the CPU kernel around these weights and build a generator.
     pub fn into_cpu_generator(self) -> Result<Generator<CpuKernel>> {
+        let embed_scale = self.embed_scale;
         let kernel = CpuKernel::new(self.cfg, self.layers)?;
-        Generator::new(
+        Ok(Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -290,15 +293,17 @@ impl ModelParts {
             self.rms_eps,
             self.kv_config,
             self.kv_blocks,
-        )
+        )?
+        .with_embed_scale(embed_scale))
     }
 
     /// Upload every layer to VRAM and build a generator over the GPU kernel.
     #[cfg(feature = "cuda-kernels")]
     pub fn into_gpu_generator(self) -> Result<Generator<crate::forward::GpuKernel>> {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
+        let embed_scale = self.embed_scale;
         let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
-        Generator::new(
+        Ok(Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -307,7 +312,8 @@ impl ModelParts {
             self.rms_eps,
             self.kv_config,
             self.kv_blocks,
-        )
+        )?
+        .with_embed_scale(embed_scale))
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
@@ -320,8 +326,9 @@ impl ModelParts {
         self,
         gpu_ids: &[u32],
     ) -> Result<Generator<PipelineParallelKernel<CpuKernel>>> {
+        let embed_scale = self.embed_scale;
         let kernel = PipelineParallelKernel::new(CpuKernel::new(self.cfg, self.layers)?, gpu_ids)?;
-        Generator::new(
+        Ok(Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -330,7 +337,8 @@ impl ModelParts {
             self.rms_eps,
             self.kv_config,
             self.kv_blocks,
-        )
+        )?
+        .with_embed_scale(embed_scale))
     }
 }
 
@@ -358,6 +366,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         rope_scaling: config.rope_scaling,
         moe: config.moe,
         sliding_window: config.sliding_window.map(|w| w as usize),
+        activation: config.activation,
     }
 }
 
@@ -370,8 +379,21 @@ pub(crate) fn load_layer_tensors(
     layer: u32,
     quant: QuantScheme,
     packed: Option<PackedQuant>,
+    norm_add_one: bool,
 ) -> Result<LayerTensors> {
-    load_layer_tensors_opt(store, cfg, layer, quant, packed, true)
+    load_layer_tensors_opt(store, cfg, layer, quant, packed, true, norm_add_one)
+}
+
+/// Load an RMSNorm weight, baking Gemma's `+1` in when `add_one` so the norm
+/// kernels can stay a plain `w` multiply.
+fn load_norm(store: &MmapStore, name: &str, len: usize, add_one: bool) -> Result<Vec<f32>> {
+    let mut v = load_tensor(store, name, len)?;
+    if add_one {
+        for x in &mut v {
+            *x += 1.0;
+        }
+    }
+    Ok(v)
 }
 
 /// Like [`load_layer_tensors`], but `include_experts = false` loads only the MoE
@@ -385,6 +407,7 @@ pub(crate) fn load_layer_tensors_opt(
     quant: QuantScheme,
     packed: Option<PackedQuant>,
     include_experts: bool,
+    norm_add_one: bool,
 ) -> Result<LayerTensors> {
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
@@ -406,11 +429,12 @@ pub(crate) fn load_layer_tensors_opt(
         v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
         o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
         ffn,
-        input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
-        post_attention_layernorm: load_tensor(
+        input_layernorm: load_norm(store, &name("input_layernorm.weight"), hidden, norm_add_one)?,
+        post_attention_layernorm: load_norm(
             store,
             &name("post_attention_layernorm.weight"),
             hidden,
+            norm_add_one,
         )?,
         // Present on Qwen2 and friends, absent on Llama/Mistral.
         q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
@@ -538,6 +562,8 @@ pub struct MmapLayerSource {
     quant: QuantScheme,
     /// Set when the checkpoint is already packed-quantized (GPTQ).
     packed: Option<PackedQuant>,
+    /// Bake Gemma's `(1+w)` into RMSNorm weights at load.
+    norm_add_one: bool,
 }
 
 impl LayerSource for MmapLayerSource {
@@ -545,13 +571,21 @@ impl LayerSource for MmapLayerSource {
         self.num_layers
     }
     fn load_layer(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
-        load_layer_tensors(&self.store, &self.cfg, layer, self.quant, self.packed)
+        load_layer_tensors(&self.store, &self.cfg, layer, self.quant, self.packed, self.norm_add_one)
             .map(std::sync::Arc::new)
     }
     fn load_layer_core(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
         // Core only (no routed experts) for the per-expert streaming GPU path.
-        load_layer_tensors_opt(&self.store, &self.cfg, layer, self.quant, self.packed, false)
-            .map(std::sync::Arc::new)
+        load_layer_tensors_opt(
+            &self.store,
+            &self.cfg,
+            layer,
+            self.quant,
+            self.packed,
+            false,
+            self.norm_add_one,
+        )
+        .map(std::sync::Arc::new)
     }
     fn load_expert(&self, layer: u32, expert: u32) -> Result<std::sync::Arc<ExpertFfn>> {
         let m = self.cfg.moe.ok_or_else(|| {
@@ -583,6 +617,7 @@ struct StreamingPieces {
     rms_eps: f32,
     kv_config: KvCacheConfig,
     kv_blocks: u32,
+    embed_scale: Option<f32>,
 }
 
 /// Load the pinned pieces (embedding, final norm, LM head, KV sizing) and bind a
@@ -597,7 +632,7 @@ fn load_streaming_pieces(
     let vocab = config.vocab_size as usize;
 
     let embedding = load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?;
-    let final_norm = load_tensor(&store, "model.norm.weight", hidden)?;
+    let final_norm = load_norm(&store, "model.norm.weight", hidden, config.norm_add_one)?;
     let lm_head = if store.locate("lm_head.weight").is_some() {
         load_tensor(&store, "lm_head.weight", vocab * hidden)?
     } else {
@@ -615,6 +650,7 @@ fn load_streaming_pieces(
         source: MmapLayerSource {
             store,
             cfg,
+            norm_add_one: config.norm_add_one,
             num_layers: config.num_layers,
             quant: config.quant,
             packed: config.packed_quant,
@@ -626,6 +662,7 @@ fn load_streaming_pieces(
         rms_eps: config.rms_eps,
         kv_config,
         kv_blocks,
+        embed_scale: config.embed_scale,
     })
 }
 
@@ -653,7 +690,7 @@ pub fn build_streaming_generator(
     } else {
         base.with_prefetch_depth(prefetch_depth as u32)
     };
-    Generator::new(
+    Ok(Generator::new(
         kernel,
         p.embedding,
         p.final_norm,
@@ -662,7 +699,8 @@ pub fn build_streaming_generator(
         p.rms_eps,
         p.kv_config,
         p.kv_blocks,
-    )
+    )?
+    .with_embed_scale(p.embed_scale))
 }
 
 /// GPU counterpart of [`build_streaming_generator`]: stream a window of layer
@@ -692,7 +730,7 @@ pub fn build_streaming_gpu_generator(
         resident_layers,
         expert_cap,
     )?;
-    Generator::new(
+    Ok(Generator::new(
         kernel,
         p.embedding,
         p.final_norm,
@@ -701,7 +739,8 @@ pub fn build_streaming_gpu_generator(
         p.rms_eps,
         p.kv_config,
         p.kv_blocks,
-    )
+    )?
+    .with_embed_scale(p.embed_scale))
 }
 
 /// Materialize a checkpoint into [`ModelParts`] (host `f32` weights + shapes).
@@ -724,11 +763,18 @@ pub fn load_model_parts(
 
     let mut layers = Vec::with_capacity(config.num_layers as usize);
     for i in 0..config.num_layers {
-        layers.push(load_layer_tensors(store, &cfg, i, config.quant, config.packed_quant)?);
+        layers.push(load_layer_tensors(
+            store,
+            &cfg,
+            i,
+            config.quant,
+            config.packed_quant,
+            config.norm_add_one,
+        )?);
     }
 
     let embedding = load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?;
-    let final_norm = load_tensor(store, "model.norm.weight", hidden)?;
+    let final_norm = load_norm(store, "model.norm.weight", hidden, config.norm_add_one)?;
     // Weight tying: reuse the embedding when there is no separate LM head.
     let lm_head = if store.locate("lm_head.weight").is_some() {
         load_tensor(store, "lm_head.weight", vocab * hidden)?
@@ -754,5 +800,6 @@ pub fn load_model_parts(
         rms_eps: config.rms_eps,
         kv_config,
         kv_blocks,
+        embed_scale: config.embed_scale,
     })
 }

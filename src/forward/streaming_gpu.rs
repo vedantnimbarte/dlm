@@ -666,6 +666,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                     expert.down.as_ptr() as *const c_void,
                     weight,
                     d_hidden.as_mut_ptr(),
+                    cfg.activation.code(),
                 )
             };
             if code != 0 {
@@ -707,6 +708,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                     sh.down.as_ptr() as *const c_void,
                     weight,
                     d_hidden.as_mut_ptr(),
+                    cfg.activation.code(),
                 )
             };
             if code != 0 {
@@ -811,6 +813,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         num_positions as i32,
                         position as i32,
                         cfg.sliding_window.unwrap_or(0) as i32,
+                        cfg.activation.code(),
                     )
                 };
                 if code != 0 {

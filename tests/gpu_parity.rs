@@ -76,7 +76,7 @@ fn gpu_run_block_matches_cpu() {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
     };
     let num_layers = 2u32;
 
@@ -139,7 +139,7 @@ fn gpu_batched_sessions_keep_independent_kv() {
         rope_theta: 10000.0,
         rms_eps: 1e-5,
         rope_scaling: None,
-        moe: None, sliding_window: None,
+        moe: None, sliding_window: None, activation: Default::default(),
     };
     let num_layers = 3u32;
     let layers = random_layers(&cfg, num_layers, 0xB0A7);
@@ -244,9 +244,31 @@ fn gpu_sliding_window_matches_cpu() {
         rope_scaling: None,
         moe: None,
         sliding_window: Some(2),
+        activation: dlm::forward::Activation::Silu,
     };
     let layers = random_layers(&cfg, 2, 0x5117);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "sliding-window");
+}
+
+/// Gemma's GeGLU (tanh-GELU gate) must match the CPU oracle: the device
+/// `swiglu_kernel` and CPU `activate()` compute the same tanh-approximate GELU.
+#[test]
+fn gpu_gelu_activation_matches_cpu() {
+    let cfg = BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: dlm::forward::Activation::GeluTanh,
+    };
+    let layers = random_layers(&cfg, 2, 0x6E10);
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "gelu-activation");
 }
 
 /// `--quant int4` weights must decode identically on device and on the CPU
@@ -268,7 +290,7 @@ fn gpu_matches_cpu_with_int4_weights() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None, moe: None, sliding_window: None,
+        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
     };
     // Quantize the same random weights both kernels would otherwise share.
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
@@ -307,7 +329,7 @@ fn gpu_matches_cpu_with_int8_weights() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None, moe: None, sliding_window: None,
+        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
     };
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
         .into_iter()
@@ -346,7 +368,7 @@ fn gpu_matches_cpu_at_realistic_hidden_size() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None, moe: None, sliding_window: None,
+        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
     };
     let layers = random_layers(&cfg, 2, 0xA11CE);
     assert_gpu_matches_cpu(cfg, layers, 2e-3, "hidden_size=2048");
@@ -363,7 +385,7 @@ fn gpu_matches_cpu_with_qkv_biases() {
         intermediate_size: 128,
         rope_theta: 1_000_000.0,
         rms_eps: 1e-6,
-        rope_scaling: None, moe: None, sliding_window: None,
+        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
     };
     let mut rng = Rng::new(0xB1A5);
     let mut layers = random_layers(&cfg, 2, 0xB1A5);
@@ -393,7 +415,7 @@ fn gpu_matches_cpu_with_llama3_rope_scaling() {
             high_freq_factor: 4.0,
             original_max_position: 8192.0,
         }),
-        moe: None, sliding_window: None,
+        moe: None, sliding_window: None, activation: Default::default(),
     };
     let layers = random_layers(&cfg, 2, 0x5CA1E);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "llama3 rope scaling");
@@ -407,7 +429,7 @@ fn small_cfg() -> BlockConfig {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
     }
 }
 
@@ -535,7 +557,7 @@ fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
         rope_theta: 10000.0,
         rms_eps: 1e-5,
         rope_scaling: None,
-        moe: Some(m), sliding_window: None,
+        moe: Some(m), sliding_window: None, activation: Default::default(),
     };
     let num_layers = 6u32;
     let layers = random_moe_layers(&cfg, num_layers, 0x50FA);

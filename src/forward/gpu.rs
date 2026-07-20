@@ -63,6 +63,8 @@ extern "C" {
         position: i32,
         // Sliding-window span (Mistral); 0 = full causal attention.
         sliding_window: i32,
+        // Gate activation (DLM_ACT_*): SiLU (0) or GELU (1, Gemma).
+        activation: i32,
     ) -> i32;
 
     /// MoE layer, part 1: attention sublayer + post-attn norm. Leaves `normed2`
@@ -121,6 +123,8 @@ extern "C" {
         down: *const c_void,
         weight: f32,
         x: *mut f32,
+        // Gate activation (DLM_ACT_*): SiLU (0) or GELU (1, Gemma).
+        activation: i32,
     ) -> i32;
 }
 
@@ -312,6 +316,7 @@ impl ComputeKernel for GpuKernel {
                 num_positions as i32,
                 position as i32,
                 self.cfg.sliding_window.unwrap_or(0) as i32,
+                self.cfg.activation.code(),
             )
         };
         if code != 0 {

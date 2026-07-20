@@ -260,12 +260,24 @@ __global__ void scaled_add_kernel(float* x, const float* y, float w, int n) {
     if (i < n) x[i] += w * y[i];
 }
 
-// out[i] = silu(gate[i]) * up[i]
-__global__ void swiglu_kernel(const float* gate, const float* up, float* out, int n) {
+// Gated-MLP activation tags — must match `Activation::code()` in src/forward/cpu.rs.
+#define DLM_ACT_SILU 0
+#define DLM_ACT_GELU_TANH 1
+
+// Gate activation: SiLU (SwiGLU) or tanh-approximate GELU (Gemma's GeGLU).
+__device__ __forceinline__ float dlm_activate(float x, int act) {
+    if (act == DLM_ACT_GELU_TANH) {
+        const float c = 0.7978845608f; // sqrt(2/pi)
+        return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
+    }
+    return x / (1.0f + expf(-x)); // SiLU
+}
+
+// out[i] = act(gate[i]) * up[i]
+__global__ void swiglu_kernel(const float* gate, const float* up, float* out, int n, int act) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float g = gate[i];
-        out[i] = (g / (1.0f + expf(-g))) * up[i];
+        out[i] = dlm_activate(gate[i], act) * up[i];
     }
 }
 
@@ -329,7 +341,8 @@ extern "C" int dlm_decode_block(
     float* x,                              // [hidden] in/out
     float* kv_keys, float* kv_values,      // persistent device KV, mutated in place
     int num_positions, int position,
-    int sliding_window)                    // 0 = full causal attention (Mistral SWA otherwise)
+    int sliding_window,                    // 0 = full causal attention (Mistral SWA otherwise)
+    int activation)                        // DLM_ACT_* gate activation (SiLU / GELU)
 {
     const int B = 256;
     int total_pos = num_positions + 1;
@@ -378,7 +391,7 @@ extern "C" int dlm_decode_block(
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);
         launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
         launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size);
-        swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter);
+        swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
         launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
@@ -493,7 +506,7 @@ extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_g
 // describe the expert's weights, which may differ from the core's.
 extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_group_size,
                                 const void* gate, const void* up, const void* down,
-                                float weight, float* x)
+                                float weight, float* x, int activation)
 {
     const int B = 256;
     cudaError_t e = cudaSuccess;
@@ -509,7 +522,7 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
     if (e == cudaSuccess) {
         launch_matvec(w_dtype, gate, normed2, (const float*)0, g, inter, hidden_size, w_group_size);
         launch_matvec(w_dtype, up, normed2, (const float*)0, u, inter, hidden_size, w_group_size);
-        swiglu_kernel<<<grid_for(inter, B), B>>>(g, u, inter_buf, inter);
+        swiglu_kernel<<<grid_for(inter, B), B>>>(g, u, inter_buf, inter, activation);
         launch_matvec(w_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, w_group_size);
         scaled_add_kernel<<<grid_for(hidden_size, B), B>>>(x, down_out, weight, hidden_size);
         e = cudaGetLastError();

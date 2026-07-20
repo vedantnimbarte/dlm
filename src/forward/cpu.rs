@@ -70,6 +70,9 @@ pub struct BlockConfig {
     /// `window` positions. `None` is full causal attention. Bounds only the
     /// attention *read*, not KV storage.
     pub sliding_window: Option<usize>,
+    /// Gated-MLP activation: SiLU (SwiGLU) for Llama/Mistral/Qwen, GELU (GeGLU)
+    /// for Gemma. Defaults to SiLU.
+    pub activation: Activation,
 }
 
 impl BlockConfig {
@@ -1019,18 +1022,56 @@ fn softmax_inplace(v: &mut [f32]) {
     }
 }
 
+/// Gated-MLP activation function. Llama/Mistral/Qwen gate with SiLU (SwiGLU);
+/// Gemma gates with the tanh-approximate GELU (GeGLU). Must match the
+/// `DLM_ACT_*` constants in `src/gpu/kernels.cu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activation {
+    /// SiLU / swish: `x·σ(x)` — the SwiGLU default.
+    #[default]
+    Silu,
+    /// tanh-approximate GELU (`gelu_pytorch_tanh`): Gemma's GeGLU gate.
+    GeluTanh,
+}
+
+impl Activation {
+    /// Device tag handed to the CUDA kernel (`DLM_ACT_*`).
+    pub fn code(self) -> i32 {
+        match self {
+            Activation::Silu => 0,
+            Activation::GeluTanh => 1,
+        }
+    }
+}
+
 /// SiLU / swish activation.
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// One SwiGLU expert applied to `x`: `down · (silu(gate·x) ⊙ up·x)`, returning
+/// tanh-approximate GELU (`gelu_pytorch_tanh`), Gemma's gate activation.
+fn gelu_tanh(x: f32) -> f32 {
+    const C: f32 = 0.797_884_6; // sqrt(2/pi)
+    0.5 * x * (1.0 + (C * (x + 0.044715 * x * x * x)).tanh())
+}
+
+/// Apply the gate activation elementwise.
+#[inline]
+fn activate(act: Activation, x: f32) -> f32 {
+    match act {
+        Activation::Silu => silu(x),
+        Activation::GeluTanh => gelu_tanh(x),
+    }
+}
+
+/// One gated-MLP expert applied to `x`: `down · (act(gate·x) ⊙ up·x)`, returning
 /// the `hidden`-wide contribution to the residual (the caller scales and adds it).
-fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+/// `act` selects SwiGLU (SiLU) or Gemma's GeGLU (GELU).
+fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize, act: Activation) -> Vec<f32> {
     let gate = matvec_native(&f.gate, x, inter, hidden);
     let up = matvec_native(&f.up, x, inter, hidden);
-    let act: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
-    matvec_native(&f.down, &act, hidden, inter)
+    let combined: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| activate(act, g) * u).collect();
+    matvec_native(&f.down, &combined, hidden, inter)
 }
 
 /// Select the top-`k` experts by routing probability and return
@@ -1082,7 +1123,7 @@ fn add_shared_expert(
             }
             None => 1.0,
         };
-        let down = swiglu_ffn(s, x, hidden, si);
+        let down = swiglu_ffn(s, x, hidden, si, cfg.activation);
         for (o, d) in out.iter_mut().zip(&down) {
             *o += g * d;
         }
@@ -1116,7 +1157,7 @@ fn moe_ffn(
                 experts.len()
             ))
         })?;
-        let down = swiglu_ffn(expert, x, hidden, inter);
+        let down = swiglu_ffn(expert, x, hidden, inter, cfg.activation);
         for (o, d) in out.iter_mut().zip(&down) {
             *o += weight * d;
         }
@@ -1156,7 +1197,7 @@ where
     for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
         // `expert` may be an `Arc<ExpertFfn>` from a host cache — deref, don't clone.
         let expert = fetch_expert(e)?;
-        let down = swiglu_ffn(&expert, x, hidden, inter);
+        let down = swiglu_ffn(&expert, x, hidden, inter, cfg.activation);
         for (o, d) in out.iter_mut().zip(&down) {
             *o += weight * d;
         }
@@ -1291,7 +1332,7 @@ pub fn decode_block(
     // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
     let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
     let ffn_out = match &w.ffn {
-        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size),
+        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size, cfg.activation),
         Ffn::Moe { router, experts, shared, shared_gate } => moe_ffn(
             router,
             experts,
@@ -1450,7 +1491,7 @@ mod tests {
             rms_eps: 1e-5,
             rope_scaling: None,
             moe: None,
-            sliding_window: None,
+            sliding_window: None, activation: Default::default(),
         };
         // Four cached positions with distinct K/V.
         let fill = |from: usize| {
@@ -1511,6 +1552,16 @@ mod tests {
     fn silu_values() {
         assert!((silu(0.0)).abs() < 1e-6);
         assert!(silu(20.0) > 19.9); // ~x for large x
+    }
+
+    #[test]
+    fn gelu_tanh_values() {
+        assert!(gelu_tanh(0.0).abs() < 1e-6); // 0 → 0
+        assert!(gelu_tanh(20.0) > 19.9); // ~x for large positive x
+        assert!(gelu_tanh(-20.0).abs() < 1e-3); // ~0 for large negative x
+        // GELU(1) ≈ 0.8412 (tanh approximation), distinct from SiLU(1) ≈ 0.7311.
+        assert!((gelu_tanh(1.0) - 0.8412).abs() < 1e-3);
+        assert_ne!(activate(Activation::GeluTanh, 1.0), activate(Activation::Silu, 1.0));
     }
 
     #[test]
@@ -1587,7 +1638,7 @@ mod tests {
             intermediate_size: 6,
             rope_theta: 10000.0,
             rms_eps: 1e-5,
-            rope_scaling: None, moe: None, sliding_window: None,
+            rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let hidden = vec![1.5, -2.0, 0.5, 3.0];
 
@@ -1623,7 +1674,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
@@ -1641,7 +1692,7 @@ mod tests {
             head_dim: 1,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
@@ -1659,7 +1710,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 6,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1693,7 +1744,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
@@ -1734,7 +1785,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
@@ -1759,7 +1810,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1779,7 +1830,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             rope_scaling: None,
-            moe: Some(m), sliding_window: None,
+            moe: Some(m), sliding_window: None, activation: Default::default(),
         }
     }
 
@@ -1887,8 +1938,8 @@ mod tests {
         // Independent expected: attention is all-zero so h1 == hidden; the FFN
         // input is rmsnorm(hidden, unit, eps); each expert's SwiGLU is weighted 0.5.
         let normed2 = rmsnorm(&hidden, &w.post_attention_layernorm, cfg.rms_eps);
-        let d0 = swiglu_ffn(&e0, &normed2, cfg.hidden_size, 2);
-        let d1 = swiglu_ffn(&e1, &normed2, cfg.hidden_size, 2);
+        let d0 = swiglu_ffn(&e0, &normed2, cfg.hidden_size, 2, cfg.activation);
+        let d1 = swiglu_ffn(&e1, &normed2, cfg.hidden_size, 2, cfg.activation);
         let expected: Vec<f32> = (0..cfg.hidden_size)
             .map(|i| hidden[i] + 0.5 * d0[i] + 0.5 * d1[i])
             .collect();
@@ -1923,7 +1974,7 @@ mod tests {
         let out = decode_block(&cfg, &w, &hidden, &mut kv, 0).unwrap();
 
         let normed2 = rmsnorm(&hidden, &w.post_attention_layernorm, cfg.rms_eps);
-        let sh = swiglu_ffn(&shared, &normed2, cfg.hidden_size, 2);
+        let sh = swiglu_ffn(&shared, &normed2, cfg.hidden_size, 2, cfg.activation);
         let expected: Vec<f32> =
             (0..cfg.hidden_size).map(|i| hidden[i] + 0.5 * sh[i]).collect();
         approx(&out, &expected, 1e-6);

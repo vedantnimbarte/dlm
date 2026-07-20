@@ -46,7 +46,7 @@ fn build_model() -> Model {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
     };
     let mut rng = Rng::new(99);
     let s = 0.05;

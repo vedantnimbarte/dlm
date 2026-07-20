@@ -247,6 +247,9 @@ pub struct Generator<K: ComputeKernel> {
     kv_total_blocks: u32,
     /// Per-layer KV precision (int8/int4 shrink KV memory, approximate).
     kv_quant: crate::forward::KvQuant,
+    /// Scalar applied to each token embedding after lookup (Gemma multiplies by
+    /// `sqrt(hidden)`); `None` leaves embeddings unscaled.
+    embed_scale: Option<f32>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -286,6 +289,7 @@ impl<K: ComputeKernel> Generator<K> {
             kv_config,
             kv_total_blocks,
             kv_quant: crate::forward::KvQuant::None,
+            embed_scale: None,
         })
     }
 
@@ -293,6 +297,13 @@ impl<K: ComputeKernel> Generator<K> {
     /// Affects sessions started after this call.
     pub fn with_kv_quant(mut self, kv_quant: crate::forward::KvQuant) -> Self {
         self.kv_quant = kv_quant;
+        self
+    }
+
+    /// Scale token embeddings by `scale` after lookup (Gemma uses `sqrt(hidden)`).
+    /// `None` leaves them unscaled.
+    pub fn with_embed_scale(mut self, scale: Option<f32>) -> Self {
+        self.embed_scale = scale;
         self
     }
 
@@ -321,7 +332,13 @@ impl<K: ComputeKernel> Generator<K> {
             )));
         }
         let start = idx * self.hidden_size;
-        Ok(self.embedding[start..start + self.hidden_size].to_vec())
+        let mut v = self.embedding[start..start + self.hidden_size].to_vec();
+        if let Some(scale) = self.embed_scale {
+            for x in &mut v {
+                *x *= scale;
+            }
+        }
+        Ok(v)
     }
 
     /// Project a hidden state to vocabulary logits via final norm + LM head.
@@ -499,7 +516,7 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         // One identity (zero-weight) block: hidden passes through unchanged.
         let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
@@ -620,7 +637,7 @@ mod tests {
             head_dim: 4,
             intermediate_size: 32,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(),
         };
         let mut r = SplitMix64::new(42);
         let mut vec = |n: usize| -> Vec<f32> {
