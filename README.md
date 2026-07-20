@@ -44,9 +44,12 @@ safety cushion on a small card to fit more layers).
 One line — downloads a prebuilt binary for your platform and installs it. No
 clone, no build, no Rust toolchain. Every download is checked against a published
 `.sha256` before it is unpacked or run, so a corrupted or truncated download is
-caught. Note this is an **integrity** check, not authenticity: the checksum is
-served from the same GitHub release as the binary, so it guards against corruption
-in transit, not a compromised release. Signed releases are on the roadmap.
+caught. That is an **integrity** check; for **authenticity**, the release
+workflow also signs each archive with [minisign](https://jedisct1.github.io/minisign/)
+and the installers verify the `.minisig` when a public key is configured. Set
+`MINISIGN_PUBKEY` in the installer (or export `DLM_MINISIGN_PUBKEY`) to the
+project key and install minisign to enable it; without a key the checksum still
+applies. A present-but-invalid signature aborts the install.
 
 **Linux / macOS** (installs to `~/.local/bin`):
 
