@@ -918,6 +918,35 @@ impl KvLayerCache {
         self.len() == 0
     }
 
+    /// Drop cached positions beyond `n`, keeping the first `n` (a no-op if already
+    /// `<= n`). The rollback hook a **persistent-KV** speculative session would use
+    /// to discard rejected draft tokens — the current speculative path re-prefills
+    /// a fresh cache each verification, so this is not yet on the hot path. On the
+    /// GPU path the device slots are simply overwritten at the reduced length, so
+    /// only the host length (which drives `num_positions`) needs shrinking.
+    pub fn truncate(&mut self, n: usize) {
+        let kv_dim = self.kv_dim;
+        match &mut self.store {
+            KvStore::Full { keys, values } => {
+                keys.truncate(n * kv_dim);
+                values.truncate(n * kv_dim);
+            }
+            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+                keys.truncate(n * kv_dim);
+                values.truncate(n * kv_dim);
+                key_scales.truncate(n);
+                value_scales.truncate(n);
+            }
+            KvStore::Int4 { keys, key_scales, values, value_scales } => {
+                let bytes = n * kv_dim.div_ceil(2);
+                keys.truncate(bytes);
+                values.truncate(bytes);
+                key_scales.truncate(n);
+                value_scales.truncate(n);
+            }
+        }
+    }
+
     /// Append one position's key and value vectors.
     pub fn append(&mut self, key: &[f32], value: &[f32]) -> Result<()> {
         if key.len() != self.kv_dim || value.len() != self.kv_dim {
@@ -1751,6 +1780,51 @@ impl ComputeKernel for CpuKernel {
 mod tests {
     use super::*;
     use crate::model::MoeNaming;
+
+    #[test]
+    fn kv_truncate_rolls_back_positions() {
+        let mut kv = KvLayerCache::new(2);
+        for i in 0..5 {
+            kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+        }
+        kv.truncate(3);
+        assert_eq!(kv.len(), 3);
+        // The first 3 positions are intact: attention over the truncated cache
+        // equals a fresh cache built from just those positions.
+        let mut fresh = KvLayerCache::new(2);
+        for i in 0..3 {
+            fresh.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+        }
+        let cfg = BlockConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 2,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
+        };
+        approx(&attention(&cfg, &[1.0, 0.0], &kv), &attention(&cfg, &[1.0, 0.0], &fresh), 1e-6);
+        kv.truncate(10); // beyond len → no-op
+        assert_eq!(kv.len(), 3);
+    }
+
+    #[test]
+    fn kv_truncate_quantized() {
+        for q in [KvQuant::Int8, KvQuant::Int4] {
+            let mut kv = KvLayerCache::new_quant(2, q);
+            for i in 0..4 {
+                kv.append(&[i as f32, 1.0], &[i as f32, 2.0]).unwrap();
+            }
+            kv.truncate(2);
+            assert_eq!(kv.len(), 2, "{q:?}");
+        }
+    }
 
     /// Sliding-window attention must attend *only* the last `window` positions:
     /// a windowed run equals full attention computed over just that tail, and a
