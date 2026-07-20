@@ -642,6 +642,17 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     );
                 }
                 if device == Device::Gpu {
+                    // Batch KV is planned into the window; refuse if it left no room
+                    // for even one resident layer instead of OOMing mid-request.
+                    ensure_batch_kv_fits(
+                        plan.free_bytes,
+                        plan.safety_bytes,
+                        plan.kv_total_bytes,
+                        (window as u64).saturating_mul(plan.per_layer_weight_bytes),
+                        args.max_batch,
+                        args.context_length,
+                        "resident window",
+                    )?;
                     let expert_cache = resolve_expert_cache_bytes(&args, &config, &plan, window);
                     if config.is_moe() {
                         println!(
@@ -775,7 +786,7 @@ fn resolve_device(requested: Device) -> Device {
 /// under Windows WDDM, and an outright OOM where there is no such paging.
 fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> VramPlan {
     let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
-    let profiler = build_profiler(args.context_length, args.safety_margin_gb);
+    let profiler = build_profiler(args.context_length, args.safety_margin_gb, args.max_batch as u32);
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
     if catalog.is_empty() {
@@ -853,12 +864,46 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
 
 /// Build a VRAM profiler, overriding the default safety cushion when the user
 /// passed `--safety-margin-gb` (small cards claw back the fixed 1.5 GiB default).
-fn build_profiler(context_length: u32, safety_margin_gb: Option<f64>) -> VramProfiler {
-    let p = VramProfiler::new(context_length);
+fn build_profiler(context_length: u32, safety_margin_gb: Option<f64>, max_batch: u32) -> VramProfiler {
+    let p = VramProfiler::new(context_length).with_max_batch(max_batch);
     match safety_margin_gb {
         Some(gb) => p.with_safety_margin_bytes((gb.max(0.0) * GIB as f64) as u64),
         None => p,
     }
+}
+
+/// Refuse a serve config whose concurrent-batch KV reservation won't fit VRAM,
+/// with a message naming the levers to pull — rather than letting the engine OOM
+/// on the first token. `resident_bytes` is what sits in VRAM beside the KV caches
+/// (the streamed window, or the resident weights); `kv_reservation` already
+/// includes the `max_batch` multiplier. A no-op when everything fits.
+#[allow(clippy::too_many_arguments)]
+fn ensure_batch_kv_fits(
+    free: u64,
+    safety: u64,
+    kv_reservation: u64,
+    resident_bytes: u64,
+    max_batch: usize,
+    context: u32,
+    what: &str,
+) -> Result<()> {
+    let need = safety
+        .saturating_add(kv_reservation)
+        .saturating_add(resident_bytes);
+    if need > free {
+        let gib = |b: u64| b as f64 / GIB as f64;
+        return Err(DlmError::InvalidConfig(format!(
+            "--max-batch {max_batch} needs ~{:.1} GiB VRAM ({what} {:.1} + KV {:.1} for \
+             {max_batch}×{context} tokens + safety {:.1}) but only {:.1} GiB is free. \
+             Lower --max-batch or --context-length (or use --quant / a smaller model).",
+            gib(need),
+            gib(resident_bytes),
+            gib(kv_reservation),
+            gib(safety),
+            gib(free),
+        )));
+    }
+    Ok(())
 }
 
 /// Serve with the GPU kernel (all layers resident in VRAM). Feature-gated on
@@ -873,6 +918,20 @@ fn serve_on_gpu(
 ) -> Result<()> {
     println!();
     println!("device       : gpu ({})", gpu::active_vendor().label());
+    // All weights sit resident in VRAM; each batched request adds a full-context
+    // KV cache. Refuse up front if the batch won't fit rather than OOM mid-request.
+    let (free, _) = resolve_free_bytes(args.vram_budget_gb);
+    let profiler = build_profiler(args.context_length, args.safety_margin_gb, args.max_batch as u32);
+    let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
+    ensure_batch_kv_fits(
+        free,
+        profiler.safety_margin_bytes,
+        profiler.kv_total_bytes(config),
+        weights,
+        args.max_batch,
+        args.context_length,
+        "weights",
+    )?;
     let generator = parts.into_gpu_generator()?;
     let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
     start_batched_server(generator, draft, args, config, listen)
@@ -1063,7 +1122,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             "dlm",
             128,
             created,
-            8, // max concurrent batch
+            args.max_batch.max(1), // max concurrent batch (--max-batch)
             args.prefix_cache_size,
         ),
         None => dlm::server::EngineService::start(
@@ -1073,7 +1132,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             "dlm",
             128,
             created,
-            8, // max concurrent batch
+            args.max_batch.max(1), // max concurrent batch (--max-batch)
             args.prefix_cache_size,
         ),
     }
@@ -1145,7 +1204,8 @@ fn report_plan(
     let catalog = mapped.as_ref().map(|(_, cat)| cat);
 
     // Resolve free VRAM: explicit budget > live device query > simulated 16 GiB.
-    let profiler = build_profiler(context_length, safety_margin_gb);
+    // `profile` plans for a single sequence (batch is a serve-time concern).
+    let profiler = build_profiler(context_length, safety_margin_gb, 1);
     let (free_bytes, free_source) = resolve_free_bytes(vram_budget_gb);
     println!("free VRAM    : {free_source}");
 
@@ -1366,4 +1426,24 @@ fn sample_70b_config(quant: QuantScheme) -> ModelConfig {
         "max_position_embeddings": 8192
     }"#;
     ModelConfig::from_json_bytes(json, quant).expect("built-in sample config is valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_kv_fit_check_accepts_and_refuses() {
+        // Fits: free 10 GiB, need = safety 0.5 + KV 2 + resident 1 = 3.5.
+        assert!(ensure_batch_kv_fits(
+            10 * GIB, GIB / 2, 2 * GIB, GIB, 4, 2048, "weights"
+        )
+        .is_ok());
+
+        // Doesn't fit: an 8 GiB batch KV reservation blows a 4 GiB card.
+        let err = ensure_batch_kv_fits(4 * GIB, GIB, 8 * GIB, GIB, 16, 8192, "weights");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("--max-batch"), "message should name the lever: {msg}");
+    }
 }

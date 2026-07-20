@@ -212,6 +212,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "GB")]
     pub ram_cache_gb: Option<f64>,
 
+    /// Maximum number of requests decoded concurrently (continuous batching).
+    /// Each in-flight sequence holds its own KV cache, so on the GPU the KV VRAM
+    /// scales with this — raise it for throughput on a big card, lower it (or
+    /// lower `--context-length`) if a batch would exceed VRAM.
+    #[arg(long, default_value_t = 8)]
+    pub max_batch: usize,
+
     /// VRAM budget (GiB) for the routed-expert cache on the GPU MoE streaming path
     /// (`--stream --device gpu` with a Mixture-of-Experts checkpoint). Only the
     /// top-k experts a token selects are streamed into VRAM and cached here; a
