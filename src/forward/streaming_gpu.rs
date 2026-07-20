@@ -489,6 +489,11 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     /// RoPE inverse frequencies (see [`GpuKernel`](crate::forward::GpuKernel)):
     /// computed once by the shared host function, resident for the kernel's life.
     inv_freq: DeviceBuffer,
+    /// Persistent device hidden buffer, chained across the streamed layer stack:
+    /// uploaded once before layer 0 and downloaded once after the last layer, so
+    /// only weights (not the hidden vector) cross the bus per layer. Safe because
+    /// the scheduler drives one sequence's full stack per step (see `GpuKernel`).
+    d_hidden: DeviceBuffer,
     prefetch_tx: Option<Sender<u32>>,
     worker: Option<JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
@@ -560,11 +565,13 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             cfg.rope_theta,
             cfg.rope_scaling,
         ))?;
+        let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         Ok(Self {
             shared,
             num_layers,
             kv_capacity_tokens: cap,
             inv_freq,
+            d_hidden,
             prefetch_tx: Some(tx),
             worker: Some(worker),
             stopped,
@@ -791,9 +798,15 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         // requests sharing this kernel keep independent history.
         let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens)?;
 
-        // Only the hidden vector crosses the bus per layer; weights are already
-        // resident (this window) and KV lives on-device.
-        let d_hidden = DeviceBuffer::from_slice(hidden)?;
+        // The hidden stays resident across the streamed stack: upload before the
+        // first layer, chain through, download after the last — so only weights
+        // cross the bus per layer, not a hidden round-trip each time.
+        let is_first = layer == 0;
+        let is_last = layer == self.num_layers - 1;
+        let d_hidden = &self.d_hidden;
+        if is_first {
+            d_hidden.upload(hidden)?;
+        }
 
         match &w.ffn {
             GpuFfn::Dense(f) => {
@@ -842,14 +855,17 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
             }
             GpuFfn::Moe { .. } => {
                 self.run_moe_block(
-                    layer, &w, kv_keys, kv_values, &d_hidden, num_positions, position,
+                    layer, &w, kv_keys, kv_values, d_hidden, num_positions, position,
                 )?;
             }
         }
-        // Wait only for the default (compute) stream, not the whole device, so an
-        // in-flight weight upload on the copy stream keeps overlapping.
-        synchronize_default()?;
-        d_hidden.download(hidden)?;
+        // Bring the result back only after the last layer. `download` is a blocking
+        // D2H that drains the default stream, so an in-flight weight upload on the
+        // copy stream keeps overlapping until then.
+        if is_last {
+            synchronize_default()?;
+            d_hidden.download(hidden)?;
+        }
 
         // Keep the orchestrator's length bookkeeping in step (real K/V is in VRAM).
         kv.append(&vec![0.0; kv_dim], &vec![0.0; kv_dim])?;
