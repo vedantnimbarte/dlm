@@ -122,6 +122,74 @@ fn gpu_run_block_matches_cpu() {
     }
 }
 
+/// Two sessions sharing one GPU kernel — exactly what the batching server does —
+/// must keep **independent** KV: interleaving their decode steps yields the same
+/// trajectory as running each alone. This is the regression guard for
+/// per-session GPU KV (`KvLayerCache::gpu_kv`). With the old kernel-owned
+/// per-layer KV, the second session's writes clobbered the first's history and
+/// this diverged.
+#[test]
+fn gpu_batched_sessions_keep_independent_kv() {
+    let cfg = BlockConfig {
+        hidden_size: 32,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 8,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+    };
+    let num_layers = 3u32;
+    let layers = random_layers(&cfg, num_layers, 0xB0A7);
+    // One kernel, shared by both sessions via `&gpu` (as the server shares it).
+    let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+
+    // Two distinct start states → distinct trajectories that would visibly
+    // cross-contaminate if KV were shared.
+    let start_a: Vec<f32> = (0..cfg.hidden_size).map(|i| (i as f32) * 0.03 - 0.5).collect();
+    let start_b: Vec<f32> =
+        (0..cfg.hidden_size).map(|i| ((i * 3 % 29) as f32) * 0.02 - 0.3).collect();
+
+    let solo = |start: &[f32]| -> Vec<Vec<f32>> {
+        let mut orch = ForwardOrchestrator::new(
+            &gpu,
+            PagedKvCache::new(kv_cfg, 16),
+            dlm::forward::KvQuant::None,
+        );
+        let mut h = start.to_vec();
+        (0..5)
+            .map(|_| {
+                orch.decode_token(&mut h).unwrap();
+                h.clone()
+            })
+            .collect()
+    };
+    let solo_a = solo(&start_a);
+    let solo_b = solo(&start_b);
+
+    // Interleave A and B step-by-step on the SAME kernel.
+    let mut orch_a =
+        ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_b =
+        ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut ha = start_a.clone();
+    let mut hb = start_b.clone();
+    for step in 0..5 {
+        orch_a.decode_token(&mut ha).unwrap();
+        orch_b.decode_token(&mut hb).unwrap();
+        assert_eq!(ha, solo_a[step], "session A diverged when interleaved with B at step {step}");
+        assert_eq!(hb, solo_b[step], "session B diverged when interleaved with A at step {step}");
+    }
+}
+
 /// Decode a few tokens on both kernels from the same start state and assert the
 /// GPU tracks the CPU oracle.
 fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32, what: &str) {
@@ -330,7 +398,7 @@ fn streaming_gpu_matches_resident() {
 
     // Resident GPU (all layers) vs streaming GPU (window 2 of 6, prefetch on).
     let resident = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
-    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers), 64, 2).unwrap();
+    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers), 64, 2, None).unwrap();
 
     let kv_cfg = KvCacheConfig {
         num_layers,
@@ -355,7 +423,7 @@ fn streaming_gpu_matches_resident() {
 #[test]
 fn streaming_gpu_worker_prefetches() {
     let cfg = small_cfg();
-    let k = StreamingGpuKernel::new(cfg, VecSource(random_layers(&cfg, 4, 3)), 64, 4).unwrap();
+    let k = StreamingGpuKernel::new(cfg, VecSource(random_layers(&cfg, 4, 3)), 64, 4, None).unwrap();
     let mut h: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.01).collect();
     let mut kv = KvLayerCache::new(cfg.kv_dim());
 
@@ -454,7 +522,7 @@ fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
     // Resident CPU (all experts inline) vs streaming GPU (core resident window of
     // 2, experts streamed per (layer, expert)).
     let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
-    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers), 64, 2).unwrap();
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers), 64, 2, None).unwrap();
 
     let kv_cfg = KvCacheConfig {
         num_layers,

@@ -212,6 +212,15 @@ pub struct ServeArgs {
     #[arg(long, value_name = "GB")]
     pub ram_cache_gb: Option<f64>,
 
+    /// VRAM budget (GiB) for the routed-expert cache on the GPU MoE streaming path
+    /// (`--stream --device gpu` with a Mixture-of-Experts checkpoint). Only the
+    /// top-k experts a token selects are streamed into VRAM and cached here; a
+    /// bigger budget keeps more of the hot set resident, cutting PCIe re-streams.
+    /// Ignored for dense models. Defaults to the VRAM left after the resident
+    /// layer window — so it can't be set so large it OOMs the card.
+    #[arg(long, value_name = "GB")]
+    pub expert_cache_gb: Option<f64>,
+
     /// TCP port for the API server.
     #[arg(long, default_value_t = 8000)]
     pub port: u16,

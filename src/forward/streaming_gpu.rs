@@ -233,12 +233,6 @@ impl GpuWeights {
     }
 }
 
-/// One layer's persistent KV history in VRAM.
-struct GpuKv {
-    keys: DeviceBuffer,
-    values: DeviceBuffer,
-}
-
 /// A bounded cache of device-resident weight sets, ordered least-recent first.
 ///
 /// Despite the name it evicts the **most** recently used entry — see
@@ -336,6 +330,7 @@ struct GpuExpertCache {
     order: VecDeque<(u32, u32)>,
     hits: u64,
     misses: u64,
+    evictions: u64,
 }
 
 impl GpuExpertCache {
@@ -346,6 +341,7 @@ impl GpuExpertCache {
             order: VecDeque::new(),
             hits: 0,
             misses: 0,
+            evictions: 0,
         }
     }
 
@@ -369,6 +365,7 @@ impl GpuExpertCache {
                 continue;
             }
             self.map.remove(&evict);
+            self.evictions += 1;
         }
         self.map.insert(key, expert);
         self.order.push_back(key);
@@ -485,7 +482,6 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     /// RoPE inverse frequencies (see [`GpuKernel`](crate::forward::GpuKernel)):
     /// computed once by the shared host function, resident for the kernel's life.
     inv_freq: DeviceBuffer,
-    kv: Vec<GpuKv>,
     prefetch_tx: Option<Sender<u32>>,
     worker: Option<JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
@@ -495,33 +491,32 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     /// Build a streaming GPU kernel: allocate per-layer KV for up to
     /// `max_kv_tokens` positions and stream weights keeping at most
     /// `resident_layers` sets in VRAM, prefetching one layer ahead.
+    /// `expert_cache_capacity` bounds how many routed experts stay VRAM-resident.
+    /// Pass `Some(n)` from a VRAM budget (`--expert-cache-gb`, see
+    /// [`ModelConfig::expert_cache_capacity`](crate::model::ModelConfig::expert_cache_capacity))
+    /// so a fine-grained (128-expert) model can't OOM the card; `None` falls back
+    /// to a per-window count heuristic for tests and dense models.
     pub fn new(
         cfg: BlockConfig,
         source: S,
         max_kv_tokens: usize,
         resident_layers: usize,
+        expert_cache_capacity: Option<usize>,
     ) -> Result<Self> {
         let num_layers = source.num_layers();
         let cap = max_kv_tokens.max(1);
-        let kv_buffer_len = cap * cfg.kv_dim();
-        let mut kv = Vec::with_capacity(num_layers as usize);
-        for _ in 0..num_layers {
-            kv.push(GpuKv {
-                keys: DeviceBuffer::new(kv_buffer_len)?,
-                values: DeviceBuffer::new(kv_buffer_len)?,
-            });
-        }
+        // KV is per-session (owned by each sequence's KvLayerCache), so the kernel
+        // allocates none here — batched sessions keep isolated history.
         // Page-locked staging sized to one layer's weights (all layers same size).
         let staging_bytes = GpuWeights::f32_count(&cfg) * std::mem::size_of::<f32>();
-        // Expert cache capacity: hold enough routed experts that per-token reuse
-        // hits rather than re-streams. Heuristic — a few tokens' worth across the
-        // resident window, capped at what the window could actually reference.
-        // ponytail: static heuristic. Make it a `--expert-cache-gb` budget if the
-        // hit rate is poor on real fine-grained (128-expert) models.
-        let expert_capacity = cfg.moe.map_or(1, |m| {
-            let per_tok = m.experts_per_tok as usize;
-            (per_tok * resident_layers.max(1) * 4)
-                .clamp(per_tok.max(1), m.num_experts as usize * resident_layers.max(1))
+        // Expert cache capacity: prefer the VRAM-budget-derived count the caller
+        // passes; else fall back to a per-window count heuristic (tests, dense).
+        let expert_capacity = expert_cache_capacity.unwrap_or_else(|| {
+            cfg.moe.map_or(1, |m| {
+                let per_tok = m.experts_per_tok as usize;
+                (per_tok * resident_layers.max(1) * 4)
+                    .clamp(per_tok.max(1), m.num_experts as usize * resident_layers.max(1))
+            })
         });
         let shared = Arc::new(GpuShared {
             cfg,
@@ -556,17 +551,21 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             num_layers,
             kv_capacity_tokens: cap,
             inv_freq,
-            kv,
             prefetch_tx: Some(tx),
             worker: Some(worker),
             stopped,
         })
     }
 
-    /// Streaming cache stats (hits/misses/evictions/prefetched).
+    /// Streaming cache stats: the layer-window counters plus the routed-expert
+    /// VRAM cache's hit/miss/eviction counts (the throughput signal for MoE).
     pub fn stats(&self) -> StreamStats {
         let mut s = self.shared.weights.lock().unwrap().stats;
         s.depth = 1;
+        let ec = self.shared.experts.lock().unwrap();
+        s.expert_hits = ec.hits;
+        s.expert_misses = ec.misses;
+        s.expert_evictions = ec.evictions;
         s
     }
 
@@ -574,11 +573,13 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     /// core, then per-expert application streaming only the top-k experts a token
     /// selects. Mirrors `moe_ffn` in `src/forward/cpu.rs`; the three device calls
     /// share `normed2` via scratch on the in-order default stream.
+    #[allow(clippy::too_many_arguments)]
     fn run_moe_block(
         &self,
         layer: u32,
         w: &GpuWeights,
-        dkv: &GpuKv,
+        kv_keys: *mut f32,
+        kv_values: *mut f32,
         d_hidden: &DeviceBuffer,
         num_positions: usize,
         position: usize,
@@ -622,8 +623,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 bias_ptr(&w.v_bias),
                 self.inv_freq.as_ptr(),
                 d_hidden.as_mut_ptr(),
-                dkv.keys.as_mut_ptr(),
-                dkv.values.as_mut_ptr(),
+                kv_keys,
+                kv_values,
                 num_positions as i32,
                 position as i32,
             )
@@ -766,7 +767,9 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         if let Some(tx) = &self.prefetch_tx {
             let _ = tx.send((layer + 1) % self.num_layers);
         }
-        let dkv = &self.kv[layer as usize];
+        // Per-session K/V (owned by this sequence's KvLayerCache), so batched
+        // requests sharing this kernel keep independent history.
+        let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens)?;
 
         // Only the hidden vector crosses the bus per layer; weights are already
         // resident (this window) and KV lives on-device.
@@ -802,8 +805,8 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         bias_ptr(&w.v_bias),
                         self.inv_freq.as_ptr(),
                         d_hidden.as_mut_ptr(),
-                        dkv.keys.as_mut_ptr(),
-                        dkv.values.as_mut_ptr(),
+                        kv_keys,
+                        kv_values,
                         num_positions as i32,
                         position as i32,
                     )
@@ -813,7 +816,9 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 }
             }
             GpuFfn::Moe { .. } => {
-                self.run_moe_block(layer, &w, dkv, &d_hidden, num_positions, position)?;
+                self.run_moe_block(
+                    layer, &w, kv_keys, kv_values, &d_hidden, num_positions, position,
+                )?;
             }
         }
         // Wait only for the default (compute) stream, not the whole device, so an

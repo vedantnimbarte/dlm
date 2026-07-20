@@ -507,6 +507,65 @@ impl ModelConfig {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    /// Attention-projection parameters for one layer: q + o (`h*h` each) and
+    /// k + v, scaled by the GQA ratio (`2 * kv_ratio * h*h`).
+    fn attn_params(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
+        (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64
+    }
+
+    /// Parameters in one routed MoE expert's SwiGLU triple (gate + up + down),
+    /// or `None` for a dense model. This is the unit that streams per
+    /// `(layer, expert)` on the GPU MoE path, so it sizes both the expert-cache
+    /// budget and the per-expert PCIe cost.
+    pub fn expert_params(&self) -> Option<u64> {
+        let h = self.hidden_size as u64;
+        self.moe
+            .as_ref()
+            .map(|m| 3 * h * m.moe_intermediate_size as u64)
+    }
+
+    /// Parameters that stay **resident per layer** on the streaming path: the
+    /// whole layer for a dense model, but for an MoE model only the *core*
+    /// (attention + router + optional shared expert + norms) — the routed experts
+    /// stream separately into the per-`(layer, expert)` cache and are *not*
+    /// resident. The VRAM planner sizes the resident layer window from this, so a
+    /// sparse layer isn't mis-planned as if it held all its experts at once.
+    pub fn resident_layer_params(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let norms = 2 * h;
+        let ffn = match &self.moe {
+            None => 3 * h * self.intermediate_size as u64,
+            Some(m) => {
+                let router = h * m.num_experts as u64;
+                let shared = m
+                    .shared_intermediate_size
+                    .map_or(0, |s| 3 * h * s as u64 + h);
+                // Core only — routed experts are excluded (they stream on demand).
+                router + shared
+            }
+        };
+        self.attn_params() + ffn + norms
+    }
+
+    /// How many routed experts a VRAM cache of `budget_bytes` can hold, in the
+    /// precision the experts land in VRAM (`self.quant`). Clamped so at least a
+    /// token's top-k stay resident (progress + intra-token reuse) and never more
+    /// than the model has across every layer. `None` for a dense model.
+    ///
+    /// This is what turns the old count-heuristic into a real VRAM budget: on a
+    /// fine-grained (128-expert) checkpoint an unbounded count would OOM the card.
+    pub fn expert_cache_capacity(&self, budget_bytes: u64) -> Option<usize> {
+        let m = self.moe.as_ref()?;
+        let per_expert =
+            (self.expert_params()? as f64 * self.quant.bytes_per_param()).ceil() as u64;
+        let fit = if per_expert == 0 { 0 } else { (budget_bytes / per_expert) as usize };
+        let lo = m.experts_per_tok as usize;
+        let hi = m.num_experts as usize * self.num_layers as usize;
+        Some(fit.clamp(lo, hi))
+    }
+
     /// Rough total parameter count for the whole model, used to estimate the
     /// average size of one streamed transformer block.
     ///
@@ -517,10 +576,7 @@ impl ModelConfig {
     pub fn estimated_total_params(&self) -> u64 {
         let h = self.hidden_size as u64;
         let inter = self.intermediate_size as u64;
-        let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
 
-        // q (h*h) + o (h*h) + k,v scaled by the GQA ratio (2 * kv_ratio * h*h).
-        let attn = (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64;
         // FFN: one dense SwiGLU (3*h*inter), or per layer the full set of expert
         // FFNs plus an optional shared expert for MoE. The catalog path measures
         // real per-layer bytes; this estimate only backs the fallback planner.
@@ -536,10 +592,54 @@ impl ModelConfig {
                 experts + router + shared
             }
         };
-        let per_layer = attn + ffn;
+        let per_layer = self.attn_params() + ffn;
 
         let blocks = per_layer * self.num_layers as u64;
         let embed_and_head = 2 * self.vocab_size as u64 * h;
         blocks + embed_and_head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn moe_config() -> ModelConfig {
+        // 8 experts, top-2, no shared expert (Mixtral-shaped).
+        let json = br#"{"hidden_size":16,"num_attention_heads":4,"num_key_value_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":8,
+            "num_local_experts":8,"num_experts_per_tok":2}"#;
+        ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap()
+    }
+
+    #[test]
+    fn resident_core_excludes_routed_experts() {
+        let c = moe_config();
+        let h = 16u64;
+        // One expert: 3 * h * moe_inter (= intermediate_size 8 for Mixtral).
+        assert_eq!(c.expert_params(), Some(3 * h * 8));
+        // The resident core must NOT include the 8 experts — only attn + router +
+        // norms. So it is far smaller than a full layer with all experts.
+        let core = c.resident_layer_params();
+        let one_expert = c.expert_params().unwrap();
+        assert!(
+            core < one_expert * 8,
+            "core {core} should exclude all 8 experts ({}/expert)",
+            one_expert
+        );
+        // Core = attn (q,o = h*h each; k,v full since MHA) + router (h*8) + 2 norms.
+        let expected_core = 4 * h * h + h * 8 + 2 * h;
+        assert_eq!(core, expected_core);
+    }
+
+    #[test]
+    fn dense_resident_core_is_the_whole_layer_ffn() {
+        let json = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.expert_params(), None);
+        let h = 16u64;
+        // Dense: attn + full SwiGLU (3*h*inter) + 2 norms.
+        assert_eq!(c.resident_layer_params(), 4 * h * h + 3 * h * 64 + 2 * h);
     }
 }

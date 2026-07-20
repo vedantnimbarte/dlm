@@ -151,8 +151,6 @@ struct GpuLayer {
     q_bias: Option<DeviceBuffer>,
     k_bias: Option<DeviceBuffer>,
     v_bias: Option<DeviceBuffer>,
-    kv_keys: DeviceBuffer,
-    kv_values: DeviceBuffer,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -160,7 +158,7 @@ struct GpuLayer {
 }
 
 impl GpuLayer {
-    fn upload(t: &LayerTensors, kv_buffer_len: usize) -> Result<Self> {
+    fn upload(t: &LayerTensors) -> Result<Self> {
         let ffn = t.dense_ffn()?;
         Ok(Self {
             q_proj: DeviceBuffer::from_bytes(t.q_proj.as_bytes(), t.q_proj.len())?,
@@ -175,8 +173,6 @@ impl GpuLayer {
             q_bias: upload_bias(t.q_bias.as_ref())?,
             k_bias: upload_bias(t.k_bias.as_ref())?,
             v_bias: upload_bias(t.v_bias.as_ref())?,
-            kv_keys: DeviceBuffer::new(kv_buffer_len)?,
-            kv_values: DeviceBuffer::new(kv_buffer_len)?,
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
         })
@@ -206,11 +202,10 @@ impl GpuKernel {
     /// buffers sized for up to `max_kv_tokens` positions.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>, max_kv_tokens: usize) -> Result<Self> {
         let cap = max_kv_tokens.max(1);
-        let kv_buffer_len = cap * cfg.kv_dim();
         let mut gpu_layers = Vec::with_capacity(layers.len());
         for layer in &layers {
             layer.validate(&cfg)?;
-            gpu_layers.push(GpuLayer::upload(layer, kv_buffer_len)?);
+            gpu_layers.push(GpuLayer::upload(layer)?);
         }
         let inv_freq = DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
             cfg.head_dim,
@@ -263,6 +258,10 @@ impl ComputeKernel for GpuKernel {
             )));
         }
 
+        // Per-session K/V (owned by this sequence's KvLayerCache, not the shared
+        // kernel), so concurrent batched requests keep independent history.
+        let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens)?;
+
         // The hidden state stays resident on the device for the whole layer stack:
         // upload the host vector once before the first layer, chain every layer
         // through the same persistent buffer on the (in-order) default stream, and
@@ -304,8 +303,8 @@ impl ComputeKernel for GpuKernel {
                 bias_ptr(&w.v_bias),
                 self.inv_freq.as_ptr(),
                 d_hidden.as_mut_ptr(),
-                w.kv_keys.as_mut_ptr(),
-                w.kv_values.as_mut_ptr(),
+                kv_keys,
+                kv_values,
                 num_positions as i32,
                 position as i32,
             )

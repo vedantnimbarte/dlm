@@ -663,13 +663,22 @@ pub fn build_streaming_gpu_generator(
     max_context: u32,
     resident_layers: usize,
     ram_cache_bytes: usize,
+    expert_cache_bytes: usize,
 ) -> Result<Generator<crate::forward::StreamingGpuKernel<CachedLayerSource<MmapLayerSource>>>> {
     let p = load_streaming_pieces(store, config, max_context)?;
     let cfg = p.source.cfg;
     let max_kv_tokens = p.kv_blocks as usize * p.kv_config.block_size as usize;
+    // Bound the routed-expert VRAM cache by the budget, not an unbounded count —
+    // a 128-expert model would otherwise OOM the card (see B2). `None` for dense.
+    let expert_cap = config.expert_cache_capacity(expert_cache_bytes as u64);
     let source = CachedLayerSource::new(p.source, ram_cache_bytes);
-    let kernel =
-        crate::forward::StreamingGpuKernel::new(cfg, source, max_kv_tokens, resident_layers)?;
+    let kernel = crate::forward::StreamingGpuKernel::new(
+        cfg,
+        source,
+        max_kv_tokens,
+        resident_layers,
+        expert_cap,
+    )?;
     Generator::new(
         kernel,
         p.embedding,
