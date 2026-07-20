@@ -486,6 +486,7 @@ impl LayerTensors {
 
     /// The MoE block (router + routed experts + optional shared expert), or an
     /// error if this layer is dense.
+    #[allow(clippy::type_complexity)] // a borrow-tuple of the four MoE parts; a struct would only add indirection
     pub fn moe(&self) -> Result<(&Weights, &[ExpertFfn], Option<&ExpertFfn>, Option<&Weights>)> {
         match &self.ffn {
             Ffn::Moe { router, experts, shared, shared_gate } => {

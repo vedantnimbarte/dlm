@@ -560,7 +560,7 @@ impl ModelConfig {
         let m = self.moe.as_ref()?;
         let per_expert =
             (self.expert_params()? as f64 * self.quant.bytes_per_param()).ceil() as u64;
-        let fit = if per_expert == 0 { 0 } else { (budget_bytes / per_expert) as usize };
+        let fit = budget_bytes.checked_div(per_expert).unwrap_or(0) as usize;
         let lo = m.experts_per_tok as usize;
         let hi = m.num_experts as usize * self.num_layers as usize;
         Some(fit.clamp(lo, hi))
