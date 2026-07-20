@@ -13,6 +13,12 @@ set -eu
 
 REPO="vedantnimbarte/dlm"
 BIN="dlm"
+# minisign public key for release authenticity. The sha256 check proves the
+# download is intact; a signature proves it came from whoever holds this key.
+# Empty until a signing key is published for the project (see release.yml) —
+# while empty, signature verification is skipped and only the checksum applies.
+# Override with DLM_MINISIGN_PUBKEY to pin your own key.
+MINISIGN_PUBKEY="${DLM_MINISIGN_PUBKEY:-}"
 INSTALL_DIR="${DLM_INSTALL_DIR:-$HOME/.local/bin}"
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -115,11 +121,30 @@ Install one (coreutils/perl) and re-run, or set DLM_SKIP_CHECKSUM=1 to install u
 This means the download was corrupted or tampered with. Aborting."
 }
 
+# Verify $tmp/$1's minisign signature against MINISIGN_PUBKEY. The checksum
+# already guarantees integrity; this adds authenticity (it came from the key
+# holder). Opt-in and best-effort: skipped when no key is configured or minisign
+# isn't installed, but a *present* signature that fails to verify aborts.
+verify_signature() {
+  a="$1"
+  [ -n "$MINISIGN_PUBKEY" ] || return 0
+  if ! command -v minisign >/dev/null 2>&1; then
+    info "note: minisign not installed — skipping signature (authenticity) check; sha256 integrity still verified. Install minisign to enable it."
+    return 0
+  fi
+  download "https://github.com/${REPO}/releases/latest/download/${a}.minisig" "$tmp/$a.minisig"
+  printf '%s\n' "$MINISIGN_PUBKEY" >"$tmp/dlm.pub"
+  minisign -Vm "$tmp/$a" -p "$tmp/dlm.pub" -x "$tmp/$a.minisig" >/dev/null 2>&1 \
+    || err "signature verification failed for $a — it is not signed by the expected key. Aborting."
+  info "release signature verified"
+}
+
 # Download + verify + extract the named asset into $tmp; sets $tmp/$BIN.
 fetch() {
   a="$1"
   download "https://github.com/${REPO}/releases/latest/download/${a}" "$tmp/$a"
   verify "$a"
+  verify_signature "$a"
   tar -xzf "$tmp/$a" -C "$tmp" || err "extract failed — is there a published release for ${a}?"
   [ -f "$tmp/$BIN" ] || err "binary '$BIN' not found in ${a}"
 }
