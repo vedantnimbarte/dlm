@@ -305,6 +305,30 @@ fn parse_rope_scaling(r: &RawRopeScaling) -> Result<Option<RopeScaling>> {
                 1.0
             }),
         })),
+        // The remaining HF variants are refused with the specific reason, so a
+        // user hitting one knows what is missing rather than just that it is.
+        // Running any of them as plain RoPE produces fluent-looking nonsense past
+        // the original context length, so none is silently approximated.
+        "longrope" | "su" => Err(DlmError::InvalidConfig(format!(
+            "rope_scaling type {other:?} (Phi-3 long-context) is not implemented: it needs \
+             per-dimension short_factor/long_factor arrays, which dlm's inverse-frequency \
+             table does not yet carry. Use a Phi-3 checkpoint at its base context, or run \
+             a model with \"linear\", \"llama3\", or \"yarn\" scaling.",
+            other = kind
+        ))),
+        "dynamic" => Err(DlmError::InvalidConfig(
+            "rope_scaling type \"dynamic\" (dynamic NTK) is not implemented: its frequencies \
+             depend on the *current* sequence length, but dlm precomputes one inverse-frequency \
+             table per model and uploads it to the device once. Supporting it means recomputing \
+             (and re-uploading) that table as the sequence grows. Use \"linear\", \"llama3\", or \
+             \"yarn\"."
+                .into(),
+        )),
+        "mrope" => Err(DlmError::InvalidConfig(
+            "rope_scaling type \"mrope\" is multimodal (Qwen2-VL) and has no meaning for a \
+             text-only engine; dlm does not run vision checkpoints."
+                .into(),
+        )),
         other => Err(DlmError::InvalidConfig(format!(
             "rope_scaling type {other:?} is not implemented; dlm supports \"linear\", \"llama3\", \
              and \"yarn\". Running this model without its trained RoPE scaling would produce \

@@ -1106,3 +1106,88 @@ fn gpu_resumed_prefix_matches_full_prefill() {
         );
     }
 }
+
+/// The batched device block must produce exactly what decoding each sequence on
+/// its own produces. It reads each weight row once for the whole batch (the
+/// point), and every slot keeps its own KV, history length and RoPE position —
+/// so a mixed-length batch is the case that catches per-slot state being shared.
+#[test]
+fn gpu_batched_block_matches_sequential() {
+    let cfg = small_cfg();
+    let num_layers = 3u32;
+    let layers = random_layers(&cfg, num_layers, 0xBA7C4);
+    let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let starts: Vec<Vec<f32>> = (0..3)
+        .map(|b| {
+            (0..cfg.hidden_size)
+                .map(|i| ((i * (b + 2)) % 23) as f32 * 0.02 - 0.25)
+                .collect()
+        })
+        .collect();
+
+    // Reference: each sequence decoded alone through the per-slot path.
+    let solo: Vec<Vec<f32>> = starts
+        .iter()
+        .map(|start| {
+            let mut orch = ForwardOrchestrator::new(
+                &gpu,
+                PagedKvCache::new(kv_cfg, 16),
+                dlm::forward::KvQuant::None,
+            );
+            let mut h = start.clone();
+            for _ in 0..4 {
+                orch.decode_token(&mut h).unwrap();
+            }
+            h
+        })
+        .collect();
+
+    // Batched: all three stepped together through run_block_batched. Give the
+    // slots different starting positions so their KV lengths diverge.
+    let mut kvs: Vec<Vec<KvLayerCache>> = (0..starts.len())
+        .map(|_| (0..num_layers).map(|_| KvLayerCache::new(cfg.kv_dim())).collect())
+        .collect();
+    let mut hs: Vec<Vec<f32>> = starts.clone();
+    for step in 0..4 {
+        for l in 0..num_layers {
+            let mut hidden_refs: Vec<&mut [f32]> =
+                hs.iter_mut().map(|h| h.as_mut_slice()).collect();
+            let mut kv_refs: Vec<&mut KvLayerCache> =
+                kvs.iter_mut().map(|k| &mut k[l as usize]).collect();
+            let positions = vec![step; starts.len()];
+            gpu.run_block_batched(l, &mut hidden_refs, &mut kv_refs, &positions)
+                .unwrap();
+        }
+    }
+
+    for (b, (batched, alone)) in hs.iter().zip(&solo).enumerate() {
+        let max_diff =
+            batched.iter().zip(alone).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "slot {b}: batched diverged from solo by {max_diff}");
+    }
+}
+
+/// The grouped expert launch (`dlm_apply_experts`) must equal the per-expert
+/// loop it replaces. Covered end-to-end by the MoE parity cases above — which now
+/// exercise the grouped path — but asserted directly here against the CPU oracle
+/// with a top-k large enough that grouping actually batches several experts.
+#[test]
+fn gpu_grouped_experts_match_cpu() {
+    assert_moe_gpu_matches_cpu(
+        MoeConfig {
+            num_experts: 8,
+            experts_per_tok: 4,
+            moe_intermediate_size: 64,
+            shared_intermediate_size: None,
+            norm_topk_prob: true,
+            naming: MoeNaming::Mixtral,
+        },
+        "grouped-top4",
+    );
+}

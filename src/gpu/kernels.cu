@@ -470,6 +470,201 @@ extern "C" int dlm_decode_block(
     return (int)e;
 }
 
+// ── Batched decode block (many sequences, one weight read) ─────────────────
+//
+// Decoding B sequences by calling `dlm_decode_block` B times reads every weight
+// matrix B times. Decode is memory-bound on exactly those reads, so the win here
+// is not fusing arithmetic but **streaming each weight row once and using it for
+// all B slots**: `matvec_batched_kernel` holds a row in registers across the
+// batch loop, turning B GEMVs into one GEMM-shaped pass.
+//
+// Per-slot state that cannot be batched — each sequence has its own KV buffer,
+// history length and position — stays per-slot: the norms, RoPE and attention run
+// once per sequence, which is cheap (they touch activations, not weights).
+#define DLM_MAX_BATCH 16
+typedef struct { float* p[DLM_MAX_BATCH]; } DlmSlots;
+typedef struct { int v[DLM_MAX_BATCH]; } DlmInts;
+
+// out[b*out_dim + o] = dot(W[o], x + b*in_dim) (+ bias[o]) for all b.
+// One block per output row; the row is read once and reused across the batch.
+template <int DT>
+__global__ void matvec_batched_kernel(const void* W, const float* x, const float* bias,
+                                      float* out, int out_dim, int in_dim, int group_size,
+                                      int batch) {
+    __shared__ float partial[MATVEC_THREADS];
+    int o = blockIdx.x;
+    if (o >= out_dim) return;
+    long base = (long)o * in_dim;
+    long n = (long)out_dim * in_dim;
+
+    for (int b = 0; b < batch; ++b) {
+        const float* xb = x + (long)b * in_dim;
+        float acc = 0.0f;
+        for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+            acc += load_w<DT>(W, base + i, n, group_size) * xb[i];
+        }
+        partial[threadIdx.x] = acc;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            out[(long)b * out_dim + o] = partial[0] + (bias ? bias[o] : 0.0f);
+        }
+        __syncthreads();
+    }
+}
+
+static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
+                                  float* out, int out_dim, int in_dim, int group_size, int batch) {
+    switch (dt) {
+        case DLM_W_BF16:
+            matvec_batched_kernel<DLM_W_BF16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+            break;
+        case DLM_W_F16:
+            matvec_batched_kernel<DLM_W_F16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+            break;
+        case DLM_W_INT4:
+            matvec_batched_kernel<DLM_W_INT4><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+            break;
+        case DLM_W_INT8:
+            matvec_batched_kernel<DLM_W_INT8><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+            break;
+        default:
+            matvec_batched_kernel<DLM_W_F32><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+            break;
+    }
+}
+
+// rmsnorm over B rows: one block per row (grid.x = batch).
+__global__ void rmsnorm_batched_kernel(const float* x, const float* w, float* out, int n,
+                                       float eps) {
+    __shared__ float partial[RMS_THREADS];
+    __shared__ float inv_rms;
+    const float* xb = x + (long)blockIdx.x * n;
+    float* ob = out + (long)blockIdx.x * n;
+
+    float ss = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) ss += xb[k] * xb[k];
+    partial[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_rms = rsqrtf(partial[0] / (float)n + eps);
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ob[i] = xb[i] * inv_rms * w[i];
+}
+
+// SwiGLU/GeGLU over the whole [batch, inter] plane.
+__global__ void swiglu_batched_kernel(const float* gate, const float* up, float* out, long n,
+                                      int act) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = dlm_activate(gate[i], act) * up[i];
+}
+
+// x[i] += y[i] over the whole [batch, n] plane.
+__global__ void add_inplace_batched_kernel(float* x, const float* y, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
+// One decode block for `batch` sequences at once. `x` is a contiguous
+// [batch, hidden_size] device block; each slot keeps its own KV buffers, history
+// length and RoPE position. Op-for-op identical to calling `dlm_decode_block`
+// per slot — only the weight traffic changes. `batch <= DLM_MAX_BATCH`.
+extern "C" int dlm_decode_block_batched(
+    int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
+    int inter, float rms_eps, int w_dtype, int w_group_size,
+    const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
+    const void* gate_proj, const void* up_proj, const void* down_proj,
+    const float* in_norm, const float* post_norm,
+    const float* q_bias, const float* k_bias, const float* v_bias,
+    const float* q_norm, const float* k_norm,
+    const float* inv_freq,
+    float* x,
+    const DlmSlots* kv_keys, const DlmSlots* kv_values,
+    const DlmInts* num_positions, const DlmInts* positions,
+    int batch,
+    int sliding_window, int activation, float rope_mscale,
+    float attn_scale, float attn_softcap,
+    const float* pre_ffn_norm, const float* post_ffn_norm)
+{
+    const int B = 256;
+    if (batch <= 0) return 0;
+    if (batch > DLM_MAX_BATCH) return (int)cudaErrorInvalidValue;
+    if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
+    const int gemma2 = (pre_ffn_norm != 0);
+
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(0, batch * hidden_size)
+    DLM_ALLOC(1, batch * q_dim)
+    DLM_ALLOC(2, batch * kv_dim)
+    DLM_ALLOC(3, batch * kv_dim)
+    DLM_ALLOC(4, batch * q_dim)
+    DLM_ALLOC(5, batch * hidden_size)
+    DLM_ALLOC(6, batch * hidden_size)
+    DLM_ALLOC(7, batch * inter)
+    DLM_ALLOC(8, batch * inter)
+    DLM_ALLOC(9, batch * inter)
+    DLM_ALLOC(10, batch * hidden_size)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+    float *normed = g_scratch[0], *q = g_scratch[1], *k = g_scratch[2];
+    float *v = g_scratch[3], *ctx = g_scratch[4], *attn_out = g_scratch[5];
+    float *normed2 = g_scratch[6], *gate = g_scratch[7], *up = g_scratch[8];
+    float *inter_buf = g_scratch[9], *down = g_scratch[10];
+
+    // Attention sublayer. Projections are batched (one weight read for all
+    // slots); everything downstream of them is per-slot state.
+    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    launch_matvec_batched(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size, batch);
+    launch_matvec_batched(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size, batch);
+    launch_matvec_batched(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size, batch);
+
+    for (int b = 0; b < batch; ++b) {
+        float* qb = q + (long)b * q_dim;
+        float* kb = k + (long)b * kv_dim;
+        float* vb = v + (long)b * kv_dim;
+        float* ctxb = ctx + (long)b * q_dim;
+        int np = num_positions->v[b];
+        int pos = positions->v[b];
+        int total_pos = np + 1;
+
+        if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(qb, q_norm, num_heads, head_dim, rms_eps);
+        if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(kb, k_norm, num_kv_heads, head_dim, rms_eps);
+        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(qb, num_heads, head_dim, pos, inv_freq, rope_mscale);
+        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(kb, num_kv_heads, head_dim, pos, inv_freq, rope_mscale);
+        copy_kernel<<<grid_for(kv_dim, B), B>>>(kb, kv_keys->p[b] + (long)np * kv_dim, kv_dim);
+        copy_kernel<<<grid_for(kv_dim, B), B>>>(vb, kv_values->p[b] + (long)np * kv_dim, kv_dim);
+        attention_kernel<<<grid_for(num_heads, B), B>>>(qb, kv_keys->p[b], kv_values->p[b], ctxb,
+                                                        num_heads, num_kv_heads, head_dim,
+                                                        total_pos, sliding_window, attn_scale,
+                                                        attn_softcap);
+    }
+
+    launch_matvec_batched(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size, batch);
+    if (gemma2) {
+        rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
+    }
+    add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, attn_out, (long)batch * hidden_size);
+
+    // MLP sublayer — all batched.
+    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, gemma2 ? pre_ffn_norm : post_norm, normed2, hidden_size, rms_eps);
+    launch_matvec_batched(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size, batch);
+    launch_matvec_batched(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size, batch);
+    swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
+    launch_matvec_batched(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size, batch);
+    if (gemma2) {
+        rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
+    }
+    add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, down, (long)batch * hidden_size);
+    return (int)cudaGetLastError();
+}
+
 // ── Mixture-of-Experts device path ─────────────────────────────────────────
 //
 // A dense layer runs in one `dlm_decode_block` call. A MoE layer cannot: the
@@ -586,6 +781,155 @@ extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_g
 // Apply one expert to the residual: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.
 // Reads normed2 from scratch (left by dlm_moe_attn). `w_dtype`/`w_group_size`
 // describe the expert's weights, which may differ from the core's.
+
+// ── Grouped expert application (the top-k experts in one launch each) ───────
+//
+// `dlm_apply_expert` runs 3 kernels per selected expert. With top-k = 2..8 and
+// 60 layers that is a few hundred launches per token, each with fixed overhead,
+// and each grid is small enough to leave the GPU underutilized. The grouped form
+// below does the same arithmetic with **3 launches total**, giving every launch a
+// k-times-larger grid. It is op-for-op the same math as the loop — only the
+// summation order over experts changes (all k accumulated before the store
+// instead of one at a time), which is why the parity tolerance already covers it.
+//
+// Expert pointers travel by value inside a small struct: CUDA copies kernel
+// parameters to the device for us, so no separate pointer-array upload is needed.
+#define DLM_MAX_TOPK 16
+typedef struct { const void* p[DLM_MAX_TOPK]; } DlmPtrs;
+typedef struct { float w[DLM_MAX_TOPK]; } DlmWeights;
+
+// out[e*out_dim + row] = dot(W_e[row], x)  for every (expert, row) pair.
+// One block per (e, row); threads stride the row and tree-reduce, exactly like
+// `matvec_kernel`.
+template <int DT>
+__global__ void grouped_matvec_kernel(DlmPtrs W, const float* x, float* out,
+                                      int out_dim, int in_dim, int group_size) {
+    __shared__ float partial[MATVEC_THREADS];
+    int e = blockIdx.x / out_dim;
+    int row = blockIdx.x - e * out_dim;
+    const void* We = W.p[e];
+    long base = (long)row * in_dim;
+    long n = (long)out_dim * in_dim;
+
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        acc += load_w<DT>(We, base + i, n, group_size) * x[i];
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[(long)e * out_dim + row] = partial[0];
+}
+
+static void launch_grouped_matvec(int dt, DlmPtrs W, const float* x, float* out,
+                                  int n_experts, int out_dim, int in_dim, int group_size) {
+    int blocks = n_experts * out_dim;
+    switch (dt) {
+        case DLM_W_BF16:
+            grouped_matvec_kernel<DLM_W_BF16><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
+            break;
+        case DLM_W_F16:
+            grouped_matvec_kernel<DLM_W_F16><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
+            break;
+        case DLM_W_INT4:
+            grouped_matvec_kernel<DLM_W_INT4><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
+            break;
+        case DLM_W_INT8:
+            grouped_matvec_kernel<DLM_W_INT8><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
+            break;
+        default:
+            grouped_matvec_kernel<DLM_W_F32><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
+            break;
+    }
+}
+
+// x[h] += sum_e weight[e] * dot(down_e[h], inter_buf + e*inter)
+//
+// One block per hidden row, reducing over the whole (expert, inter) plane, so the
+// k experts' down-projections and their weighted sum collapse into one launch
+// with no atomics and no per-expert temporary.
+template <int DT>
+__global__ void grouped_down_kernel(DlmPtrs W, DlmWeights weights, const float* inter_buf,
+                                    float* x, int n_experts, int hidden, int inter,
+                                    int group_size) {
+    __shared__ float partial[MATVEC_THREADS];
+    int h = blockIdx.x;
+    long n = (long)hidden * inter;
+    long total = (long)n_experts * inter;
+
+    float acc = 0.0f;
+    for (long t = threadIdx.x; t < total; t += blockDim.x) {
+        int e = (int)(t / inter);
+        int i = (int)(t - (long)e * inter);
+        acc += weights.w[e] * load_w<DT>(W.p[e], (long)h * inter + i, n, group_size) * inter_buf[t];
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) x[h] += partial[0];
+}
+
+static void launch_grouped_down(int dt, DlmPtrs W, DlmWeights weights, const float* inter_buf,
+                                float* x, int n_experts, int hidden, int inter, int group_size) {
+    switch (dt) {
+        case DLM_W_BF16:
+            grouped_down_kernel<DLM_W_BF16><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
+            break;
+        case DLM_W_F16:
+            grouped_down_kernel<DLM_W_F16><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
+            break;
+        case DLM_W_INT4:
+            grouped_down_kernel<DLM_W_INT4><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
+            break;
+        case DLM_W_INT8:
+            grouped_down_kernel<DLM_W_INT8><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
+            break;
+        default:
+            grouped_down_kernel<DLM_W_F32><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
+            break;
+    }
+}
+
+// Apply all `n_experts` selected experts to `normed2`, accumulating each one's
+// gate-weighted SwiGLU output into `x`. Equivalent to calling `dlm_apply_expert`
+// once per expert; every expert must share `w_dtype`/`w_group_size` (they come
+// from one checkpoint). `n_experts` must be <= DLM_MAX_TOPK — the caller falls
+// back to the per-expert loop otherwise.
+extern "C" int dlm_apply_experts(int hidden_size, int inter, int n_experts,
+                                 int w_dtype, int w_group_size,
+                                 const DlmPtrs* gate, const DlmPtrs* up, const DlmPtrs* down,
+                                 const DlmWeights* weights, float* x, int activation)
+{
+    const int B = 256;
+    if (n_experts <= 0) return 0;
+    if (n_experts > DLM_MAX_TOPK) return (int)cudaErrorInvalidValue;
+
+    long span = (long)n_experts * inter;
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(7, (int)span)
+    DLM_ALLOC(8, (int)span)
+    DLM_ALLOC(9, (int)span)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+
+    float *g = g_scratch[7], *u = g_scratch[8], *inter_buf = g_scratch[9];
+    float *normed2 = g_scratch[MOE_NORMED2];
+
+    launch_grouped_matvec(w_dtype, *gate, normed2, g, n_experts, inter, hidden_size, w_group_size);
+    launch_grouped_matvec(w_dtype, *up, normed2, u, n_experts, inter, hidden_size, w_group_size);
+    // Elementwise over the whole (expert, inter) plane in one launch.
+    swiglu_kernel<<<grid_for((int)span, B), B>>>(g, u, inter_buf, (int)span, activation);
+    launch_grouped_down(w_dtype, *down, *weights, inter_buf, x, n_experts, hidden_size, inter, w_group_size);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_group_size,
                                 const void* gate, const void* up, const void* down,
                                 float weight, float* x, int activation)

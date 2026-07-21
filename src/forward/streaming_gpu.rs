@@ -42,7 +42,8 @@ use std::thread::JoinHandle;
 // kernel signature changed — a silent mismatch the compiler only warns about.
 use crate::forward::gpu::{
     bias_ptr, dlm_apply_expert, dlm_decode_block, dlm_dense_ffn, dlm_mla_attn, dlm_moe_attn,
-    dlm_moe_matvec, dlm_moe_norm, upload_bias, upload_weight, GpuMla,
+    dlm_apply_experts, dlm_moe_matvec, dlm_moe_norm, upload_bias, upload_weight, DlmPtrs,
+    DlmWeights, GpuMla, DLM_MAX_TOPK,
 };
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -802,33 +803,73 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             return Err(DlmError::Gpu { api: "dlm_moe_matvec", code });
         }
 
-        // 3. Stream + apply each selected expert, scaled by its gate weight.
-        // ponytail: one kernel launch per selected expert (top-k, usually 2). A
-        // grouped/batched expert GEMM — all top-k gate/up/down in a single launch —
-        // would cut launch overhead, but a fused kernel has no CPU oracle to check
-        // against, so it's deferred to hardware where it can be parity-tested
-        // against this loop. This form stays op-for-op equal to the CPU `moe_ffn`.
+        // 3. Stream in the selected experts, then apply them all in one grouped
+        // launch (`dlm_apply_experts`: 3 kernels total rather than 3 per expert,
+        // each with a k-times-larger grid). Same arithmetic as applying them one
+        // at a time — only the summation order over experts differs.
         let inter = m.moe_intermediate_size as i32;
-        for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+        let selected = route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob);
+        let mut experts = Vec::with_capacity(selected.len());
+        for (e, weight) in selected {
             // Feed the prefetch heuristic: next token's hot set predicts this one's.
             self.shared.history.lock().unwrap().record(layer, e as u32);
-            let expert = self.shared.ensure_expert(layer, e as u32)?;
+            experts.push((self.shared.ensure_expert(layer, e as u32)?, weight));
+        }
+        // The grouped kernel takes one dtype for the whole group and a bounded
+        // expert count; both hold for every real checkpoint (one export, top-k
+        // <= 8). Anything else falls back to the per-expert path rather than
+        // silently applying the wrong decode.
+        let uniform_dtype = experts.windows(2).all(|w| {
+            w[0].0.w_dtype == w[1].0.w_dtype && w[0].0.w_group_size == w[1].0.w_group_size
+        });
+        if !experts.is_empty() && experts.len() <= DLM_MAX_TOPK && uniform_dtype {
+            let mut gate = DlmPtrs { p: [std::ptr::null(); DLM_MAX_TOPK] };
+            let mut up = DlmPtrs { p: [std::ptr::null(); DLM_MAX_TOPK] };
+            let mut down = DlmPtrs { p: [std::ptr::null(); DLM_MAX_TOPK] };
+            let mut weights = DlmWeights { w: [0.0; DLM_MAX_TOPK] };
+            for (i, (expert, weight)) in experts.iter().enumerate() {
+                gate.p[i] = expert.gate.as_ptr() as *const c_void;
+                up.p[i] = expert.up.as_ptr() as *const c_void;
+                down.p[i] = expert.down.as_ptr() as *const c_void;
+                weights.w[i] = *weight;
+            }
             let code = unsafe {
-                dlm_apply_expert(
+                dlm_apply_experts(
                     cfg.hidden_size as i32,
                     inter,
-                    expert.w_dtype,
-                    expert.w_group_size,
-                    expert.gate.as_ptr() as *const c_void,
-                    expert.up.as_ptr() as *const c_void,
-                    expert.down.as_ptr() as *const c_void,
-                    weight,
+                    experts.len() as i32,
+                    experts[0].0.w_dtype,
+                    experts[0].0.w_group_size,
+                    &gate,
+                    &up,
+                    &down,
+                    &weights,
                     d_hidden.as_mut_ptr(),
                     cfg.activation.code(),
                 )
             };
             if code != 0 {
-                return Err(DlmError::Gpu { api: "dlm_apply_expert", code });
+                return Err(DlmError::Gpu { api: "dlm_apply_experts", code });
+            }
+        } else {
+            for (expert, weight) in &experts {
+                let code = unsafe {
+                    dlm_apply_expert(
+                        cfg.hidden_size as i32,
+                        inter,
+                        expert.w_dtype,
+                        expert.w_group_size,
+                        expert.gate.as_ptr() as *const c_void,
+                        expert.up.as_ptr() as *const c_void,
+                        expert.down.as_ptr() as *const c_void,
+                        *weight,
+                        d_hidden.as_mut_ptr(),
+                        cfg.activation.code(),
+                    )
+                };
+                if code != 0 {
+                    return Err(DlmError::Gpu { api: "dlm_apply_expert", code });
+                }
             }
         }
 
