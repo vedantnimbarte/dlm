@@ -556,7 +556,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
             let secret = cluster_secret(&args);
             let worker =
-                dlm::distributed::Worker::new(parts.cfg, parts.layers)?.with_auth(secret.clone());
+                dlm::distributed::Worker::new(parts.cfg, parts.layers)?
+                    .with_auth(secret.clone())
+                    .with_io_timeout(args.worker_timeout_secs.map(std::time::Duration::from_secs));
             let listener = dlm::distributed::worker::bind(&listen)?;
             println!();
             println!("worker node  : listening on {listen} ({} layers)", config.num_layers);
@@ -1351,11 +1353,28 @@ fn report_plan(
 /// Cap on the *defaulted* host-RAM layer cache. An explicit `--ram-cache-gb`
 /// overrides it in either direction.
 ///
-/// ponytail: a fixed ceiling, because dlm has no dependency that can ask the OS
-/// how much RAM is free. Sized so the default can hold a small quantized model
-/// outright while never silently claiming a big fraction of a modest box; raise
-/// it explicitly if you have the memory.
+/// Floor for the cap when the platform will not report its RAM — sized so the
+/// default can still hold a small quantized model outright while never silently
+/// claiming a big fraction of a modest box.
 const DEFAULT_RAM_CACHE_CAP: u64 = 4 * GIB;
+
+/// Share of physical RAM the *defaulted* cache may claim. The cache duplicates
+/// layer weights on top of the page cache, so it stays a minority of the box.
+const RAM_CACHE_SHARE: u64 = 4; // one quarter
+
+/// Ceiling on the defaulted host-RAM layer cache, scaled to the machine.
+///
+/// Asks the OS for physical RAM ([`total_ram`](dlm::memory::page::total_ram) —
+/// the same direct platform call [`page_size`] already uses, no dependency) and
+/// allows a quarter of it, never less than [`DEFAULT_RAM_CACHE_CAP`]. A fixed
+/// ceiling either wasted a large machine or overcommitted a small one; this does
+/// neither. An explicit `--ram-cache-gb` still overrides it in both directions.
+fn ram_cache_cap() -> u64 {
+    match dlm::memory::page::total_ram() {
+        Some(total) => (total / RAM_CACHE_SHARE).max(DEFAULT_RAM_CACHE_CAP),
+        None => DEFAULT_RAM_CACHE_CAP,
+    }
+}
 
 /// Host-RAM budget for the streaming layer cache.
 ///
@@ -1389,7 +1408,7 @@ fn resolve_ram_cache_bytes(args: &ServeArgs, quant: QuantScheme, plan: &VramPlan
     // reserves RAM the cache never fills.
     let whole_model = plan.per_layer_weight_bytes * plan.num_layers as u64;
     let with_headroom = whole_model + whole_model / 4; // +25%
-    with_headroom.min(DEFAULT_RAM_CACHE_CAP) as usize
+    with_headroom.min(ram_cache_cap()) as usize
 }
 
 fn resolve_free_bytes(vram_budget_gb: Option<f64>) -> (u64, String) {

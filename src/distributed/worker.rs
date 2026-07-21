@@ -21,10 +21,11 @@ use std::time::Duration;
 /// otherwise open connections until the process runs out of threads/memory).
 const MAX_CONNECTIONS: usize = 64;
 
-/// Per-connection read/write timeout. A shard's forward pass for one token is
-/// sub-second even on CPU, so a stalled or slow-loris peer that goes quiet for
-/// this long is dropped rather than pinning a thread forever.
-// ponytail: fixed 30s; expose --worker-timeout-secs if a real deployment needs it.
+/// Default per-connection read/write timeout. A shard's forward pass for one
+/// token is sub-second even on CPU, so a stalled or slow-loris peer that goes
+/// quiet for this long is dropped rather than pinning a thread forever.
+/// Override with `--worker-timeout-secs` (see [`Worker::with_io_timeout`]) when a
+/// deployment's links are slower than that.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Mutable worker state: its shard weights and KV history.
@@ -54,6 +55,8 @@ pub struct Worker {
     state: Arc<Mutex<WorkerState>>,
     hidden_size: usize,
     secret: Option<Arc<String>>,
+    /// Per-connection read/write timeout; defaults to [`IO_TIMEOUT`].
+    io_timeout: Duration,
 }
 
 impl Worker {
@@ -70,6 +73,7 @@ impl Worker {
             state: Arc::new(Mutex::new(WorkerState { cfg, layers, kv })),
             hidden_size,
             secret: None,
+            io_timeout: IO_TIMEOUT,
         })
     }
 
@@ -78,6 +82,19 @@ impl Worker {
     /// network or localhost.
     pub fn with_auth(mut self, secret: Option<String>) -> Self {
         self.secret = secret.map(Arc::new);
+        self
+    }
+
+    /// Override the per-connection read/write timeout (`--worker-timeout-secs`).
+    /// `None`, or a zero duration, keeps the [`IO_TIMEOUT`] default — a worker
+    /// with no timeout at all would let one silent peer pin a thread forever, so
+    /// it is not an option.
+    pub fn with_io_timeout(mut self, timeout: Option<Duration>) -> Self {
+        if let Some(t) = timeout {
+            if !t.is_zero() {
+                self.io_timeout = t;
+            }
+        }
         self
     }
 
@@ -95,9 +112,10 @@ impl Worker {
             let hidden_size = self.hidden_size;
             let secret = self.secret.clone();
             let live = Arc::clone(&live);
+            let io_timeout = self.io_timeout;
             live.fetch_add(1, Ordering::AcqRel);
             std::thread::spawn(move || {
-                handle_connection(stream, state, hidden_size, secret.as_deref());
+                handle_connection(stream, state, hidden_size, secret.as_deref(), io_timeout);
                 live.fetch_sub(1, Ordering::AcqRel);
             });
         }
@@ -110,9 +128,10 @@ fn handle_connection(
     state: Arc<Mutex<WorkerState>>,
     hidden_size: usize,
     secret: Option<&String>,
+    io_timeout: Duration,
 ) {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(io_timeout));
+    let _ = stream.set_write_timeout(Some(io_timeout));
 
     // When auth is required the first frame must be a matching Auth; anything
     // else closes the connection before any compute is done.

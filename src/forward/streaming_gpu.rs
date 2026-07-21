@@ -229,8 +229,11 @@ impl GpuWeights {
     ///   staging layout doesn't fit.
     ///
     /// ponytail: plain `from_bytes` uploads, not the pinned async staging the
-    /// dense path uses. Wire these through staging too if their upload latency
-    /// shows up in profiles.
+    /// dense path uses, so these uploads do not overlap compute. Deliberately
+    /// left until measured: the fix is to widen the staging layout to a variable
+    /// tensor list, which is only worth it if MoE/MLA core-upload latency shows
+    /// up in a profile on real hardware. Trigger: streamed MoE/MLA throughput
+    /// materially below the dense path at the same layer size.
     fn upload_sync(t: &LayerTensors) -> Result<Self> {
         let up = |w: &crate::forward::Weights| DeviceBuffer::from_bytes(w.as_bytes(), w.len());
         let ffn = match &t.ffn {

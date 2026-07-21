@@ -1314,8 +1314,12 @@ pub(crate) fn matvec_native(w: &Weights, x: &[f32], out_dim: usize, in_dim: usiz
 /// The LM head is [vocab≈128k, hidden] — ~1 GB streamed per token — and
 /// single-threaded it dominates decode latency (the GPU path still computes
 /// logits on the CPU). Output rows are independent, so split them across cores.
-/// ponytail: parallelize only large GEMVs; small per-layer projections aren't
-/// worth the thread hop. Threshold in MACs, not a tuned constant.
+/// Only large GEMVs are parallelized: below the threshold the thread hop costs
+/// more than the work it distributes, so a small per-layer projection is faster
+/// single-threaded. The threshold is expressed in MACs (`out_dim × in_dim`)
+/// rather than a tuned constant, so it tracks the actual work rather than one
+/// machine's timings. Both paths must produce identical results — pinned by
+/// `matvec_rows_agrees_across_the_parallel_threshold`.
 fn matvec_rows<F>(out_dim: usize, in_dim: usize, x: &[f32], row_dot: F) -> Vec<f32>
 where
     F: Fn(usize, &[f32]) -> f32 + Sync,
@@ -2110,6 +2114,35 @@ mod tests {
         let mut win_big = base;
         win_big.sliding_window = Some(10);
         approx(&attention(&win_big, &q, &kv_all), &full, 1e-6);
+    }
+
+
+    /// `matvec_rows` runs single-threaded below its size threshold and split
+    /// across cores above it. The two paths must agree exactly — a divergence
+    /// would make output depend on how big the matrix happened to be, which is
+    /// the kind of bug that only shows up on one layer of one model.
+    #[test]
+    fn matvec_rows_agrees_across_the_parallel_threshold() {
+        // Straddle the 1<<20 MAC threshold: `small` stays serial, `large` splits.
+        for (out_dim, in_dim) in [(4usize, 8usize), (2048usize, 1024usize)] {
+            let x: Vec<f32> = (0..in_dim).map(|i| ((i % 13) as f32) * 0.031 - 0.2).collect();
+            let row = |r: usize, v: &[f32]| -> f32 {
+                v.iter()
+                    .enumerate()
+                    .map(|(c, &xv)| xv * (((r * 31 + c * 7) % 17) as f32 * 0.01 - 0.08))
+                    .sum()
+            };
+            let got = matvec_rows(out_dim, in_dim, &x, row);
+            // Reference: the same dot products, computed serially right here.
+            let want: Vec<f32> = (0..out_dim).map(|r| row(r, &x)).collect();
+            assert_eq!(got.len(), want.len());
+            for (r, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "{out_dim}x{in_dim} row {r}: parallel {a} vs serial {b}"
+                );
+            }
+        }
     }
 
     /// `row_f32` is the inverse of `append` and the hinge of GPU prefix caching:
