@@ -47,8 +47,11 @@ impl PrefixCache {
 
     /// The snapshot of the longest cached prompt that is a strict prefix of
     /// `prompt` (so there is a non-empty suffix left to prefill).
-    // ponytail: linear scan, fine for a small cache; index by first token if the
-    // cache ever grows large.
+    // Linear scan, deliberately: the cache is hard-bounded by `max_entries` (the
+    // --prefix-cache-size flag) in `insert`, so this is O(configured size), not
+    // O(traffic). Index by first token only if that bound is ever raised to
+    // something large. The bound is enforced by
+    // `prefix_cache_never_exceeds_its_bound`.
     fn longest_prefix(&self, prompt: &[u32]) -> Option<KvSnapshot> {
         self.entries
             .iter()
@@ -400,5 +403,82 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             }
         }
         Ok(results)
+    }
+}
+
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::PrefixCache;
+    use crate::cache::{KvCacheConfig, PagedKvCache};
+    use crate::forward::{ForwardOrchestrator, KvSnapshot, StubKernel};
+
+    /// A throwaway snapshot; these tests exercise the cache's bookkeeping, not
+    /// the KV contents.
+    fn snap() -> KvSnapshot {
+        let kv_cfg = KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            block_size: 16,
+        };
+        let orch = ForwardOrchestrator::new(
+            StubKernel::new(1, 4, 2),
+            PagedKvCache::new(kv_cfg, 4),
+            crate::forward::KvQuant::None,
+        );
+        orch.snapshot()
+    }
+
+    /// `longest_prefix` scans linearly, which is only acceptable because the
+    /// cache is bounded. Pin the bound so that stays true: inserting far more
+    /// entries than the limit must evict, never grow.
+    #[test]
+    fn prefix_cache_never_exceeds_its_bound() {
+        let mut cache = PrefixCache::new(3);
+        for i in 0..50u32 {
+            cache.insert(vec![i, i + 1], snap());
+            assert!(
+                cache.entries.len() <= 3,
+                "cache grew to {} past its bound of 3",
+                cache.entries.len()
+            );
+        }
+        assert_eq!(cache.entries.len(), 3);
+
+        // Size 0 disables it entirely rather than caching one entry.
+        let mut off = PrefixCache::new(0);
+        off.insert(vec![1, 2], snap());
+        assert!(off.entries.is_empty());
+    }
+
+    /// Re-inserting a prompt replaces its entry instead of duplicating it —
+    /// otherwise a hot prompt would evict everything else out of the bound.
+    #[test]
+    fn prefix_cache_replaces_rather_than_duplicates() {
+        let mut cache = PrefixCache::new(4);
+        for _ in 0..5 {
+            cache.insert(vec![7, 8, 9], snap());
+        }
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    /// The match must be a *strict* prefix (a non-empty suffix left to prefill),
+    /// and the longest one available. An exact-length match would leave nothing
+    /// to decode from.
+    #[test]
+    fn longest_prefix_picks_the_longest_strict_prefix() {
+        let mut cache = PrefixCache::new(8);
+        cache.insert(vec![1], snap());
+        cache.insert(vec![1, 2, 3], snap());
+        cache.insert(vec![1, 2], snap());
+        cache.insert(vec![9, 9], snap());
+
+        // Longest strict prefix of [1,2,3,4] is [1,2,3].
+        assert!(cache.longest_prefix(&[1, 2, 3, 4]).is_some());
+        // Exact match is not a *strict* prefix — nothing would be left to prefill.
+        assert!(cache.longest_prefix(&[1]).is_none());
+        // No shared prefix at all.
+        assert!(cache.longest_prefix(&[5, 5, 5]).is_none());
     }
 }

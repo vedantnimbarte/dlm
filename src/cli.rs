@@ -293,6 +293,14 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "ADDRS")]
     pub worker_nodes: Vec<String>,
 
+    /// Per-connection read/write timeout for a worker, in seconds (worker mode).
+    /// A peer that goes quiet for this long is dropped rather than pinning a
+    /// thread. The 30s default suits a LAN; raise it for slow or congested links.
+    /// `0` keeps the default — a worker with no timeout would let one silent peer
+    /// hold a thread forever.
+    #[arg(long, value_name = "SECS")]
+    pub worker_timeout_secs: Option<u64>,
+
     /// Shared secret authenticating the master↔worker link. Set the *same* value
     /// on every worker and the master; the master presents it on each connection
     /// and workers reject peers that don't. Omit only on a fully trusted network
