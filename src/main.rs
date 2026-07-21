@@ -730,21 +730,18 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 /// dies just because no GPU is present. On a CPU-only build, an explicit
 /// `--device gpu` passes through and the downstream `not(cuda-kernels)` arm
 /// reports the clearer "requires --features cuda-kernels" error.
-/// Error for a GPU request on a build without the CUDA compute kernels. On an
-/// AMD (`rocm`) build `--features cuda-kernels` is unsatisfiable — it pulls in
-/// `cuda` — so pointing AMD users at that flag is a dead end. Give them the real
-/// state (AMD compute isn't implemented yet, run on CPU) and keep the
-/// build-flag hint only for a plain CPU build that *could* enable it.
+/// Error for a GPU request on a build without any device compute kernels. Each
+/// vendor gets the flag that actually works for it: on an AMD (`rocm`) build
+/// `--features cuda-kernels` is unsatisfiable — it pulls in `cuda` — so pointing
+/// AMD users there is a dead end; they need `rocm-kernels`.
 fn gpu_compute_unavailable(what: &str) -> DlmError {
-    match gpu::active_vendor() {
-        gpu::GpuVendor::Amd => DlmError::InvalidConfig(format!(
-            "{what} on GPU is not supported on this AMD (ROCm) build — AMD GPU compute is \
-             not implemented yet. Run on CPU (drop --device gpu)."
-        )),
-        _ => DlmError::InvalidConfig(format!(
-            "{what} requires building with `--features cuda-kernels`"
-        )),
-    }
+    let feature = match gpu::active_vendor() {
+        gpu::GpuVendor::Amd => "rocm-kernels",
+        _ => "cuda-kernels",
+    };
+    DlmError::InvalidConfig(format!(
+        "{what} requires building with `--features {feature}`"
+    ))
 }
 
 fn resolve_device(requested: Device) -> Device {
