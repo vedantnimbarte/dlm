@@ -76,6 +76,39 @@ jobs:
       - name: Assert the GPTQ export still decodes to weights that mean something
         run: cargo test --release --test gptq_model -- --nocapture
 
+  # One real `config.json` + `tokenizer.json` per model family.
+  #
+  # `real-model` above proves the engine is right, but only for the one shape it
+  # loads: Qwen — dense, byte-level BPE, no BOS. Every defect found before 0.3.0
+  # hid in exactly the space that leaves uncovered — a Gemma2 config that would
+  # not parse, SentencePiece vocabularies encoded with byte-level rules, an
+  # expert count DeepSeek spells differently — and all of them lived in these two
+  # files, which the in-code fixtures never touch. A green suite said nothing
+  # about a family whose checkpoint nobody had loaded.
+  #
+  # No weights: these are parsing defects, and a tokenizer that picks the wrong
+  # pieces yields the wrong ids whatever the weights are. ~35 MB, and every
+  # source is ungated, so this runs on fork PRs too.
+  family-fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch one config + tokenizer per family
+        run: sh .github/fetch-family-fixtures.sh models/fixtures
+      # Each test skips when its directory is absent so a fresh clone still runs
+      # the suite; in CI that would turn a broken download into a green run that
+      # checked nothing, so require every fixture explicitly.
+      - name: Require every fixture (a silent skip would prove nothing)
+        run: |
+          for f in gemma-2 llama-2 mistral deepseek-v2 qwen2.5; do
+            test -s "models/fixtures/$f/config.json"
+            test -s "models/fixtures/$f/tokenizer.json"
+          done
+      - name: Assert each family parses and tokenizes as its checkpoint says
+        run: cargo test --release --test family_fixtures -- --nocapture
+
   # Type-check the CUDA FFI without a GPU. nvcc is absent here, so build.rs skips
   # device-code compilation — `cargo check` still validates the Rust side of the
   # kernel signatures, which is what silently drifted before (two `extern` blocks
@@ -107,7 +140,7 @@ jobs:
   # suite rather than a single Linux run.
   test:
     if: always()
-    needs: [test-matrix, real-model, gptq-model, cuda-check, lint]
+    needs: [test-matrix, real-model, gptq-model, family-fixtures, cuda-check, lint]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job did not succeed
