@@ -153,6 +153,11 @@ impl BlockConfig {
             sliding_window: self.window_for_layer(layer),
             // A resolved config must not re-resolve: the window above is final.
             sliding_window_pattern: None,
+            // DeepSeek's leading `first_k_dense_replace` layers carry a plain
+            // dense FFN even though the model as a whole is MoE, so those layers
+            // must look dense to everything downstream — loader, validation and
+            // the FFN dispatch alike.
+            moe: self.moe.filter(|m| layer >= m.first_k_dense),
             ..*self
         }
     }
@@ -1981,8 +1986,10 @@ impl CpuKernel {
     /// Build a kernel from a shared block config and one [`LayerTensors`] per
     /// layer, validating every layer's matrix dimensions up front.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>) -> Result<Self> {
-        for layer in &layers {
-            layer.validate(&cfg)?;
+        for (i, layer) in layers.iter().enumerate() {
+            // Per-layer config: a DeepSeek dense prefix layer is validated as
+            // dense even though the model is MoE overall.
+            layer.validate(&cfg.for_layer(i as u32))?;
         }
         Ok(Self { cfg, layers })
     }
@@ -2745,6 +2752,7 @@ mod tests {
             shared_intermediate_size: None,
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
+            first_k_dense: 0,
         });
         let hidden = vec![1.0f32, 1.0];
 
@@ -2795,6 +2803,7 @@ mod tests {
             shared_intermediate_size: None,
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
+            first_k_dense: 0,
         });
         let hidden = vec![0.7f32, -1.3];
         let mut w = LayerTensors::zeros(&cfg);
@@ -2838,6 +2847,7 @@ mod tests {
             shared_intermediate_size: Some(2),
             norm_topk_prob: true,
             naming: MoeNaming::Qwen,
+            first_k_dense: 0,
         });
         let hidden = vec![1.0f32, 0.4];
         let mut w = LayerTensors::zeros(&cfg);

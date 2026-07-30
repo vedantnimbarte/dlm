@@ -30,6 +30,15 @@ struct HfTokenizer {
     #[serde(default)]
     added_tokens: Vec<HfAddedToken>,
     model: HfModel,
+    /// Normalizer / pre-tokenizer graphs, kept raw. dlm reads them only to answer
+    /// one question: does this tokenizer escape whitespace the SentencePiece way
+    /// (space → ▁)? A `"type": "BPE"` model can be either byte-level (GPT-2,
+    /// Qwen, Llama-3) or SentencePiece-style (Gemma, Mistral, Llama-2), and the
+    /// model block alone cannot tell them apart — the answer lives out here.
+    #[serde(default)]
+    normalizer: serde_json::Value,
+    #[serde(default)]
+    pre_tokenizer: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +128,27 @@ pub struct BpeTokenizer {
     /// use Viterbi segmentation over a scored vocabulary instead of BPE merges.
     /// `None` keeps the byte-level BPE path unchanged.
     unigram: Option<UnigramState>,
+    /// SentencePiece-style **BPE** mode (Gemma, Mistral, Llama-2): merges run over
+    /// literal characters with ▁ for spaces, not over GPT-2 byte chars. `None`
+    /// keeps the byte-level BPE path unchanged.
+    spm: Option<SpmBpe>,
+    /// Beginning-of-sequence id to prepend when encoding, from the checkpoint's
+    /// `add_bos_token`. Gemma and Llama/Mistral are trained with it always
+    /// present and degenerate without it; Qwen sets `add_bos_token: false` and so
+    /// leaves this `None`.
+    bos_id: Option<u32>,
+}
+
+/// Knobs for SentencePiece-style BPE, read from the tokenizer's normalizer and
+/// pre-tokenizer.
+#[derive(Debug, Clone)]
+struct SpmBpe {
+    /// Prepend one ▁ before encoding, and strip the matching leading space when
+    /// decoding. Set by HF's `Metaspace{prepend_scheme}` (Mistral, Llama-2) and
+    /// by a `Prepend` normalizer; Gemma has neither and so keeps this false.
+    prepend: bool,
+    /// Decompose an out-of-vocabulary character into `<0xNN>` byte pieces.
+    byte_fallback: bool,
 }
 
 /// State for the SentencePiece Unigram model: per-piece log-prob scores plus the
@@ -158,6 +188,8 @@ impl BpeTokenizer {
             special_encoder: HashMap::new(),
             special_decoder: HashMap::new(),
             unigram: None,
+            spm: None,
+            bos_id: None,
         }
     }
 
@@ -170,6 +202,25 @@ impl BpeTokenizer {
             self.special_encoder.insert(s, id);
         }
         self
+    }
+
+    /// Switch this BPE tokenizer to SentencePiece-style merging (▁ for spaces,
+    /// literal-character symbols) instead of GPT-2 byte-level merging.
+    fn with_spm(mut self, spm: SpmBpe) -> Self {
+        self.spm = Some(spm);
+        self
+    }
+
+    /// Prepend `id` to every [`encode`](Self::encode), as the checkpoint's
+    /// `add_bos_token` asks. Consumes and returns `self` for chaining.
+    pub fn with_bos(mut self, id: Option<u32>) -> Self {
+        self.bos_id = id;
+        self
+    }
+
+    /// The beginning-of-sequence id this tokenizer prepends, if any.
+    pub fn bos_id(&self) -> Option<u32> {
+        self.bos_id
     }
 
     /// A trivial byte tokenizer: 256 tokens (one per byte), no merges. Every text
@@ -192,6 +243,8 @@ impl BpeTokenizer {
             special_encoder: HashMap::new(),
             special_decoder: HashMap::new(),
             unigram: None,
+            spm: None,
+            bos_id: None,
         }
     }
 
@@ -221,6 +274,8 @@ impl BpeTokenizer {
             special_encoder: HashMap::new(),
             special_decoder: HashMap::new(),
             unigram: Some(UnigramState { scores, max_piece_len, byte_fallback, unk_id }),
+            spm: None,
+            bos_id: None,
         }
     }
 
@@ -287,7 +342,8 @@ impl BpeTokenizer {
             );
         }
 
-        // Byte-level BPE.
+        // BPE — byte-level (GPT-2/Qwen/Llama-3) or SentencePiece-style
+        // (Gemma/Mistral/Llama-2), decided by the normalizer + pre-tokenizer.
         let vocab: HashMap<String, u32> =
             serde_json::from_value(hf.model.vocab).map_err(|source| DlmError::Json {
                 context: "tokenizer.json BPE vocab".to_string(),
@@ -305,17 +361,24 @@ impl BpeTokenizer {
                 }
             })
             .collect();
-        Ok(Self::new(vocab, merges_list).with_special(specials))
+        let tok = Self::new(vocab, merges_list).with_special(specials);
+        match detect_spm(&hf.normalizer, &hf.pre_tokenizer, hf.model.byte_fallback) {
+            Some(spm) => Ok(tok.with_spm(spm)),
+            None => Ok(tok),
+        }
     }
 
     /// Load a tokenizer from a model directory: prefer HF `tokenizer.json`, else
     /// fall back to the classic `vocab.json` + `merges.txt` pair.
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let hf = dir.join("tokenizer.json");
-        if hf.exists() {
-            return Self::from_hf_json(&hf);
-        }
-        Self::from_files(&dir.join("vocab.json"), &dir.join("merges.txt"))
+        let tok = if hf.exists() {
+            Self::from_hf_json(&hf)?
+        } else {
+            Self::from_files(&dir.join("vocab.json"), &dir.join("merges.txt"))?
+        };
+        let bos = read_bos_config(&dir.join("tokenizer_config.json"), &tok);
+        Ok(tok.with_bos(bos))
     }
 
     /// Number of tokens in the vocabulary.
@@ -327,14 +390,27 @@ impl BpeTokenizer {
     /// units (longest-match) and emit their own id; the text between is BPE'd.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
+        // BOS goes on unless the caller already supplied it — a chat template that
+        // spells `<bos>` literally must not end up with two.
+        if let Some(bos) = self.bos_id {
+            let already = self
+                .special_decoder
+                .get(&bos)
+                .is_some_and(|lit| text.starts_with(lit.as_str()));
+            if !already {
+                ids.push(bos);
+            }
+        }
         for seg in self.split_special(text) {
             match seg {
                 Seg::Special(id) => ids.push(id),
-                Seg::Text(chunk_text) => match &self.unigram {
+                Seg::Text(chunk_text) => match (&self.unigram, &self.spm) {
                     // SentencePiece Unigram: Viterbi over the whole text segment.
-                    Some(u) => self.encode_unigram(u, &chunk_text, &mut ids)?,
+                    (Some(u), _) => self.encode_unigram(u, &chunk_text, &mut ids)?,
+                    // SentencePiece-style BPE: merge over ▁-escaped characters.
+                    (None, Some(spm)) => self.encode_spm_bpe(spm, &chunk_text, &mut ids)?,
                     // Byte-level BPE: pre-tokenize into chunks, merge each.
-                    None => {
+                    (None, None) => {
                         for chunk in pretokenize(&chunk_text) {
                             for symbol in self.bpe(chunk.as_bytes()) {
                                 let id = self.encoder.get(&symbol).ok_or_else(|| {
@@ -348,6 +424,56 @@ impl BpeTokenizer {
             }
         }
         Ok(ids)
+    }
+
+    /// SentencePiece-style **BPE** encode: escape spaces to ▁ (optionally
+    /// prefixing one), then merge over literal characters rather than GPT-2 byte
+    /// chars, because the vocabulary is literal text — `▁capital`, not `Ġcapital`.
+    ///
+    /// A symbol left out of vocabulary after merging is decomposed into `<0xNN>`
+    /// byte pieces when the model declares `byte_fallback`.
+    fn encode_spm_bpe(&self, spm: &SpmBpe, text: &str, out: &mut Vec<u32>) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut norm = String::with_capacity(text.len() + 3);
+        if spm.prepend {
+            norm.push(SPM_SPACE);
+        }
+        for ch in text.chars() {
+            norm.push(if ch == ' ' { SPM_SPACE } else { ch });
+        }
+
+        for chunk in pretokenize_spm(&norm) {
+            let symbols: Vec<String> = chunk.chars().map(|c| c.to_string()).collect();
+            for symbol in self.merge_symbols(symbols) {
+                match self.encoder.get(&symbol) {
+                    Some(&id) => out.push(id),
+                    None if spm.byte_fallback => self.push_byte_pieces(&symbol, out)?,
+                    None => {
+                        return Err(DlmError::Tokenizer(format!(
+                            "token {symbol:?} not in vocabulary"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Append the `<0xNN>` byte pieces spelling `symbol` (SentencePiece byte
+    /// fallback). Errors if the vocabulary is missing one of them.
+    fn push_byte_pieces(&self, symbol: &str, out: &mut Vec<u32>) -> Result<()> {
+        for b in symbol.as_bytes() {
+            let piece = format!("<0x{b:02X}>");
+            let id = self.encoder.get(&piece).ok_or_else(|| {
+                DlmError::Tokenizer(format!(
+                    "token {symbol:?} not in vocabulary and byte-fallback piece {piece:?} is missing"
+                ))
+            })?;
+            out.push(*id);
+        }
+        Ok(())
     }
 
     /// SentencePiece Unigram encode: escape whitespace (space → ▁) with a leading
@@ -491,8 +617,14 @@ impl BpeTokenizer {
     /// Decode token ids back into text (lossy on invalid UTF-8). Special-token
     /// ids render as their literal text; runs of byte tokens are byte-decoded.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        // Both SentencePiece modes decode the same way: pieces are literal text
+        // with ▁ for spaces. Only Unigram always prepends at encode time, so only
+        // it always strips the leading space back off.
         if self.unigram.is_some() {
-            return self.decode_unigram(ids);
+            return self.decode_spm_pieces(ids, true);
+        }
+        if let Some(spm) = &self.spm {
+            return self.decode_spm_pieces(ids, spm.prepend);
         }
         let mut result = String::new();
         let mut run = String::new();
@@ -512,10 +644,10 @@ impl BpeTokenizer {
         Ok(result)
     }
 
-    /// SentencePiece Unigram decode: concatenate pieces (byte-fallback `<0xNN>`
-    /// pieces reassemble into UTF-8), turn ▁ back into spaces, and drop the single
-    /// leading space added as the dummy prefix at encode time.
-    fn decode_unigram(&self, ids: &[u32]) -> Result<String> {
+    /// SentencePiece decode (Unigram and SPM-style BPE alike): concatenate pieces
+    /// (byte-fallback `<0xNN>` pieces reassemble into UTF-8), turn ▁ back into
+    /// spaces, and — when the encoder prepended one — drop the leading space again.
+    fn decode_spm_pieces(&self, ids: &[u32], strip_leading_space: bool) -> Result<String> {
         let mut pieces = String::new();
         let mut byte_run: Vec<u8> = Vec::new();
         for &id in ids {
@@ -538,7 +670,10 @@ impl BpeTokenizer {
         }
         flush_bytes(&mut byte_run, &mut pieces);
         let text = pieces.replace(SPM_SPACE, " ");
-        Ok(text.strip_prefix(' ').unwrap_or(&text).to_string())
+        if strip_leading_space {
+            return Ok(text.strip_prefix(' ').unwrap_or(&text).to_string());
+        }
+        Ok(text)
     }
 
     /// Byte-decode an accumulated run of byte-level tokens into `out`, clearing
@@ -562,11 +697,19 @@ impl BpeTokenizer {
 
     /// Apply BPE merges to one pre-tokenized chunk, returning its token strings.
     fn bpe(&self, chunk_bytes: &[u8]) -> Vec<String> {
-        let mut symbols: Vec<String> = chunk_bytes
+        let symbols: Vec<String> = chunk_bytes
             .iter()
             .map(|&b| self.byte_encoder[b as usize].to_string())
             .collect();
+        self.merge_symbols(symbols)
+    }
 
+    /// Apply BPE merges to an already-split symbol list, lowest rank first.
+    ///
+    /// Split out of [`bpe`] so the SentencePiece path can feed it literal
+    /// characters while the byte-level path keeps feeding it byte chars — the
+    /// merging itself is identical either way.
+    fn merge_symbols(&self, mut symbols: Vec<String>) -> Vec<String> {
         while symbols.len() >= 2 {
             // Find the adjacent pair with the lowest merge rank.
             let mut best: Option<(usize, u32)> = None;
@@ -619,6 +762,129 @@ fn parse_byte_piece(piece: &str) -> Option<u8> {
     } else {
         None
     }
+}
+
+/// Resolve the BOS id to prepend, from `tokenizer_config.json`.
+///
+/// Returns `None` unless the checkpoint both sets `add_bos_token: true` and names
+/// a `bos_token` that resolves to an id — so Qwen (`add_bos_token: false`) is
+/// untouched while Gemma and Llama/Mistral get the token they were trained with.
+/// A missing or malformed file is simply "no BOS", never an error: the tokenizer
+/// itself already loaded, and refusing to run over an optional hint would be
+/// worse than running without it.
+fn read_bos_config(path: &Path, tok: &BpeTokenizer) -> Option<u32> {
+    let bytes = std::fs::read(path).ok()?;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if cfg.get("add_bos_token")?.as_bool() != Some(true) {
+        return None;
+    }
+    // `bos_token` is either a plain string or an AddedToken object.
+    let bos = cfg.get("bos_token")?;
+    let content = bos
+        .as_str()
+        .or_else(|| bos.get("content").and_then(|c| c.as_str()))?;
+    tok.special_encoder
+        .get(content)
+        .or_else(|| tok.encoder.get(content))
+        .copied()
+}
+
+/// Decide whether a `tokenizer.json` describes SentencePiece whitespace escaping,
+/// by walking its normalizer and pre-tokenizer graphs.
+///
+/// The `model.type` is `"BPE"` for both conventions, so this is the only thing
+/// that separates Gemma/Mistral/Llama-2 from Qwen/Llama-3. The two families
+/// signal it in different places — Gemma with a `Replace(" " → ▁)` normalizer,
+/// Mistral with a `Metaspace` pre-tokenizer and a *null* normalizer — so both
+/// graphs have to be inspected, and neither alone is sufficient.
+fn detect_spm(
+    normalizer: &serde_json::Value,
+    pre_tokenizer: &serde_json::Value,
+    byte_fallback: bool,
+) -> Option<SpmBpe> {
+    let mut escapes = false;
+    let mut prepend = false;
+    walk_spm_nodes(normalizer, &mut escapes, &mut prepend);
+    walk_spm_nodes(pre_tokenizer, &mut escapes, &mut prepend);
+    escapes.then_some(SpmBpe { prepend, byte_fallback })
+}
+
+/// Recurse through a normalizer/pre-tokenizer node (or a `Sequence` of them),
+/// setting `escapes` when it rewrites spaces to ▁ and `prepend` when it also
+/// prefixes one.
+fn walk_spm_nodes(node: &serde_json::Value, escapes: &mut bool, prepend: &mut bool) {
+    let Some(obj) = node.as_object() else { return };
+    // A Sequence nests the real nodes under one of these keys.
+    for key in ["normalizers", "pretokenizers"] {
+        if let Some(list) = obj.get(key).and_then(|v| v.as_array()) {
+            for child in list {
+                walk_spm_nodes(child, escapes, prepend);
+            }
+        }
+    }
+    let spm_space = SPM_SPACE.to_string();
+    match obj.get("type").and_then(|v| v.as_str()) {
+        // Gemma: {"type":"Replace","pattern":{"String":" "},"content":"▁"}
+        Some("Replace") => {
+            let pattern = obj
+                .get("pattern")
+                .and_then(|p| p.get("String"))
+                .and_then(|s| s.as_str());
+            let content = obj.get("content").and_then(|c| c.as_str());
+            if pattern == Some(" ") && content == Some(spm_space.as_str()) {
+                *escapes = true;
+            }
+        }
+        // Mistral / Llama-2: {"type":"Metaspace","replacement":"▁",
+        //                     "prepend_scheme":"first"}. `replacement` defaults
+        // to ▁, and the legacy spelling of the prefix flag is `add_prefix_space`.
+        Some("Metaspace") => {
+            let replacement = obj
+                .get("replacement")
+                .and_then(|r| r.as_str())
+                .unwrap_or(spm_space.as_str());
+            if replacement == spm_space {
+                *escapes = true;
+                let scheme = obj.get("prepend_scheme").and_then(|s| s.as_str());
+                let legacy = obj.get("add_prefix_space").and_then(|b| b.as_bool());
+                if matches!(scheme, Some("first") | Some("always")) || legacy == Some(true) {
+                    *prepend = true;
+                }
+            }
+        }
+        // Llama-2: {"type":"Prepend","prepend":"▁"} ahead of the Replace.
+        Some("Prepend")
+            if obj.get("prepend").and_then(|p| p.as_str()) == Some(spm_space.as_str()) =>
+        {
+            *prepend = true;
+        }
+        _ => {}
+    }
+}
+
+/// Split SentencePiece-normalized text so each chunk starts at a ▁ run.
+///
+/// Bounds the cost of merging (which is quadratic in chunk length) without
+/// changing the result: the only vocabulary pieces that contain ▁ anywhere but
+/// the front are *runs of ▁* (indentation), and a run is never split across
+/// chunks here — so no reachable merge spans a chunk boundary.
+fn pretokenize_spm(text: &str) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_was_mark = false;
+    for ch in text.chars() {
+        let is_mark = ch == SPM_SPACE;
+        // Break at the *start* of a ▁ run, so "a▁▁▁▁b" stays one chunk after "a".
+        if is_mark && !prev_was_mark && !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch);
+        prev_was_mark = is_mark;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
 }
 
 /// Split text so a leading space attaches to the following chunk (GPT-2 style:
@@ -769,6 +1035,111 @@ mod tests {
         // "ab" merges to id 2; the special token becomes id 5.
         assert_eq!(tok.encode("ab<|end|>").unwrap(), vec![2, 5]);
         assert_eq!(tok.decode(&[2, 5]).unwrap(), "ab<|end|>");
+    }
+
+    /// A `"type": "BPE"` model whose pre-tokenizer is `Metaspace` (Mistral,
+    /// Llama-2) must merge over ▁-escaped characters, not GPT-2 byte chars.
+    /// Encoding it byte-level produced `Ġ` symbols that these vocabularies do not
+    /// contain, so the whole family failed to tokenize at all.
+    #[test]
+    fn metaspace_bpe_encodes_spm_pieces_not_byte_chars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "pre_tokenizer": {"type": "Metaspace", "replacement": "▁",
+                                  "prepend_scheme": "first"},
+                "model": {"type": "BPE", "byte_fallback": true,
+                          "vocab": {"▁": 0, "h": 1, "i": 2, "▁hi": 3, "▁h": 4},
+                          "merges": ["▁ h", "▁h i"]}
+            }"#,
+        )
+        .unwrap();
+
+        let tok = BpeTokenizer::from_hf_json(&path).unwrap();
+        // "hi" gets the prepended ▁ and merges to the single piece "▁hi".
+        assert_eq!(tok.encode("hi").unwrap(), vec![3]);
+        // Decode inverts ▁ and drops the prefix the encoder added.
+        assert_eq!(tok.decode(&[3]).unwrap(), "hi");
+    }
+
+    /// Gemma signals the same convention with a `Replace` *normalizer* and no
+    /// Metaspace, and prepends nothing — so keying detection on the pre-tokenizer
+    /// alone (or always prepending) would get Gemma wrong.
+    #[test]
+    fn replace_normalizer_is_spm_without_a_prepended_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
+                "model": {"type": "BPE",
+                          "vocab": {"a": 0, "▁b": 1, "▁": 2, "b": 3},
+                          "merges": ["▁ b"]}
+            }"#,
+        )
+        .unwrap();
+
+        let tok = BpeTokenizer::from_hf_json(&path).unwrap();
+        // No prepend: "a" keeps its bare form, and the space joins the next piece.
+        assert_eq!(tok.encode("a b").unwrap(), vec![0, 1]);
+        assert_eq!(tok.decode(&[0, 1]).unwrap(), "a b");
+    }
+
+    /// A byte-level tokenizer (Qwen, Llama-3) must be left alone: no normalizer
+    /// and no Metaspace means spaces stay `Ġ`.
+    #[test]
+    fn byte_level_bpe_is_untouched_by_spm_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{"model": {"type": "BPE", "vocab": {"a": 0, "Ġb": 1, "Ġ": 2, "b": 3},
+                          "merges": ["Ġ b"]}}"#,
+        )
+        .unwrap();
+        let tok = BpeTokenizer::from_hf_json(&path).unwrap();
+        assert!(tok.spm.is_none(), "no SPM signal means byte-level");
+        assert_eq!(tok.encode("a b").unwrap(), vec![0, 1]);
+    }
+
+    /// `add_bos_token` is honored from `tokenizer_config.json`, exactly once.
+    /// Gemma is trained with `<bos>` always present and emits degenerate text
+    /// without it; Qwen sets the flag false and must not get one.
+    #[test]
+    fn add_bos_token_prepends_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("tokenizer.json"),
+            r#"{
+                "added_tokens": [{"id": 9, "content": "<bos>", "special": true}],
+                "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            r#"{"add_bos_token": true, "bos_token": {"content": "<bos>"}}"#,
+        )
+        .unwrap();
+
+        let tok = BpeTokenizer::from_dir(tmp.path()).unwrap();
+        assert_eq!(tok.bos_id(), Some(9));
+        assert_eq!(tok.encode("ab").unwrap(), vec![9, 0, 1]);
+        // Text that already opens with the literal must not get a second one.
+        assert_eq!(tok.encode("<bos>ab").unwrap(), vec![9, 0, 1]);
+
+        // add_bos_token: false leaves encoding untouched.
+        std::fs::write(
+            tmp.path().join("tokenizer_config.json"),
+            r#"{"add_bos_token": false, "bos_token": "<bos>"}"#,
+        )
+        .unwrap();
+        let tok = BpeTokenizer::from_dir(tmp.path()).unwrap();
+        assert_eq!(tok.bos_id(), None);
+        assert_eq!(tok.encode("ab").unwrap(), vec![0, 1]);
     }
 
     /// SentencePiece Unigram: Viterbi picks the highest-scoring segmentation, and

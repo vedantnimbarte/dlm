@@ -754,7 +754,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 kv_values,
                 num_positions as i32,
                 position as i32,
-                cfg.sliding_window.unwrap_or(0) as i32,
+                // Per-layer window: Gemma2's global layers must not be clipped.
+                cfg.window_for_layer(layer).unwrap_or(0) as i32,
                 crate::forward::cpu::rope_mscale(cfg.rope_scaling),
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
@@ -1106,7 +1107,8 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                             kv_values,
                             num_positions as i32,
                             position as i32,
-                            cfg.sliding_window.unwrap_or(0) as i32,
+                            // Per-layer window: Gemma2's global layers must not be clipped.
+                            cfg.window_for_layer(layer).unwrap_or(0) as i32,
                             cfg.activation.code(),
                             crate::forward::cpu::rope_mscale(cfg.rope_scaling),
                             cfg.attn_scale(),
