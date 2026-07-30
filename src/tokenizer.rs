@@ -386,6 +386,19 @@ impl BpeTokenizer {
         self.encoder.len()
     }
 
+    /// The id of a literal vocabulary piece, if the checkpoint has one.
+    ///
+    /// Lets a test state its expectation as the *pieces* a tokenizer should
+    /// produce (`▁capital`) and resolve them against the checkpoint's own
+    /// vocabulary, instead of hard-coding ids that came out of this encoder —
+    /// which would only prove the encoder agrees with itself.
+    pub fn id_of(&self, piece: &str) -> Option<u32> {
+        self.encoder
+            .get(piece)
+            .or_else(|| self.special_encoder.get(piece))
+            .copied()
+    }
+
     /// Encode text into token ids. Registered special tokens are matched as whole
     /// units (longest-match) and emit their own id; the text between is BPE'd.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
