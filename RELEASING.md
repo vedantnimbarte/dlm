@@ -43,24 +43,39 @@ cargo run --release --features cuda-kernels -- \
 
 All three must pass on real hardware before tagging.
 
+**Vary the family, not just the size.** Every blocker found before 0.3.0 lived in
+`config.json` or `tokenizer.json` — a duplicate key that made Gemma2 unparseable,
+a SentencePiece vocabulary encoded with byte-level BPE rules, an expert-count
+field spelled differently by DeepSeek. The in-code test fixtures never touch
+either file, and CI's only real checkpoint is Qwen: dense, byte-level BPE, no
+BOS. A green suite says nothing about a family whose checkpoint nobody loaded.
+Run check 2 against one model per family you intend to claim support for.
+
+As of 0.3.0 that meant, by hand: Qwen2.5-0.5B, Qwen3-0.6B, a Qwen2.5 GPTQ-Int4
+export, gemma-2-2b-it, gemma-1.1-2b-it, Mistral-7B-Instruct-v0.1,
+Qwen1.5-MoE-A2.7B (14.3 B) and DeepSeek-V2-Lite-Chat (15.7 B) — the last two also
+covering check 3, a model far larger than the card at `--quant int4`.
+
 ## Known gaps — read before you tag
 
 These are not TODOs; they are the honest limits of what has been verified. A
 release is a claim, and these bound it.
 
-- **Only one GPU has ever run this code**: a GTX 1650 (Turing, 4 GB), on Windows.
-  Ampere/Ada/Blackwell, and anything with a different warp/SM profile, are
-  unexercised.
-- **The Linux CUDA path has never been run**, and the release ships a Linux
-  `-cuda-static` binary. This is not theoretical: `serve --stream` used to
-  over-commit VRAM, which Windows' WDDM driver hides by paging GPU memory to host
-  RAM — Linux has no such fallback and would likely have OOM'd outright. That bug
-  is fixed, but the fact it survived is evidence the Linux GPU path was never
-  exercised. Run at least check 2 above on a Linux box with an NVIDIA GPU.
-  (WSL2 does **not** count: its GPU is paravirtualized through the same Windows
-  WDDM driver and inherits the same paging behaviour.)
+- **Only Turing-class hardware has run this code**: a GTX 1650 (4 GB). Ampere,
+  Ada, Blackwell — anything with a different warp/SM profile — are unexercised.
 - **Multi-GPU and distributed serving** are untested on real hardware.
-- **Models above 3B** are untested; so is any context near the 8192 default.
+- **Any context near the 8192 default is untested.** This is the sharpest one
+  left: Gemma2 alternates windowed and global attention layers, and a window is
+  only *reachable* past `sliding_window` tokens (4096 on gemma-2). A bug there is
+  invisible in every short prompt — which is exactly how one shipped before, the
+  device path clipping layers that must see full history. Decode past 4096 tokens
+  on a Gemma2 model before trusting long-context output.
+- **DeepSeek-V2/V3 (MLA + MoE) has only been run on the CPU path.** The README
+  advertises it on the streaming GPU path; that has never been executed against
+  real weights, because a 4 GB card cannot meaningfully stream a 30 GB
+  checkpoint. The synthetic GPU parity tests pass, which is not the same claim.
+- **Llama 2 is untested.** It shares Mistral's SentencePiece tokenizer shape,
+  which is verified, so it is expected to work — expected, not demonstrated.
 
 ## Tag
 
