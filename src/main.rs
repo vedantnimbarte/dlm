@@ -819,16 +819,16 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     }
 }
 
-/// Resolve the effective compute device. `cpu` is honored as-is. `gpu` is
-/// honored only if the binary was built with the device kernels AND a GPU
-/// actually responds; otherwise dlm warns and falls back to CPU so a run never
-/// dies just because no GPU is present. On a CPU-only build, an explicit
-/// `--device gpu` passes through and the downstream `not(cuda-kernels)` arm
-/// reports the clearer "requires --features cuda-kernels" error.
 /// Error for a GPU request on a build without any device compute kernels. Each
 /// vendor gets the flag that actually works for it: on an AMD (`rocm`) build
 /// `--features cuda-kernels` is unsatisfiable — it pulls in `cuda` — so pointing
 /// AMD users there is a dead end; they need `rocm-kernels`.
+///
+/// Gated to match its call sites: a build that *has* device kernels never needs
+/// to tell anyone to go build one, so without this the function is dead code on
+/// every `cuda-kernels` and `rocm-kernels` build — which is exactly the warning
+/// the feature-gated CI jobs now refuse.
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
 fn gpu_compute_unavailable(what: &str) -> DlmError {
     let feature = match gpu::active_vendor() {
         gpu::GpuVendor::Amd => "rocm-kernels",
@@ -839,6 +839,12 @@ fn gpu_compute_unavailable(what: &str) -> DlmError {
     ))
 }
 
+/// Resolve the effective compute device. `cpu` is honored as-is. `gpu` is
+/// honored only if the binary was built with the device kernels AND a GPU
+/// actually responds; otherwise dlm warns and falls back to CPU so a run never
+/// dies just because no GPU is present. On a CPU-only build, an explicit
+/// `--device gpu` passes through and the downstream `not(cuda-kernels)` arm
+/// reports the clearer "requires --features cuda-kernels" error.
 fn resolve_device(requested: Device) -> Device {
     if requested == Device::Cpu {
         return Device::Cpu;

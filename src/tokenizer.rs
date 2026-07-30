@@ -742,7 +742,7 @@ impl BpeTokenizer {
                     .merges
                     .get(&(symbols[i].clone(), symbols[i + 1].clone()))
                 {
-                    if best.map_or(true, |(_, r)| rank < r) {
+                    if best.is_none_or(|(_, r)| rank < r) {
                         best = Some((i, rank));
                     }
                 }

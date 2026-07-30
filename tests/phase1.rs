@@ -440,7 +440,7 @@ fn write_patterned_model(dir: &std::path::Path, tensors: &[(&str, usize)]) {
             r#""{name}":{{"dtype":"U8","shape":[{len}],"data_offsets":[{offset},{}]}}"#,
             offset + len
         ));
-        data.extend(std::iter::repeat((i as u8).wrapping_add(1)).take(*len));
+        data.extend(std::iter::repeat_n((i as u8).wrapping_add(1), *len));
         offset += len;
     }
     let header = format!("{{{}}}", entries.join(","));

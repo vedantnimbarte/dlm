@@ -12,11 +12,45 @@ permissions:
   contents: write
 
 jobs:
+  # Prove the tagged commit is sound BEFORE anything is published.
+  #
+  # This workflow triggers on a tag, and a tag is not required to point at a
+  # commit CI ever ran: `main`'s branch protection gates pull requests, not
+  # `git tag`. Nothing connected the two, so tagging a commit with a failing
+  # suite published binaries built from it — and because the installers pull
+  # `releases/latest/download/`, every new user would get exactly that build.
+  # "Whatever is tagged is what every new user gets" (RELEASING.md) is only a
+  # safe thing to say if the tag is checked.
+  #
+  # Ordered ahead of `create-release` rather than beside it, so a red tag never
+  # even leaves an empty GitHub Release behind to clean up.
+  #
+  # Scope: the deterministic checks. The real-checkpoint and family-fixture jobs
+  # in ci.yml are deliberately not duplicated here — they download ~35 MB+ per
+  # run and gate every push to `main` already. This job closes the tag-specific
+  # hole, and does not replace the manual GPU checks in RELEASING.md, which no
+  # runner can perform.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --verbose
+
   # Create the GitHub Release first so every upload job has a target. Without
   # this the uploads race — `gh release upload` doesn't create a release, and
   # parallel jobs each try to create one — which is how the first tagged run
   # failed with repeated "release not found".
   create-release:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

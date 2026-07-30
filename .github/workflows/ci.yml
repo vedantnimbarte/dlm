@@ -109,18 +109,53 @@ jobs:
       - name: Assert each family parses and tokenizes as its checkpoint says
         run: cargo test --release --test family_fixtures -- --nocapture
 
-  # Type-check the CUDA FFI without a GPU. nvcc is absent here, so build.rs skips
-  # device-code compilation — `cargo check` still validates the Rust side of the
-  # kernel signatures, which is what silently drifted before (two `extern` blocks
-  # declaring `dlm_decode_block` with different ABIs).
-  cuda-check:
+  # Type-check the GPU FFI without a GPU. Neither nvcc nor hipcc is present here,
+  # so build.rs skips device-code compilation — `cargo check` still validates the
+  # Rust side of the kernel signatures, which is what silently drifted before
+  # (two `extern` blocks declaring `dlm_decode_block` with different ABIs).
+  #
+  # Both vendors, because the drift this catches is per-backend: the HIP path was
+  # never built by CI at all, so `src/gpu/ffi_hip.rs` could break in exactly the
+  # way this job exists to prevent and no push would have noticed.
+  #
+  # `-D warnings`, because a feature-gated build is where dead code accumulates:
+  # arms that exist only on the *other* side of a `cfg` stop being compiled and
+  # nothing complains. This job ran for months emitting an unheeded "function
+  # `gpu_compute_unavailable` is never used".
+  gpu-ffi-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [cuda-kernels, rocm-kernels]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check cuda-kernels FFI
-        run: cargo check --features cuda-kernels --all-targets
+      - name: Check ${{ matrix.feature }} FFI
+        run: cargo check --features ${{ matrix.feature }} --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+
+  # Build on the exact toolchain `rust-version` in Cargo.toml promises.
+  #
+  # Nothing checked this before, and by the time it was checked the claim had
+  # already gone stale: the manifest said 1.75 while `clap_lex 1.1.0` — pulled in
+  # by clap's unpinned `"4"` — needs 1.85 to so much as parse. A transitive bump
+  # is all it takes, which is why this cannot be a thing anyone remembers to do.
+  #
+  # `--locked` on purpose: without it Cargo resolves fresh versions and the job
+  # tests a dependency set no user has, passing or failing for reasons unrelated
+  # to the commit. Pin the toolchain explicitly rather than tracking a moving
+  # target, so this fails when *dlm* raises its floor, not when Rust ships.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on the declared MSRV
+        run: cargo check --locked --all-targets
 
   lint:
     runs-on: ubuntu-latest
@@ -146,7 +181,16 @@ jobs:
   # suite rather than a single Linux run.
   test:
     if: always()
-    needs: [test-matrix, real-model, gptq-model, family-fixtures, cuda-check, lint]
+    needs:
+      [
+        test-matrix,
+        real-model,
+        gptq-model,
+        family-fixtures,
+        gpu-ffi-check,
+        msrv,
+        lint,
+      ]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job did not succeed
