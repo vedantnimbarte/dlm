@@ -62,8 +62,10 @@ pub struct Worker {
 impl Worker {
     /// Create a worker for `layers` (its shard), validating dimensions.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>) -> Result<Self> {
-        for layer in &layers {
-            layer.validate(&cfg)?;
+        for (i, layer) in layers.iter().enumerate() {
+            // Per-layer config: a MoE model's dense prefix layers
+            // (DeepSeek's `first_k_dense_replace`) validate as dense.
+            layer.validate(&cfg.for_layer(i as u32))?;
         }
         let kv = (0..layers.len())
             .map(|_| KvLayerCache::new(cfg.kv_dim()))

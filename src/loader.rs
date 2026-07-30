@@ -511,6 +511,10 @@ pub(crate) fn load_layer_tensors_opt(
     include_experts: bool,
     norm_add_one: bool,
 ) -> Result<LayerTensors> {
+    // Resolve the config for THIS layer: DeepSeek's leading dense layers report
+    // `moe: None` here even though the checkpoint is MoE overall, which is what
+    // routes them to the dense FFN below and satisfies `validate` afterwards.
+    let cfg = &cfg.for_layer(layer);
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
@@ -637,7 +641,7 @@ struct MoeNames {
     router: String,
     experts_base: String, // e.g. "…block_sparse_moe.experts" / "…mlp.experts"
     proj: (&'static str, &'static str, &'static str), // (gate, up, down) suffixes
-    shared: Option<(String, String)>,                 // (shared_expert base, shared_gate)
+    shared: Option<(String, Option<String>)>, // (shared_expert base, optional sigmoid gate)
 }
 
 fn moe_names(naming: crate::model::MoeNaming, layer: u32) -> MoeNames {
@@ -656,7 +660,18 @@ fn moe_names(naming: crate::model::MoeNaming, layer: u32) -> MoeNames {
             router: format!("{p}.mlp.gate"),
             experts_base: format!("{p}.mlp.experts"),
             proj: ("gate_proj", "up_proj", "down_proj"),
-            shared: Some((format!("{p}.mlp.shared_expert"), format!("{p}.mlp.shared_expert_gate"))),
+            shared: Some((
+                format!("{p}.mlp.shared_expert"),
+                Some(format!("{p}.mlp.shared_expert_gate")),
+            )),
+        },
+        // DeepSeek: as Qwen, but `shared_experts` (plural) and no gate tensor —
+        // the shared output is added unweighted.
+        DeepSeek => MoeNames {
+            router: format!("{p}.mlp.gate"),
+            experts_base: format!("{p}.mlp.experts"),
+            proj: ("gate_proj", "up_proj", "down_proj"),
+            shared: Some((format!("{p}.mlp.shared_experts"), None)),
         },
     }
 }
@@ -728,8 +743,12 @@ pub(crate) fn load_moe_ffn(
             let si = si as usize;
             let shared = load_expert(store, sbase, names.proj, hidden, si, quant, packed)?;
             // shared_expert_gate is a Linear(hidden -> 1): weight is [1, hidden].
-            let gate = load_linear(store, sgate, hidden, 1, quant, packed)?;
-            (Some(shared), Some(gate))
+            // DeepSeek ships no gate at all — its shared expert is added unweighted.
+            let gate = match sgate {
+                Some(g) => Some(load_linear(store, g, hidden, 1, quant, packed)?),
+                None => None,
+            };
+            (Some(shared), gate)
         }
         _ => (None, None),
     };

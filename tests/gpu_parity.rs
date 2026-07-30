@@ -776,6 +776,7 @@ fn gpu_moe_matches_cpu_routed_only() {
             shared_intermediate_size: None,
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
+            first_k_dense: 0,
         },
         "routed-only",
     );
@@ -792,6 +793,7 @@ fn gpu_moe_matches_cpu_with_shared_expert() {
             shared_intermediate_size: Some(64),
             norm_topk_prob: true,
             naming: MoeNaming::Qwen,
+            first_k_dense: 0,
         },
         "shared-expert",
     );
@@ -804,6 +806,58 @@ fn gpu_moe_matches_cpu_with_shared_expert() {
 /// them together against the CPU oracle.
 #[test]
 fn gpu_gemma2_matches_cpu() {
+    let (cfg, layers) = gemma2_fixture();
+    assert_gpu_matches_cpu(cfg, layers, 1e-3, "gemma2");
+}
+
+/// The same Gemma2 geometry on the **streaming** GPU kernel. The resident and
+/// streaming paths issue their own `dlm_decode_block` calls, so each has to
+/// resolve the alternating window for itself — a per-layer window that is
+/// correct on one path proves nothing about the other.
+#[test]
+fn streaming_gpu_gemma2_matches_cpu() {
+    let (cfg, layers) = gemma2_fixture();
+    let num_layers = layers.len() as u32;
+    let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+    // Window 2 of 4 layers: every layer is evicted and re-uploaded at least once.
+    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers), 64, 2, None).unwrap();
+
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu =
+        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_str = ForwardOrchestrator::new(
+        streaming,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+
+    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| ((i % 17) as f32) * 0.03 - 0.25)
+        .collect();
+    let mut h_str = h_cpu.clone();
+    for step in 0..3 {
+        orch_cpu.decode_token(&mut h_cpu).unwrap();
+        orch_str.decode_token(&mut h_str).unwrap();
+        let max_diff = h_cpu
+            .iter()
+            .zip(&h_str)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-3,
+            "gemma2 streaming: step {step}: GPU diverged from CPU by {max_diff}"
+        );
+    }
+}
+
+/// Shared Gemma2 geometry: window 2 with period 2, so layers 0 and 2 clip to the
+/// last two positions while layers 1 and 3 must see the full history.
+fn gemma2_fixture() -> (BlockConfig, Vec<LayerTensors>) {
     let cfg = BlockConfig {
         hidden_size: 32,
         num_heads: 4,
@@ -844,7 +898,7 @@ fn gpu_gemma2_matches_cpu() {
             ..Default::default()
         })
         .collect();
-    assert_gpu_matches_cpu(cfg, layers, 1e-3, "gemma2");
+    (cfg, layers)
 }
 
 // ── MLA on the streaming GPU kernel ──────────────────────────────────────────
@@ -1018,6 +1072,7 @@ fn gpu_mla_moe_streaming_matches_cpu() {
         shared_intermediate_size: None,
         norm_topk_prob: true,
         naming: MoeNaming::Mixtral,
+        first_k_dense: 0,
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 6, 0xD5EE, Some(m));
@@ -1035,6 +1090,7 @@ fn gpu_mla_moe_streaming_matches_cpu_with_shared_expert() {
         shared_intermediate_size: Some(16),
         norm_topk_prob: true,
         naming: MoeNaming::Qwen,
+        first_k_dense: 0,
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 6, 0xD5EF, Some(m));
@@ -1187,6 +1243,7 @@ fn gpu_grouped_experts_match_cpu() {
             shared_intermediate_size: None,
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
+            first_k_dense: 0,
         },
         "grouped-top4",
     );

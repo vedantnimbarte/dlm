@@ -466,8 +466,10 @@ impl GpuKernel {
         }
         let cap = max_kv_tokens.max(1);
         let mut gpu_layers = Vec::with_capacity(layers.len());
-        for layer in &layers {
-            layer.validate(&cfg)?;
+        for (i, layer) in layers.iter().enumerate() {
+            // Per-layer config, so a MoE model's dense prefix layers (DeepSeek's
+            // `first_k_dense_replace`) validate as the dense blocks they are.
+            layer.validate(&cfg.for_layer(i as u32))?;
             gpu_layers.push(GpuLayer::upload(layer)?);
         }
         let inv_freq = DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
@@ -757,7 +759,11 @@ impl ComputeKernel for GpuKernel {
                         kv_values,
                         num_positions as i32,
                         position as i32,
-                        self.cfg.sliding_window.unwrap_or(0) as i32,
+                        // Gemma2 alternates windowed and global layers, so the
+                        // window is resolved per layer here exactly as
+                        // `run_block_batched` does — passing the unresolved
+                        // `sliding_window` would clip the global layers too.
+                        self.cfg.window_for_layer(layer).unwrap_or(0) as i32,
                         self.cfg.activation.code(),
                         crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
                         self.cfg.attn_scale(),

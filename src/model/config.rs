@@ -46,8 +46,16 @@ struct RawConfig {
     model_type: Option<String>,
     /// Gated-MLP activation name (Gemma ships "gelu_pytorch_tanh"). Older configs
     /// spell it `hidden_act`.
-    #[serde(default, alias = "hidden_act")]
+    ///
+    /// These are two separate fields rather than one with `alias = "hidden_act"`,
+    /// because every Gemma2 config (2b/9b/27b) ships *both* keys — and serde
+    /// rejects a field matched by two names in the same object as a duplicate,
+    /// which made the whole config unparseable. `hidden_activation` wins when
+    /// both are present, matching transformers' Gemma2Config.
+    #[serde(default)]
     hidden_activation: Option<String>,
+    #[serde(default)]
+    hidden_act: Option<String>,
     hidden_size: u32,
     num_attention_heads: u32,
     #[serde(default)]
@@ -86,6 +94,22 @@ struct RawConfig {
     /// Qwen-MoE's expert count key.
     #[serde(default)]
     num_experts: Option<u32>,
+    /// DeepSeek-V2/V3's expert count key.
+    #[serde(default)]
+    n_routed_experts: Option<u32>,
+    /// DeepSeek's shared-expert *count* (not a width): the shared FFN is this
+    /// many `moe_intermediate_size` experts fused into one wider SwiGLU.
+    #[serde(default)]
+    n_shared_experts: Option<u32>,
+    /// DeepSeek: the first N layers are dense, the rest MoE. Ignoring this loads
+    /// a dense FFN for a routed layer and fails on the missing tensor.
+    #[serde(default)]
+    first_k_dense_replace: Option<u32>,
+    /// DeepSeek: place a MoE layer every N layers after the dense prefix. Only
+    /// `1` (every layer) is implemented; anything else is refused rather than
+    /// silently loading the wrong layers as dense.
+    #[serde(default)]
+    moe_layer_freq: Option<u32>,
     /// Experts routed per token (top-k). Required when the model is MoE.
     #[serde(default)]
     num_experts_per_tok: Option<u32>,
@@ -369,11 +393,13 @@ fn build_mla_config(raw: &RawConfig) -> Result<Option<MlaConfig>> {
 /// count is refused rather than guessed at — routing every token through the
 /// wrong number of experts is silent garbage, the worst failure mode.
 fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
-    let (num_experts, naming) = match (raw.num_local_experts, raw.num_experts) {
-        (Some(n), _) => (n, MoeNaming::Mixtral),
-        (None, Some(n)) => (n, MoeNaming::Qwen),
-        (None, None) => return Ok(None),
-    };
+    let (num_experts, naming) =
+        match (raw.num_local_experts, raw.num_experts, raw.n_routed_experts) {
+            (Some(n), _, _) => (n, MoeNaming::Mixtral),
+            (None, Some(n), _) => (n, MoeNaming::Qwen),
+            (None, None, Some(n)) => (n, MoeNaming::DeepSeek),
+            (None, None, None) => return Ok(None),
+        };
     if num_experts == 0 {
         return Ok(None); // an expert count of 0 is just a dense model
     }
@@ -398,14 +424,37 @@ fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
                 "MoE config declares neither moe_intermediate_size nor intermediate_size".into(),
             )
         })?;
+    // DeepSeek states a shared-expert *count*; its shared FFN is that many
+    // `moe_intermediate_size` experts fused into one. Qwen states the width
+    // directly.
+    let shared_intermediate_size = match naming {
+        MoeNaming::DeepSeek => raw
+            .n_shared_experts
+            .filter(|n| *n > 0)
+            .map(|n| n * moe_intermediate_size),
+        _ => raw.shared_expert_intermediate_size,
+    };
+
+    // Only "every layer after the dense prefix" is implemented. A larger period
+    // would make some later layers dense too, and guessing wrong loads a routed
+    // layer as dense — a missing-tensor error at best, wrong weights at worst.
+    if let Some(freq) = raw.moe_layer_freq.filter(|f| *f != 1) {
+        return Err(DlmError::InvalidConfig(format!(
+            "moe_layer_freq {freq} is not implemented; dlm places a MoE layer at every \
+             layer after the first {} dense one(s), and will not guess a sparser pattern.",
+            raw.first_k_dense_replace.unwrap_or(0)
+        )));
+    }
+
     Ok(Some(MoeConfig {
         num_experts,
         experts_per_tok,
         moe_intermediate_size,
-        shared_intermediate_size: raw.shared_expert_intermediate_size,
+        shared_intermediate_size,
         // Mixtral always renormalizes; Qwen exposes the flag (default on).
         norm_topk_prob: raw.norm_topk_prob.unwrap_or(true),
         naming,
+        first_k_dense: raw.first_k_dense_replace.unwrap_or(0),
     }))
 }
 
@@ -428,6 +477,10 @@ pub enum MoeNaming {
     /// `mlp.gate`, `mlp.experts.{e}.{gate,up,down}_proj`, optional
     /// `mlp.shared_expert.*` gated by `mlp.shared_expert_gate`.
     Qwen,
+    /// DeepSeek-V2/V3: like Qwen, but the shared expert is `mlp.shared_experts`
+    /// (plural) and is **ungated** — it is added straight to the routed sum, with
+    /// no `shared_expert_gate` tensor in the checkpoint.
+    DeepSeek,
 }
 
 /// Validated MoE geometry, present only on Mixture-of-Experts checkpoints.
@@ -445,6 +498,10 @@ pub struct MoeConfig {
     pub norm_topk_prob: bool,
     /// Expert tensor naming family.
     pub naming: MoeNaming,
+    /// How many leading layers are **dense** rather than routed (DeepSeek's
+    /// `first_k_dense_replace`). `0` — every other MoE family — means every layer
+    /// is routed. Resolved per layer by [`BlockConfig::for_layer`].
+    pub first_k_dense: u32,
 }
 
 /// Validated Multi-head Latent Attention geometry (DeepSeek-V2/V3). Present only
@@ -630,7 +687,7 @@ impl ModelConfig {
         let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
         let is_gemma2 = model_type == "gemma2";
         let is_gemma = model_type == "gemma" || is_gemma2;
-        let activation = match raw.hidden_activation.as_deref() {
+        let activation = match raw.hidden_activation.as_deref().or(raw.hidden_act.as_deref()) {
             Some(a) if a.to_ascii_lowercase().contains("gelu") => {
                 crate::forward::cpu::Activation::GeluTanh
             }
@@ -835,6 +892,44 @@ impl ModelConfig {
 mod tests {
     use super::*;
 
+    /// DeepSeek-V2/V3 spells its MoE fields differently from Mixtral and Qwen.
+    /// Reading only the other two spellings left `moe: None`, so every layer
+    /// loaded as dense and the first routed layer failed on a missing
+    /// `mlp.gate_proj` — the whole family was unloadable.
+    #[test]
+    fn deepseek_moe_config_is_recognized() {
+        // Shape of deepseek-ai/DeepSeek-V2-Lite-Chat's config.json.
+        let json = br#"{"model_type":"deepseek_v2","hidden_size":2048,
+            "num_attention_heads":16,"num_key_value_heads":16,"num_hidden_layers":27,
+            "vocab_size":102400,"intermediate_size":10944,"moe_intermediate_size":1408,
+            "n_routed_experts":64,"n_shared_experts":2,"num_experts_per_tok":6,
+            "first_k_dense_replace":1,"moe_layer_freq":1}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        let m = c.moe.expect("DeepSeek declares experts via n_routed_experts");
+        assert_eq!(m.num_experts, 64);
+        assert_eq!(m.experts_per_tok, 6);
+        assert_eq!(m.naming, MoeNaming::DeepSeek);
+        // The shared expert is a *count* of moe_intermediate_size experts fused
+        // into one: 2 × 1408. Reading it as a width would size it 1408.
+        assert_eq!(m.shared_intermediate_size, Some(2816));
+        assert_eq!(m.first_k_dense, 1, "layer 0 is dense, layers 1.. are routed");
+    }
+
+    /// A sparser MoE period is refused rather than guessed: loading a routed
+    /// layer as dense is a missing-tensor error at best, wrong weights at worst.
+    #[test]
+    fn unimplemented_moe_layer_freq_is_refused() {
+        let json = br#"{"model_type":"deepseek_v2","hidden_size":16,
+            "num_attention_heads":4,"num_hidden_layers":4,"vocab_size":32,
+            "intermediate_size":8,"moe_intermediate_size":4,
+            "n_routed_experts":8,"num_experts_per_tok":2,"moe_layer_freq":2}"#;
+        let err = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap_err();
+        assert!(
+            format!("{err}").contains("moe_layer_freq"),
+            "expected a moe_layer_freq refusal, got: {err}"
+        );
+    }
+
     fn moe_config() -> ModelConfig {
         // 8 experts, top-2, no shared expert (Mixtral-shaped).
         let json = br#"{"hidden_size":16,"num_attention_heads":4,"num_key_value_heads":4,
@@ -861,6 +956,32 @@ mod tests {
         // Core = attn (q,o = h*h each; k,v full since MHA) + router (h*8) + 2 norms.
         let expected_core = 4 * h * h + h * 8 + 2 * h;
         assert_eq!(core, expected_core);
+    }
+
+    /// Every Gemma2 config Google publishes carries `hidden_act` *and*
+    /// `hidden_activation`. One field aliasing the other made serde reject the
+    /// whole file as a duplicate, so no Gemma2 checkpoint could be loaded at all.
+    #[test]
+    fn gemma2_config_with_both_activation_spellings_parses() {
+        use crate::forward::cpu::Activation;
+        // Verbatim shape of google/gemma-2-2b-it's config.json.
+        let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64,
+            "hidden_act":"gelu_pytorch_tanh","hidden_activation":"gelu_pytorch_tanh",
+            "attn_logit_softcapping":50.0,"final_logit_softcapping":30.0,
+            "query_pre_attn_scalar":256,"sliding_window":4096}"#;
+        let c = ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16)
+            .expect("real Gemma2 config must parse");
+        assert_eq!(c.activation, Activation::GeluTanh);
+        assert_eq!(c.attn_logit_softcap, Some(50.0));
+        assert_eq!(c.final_logit_softcap, Some(30.0));
+
+        // `hidden_act` alone (Gemma v1 / older exports) still resolves.
+        let only_act = br#"{"model_type":"llama","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64,
+            "hidden_act":"gelu_pytorch_tanh"}"#;
+        let c = ModelConfig::from_json_bytes(only_act, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.activation, Activation::GeluTanh);
     }
 
     #[test]
