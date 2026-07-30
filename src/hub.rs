@@ -171,17 +171,90 @@ fn curl_json(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Download a URL to `out`, streaming curl's progress bar to the terminal.
-fn curl_download(url: &str, out: &Path, token: Option<&str>) -> Result<()> {
+/// The size the server reports for `url`, or `None` if it will not say.
+///
+/// Used to skip files already fully present and to catch a transfer that ended
+/// early. A `HEAD` is cheap next to the multi-gigabyte bodies this module moves.
+fn remote_size(url: &str, token: Option<&str>) -> Option<u64> {
     let mut cmd = Command::new("curl");
-    cmd.args(["-fL", "--progress-bar", "-o"]);
+    cmd.args(["-sIfL", url]);
+    if let Some(t) = token {
+        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Take the last Content-Length: redirects to the CDN emit one per hop.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+        })
+        .next_back()
+}
+
+fn local_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Download a URL to `out`, streaming curl's progress bar to the terminal.
+///
+/// Resumable and retrying, because the bodies here are model shards: a single
+/// dropped connection an hour into a 30 GB pull used to discard the whole file
+/// and restart from zero. `--retry-all-errors` covers the connection resets and
+/// truncated transfers that a plain `--retry` ignores, and `-C -` continues from
+/// whatever already landed rather than starting over.
+///
+/// A file already present at its full size is left alone, so re-running `pull`
+/// after a failure resumes the set instead of refetching it.
+fn curl_download(url: &str, out: &Path, token: Option<&str>) -> Result<()> {
+    let want = remote_size(url, token);
+    if let Some(want) = want {
+        if local_size(out) == want && want > 0 {
+            println!("    already complete ({want} bytes)");
+            return Ok(());
+        }
+    }
+
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-fL",
+        "--progress-bar",
+        "--retry",
+        "10",
+        "--retry-delay",
+        "3",
+        "--retry-all-errors",
+        "--continue-at",
+        "-",
+        "-o",
+    ]);
     cmd.arg(out).arg(url);
     if let Some(t) = token {
         cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
     }
     let status = cmd.status().map_err(curl_missing)?;
     if !status.success() {
-        return Err(DlmError::Hub(format!("download failed for {}", out.display())));
+        return Err(DlmError::Hub(format!(
+            "download failed for {} — re-run `dlm pull` to resume from what was fetched",
+            out.display()
+        )));
+    }
+
+    // A transfer can end "successfully" and still be short (a proxy closing the
+    // body early). Loading a truncated shard fails later with a confusing parse
+    // error, so catch it here where the cause is obvious.
+    if let Some(want) = want {
+        let have = local_size(out);
+        if have != want {
+            return Err(DlmError::Hub(format!(
+                "{} is {have} bytes but the server declared {want} — the download was truncated. \
+                 Re-run `dlm pull` to resume it.",
+                out.display()
+            )));
+        }
     }
     Ok(())
 }

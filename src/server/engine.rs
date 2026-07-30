@@ -56,6 +56,10 @@ struct StreamMetrics {
     evictions: AtomicU64,
     prefetched: AtomicU64,
     depth: AtomicU64,
+    /// Routed-expert VRAM cache (GPU MoE streaming only; stays zero otherwise).
+    expert_hits: AtomicU64,
+    expert_misses: AtomicU64,
+    expert_evictions: AtomicU64,
 }
 
 impl StreamMetrics {
@@ -66,6 +70,9 @@ impl StreamMetrics {
         self.evictions.store(s.evictions, Ordering::Relaxed);
         self.prefetched.store(s.prefetched, Ordering::Relaxed);
         self.depth.store(s.depth as u64, Ordering::Relaxed);
+        self.expert_hits.store(s.expert_hits, Ordering::Relaxed);
+        self.expert_misses.store(s.expert_misses, Ordering::Relaxed);
+        self.expert_evictions.store(s.expert_evictions, Ordering::Relaxed);
     }
 }
 
@@ -667,6 +674,28 @@ fn metrics_text(engine: &EngineService) -> String {
             s.prefetched.load(Ordering::Relaxed),
             s.depth.load(Ordering::Relaxed),
         ));
+        // Routed-expert VRAM cache (GPU MoE streaming). Zero on dense / host runs;
+        // on a sparse model the expert hit rate is the throughput signal.
+        let (eh, em) = (
+            s.expert_hits.load(Ordering::Relaxed),
+            s.expert_misses.load(Ordering::Relaxed),
+        );
+        if eh + em > 0 {
+            out.push_str(&format!(
+                "# HELP dlm_stream_expert_hits_total Routed-expert fetches served from the VRAM expert cache.\n\
+                 # TYPE dlm_stream_expert_hits_total counter\n\
+                 dlm_stream_expert_hits_total {}\n\
+                 # HELP dlm_stream_expert_misses_total Routed-expert fetches that streamed the expert from the checkpoint.\n\
+                 # TYPE dlm_stream_expert_misses_total counter\n\
+                 dlm_stream_expert_misses_total {}\n\
+                 # HELP dlm_stream_expert_evictions_total Experts evicted from the VRAM expert cache.\n\
+                 # TYPE dlm_stream_expert_evictions_total counter\n\
+                 dlm_stream_expert_evictions_total {}\n",
+                eh,
+                em,
+                s.expert_evictions.load(Ordering::Relaxed),
+            ));
+        }
     }
     out
 }

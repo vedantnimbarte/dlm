@@ -15,6 +15,12 @@ $ErrorActionPreference = 'Stop'
 
 $Repo = 'vedantnimbarte/dlm'
 $Bin = 'dlm.exe'
+# minisign public key for release authenticity. The sha256 check proves the
+# download is intact; a signature proves it came from whoever holds this key.
+# Empty until a signing key is published for the project (see release.yml) —
+# while empty, signature verification is skipped and only the checksum applies.
+# Override with $env:DLM_MINISIGN_PUBKEY to pin your own key.
+$MinisignPubkey = if ($env:DLM_MINISIGN_PUBKEY) { $env:DLM_MINISIGN_PUBKEY } else { '' }
 $InstallDir = if ($env:DLM_INSTALL_DIR) { $env:DLM_INSTALL_DIR }
               else { Join-Path $env:LOCALAPPDATA 'Programs\dlm' }
 
@@ -49,6 +55,38 @@ function Get-Asset($asset) {
     if (-not $want) { throw "empty checksum file for $asset" }
     if ($want -ne $have) {
         throw "checksum mismatch for ${asset}: expected $want, got $have. The download was corrupted or tampered with."
+    }
+
+    # Authenticity (opt-in): if a signing key is configured and minisign is on
+    # PATH, the archive's .minisig must verify. A missing tool or key falls back
+    # to the checksum above; but once a key IS set, a signature that is missing,
+    # unfetchable or invalid all abort — configuring a key means "refuse anything
+    # I cannot prove came from the key holder", and accepting a missing .minisig
+    # would let anyone strip it to bypass the check.
+    if ($MinisignPubkey) {
+        if (Get-Command minisign -ErrorAction SilentlyContinue) {
+            $sig = Join-Path $tmp "$asset.minisig"
+            try {
+                Invoke-WebRequest -Uri "$base/$asset.minisig" -OutFile $sig -UseBasicParsing
+            } catch {
+                throw @"
+no signature published for $asset, but DLM_MINISIGN_PUBKEY is set.
+
+This release was not signed, so its authenticity cannot be proven. Either
+install a signed release, or clear DLM_MINISIGN_PUBKEY to install with only
+the sha256 integrity check (which has already passed).
+"@
+            }
+            $pub = Join-Path $tmp 'dlm.pub'
+            Set-Content -Path $pub -Value $MinisignPubkey -Encoding ascii
+            & minisign -Vm $zip -p $pub -x $sig *>$null
+            if ($LASTEXITCODE -ne 0) {
+                throw "signature verification failed for $asset - it is not signed by the expected key."
+            }
+            Write-Host "  release signature verified"
+        } else {
+            Write-Host "  note: minisign not installed - skipping signature check (sha256 integrity still verified)."
+        }
     }
 
     # Extract into a per-asset subdir so the CPU and GPU binaries never collide.

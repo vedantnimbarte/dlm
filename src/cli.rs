@@ -212,6 +212,22 @@ pub struct ServeArgs {
     #[arg(long, value_name = "GB")]
     pub ram_cache_gb: Option<f64>,
 
+    /// Maximum number of requests decoded concurrently (continuous batching).
+    /// Each in-flight sequence holds its own KV cache, so on the GPU the KV VRAM
+    /// scales with this — raise it for throughput on a big card, lower it (or
+    /// lower `--context-length`) if a batch would exceed VRAM.
+    #[arg(long, default_value_t = 8)]
+    pub max_batch: usize,
+
+    /// VRAM budget (GiB) for the routed-expert cache on the GPU MoE streaming path
+    /// (`--stream --device gpu` with a Mixture-of-Experts checkpoint). Only the
+    /// top-k experts a token selects are streamed into VRAM and cached here; a
+    /// bigger budget keeps more of the hot set resident, cutting PCIe re-streams.
+    /// Ignored for dense models. Defaults to the VRAM left after the resident
+    /// layer window — so it can't be set so large it OOMs the card.
+    #[arg(long, value_name = "GB")]
+    pub expert_cache_gb: Option<f64>,
+
     /// TCP port for the API server.
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
@@ -276,6 +292,14 @@ pub struct ServeArgs {
     /// Comma-separated worker `host:port` addresses (master mode).
     #[arg(long, value_delimiter = ',', value_name = "ADDRS")]
     pub worker_nodes: Vec<String>,
+
+    /// Per-connection read/write timeout for a worker, in seconds (worker mode).
+    /// A peer that goes quiet for this long is dropped rather than pinning a
+    /// thread. The 30s default suits a LAN; raise it for slow or congested links.
+    /// `0` keeps the default — a worker with no timeout would let one silent peer
+    /// hold a thread forever.
+    #[arg(long, value_name = "SECS")]
+    pub worker_timeout_secs: Option<u64>,
 
     /// Shared secret authenticating the master↔worker link. Set the *same* value
     /// on every worker and the master; the master presents it on each connection

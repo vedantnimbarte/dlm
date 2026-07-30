@@ -15,7 +15,7 @@
 
 use crate::cache::{KvCacheConfig, PagedKvCache};
 use crate::error::{DlmError, Result};
-use crate::forward::cpu::{matvec, rmsnorm};
+use crate::forward::cpu::{matvec, rmsnorm, KvLayerCache};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
 
 /// Index of the largest logit (greedy pick; first max wins on ties).
@@ -247,6 +247,13 @@ pub struct Generator<K: ComputeKernel> {
     kv_total_blocks: u32,
     /// Per-layer KV precision (int8/int4 shrink KV memory, approximate).
     kv_quant: crate::forward::KvQuant,
+    /// Scalar applied to each token embedding after lookup (Gemma multiplies by
+    /// `sqrt(hidden)`); `None` leaves embeddings unscaled.
+    embed_scale: Option<f32>,
+    /// Gemma2 caps the final logits at `tanh(l/cap)*cap` before sampling, which
+    /// changes the distribution (it compresses the tail toward the cap), so it is
+    /// part of correctness rather than a stylistic knob. `None` elsewhere.
+    final_logit_softcap: Option<f32>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -286,6 +293,8 @@ impl<K: ComputeKernel> Generator<K> {
             kv_config,
             kv_total_blocks,
             kv_quant: crate::forward::KvQuant::None,
+            embed_scale: None,
+            final_logit_softcap: None,
         })
     }
 
@@ -293,6 +302,19 @@ impl<K: ComputeKernel> Generator<K> {
     /// Affects sessions started after this call.
     pub fn with_kv_quant(mut self, kv_quant: crate::forward::KvQuant) -> Self {
         self.kv_quant = kv_quant;
+        self
+    }
+
+    /// Scale token embeddings by `scale` after lookup (Gemma uses `sqrt(hidden)`).
+    /// `None` leaves them unscaled.
+    pub fn with_embed_scale(mut self, scale: Option<f32>) -> Self {
+        self.embed_scale = scale;
+        self
+    }
+
+    /// Cap the final logits at `tanh(l/cap)*cap` before sampling (Gemma2).
+    pub fn with_final_logit_softcap(mut self, cap: Option<f32>) -> Self {
+        self.final_logit_softcap = cap.filter(|c| *c > 0.0);
         self
     }
 
@@ -321,13 +343,112 @@ impl<K: ComputeKernel> Generator<K> {
             )));
         }
         let start = idx * self.hidden_size;
-        Ok(self.embedding[start..start + self.hidden_size].to_vec())
+        let mut v = self.embedding[start..start + self.hidden_size].to_vec();
+        if let Some(scale) = self.embed_scale {
+            for x in &mut v {
+                *x *= scale;
+            }
+        }
+        Ok(v)
     }
 
     /// Project a hidden state to vocabulary logits via final norm + LM head.
     fn logits(&self, hidden: &[f32]) -> Vec<f32> {
         let normed = rmsnorm(hidden, &self.final_norm, self.rms_eps);
-        matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size)
+        let mut out = matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
+        if let Some(cap) = self.final_logit_softcap {
+            for l in out.iter_mut() {
+                *l = (*l / cap).tanh() * cap;
+            }
+        }
+        out
+    }
+
+    /// Greedy-decode a **batch** of prompts together, advancing all sequences
+    /// through each layer in one [`run_block_batched`](ComputeKernel::run_block_batched)
+    /// call — so a GPU kernel fuses the per-sequence projections into batched
+    /// GEMMs. Each sequence's output is identical to decoding it alone (the batch
+    /// is a throughput optimization, not a semantic change).
+    ///
+    /// Prompts may differ in length (each carries its own position and KV). A
+    /// sequence that hits EOS stops emitting but still rides the batch until the
+    /// longest finishes (a scheduler would retire it; this is the simple form).
+    pub fn generate_batch(
+        &self,
+        prompts: &[&[u32]],
+        cfg: &GenerationConfig,
+    ) -> Result<Vec<Vec<u32>>> {
+        let b = prompts.len();
+        if b == 0 {
+            return Ok(Vec::new());
+        }
+        for p in prompts {
+            if p.is_empty() {
+                return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
+            }
+        }
+        let nl = self.kernel.num_layers() as usize;
+        let kv_dim = self.kernel.kv_dim();
+        // Per-sequence KV (one cache per layer) + hidden + absolute position.
+        let mut kvs: Vec<Vec<KvLayerCache>> = (0..b)
+            .map(|_| (0..nl).map(|_| KvLayerCache::new_quant(kv_dim, self.kv_quant)).collect())
+            .collect();
+        let mut hidden = vec![vec![0.0f32; self.hidden_size]; b];
+        let mut position = vec![0usize; b];
+
+        // Prefill each sequence (per-sequence — prompts differ in length). After
+        // the loop `hidden[s]` holds the last prompt token's stack output (what the
+        // first decode step samples from) and `position[s]` is the next position.
+        for (s, prompt) in prompts.iter().enumerate() {
+            for &tok in *prompt {
+                let mut h = self.embed(tok)?;
+                for (l, kv) in kvs[s].iter_mut().enumerate() {
+                    self.kernel.run_block(l as u32, &mut h, kv, position[s])?;
+                }
+                hidden[s] = h;
+                position[s] += 1;
+            }
+        }
+
+        let mut rngs: Vec<SplitMix64> = (0..b).map(|_| SplitMix64::new(cfg.sampler.seed())).collect();
+        let penalty = cfg.sampler.repetition_penalty();
+        let mut seen: Vec<std::collections::HashSet<u32>> =
+            prompts.iter().map(|p| p.iter().copied().collect()).collect();
+        let mut out = vec![Vec::with_capacity(cfg.max_new_tokens); b];
+        let mut done = vec![false; b];
+
+        for _ in 0..cfg.max_new_tokens {
+            // Sample the next token for each live sequence from its current hidden.
+            for s in 0..b {
+                if done[s] {
+                    continue;
+                }
+                let mut logits = self.logits(&hidden[s]);
+                apply_repetition_penalty(&mut logits, &seen[s], penalty);
+                let next = cfg.sampler.sample(&logits, &mut rngs[s]);
+                out[s].push(next);
+                seen[s].insert(next);
+                if cfg.eos_token == Some(next) {
+                    done[s] = true;
+                    continue;
+                }
+                hidden[s] = self.embed(next)?;
+            }
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            // Advance every sequence through the stack, one batched call per layer.
+            for l in 0..nl {
+                let mut hs: Vec<&mut [f32]> = hidden.iter_mut().map(|h| h.as_mut_slice()).collect();
+                let mut ks: Vec<&mut KvLayerCache> =
+                    kvs.iter_mut().map(|seq| &mut seq[l]).collect();
+                self.kernel.run_block_batched(l as u32, &mut hs, &mut ks, &position)?;
+            }
+            for p in &mut position {
+                *p += 1;
+            }
+        }
+        Ok(out)
     }
 
     /// Generate a continuation for `prompt`, returning the newly produced token
@@ -412,17 +533,30 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// Resume generation from a prior session's [`KvSnapshot`], prefilling only
-    /// the `suffix` tokens that follow the snapshotted prefix. The result is
-    /// identical to [`start_session`](Self::start_session) on the full
-    /// `prefix + suffix` prompt, but skips re-running the shared prefix — the
-    /// basis for cross-request prefix caching. `suffix` must be non-empty (the
-    /// session needs a last hidden state to produce the first token).
+    /// the tokens of `prompt` that follow the snapshotted prefix. The result is
+    /// identical to [`start_session`](Self::start_session) on the full `prompt`,
+    /// but skips re-running the shared prefix — the basis for cross-request prefix
+    /// caching.
+    ///
+    /// `prompt` is the **whole** prompt (the cached prefix plus the new suffix);
+    /// the snapshot's position marks where the prefix ends. Passing the full
+    /// prompt lets the repetition penalty cover the cached prefix's tokens too —
+    /// otherwise a resumed request would penalize only its suffix and drift from
+    /// the same request run without the cache. The suffix (`prompt[position..]`)
+    /// must be non-empty (the session needs a last hidden state).
     pub fn resume_session(
         &self,
         snapshot: crate::forward::KvSnapshot,
-        suffix: &[u32],
+        prompt: &[u32],
         sampler: Sampler,
     ) -> Result<GenerationSession<'_, K>> {
+        let start = snapshot.position();
+        if start > prompt.len() {
+            return Err(DlmError::InvalidConfig(
+                "resume snapshot is longer than the prompt it should prefix".into(),
+            ));
+        }
+        let suffix = &prompt[start..];
         if suffix.is_empty() {
             return Err(DlmError::InvalidConfig("resume suffix must be non-empty".into()));
         }
@@ -439,11 +573,10 @@ impl<K: ComputeKernel> Generator<K> {
             last_hidden: hidden,
             rng: SplitMix64::new(sampler.seed()),
             sampler,
-            // Only the suffix is known here — the snapshot carries KV state, not
-            // the prefix token ids — so the repetition penalty won't cover the
-            // cached prefix. Thread the prefix ids through the snapshot when
-            // resume_session is wired into the server with sampling.
-            seen: suffix.iter().copied().collect(),
+            // The full prompt (cached prefix + suffix), so the repetition penalty
+            // covers the cached prefix — a resumed request matches the same request
+            // run without the prefix cache.
+            seen: prompt.iter().copied().collect(),
         })
     }
 }
@@ -454,6 +587,14 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// [`resume`](Generator::resume_session) from it.
     pub fn snapshot(&self) -> crate::forward::KvSnapshot {
         self.orchestrator.snapshot()
+    }
+
+    /// Snapshot for the prefix cache, pulling device-resident K/V back to the
+    /// host first so the snapshot is real on the GPU kernels too (where the host
+    /// caches otherwise hold only length placeholders). See
+    /// [`ForwardOrchestrator::snapshot_synced`](crate::forward::ForwardOrchestrator::snapshot_synced).
+    pub fn snapshot_synced(&mut self) -> Result<crate::forward::KvSnapshot> {
+        self.orchestrator.snapshot_synced()
     }
 
     /// Emit the next token and advance the internal state by one step.
@@ -487,7 +628,8 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         // One identity (zero-weight) block: hidden passes through unchanged.
         let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
@@ -512,6 +654,37 @@ mod tests {
             block_size: 16,
         };
         Generator::new(kernel, embedding, final_norm, lm_head, vocab, 1e-5, kv_config, 8).unwrap()
+    }
+
+    /// Gemma2's final-logit softcap squashes logits through `tanh(l/cap)*cap`
+    /// before sampling. It must compress the spread (that is the whole point —
+    /// it changes the sampled distribution) while leaving the ranking intact,
+    /// since `tanh` is monotonic.
+    #[test]
+    fn final_logit_softcap_compresses_without_reordering() {
+        let hidden = vec![0.4f32, -0.7, 0.15, 0.9];
+        let plain = counting_generator();
+        let raw = plain.logits(&hidden);
+
+        let capped_gen = counting_generator().with_final_logit_softcap(Some(0.5));
+        let capped = capped_gen.logits(&hidden);
+
+        assert_eq!(raw.len(), capped.len());
+        // Every capped logit is inside ±cap, and strictly smaller in magnitude
+        // wherever the raw logit had any real magnitude.
+        for (r, c) in raw.iter().zip(&capped) {
+            assert!(c.abs() <= 0.5 + 1e-6, "logit {c} escaped the cap");
+            if r.abs() > 1e-3 {
+                assert!(c.abs() < r.abs(), "cap should shrink {r} but gave {c}");
+            }
+        }
+        // Monotonic ⇒ argmax (and the whole ranking) is unchanged.
+        assert_eq!(argmax(&raw), argmax(&capped));
+
+        // A non-positive cap is treated as "off", not as a divide-by-zero.
+        let off = counting_generator().with_final_logit_softcap(Some(0.0));
+        assert_eq!(off.logits(&hidden), raw);
+        assert_eq!(counting_generator().with_final_logit_softcap(None).logits(&hidden), raw);
     }
 
     #[test]
@@ -608,7 +781,8 @@ mod tests {
             head_dim: 4,
             intermediate_size: 32,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut r = SplitMix64::new(42);
         let mut vec = |n: usize| -> Vec<f32> {
@@ -656,10 +830,23 @@ mod tests {
     }
 
     #[test]
+    fn generate_batch_matches_individual() {
+        // Each sequence in a batch must decode identically to running it alone —
+        // batching is a throughput optimization, not a semantic change.
+        let gen = attention_generator();
+        let cfg = GenerationConfig { max_new_tokens: 5, eos_token: None, sampler: Sampler::Greedy };
+        let p1: &[u32] = &[1, 2, 3];
+        let p2: &[u32] = &[4, 5];
+        let batched = gen.generate_batch(&[p1, p2], &cfg).unwrap();
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[0], gen.generate(p1, &cfg).unwrap());
+        assert_eq!(batched[1], gen.generate(p2, &cfg).unwrap());
+    }
+
+    #[test]
     fn resume_from_snapshot_matches_full_prefill() {
         let gen = attention_generator();
         let prefix = [1u32, 2, 3];
-        let suffix = [4u32, 5];
         let full_prompt = [1u32, 2, 3, 4, 5];
         let n = 6;
 
@@ -667,16 +854,49 @@ mod tests {
         let mut full = gen.start_session(&full_prompt, Sampler::Greedy).unwrap();
         let tokens_full: Vec<u32> = (0..n).map(|_| full.step().unwrap()).collect();
 
-        // Snapshot after the prefix, resume prefilling only the suffix.
+        // Snapshot after the prefix, resume passing the whole prompt (resume
+        // derives the suffix from the snapshot position).
         let prefix_sess = gen.start_session(&prefix, Sampler::Greedy).unwrap();
         let snap = prefix_sess.snapshot();
         assert_eq!(snap.position(), prefix.len());
-        let mut resumed = gen.resume_session(snap, &suffix, Sampler::Greedy).unwrap();
+        let mut resumed = gen.resume_session(snap, &full_prompt, Sampler::Greedy).unwrap();
         let tokens_resumed: Vec<u32> = (0..n).map(|_| resumed.step().unwrap()).collect();
 
         // Resuming from the shared prefix is bit-for-bit identical to prefilling
         // the full prompt — the correctness property a prefix cache relies on.
         assert_eq!(tokens_full, tokens_resumed);
+    }
+
+    /// With a repetition penalty, a resumed session must match the same request
+    /// run without the prefix cache — i.e. the penalty covers the cached *prefix*
+    /// tokens, not just the suffix. Before the fix, `seen` held only the suffix,
+    /// so a resumed request penalized fewer tokens and drifted.
+    #[test]
+    fn resume_repetition_penalty_covers_cached_prefix() {
+        let gen = attention_generator();
+        let prefix = [1u32, 2, 3];
+        let full_prompt = [1u32, 2, 3, 4, 5];
+        let n = 6;
+        let sampler = Sampler::TopPK {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 4.0, // strong, so prefix coverage visibly matters
+            seed: 7,
+        };
+
+        let mut full = gen.start_session(&full_prompt, sampler).unwrap();
+        let tokens_full: Vec<u32> = (0..n).map(|_| full.step().unwrap()).collect();
+
+        let snap = gen.start_session(&prefix, sampler).unwrap().snapshot();
+        let mut resumed = gen.resume_session(snap, &full_prompt, sampler).unwrap();
+        let tokens_resumed: Vec<u32> = (0..n).map(|_| resumed.step().unwrap()).collect();
+
+        assert_eq!(
+            tokens_full, tokens_resumed,
+            "resumed penalty must cover the cached prefix, matching a full run"
+        );
     }
 
     #[test]

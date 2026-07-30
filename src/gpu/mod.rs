@@ -23,7 +23,9 @@ use std::ptr::NonNull;
 mod ffi_cuda;
 #[cfg(feature = "rocm")]
 mod ffi_hip;
-#[cfg(feature = "cuda")]
+// The owned-VRAM buffer/stream types are backend-agnostic (they dispatch to the
+// CUDA or HIP runtime), so they compile under either backend.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod device;
 
 /// Which GPU runtime this binary was compiled against.

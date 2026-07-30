@@ -37,6 +37,10 @@ pub struct VramProfiler {
     pub target_context: u32,
     /// `M_safety` cushion in bytes.
     pub safety_margin_bytes: u64,
+    /// Concurrent sequences the KV cache must hold at once (continuous batching).
+    /// Each in-flight request owns a full-context KV cache, so `M_kv_total` scales
+    /// with this; `1` sizes for a single sequence (the historical behavior).
+    pub max_batch: u32,
 }
 
 impl Default for VramProfiler {
@@ -44,6 +48,7 @@ impl Default for VramProfiler {
         Self {
             target_context: 8192,
             safety_margin_bytes: DEFAULT_SAFETY_MARGIN_BYTES,
+            max_batch: 1,
         }
     }
 }
@@ -107,6 +112,14 @@ impl VramProfiler {
         self
     }
 
+    /// Set the concurrent-batch size the KV cache is planned for (builder-style).
+    /// Sizing the plan for `max_batch` sequences keeps the resident layer window
+    /// from claiming VRAM the batch's KV caches will need.
+    pub fn with_max_batch(mut self, max_batch: u32) -> Self {
+        self.max_batch = max_batch.max(1);
+        self
+    }
+
     /// KV-cache bytes for a **single** layer across the full target context:
     /// `2 (K,V) × N_kv_heads × D_head × 2 bytes × L_context`.
     pub fn kv_bytes_per_layer(&self, config: &ModelConfig) -> u64 {
@@ -117,13 +130,24 @@ impl VramProfiler {
     }
 
     /// Total KV-cache footprint (`M_kv_total`) — per-layer KV summed over every
-    /// layer, since all layers' histories stay resident while weights stream.
+    /// layer (all layers' histories stay resident while weights stream), times the
+    /// concurrent-batch size, since each in-flight sequence holds its own full KV.
     pub fn kv_total_bytes(&self, config: &ModelConfig) -> u64 {
-        self.kv_bytes_per_layer(config) * config.num_layers as u64
+        self.kv_bytes_per_layer(config) * config.num_layers as u64 * self.max_batch as u64
     }
 
-    /// Average bytes of one streamed transformer block (`M_layer_weight`).
+    /// Average bytes of one streamed transformer block (`M_layer_weight`) — the
+    /// unit that stays resident per layer in the streaming window.
+    ///
+    /// For an MoE model this is the layer **core** (attention + router + shared
+    /// expert + norms), *not* the whole layer: the routed experts stream into a
+    /// separate per-`(layer, expert)` cache budgeted apart, so planning the window
+    /// as if each unit held all its experts would size it many times too small.
     pub fn per_layer_weight_bytes(&self, config: &ModelConfig) -> u64 {
+        if config.is_moe() {
+            return (config.resident_layer_params() as f64 * config.quant.bytes_per_param())
+                .ceil() as u64;
+        }
         let model_total_bytes =
             config.estimated_total_params() as f64 * config.quant.bytes_per_param();
         (model_total_bytes / config.num_layers as f64).ceil() as u64
@@ -158,13 +182,21 @@ impl VramProfiler {
         native: QuantScheme,
         free_bytes: u64,
     ) -> VramPlan {
-        let per_layer = match catalog.max_layer_bytes() {
-            0 => self.per_layer_weight_bytes(config),
-            // Scale the measured on-disk bytes to the precision the engine will
-            // actually hold the layer in.
-            measured => {
-                let ratio = config.quant.bytes_per_param() / native.bytes_per_param();
-                (measured as f64 * ratio).ceil() as u64
+        let per_layer = if config.is_moe() {
+            // The catalog measures a layer's *full* bytes (all experts inline), but
+            // only the core stays resident on the MoE streaming path — experts
+            // stream into their own budgeted cache. Use the core geometry estimate,
+            // which the catalog can't separate out.
+            self.per_layer_weight_bytes(config)
+        } else {
+            match catalog.max_layer_bytes() {
+                0 => self.per_layer_weight_bytes(config),
+                // Scale the measured on-disk bytes to the precision the engine will
+                // actually hold the layer in.
+                measured => {
+                    let ratio = config.quant.bytes_per_param() / native.bytes_per_param();
+                    (measured as f64 * ratio).ceil() as u64
+                }
             }
         };
         let num_layers = if catalog.num_layers() == 0 {
@@ -219,5 +251,38 @@ impl VramProfiler {
     pub fn profile(&self, config: &ModelConfig) -> Result<VramPlan> {
         let dev = gpu::mem_get_info()?;
         Ok(self.plan_with_free(config, dev.free))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::QuantScheme;
+
+    fn cfg() -> ModelConfig {
+        let json = br#"{"hidden_size":64,"num_attention_heads":8,"num_key_value_heads":8,
+            "num_hidden_layers":4,"vocab_size":128,"intermediate_size":256}"#;
+        ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap()
+    }
+
+    #[test]
+    fn kv_total_scales_with_max_batch() {
+        let c = cfg();
+        let single = VramProfiler::new(2048); // max_batch defaults to 1
+        assert_eq!(single.max_batch, 1);
+        let batched = VramProfiler::new(2048).with_max_batch(8);
+        // Eight concurrent sequences reserve 8× the single-sequence KV.
+        assert_eq!(batched.kv_total_bytes(&c), 8 * single.kv_total_bytes(&c));
+        // And that larger reservation shrinks the resident window (fixed free VRAM).
+        let free = 4 * 1024 * 1024 * 1024;
+        assert!(
+            batched.plan_with_free(&c, free).layers_to_load
+                <= single.plan_with_free(&c, free).layers_to_load
+        );
+    }
+
+    #[test]
+    fn max_batch_zero_clamps_to_one() {
+        assert_eq!(VramProfiler::new(1024).with_max_batch(0).max_batch, 1);
     }
 }

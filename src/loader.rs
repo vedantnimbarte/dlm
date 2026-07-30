@@ -230,6 +230,7 @@ fn load_gptq_linear(
     out_features: usize,
     pq: PackedQuant,
 ) -> Result<Weights> {
+    use crate::model::PackedFormat;
     let qweight = load_i32(store, &format!("{base}.qweight"))?;
     let qzeros = load_i32(store, &format!("{base}.qzeros"))?;
     let scales = load_floats(store, &format!("{base}.scales"))?;
@@ -238,8 +239,45 @@ fn load_gptq_linear(
         out_features,
         group_size: pq.group_size,
     };
-    let (codes, sc, ze) = crate::quant::unpack_gptq_4bit(&qweight, &qzeros, &scales, &cfg)?;
-    Weights::from_int4_parts(&codes, &sc, &ze, pq.group_size)
+    if pq.kind.is_experimental() {
+        warn_experimental_quant(pq.kind);
+    }
+    match pq.kind {
+        // Classic GPTQ: relabel the codes into dlm's int4 layout (keeps int4 VRAM).
+        PackedFormat::Gptq { act_order: false } => {
+            let (codes, sc, ze) = crate::quant::unpack_gptq_4bit(&qweight, &qzeros, &scales, &cfg)?;
+            Weights::from_int4_parts(&codes, &sc, &ze, pq.group_size)
+        }
+        // Act-order groups are scattered by g_idx; dequantize to f32 (dlm's flat
+        // int4 layout can't represent non-contiguous groups).
+        PackedFormat::Gptq { act_order: true } => {
+            let g_idx = load_i32(store, &format!("{base}.g_idx"))?;
+            let dense =
+                crate::quant::dequantize_gptq_4bit(&qweight, &qzeros, &scales, &cfg, Some(&g_idx))?;
+            Ok(Weights::from_f32(dense))
+        }
+        // AWQ: different nibble order + zero convention; dequantize to f32.
+        PackedFormat::Awq => {
+            let dense = crate::quant::dequantize_awq_4bit(&qweight, &qzeros, &scales, &cfg)?;
+            Ok(Weights::from_f32(dense))
+        }
+    }
+}
+
+/// Warn once (per process) that an experimental packed-quant path is in use — its
+/// decoding is validated only by internal round-trip, not against a real export,
+/// so a convention mismatch would produce plausible-but-wrong weights.
+fn warn_experimental_quant(kind: crate::model::PackedFormat) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: decoding an EXPERIMENTAL packed-quant format ({kind:?}). This path is \
+             validated only by dlm's internal round-trip, NOT against a reference export — a \
+             convention mismatch would yield plausible-but-wrong weights. Verify output with \
+             `dlm doctor` and your own prompts before trusting it."
+        );
+    });
 }
 
 /// Read an `i32` tensor (GPTQ packs its codes and zero-points as `int32`).
@@ -248,6 +286,15 @@ fn load_i32(store: &MmapStore, name: &str) -> Result<Vec<i32>> {
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
     crate::storage::bytes_to_i32(shard.tensor_bytes(name)?, info.dtype)
+}
+
+/// Read an optional f32 tensor by its full name, or `None` when absent (e.g.
+/// Qwen3's per-head Q/K norm weights, which most models don't ship).
+fn load_optional(store: &MmapStore, name: &str, len: usize) -> Result<Option<Vec<f32>>> {
+    if store.locate(name).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(load_tensor(store, name, len)?))
 }
 
 /// Read a linear layer's bias (`{base}.bias`) when the checkpoint ships one.
@@ -275,13 +322,19 @@ pub struct ModelParts {
     pub rms_eps: f32,
     pub kv_config: KvCacheConfig,
     pub kv_blocks: u32,
+    /// Embedding scale (Gemma: `sqrt(hidden)`); `None` leaves embeddings unscaled.
+    pub embed_scale: Option<f32>,
+    /// Gemma2 final-logit softcap; `None` elsewhere.
+    pub final_logit_softcap: Option<f32>,
 }
 
 impl ModelParts {
     /// Wrap the CPU kernel around these weights and build a generator.
     pub fn into_cpu_generator(self) -> Result<Generator<CpuKernel>> {
+        let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
         let kernel = CpuKernel::new(self.cfg, self.layers)?;
-        Generator::new(
+        Ok(Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -290,15 +343,19 @@ impl ModelParts {
             self.rms_eps,
             self.kv_config,
             self.kv_blocks,
-        )
+        )?
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
     }
 
     /// Upload every layer to VRAM and build a generator over the GPU kernel.
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
     pub fn into_gpu_generator(self) -> Result<Generator<crate::forward::GpuKernel>> {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
+        let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
         let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
-        Generator::new(
+        Ok(Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -307,7 +364,36 @@ impl ModelParts {
             self.rms_eps,
             self.kv_config,
             self.kv_blocks,
-        )
+        )?
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
+    }
+
+    /// Split the model's layers across `gpu_ids` and build a generator over a
+    /// **GPU** pipeline ([`MultiGpuKernel`]) — each device holds and computes its
+    /// own layer shard (real multi-GPU compute, not the CPU-backed
+    /// [`into_pipeline_parallel_generator`](Self::into_pipeline_parallel_generator)).
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn into_multi_gpu_generator(
+        self,
+        gpu_ids: &[u32],
+    ) -> Result<Generator<crate::forward::MultiGpuKernel>> {
+        let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
+        let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
+        let kernel = crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
+        Ok(Generator::new(
+            kernel,
+            self.embedding,
+            self.final_norm,
+            self.lm_head,
+            self.vocab_size,
+            self.rms_eps,
+            self.kv_config,
+            self.kv_blocks,
+        )?
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
@@ -320,8 +406,10 @@ impl ModelParts {
         self,
         gpu_ids: &[u32],
     ) -> Result<Generator<PipelineParallelKernel<CpuKernel>>> {
+        let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
         let kernel = PipelineParallelKernel::new(CpuKernel::new(self.cfg, self.layers)?, gpu_ids)?;
-        Generator::new(
+        Ok(Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -330,7 +418,9 @@ impl ModelParts {
             self.rms_eps,
             self.kv_config,
             self.kv_blocks,
-        )
+        )?
+        .with_embed_scale(embed_scale)
+        .with_final_logit_softcap(logit_cap))
     }
 }
 
@@ -357,6 +447,13 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         rms_eps: config.rms_eps,
         rope_scaling: config.rope_scaling,
         moe: config.moe,
+        sliding_window: config.sliding_window.map(|w| w as usize),
+        activation: config.activation,
+        mla: config.mla,
+        sliding_window_pattern: config.sliding_window_pattern,
+        attn_logit_softcap: config.attn_logit_softcap,
+        query_pre_attn_scalar: config.query_pre_attn_scalar,
+        gemma2_norms: config.gemma2_norms,
     }
 }
 
@@ -369,8 +466,36 @@ pub(crate) fn load_layer_tensors(
     layer: u32,
     quant: QuantScheme,
     packed: Option<PackedQuant>,
+    norm_add_one: bool,
 ) -> Result<LayerTensors> {
-    load_layer_tensors_opt(store, cfg, layer, quant, packed, true)
+    load_layer_tensors_opt(store, cfg, layer, quant, packed, true, norm_add_one)
+}
+
+/// Load an RMSNorm weight, baking Gemma's `+1` in when `add_one` so the norm
+/// kernels can stay a plain `w` multiply.
+fn load_norm(store: &MmapStore, name: &str, len: usize, add_one: bool) -> Result<Vec<f32>> {
+    let mut v = load_tensor(store, name, len)?;
+    if add_one {
+        for x in &mut v {
+            *x += 1.0;
+        }
+    }
+    Ok(v)
+}
+
+/// [`load_norm`] for a norm the checkpoint may not ship (Gemma2's FFN norm pair).
+/// Absent is `None`, not an error — but the `(1 + w)` bake still applies when
+/// present, which is why this can't just be [`load_optional`].
+fn load_norm_optional(
+    store: &MmapStore,
+    name: &str,
+    len: usize,
+    add_one: bool,
+) -> Result<Option<Vec<f32>>> {
+    if store.locate(name).is_none() {
+        return Ok(None);
+    }
+    load_norm(store, name, len, add_one).map(Some)
 }
 
 /// Like [`load_layer_tensors`], but `include_experts = false` loads only the MoE
@@ -384,7 +509,12 @@ pub(crate) fn load_layer_tensors_opt(
     quant: QuantScheme,
     packed: Option<PackedQuant>,
     include_experts: bool,
+    norm_add_one: bool,
 ) -> Result<LayerTensors> {
+    // Resolve the config for THIS layer: DeepSeek's leading dense layers report
+    // `moe: None` here even though the checkpoint is MoE overall, which is what
+    // routes them to the dense FFN below and satisfies `validate` afterwards.
+    let cfg = &cfg.for_layer(layer);
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
@@ -399,25 +529,108 @@ pub(crate) fn load_layer_tensors_opt(
         }),
         Some(_) => load_moe_ffn(store, cfg, layer, quant, packed, include_experts)?,
     };
-    let tensors = LayerTensors {
-        q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant, packed)?,
-        k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant, packed)?,
-        v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
-        o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
-        ffn,
-        input_layernorm: load_tensor(store, &name("input_layernorm.weight"), hidden)?,
-        post_attention_layernorm: load_tensor(
-            store,
-            &name("post_attention_layernorm.weight"),
-            hidden,
-        )?,
-        // Present on Qwen2 and friends, absent on Llama/Mistral.
-        q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
-        k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
-        v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
+    let input_layernorm = load_norm(store, &name("input_layernorm.weight"), hidden, norm_add_one)?;
+    let post_attention_layernorm =
+        load_norm(store, &name("post_attention_layernorm.weight"), hidden, norm_add_one)?;
+
+    // MLA (DeepSeek) replaces q/k/v with latent projections and a wider o_proj.
+    let tensors = if let Some(m) = &cfg.mla {
+        let vdim = m.v_head_dim as usize;
+        LayerTensors {
+            o_proj: load_linear(store, &name("self_attn.o_proj"), cfg.num_heads * vdim, hidden, quant, packed)?,
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
+            mla: Some(load_mla(store, cfg, m, layer, quant, packed, norm_add_one)?),
+            ..Default::default()
+        }
+    } else {
+        LayerTensors {
+            q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant, packed)?,
+            k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant, packed)?,
+            v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
+            o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
+            // Present on Qwen2 and friends, absent on Llama/Mistral.
+            q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
+            k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
+            v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
+            // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3.
+            q_norm: load_optional(store, &name("self_attn.q_norm.weight"), cfg.head_dim)?,
+            k_norm: load_optional(store, &name("self_attn.k_norm.weight"), cfg.head_dim)?,
+            mla: None,
+            // Gemma2's extra norm pair; absent on every other architecture.
+            pre_feedforward_layernorm: load_norm_optional(
+                store,
+                &name("pre_feedforward_layernorm.weight"),
+                hidden,
+                norm_add_one,
+            )?,
+            post_feedforward_layernorm: load_norm_optional(
+                store,
+                &name("post_feedforward_layernorm.weight"),
+                hidden,
+                norm_add_one,
+            )?,
+        }
     };
     tensors.validate(cfg)?;
     Ok(tensors)
+}
+
+/// Load a layer's MLA (DeepSeek) projection weights from the
+/// `self_attn.{q_a_proj,q_b_proj,kv_a_proj_with_mqa,kv_b_proj,...}` tensors.
+#[allow(clippy::too_many_arguments)]
+fn load_mla(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    m: &crate::model::MlaConfig,
+    layer: u32,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+    norm_add_one: bool,
+) -> Result<crate::forward::MlaWeights> {
+    let h = cfg.hidden_size;
+    let nh = cfg.num_heads;
+    let qk = m.qk_head_dim() as usize;
+    let latent = m.kv_lora_rank as usize;
+    let rope = m.qk_rope_head_dim as usize;
+    let vdim = m.v_head_dim as usize;
+    let name = |s: &str| format!("model.layers.{layer}.{s}");
+    // Query: low-rank (q_a_proj → norm → q_b_proj) when q_lora_rank is set, else
+    // a direct projection under the `q_proj` name.
+    let (q_a_proj, q_a_layernorm, q_b_proj) = match m.q_lora_rank {
+        Some(r) => {
+            let r = r as usize;
+            (
+                Some(load_linear(store, &name("self_attn.q_a_proj"), h, r, quant, packed)?),
+                Some(load_norm(store, &name("self_attn.q_a_layernorm.weight"), r, norm_add_one)?),
+                load_linear(store, &name("self_attn.q_b_proj"), r, nh * qk, quant, packed)?,
+            )
+        }
+        None => (
+            None,
+            None,
+            load_linear(store, &name("self_attn.q_proj"), h, nh * qk, quant, packed)?,
+        ),
+    };
+    Ok(crate::forward::MlaWeights {
+        q_a_proj,
+        q_a_layernorm,
+        q_b_proj,
+        kv_a_proj: load_linear(store, &name("self_attn.kv_a_proj_with_mqa"), h, latent + rope, quant, packed)?,
+        kv_a_layernorm: load_norm(store, &name("self_attn.kv_a_layernorm.weight"), latent, norm_add_one)?,
+        kv_b_proj: load_linear(
+            store,
+            &name("self_attn.kv_b_proj"),
+            latent,
+            nh * (m.qk_nope_head_dim as usize + vdim),
+            quant,
+            packed,
+        )?,
+    })
 }
 
 /// Tensor-name prefixes for one layer's MoE block, per family. `router` names the
@@ -428,7 +641,7 @@ struct MoeNames {
     router: String,
     experts_base: String, // e.g. "…block_sparse_moe.experts" / "…mlp.experts"
     proj: (&'static str, &'static str, &'static str), // (gate, up, down) suffixes
-    shared: Option<(String, String)>,                 // (shared_expert base, shared_gate)
+    shared: Option<(String, Option<String>)>, // (shared_expert base, optional sigmoid gate)
 }
 
 fn moe_names(naming: crate::model::MoeNaming, layer: u32) -> MoeNames {
@@ -447,7 +660,18 @@ fn moe_names(naming: crate::model::MoeNaming, layer: u32) -> MoeNames {
             router: format!("{p}.mlp.gate"),
             experts_base: format!("{p}.mlp.experts"),
             proj: ("gate_proj", "up_proj", "down_proj"),
-            shared: Some((format!("{p}.mlp.shared_expert"), format!("{p}.mlp.shared_expert_gate"))),
+            shared: Some((
+                format!("{p}.mlp.shared_expert"),
+                Some(format!("{p}.mlp.shared_expert_gate")),
+            )),
+        },
+        // DeepSeek: as Qwen, but `shared_experts` (plural) and no gate tensor —
+        // the shared output is added unweighted.
+        DeepSeek => MoeNames {
+            router: format!("{p}.mlp.gate"),
+            experts_base: format!("{p}.mlp.experts"),
+            proj: ("gate_proj", "up_proj", "down_proj"),
+            shared: Some((format!("{p}.mlp.shared_experts"), None)),
         },
     }
 }
@@ -473,9 +697,10 @@ fn load_expert(
 /// `include_experts` is false — the GPU streaming core defers them to its
 /// per-`(layer, expert)` cache), and any shared expert.
 ///
-/// ponytail: the router is quantized like the rest under `--quant`. Routers are
-/// small and precision-sensitive; if int4 routing measurably flips top-k on real
-/// models, load it native instead. Left uniform until measured.
+/// The router loads in the checkpoint's native precision even under `--quant`
+/// (see below) — it is tiny and precision-sensitive, so quantizing it can flip
+/// top-k routing. A packed GPTQ/AWQ checkpoint is the one exception: its router
+/// ships as calibrated int4 codes with no float to fall back to.
 pub(crate) fn load_moe_ffn(
     store: &MmapStore,
     cfg: &BlockConfig,
@@ -489,7 +714,19 @@ pub(crate) fn load_moe_ffn(
     let inter = m.moe_intermediate_size as usize;
     let names = moe_names(m.naming, layer);
 
-    let router = load_linear(store, &names.router, hidden, m.num_experts as usize, quant, packed)?;
+    // The router is precision-sensitive: quantizing it can flip which experts a
+    // token routes to, silently degrading a sparse model, and it is tiny
+    // (`hidden × num_experts`) so keeping it native costs almost nothing. For a
+    // float checkpoint that `--quant` would quantize, load the router in its
+    // native dtype instead. (A packed GPTQ checkpoint's router keeps its own
+    // calibrated int4 codes — there is no float to fall back to.)
+    let router_quant = if packed.is_none() && matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
+        QuantScheme::Fp16 // sentinel: load_native reads the real dtype, doesn't quantize
+    } else {
+        quant
+    };
+    let router =
+        load_linear(store, &names.router, hidden, m.num_experts as usize, router_quant, packed)?;
     let experts = if include_experts {
         (0..m.num_experts)
             .map(|e| {
@@ -506,8 +743,12 @@ pub(crate) fn load_moe_ffn(
             let si = si as usize;
             let shared = load_expert(store, sbase, names.proj, hidden, si, quant, packed)?;
             // shared_expert_gate is a Linear(hidden -> 1): weight is [1, hidden].
-            let gate = load_linear(store, sgate, hidden, 1, quant, packed)?;
-            (Some(shared), Some(gate))
+            // DeepSeek ships no gate at all — its shared expert is added unweighted.
+            let gate = match sgate {
+                Some(g) => Some(load_linear(store, g, hidden, 1, quant, packed)?),
+                None => None,
+            };
+            (Some(shared), gate)
         }
         _ => (None, None),
     };
@@ -525,6 +766,8 @@ pub struct MmapLayerSource {
     quant: QuantScheme,
     /// Set when the checkpoint is already packed-quantized (GPTQ).
     packed: Option<PackedQuant>,
+    /// Bake Gemma's `(1+w)` into RMSNorm weights at load.
+    norm_add_one: bool,
 }
 
 impl LayerSource for MmapLayerSource {
@@ -532,13 +775,21 @@ impl LayerSource for MmapLayerSource {
         self.num_layers
     }
     fn load_layer(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
-        load_layer_tensors(&self.store, &self.cfg, layer, self.quant, self.packed)
+        load_layer_tensors(&self.store, &self.cfg, layer, self.quant, self.packed, self.norm_add_one)
             .map(std::sync::Arc::new)
     }
     fn load_layer_core(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
         // Core only (no routed experts) for the per-expert streaming GPU path.
-        load_layer_tensors_opt(&self.store, &self.cfg, layer, self.quant, self.packed, false)
-            .map(std::sync::Arc::new)
+        load_layer_tensors_opt(
+            &self.store,
+            &self.cfg,
+            layer,
+            self.quant,
+            self.packed,
+            false,
+            self.norm_add_one,
+        )
+        .map(std::sync::Arc::new)
     }
     fn load_expert(&self, layer: u32, expert: u32) -> Result<std::sync::Arc<ExpertFfn>> {
         let m = self.cfg.moe.ok_or_else(|| {
@@ -570,6 +821,8 @@ struct StreamingPieces {
     rms_eps: f32,
     kv_config: KvCacheConfig,
     kv_blocks: u32,
+    embed_scale: Option<f32>,
+    final_logit_softcap: Option<f32>,
 }
 
 /// Load the pinned pieces (embedding, final norm, LM head, KV sizing) and bind a
@@ -584,7 +837,7 @@ fn load_streaming_pieces(
     let vocab = config.vocab_size as usize;
 
     let embedding = load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?;
-    let final_norm = load_tensor(&store, "model.norm.weight", hidden)?;
+    let final_norm = load_norm(&store, "model.norm.weight", hidden, config.norm_add_one)?;
     let lm_head = if store.locate("lm_head.weight").is_some() {
         load_tensor(&store, "lm_head.weight", vocab * hidden)?
     } else {
@@ -602,6 +855,7 @@ fn load_streaming_pieces(
         source: MmapLayerSource {
             store,
             cfg,
+            norm_add_one: config.norm_add_one,
             num_layers: config.num_layers,
             quant: config.quant,
             packed: config.packed_quant,
@@ -613,6 +867,8 @@ fn load_streaming_pieces(
         rms_eps: config.rms_eps,
         kv_config,
         kv_blocks,
+        embed_scale: config.embed_scale,
+        final_logit_softcap: config.final_logit_softcap,
     })
 }
 
@@ -640,7 +896,7 @@ pub fn build_streaming_generator(
     } else {
         base.with_prefetch_depth(prefetch_depth as u32)
     };
-    Generator::new(
+    Ok(Generator::new(
         kernel,
         p.embedding,
         p.final_norm,
@@ -649,28 +905,39 @@ pub fn build_streaming_generator(
         p.rms_eps,
         p.kv_config,
         p.kv_blocks,
-    )
+    )?
+    .with_embed_scale(p.embed_scale)
+    .with_final_logit_softcap(p.final_logit_softcap))
 }
 
 /// GPU counterpart of [`build_streaming_generator`]: stream a window of layer
 /// weights through VRAM ([`StreamingGpuKernel`]) while KV stays resident.
 /// `ram_cache_bytes` bounds a host-RAM LRU of materialized layers so a VRAM miss
 /// doesn't re-read and re-materialize the layer every token (`0` disables it).
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub fn build_streaming_gpu_generator(
     store: MmapStore,
     config: &ModelConfig,
     max_context: u32,
     resident_layers: usize,
     ram_cache_bytes: usize,
+    expert_cache_bytes: usize,
 ) -> Result<Generator<crate::forward::StreamingGpuKernel<CachedLayerSource<MmapLayerSource>>>> {
     let p = load_streaming_pieces(store, config, max_context)?;
     let cfg = p.source.cfg;
     let max_kv_tokens = p.kv_blocks as usize * p.kv_config.block_size as usize;
+    // Bound the routed-expert VRAM cache by the budget, not an unbounded count —
+    // a 128-expert model would otherwise OOM the card (see B2). `None` for dense.
+    let expert_cap = config.expert_cache_capacity(expert_cache_bytes as u64);
     let source = CachedLayerSource::new(p.source, ram_cache_bytes);
-    let kernel =
-        crate::forward::StreamingGpuKernel::new(cfg, source, max_kv_tokens, resident_layers)?;
-    Generator::new(
+    let kernel = crate::forward::StreamingGpuKernel::new(
+        cfg,
+        source,
+        max_kv_tokens,
+        resident_layers,
+        expert_cap,
+    )?;
+    Ok(Generator::new(
         kernel,
         p.embedding,
         p.final_norm,
@@ -679,7 +946,9 @@ pub fn build_streaming_gpu_generator(
         p.rms_eps,
         p.kv_config,
         p.kv_blocks,
-    )
+    )?
+    .with_embed_scale(p.embed_scale)
+    .with_final_logit_softcap(p.final_logit_softcap))
 }
 
 /// Materialize a checkpoint into [`ModelParts`] (host `f32` weights + shapes).
@@ -702,11 +971,18 @@ pub fn load_model_parts(
 
     let mut layers = Vec::with_capacity(config.num_layers as usize);
     for i in 0..config.num_layers {
-        layers.push(load_layer_tensors(store, &cfg, i, config.quant, config.packed_quant)?);
+        layers.push(load_layer_tensors(
+            store,
+            &cfg,
+            i,
+            config.quant,
+            config.packed_quant,
+            config.norm_add_one,
+        )?);
     }
 
     let embedding = load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?;
-    let final_norm = load_tensor(store, "model.norm.weight", hidden)?;
+    let final_norm = load_norm(store, "model.norm.weight", hidden, config.norm_add_one)?;
     // Weight tying: reuse the embedding when there is no separate LM head.
     let lm_head = if store.locate("lm_head.weight").is_some() {
         load_tensor(store, "lm_head.weight", vocab * hidden)?
@@ -732,5 +1008,7 @@ pub fn load_model_parts(
         rms_eps: config.rms_eps,
         kv_config,
         kv_blocks,
+        embed_scale: config.embed_scale,
+        final_logit_softcap: config.final_logit_softcap,
     })
 }

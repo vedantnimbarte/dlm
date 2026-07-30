@@ -40,6 +40,22 @@ impl QuantScheme {
 /// Kept private; callers get the validated [`ModelConfig`] instead.
 #[derive(Debug, Deserialize)]
 struct RawConfig {
+    /// HF architecture id (e.g. "llama", "gemma", "gemma2"). Drives the Gemma
+    /// norm/embed/activation variants.
+    #[serde(default)]
+    model_type: Option<String>,
+    /// Gated-MLP activation name (Gemma ships "gelu_pytorch_tanh"). Older configs
+    /// spell it `hidden_act`.
+    ///
+    /// These are two separate fields rather than one with `alias = "hidden_act"`,
+    /// because every Gemma2 config (2b/9b/27b) ships *both* keys — and serde
+    /// rejects a field matched by two names in the same object as a duplicate,
+    /// which made the whole config unparseable. `hidden_activation` wins when
+    /// both are present, matching transformers' Gemma2Config.
+    #[serde(default)]
+    hidden_activation: Option<String>,
+    #[serde(default)]
+    hidden_act: Option<String>,
     hidden_size: u32,
     num_attention_heads: u32,
     #[serde(default)]
@@ -78,6 +94,22 @@ struct RawConfig {
     /// Qwen-MoE's expert count key.
     #[serde(default)]
     num_experts: Option<u32>,
+    /// DeepSeek-V2/V3's expert count key.
+    #[serde(default)]
+    n_routed_experts: Option<u32>,
+    /// DeepSeek's shared-expert *count* (not a width): the shared FFN is this
+    /// many `moe_intermediate_size` experts fused into one wider SwiGLU.
+    #[serde(default)]
+    n_shared_experts: Option<u32>,
+    /// DeepSeek: the first N layers are dense, the rest MoE. Ignoring this loads
+    /// a dense FFN for a routed layer and fails on the missing tensor.
+    #[serde(default)]
+    first_k_dense_replace: Option<u32>,
+    /// DeepSeek: place a MoE layer every N layers after the dense prefix. Only
+    /// `1` (every layer) is implemented; anything else is refused rather than
+    /// silently loading the wrong layers as dense.
+    #[serde(default)]
+    moe_layer_freq: Option<u32>,
     /// Experts routed per token (top-k). Required when the model is MoE.
     #[serde(default)]
     num_experts_per_tok: Option<u32>,
@@ -91,6 +123,40 @@ struct RawConfig {
     /// Qwen exposes it as a flag.
     #[serde(default)]
     norm_topk_prob: Option<bool>,
+    // ── Multi-head Latent Attention (MLA, DeepSeek-V2/V3); absent otherwise. ──
+    /// Compressed KV latent width (the cache stores this per token, not full K/V).
+    #[serde(default)]
+    kv_lora_rank: Option<u32>,
+    /// Query down-projection rank; absent means Q is projected directly.
+    #[serde(default)]
+    q_lora_rank: Option<u32>,
+    /// Per-head query/key dim NOT carrying RoPE.
+    #[serde(default)]
+    qk_nope_head_dim: Option<u32>,
+    /// Per-head query/key dim carrying the decoupled RoPE.
+    #[serde(default)]
+    qk_rope_head_dim: Option<u32>,
+    /// Per-head value dim (may differ from the QK dim).
+    #[serde(default)]
+    v_head_dim: Option<u32>,
+    /// Sliding-window attention span (Mistral). A query attends only the last
+    /// `sliding_window` positions; absent/`null` means full causal attention.
+    #[serde(default)]
+    sliding_window: Option<u32>,
+    /// Gemma2 applies its window to every `n`-th layer rather than all of them.
+    /// HF omits this and hard-codes 2 in the model class, so it is defaulted for
+    /// `model_type == "gemma2"`.
+    #[serde(default)]
+    sliding_window_pattern: Option<u32>,
+    /// Gemma2 attention-logit softcap (`tanh(score/cap)*cap`); typically 50.0.
+    #[serde(default)]
+    attn_logit_softcapping: Option<f32>,
+    /// Gemma2 output-logit softcap applied to the LM head; typically 30.0.
+    #[serde(default)]
+    final_logit_softcapping: Option<f32>,
+    /// Gemma2 decouples the attention scale from `head_dim` (144 on the 27B).
+    #[serde(default)]
+    query_pre_attn_scalar: Option<f32>,
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -113,11 +179,30 @@ struct QuantizationConfig {
     checkpoint_format: Option<String>,
 }
 
+/// Which packed-4-bit family a checkpoint uses, and its variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedFormat {
+    /// GPTQ. `act_order` (desc_act) scatters groups by `g_idx` — decoded to f32.
+    Gptq { act_order: bool },
+    /// AWQ (interleaved nibble order) — decoded to f32.
+    Awq,
+}
+
+impl PackedFormat {
+    /// True for the paths validated only by internal round-trip, not a real
+    /// export — the loader warns for these (act-order GPTQ and AWQ).
+    pub fn is_experimental(self) -> bool {
+        matches!(self, PackedFormat::Gptq { act_order: true } | PackedFormat::Awq)
+    }
+}
+
 /// A packed-quantized checkpoint dlm can decode, as declared by `config.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedQuant {
     /// Weights per quantization group along the input dimension.
     pub group_size: usize,
+    /// The packed family/variant (drives which unpacker the loader uses).
+    pub kind: PackedFormat,
 }
 
 /// Refuse quantized checkpoints the dequantizer can't decode correctly, with a
@@ -142,16 +227,18 @@ fn check_quant_supported(q: &QuantizationConfig) -> Result<Option<PackedQuant>> 
             )));
         }
     }
+    let group_size = q.group_size.unwrap_or(-1);
+    let need_group = || -> Result<usize> {
+        if group_size <= 0 {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "{method} checkpoint declares group_size {group_size}; dlm needs a positive \
+                 per-group size (whole-row grouping is not supported)."
+            )));
+        }
+        Ok(group_size as usize)
+    };
     match method.as_str() {
         "gptq" => {
-            // act-order permutes rows by `g_idx`; decoding without un-permuting
-            // silently scrambles every weight.
-            if q.desc_act == Some(true) {
-                return Err(DlmError::UnsupportedQuant(
-                    "GPTQ checkpoint uses desc_act (act-order): its rows are permuted by                      g_idx and dlm does not un-permute them. Use a desc_act=false GPTQ                      export, or an fp16/bf16 checkpoint."
-                        .into(),
-                ));
-            }
             // `gptq_v2` stores the true zero-point; classic `gptq` stores zero-1.
             // dlm's decoder assumes the classic convention (verified against a real
             // export) and has no v2 fixture to check the other against.
@@ -160,24 +247,28 @@ fn check_quant_supported(q: &QuantizationConfig) -> Result<Option<PackedQuant>> 
                 Some(ref f) if f == "gptq" => {}
                 Some(other) => {
                     return Err(DlmError::UnsupportedQuant(format!(
-                        "GPTQ checkpoint_format {other:?} is not supported; dlm decodes the                          classic `gptq` format, whose zero-point convention it has been                          validated against."
+                        "GPTQ checkpoint_format {other:?} is not supported; dlm decodes the \
+                         classic `gptq` format, whose zero-point convention it has been \
+                         validated against."
                     )))
                 }
             }
-            let group_size = q.group_size.unwrap_or(-1);
-            if group_size <= 0 {
-                return Err(DlmError::UnsupportedQuant(format!(
-                    "GPTQ checkpoint declares group_size {group_size}; dlm needs a positive                      per-group size (act-order/whole-row grouping is not supported)."
-                )));
-            }
-            Ok(Some(PackedQuant { group_size: group_size as usize }))
+            // act-order (desc_act) decodes to f32 via `g_idx`; the loader warns
+            // because that path is validated only by internal round-trip, not a
+            // real export.
+            let act_order = q.desc_act == Some(true);
+            Ok(Some(PackedQuant {
+                group_size: need_group()?,
+                kind: PackedFormat::Gptq { act_order },
+            }))
         }
-        "awq" => Err(DlmError::UnsupportedQuant(
-            "AWQ packs its nibbles in a permuted order dlm does not unpack, and no real AWQ              fixture has been validated against. Use a 4-bit GPTQ (desc_act=false) or              fp16/bf16 checkpoint."
-                .into(),
-        )),
+        "awq" => Ok(Some(PackedQuant {
+            group_size: need_group()?,
+            kind: PackedFormat::Awq,
+        })),
         other => Err(DlmError::UnsupportedQuant(format!(
-            "unrecognized quant_method {other:?}; dlm loads fp16/bf16 and 4-bit GPTQ              (desc_act=false) checkpoints."
+            "unrecognized quant_method {other:?}; dlm loads fp16/bf16, GPTQ, and AWQ 4-bit \
+             checkpoints."
         ))),
     }
 }
@@ -196,6 +287,14 @@ struct RawRopeScaling {
     high_freq_factor: Option<f32>,
     #[serde(default)]
     original_max_position_embeddings: Option<u32>,
+    // YaRN.
+    #[serde(default)]
+    beta_fast: Option<f32>,
+    #[serde(default)]
+    beta_slow: Option<f32>,
+    /// Explicit YaRN attention temperature; when absent it's `0.1·ln(factor)+1`.
+    #[serde(default)]
+    attention_factor: Option<f32>,
 }
 
 /// Convert a declared `rope_scaling` block into the [`RopeScaling`] the block
@@ -218,12 +317,73 @@ fn parse_rope_scaling(r: &RawRopeScaling) -> Result<Option<RopeScaling>> {
             high_freq_factor: r.high_freq_factor.unwrap_or(4.0),
             original_max_position: r.original_max_position_embeddings.unwrap_or(8192) as f32,
         })),
+        "yarn" => Ok(Some(RopeScaling::Yarn {
+            factor,
+            original_max_position: r.original_max_position_embeddings.unwrap_or(4096) as f32,
+            beta_fast: r.beta_fast.unwrap_or(32.0),
+            beta_slow: r.beta_slow.unwrap_or(1.0),
+            // HF: default attention factor is `0.1·ln(factor)+1` (1.0 if no scaling).
+            mscale: r.attention_factor.unwrap_or(if factor > 1.0 {
+                0.1 * factor.ln() + 1.0
+            } else {
+                1.0
+            }),
+        })),
+        // The remaining HF variants are refused with the specific reason, so a
+        // user hitting one knows what is missing rather than just that it is.
+        // Running any of them as plain RoPE produces fluent-looking nonsense past
+        // the original context length, so none is silently approximated.
+        "longrope" | "su" => Err(DlmError::InvalidConfig(format!(
+            "rope_scaling type {other:?} (Phi-3 long-context) is not implemented: it needs \
+             per-dimension short_factor/long_factor arrays, which dlm's inverse-frequency \
+             table does not yet carry. Use a Phi-3 checkpoint at its base context, or run \
+             a model with \"linear\", \"llama3\", or \"yarn\" scaling.",
+            other = kind
+        ))),
+        "dynamic" => Err(DlmError::InvalidConfig(
+            "rope_scaling type \"dynamic\" (dynamic NTK) is not implemented: its frequencies \
+             depend on the *current* sequence length, but dlm precomputes one inverse-frequency \
+             table per model and uploads it to the device once. Supporting it means recomputing \
+             (and re-uploading) that table as the sequence grows. Use \"linear\", \"llama3\", or \
+             \"yarn\"."
+                .into(),
+        )),
+        "mrope" => Err(DlmError::InvalidConfig(
+            "rope_scaling type \"mrope\" is multimodal (Qwen2-VL) and has no meaning for a \
+             text-only engine; dlm does not run vision checkpoints."
+                .into(),
+        )),
         other => Err(DlmError::InvalidConfig(format!(
-            "rope_scaling type {other:?} is not implemented; dlm supports \"linear\" and \
-             \"llama3\". Running this model without its trained RoPE scaling would produce \
+            "rope_scaling type {other:?} is not implemented; dlm supports \"linear\", \"llama3\", \
+             and \"yarn\". Running this model without its trained RoPE scaling would produce \
              incoherent output, so it is refused rather than silently mis-run."
         ))),
     }
+}
+
+/// Derive validated [`MlaConfig`] from the raw config, or `None` for standard
+/// attention. `kv_lora_rank` marks a checkpoint as MLA (DeepSeek); once seen, the
+/// remaining latent-attention dims are required — a partial declaration is refused
+/// rather than guessed at.
+fn build_mla_config(raw: &RawConfig) -> Result<Option<MlaConfig>> {
+    let Some(kv_lora_rank) = raw.kv_lora_rank else {
+        return Ok(None);
+    };
+    let need = |v: Option<u32>, name: &str| -> Result<u32> {
+        v.ok_or_else(|| {
+            DlmError::InvalidConfig(format!(
+                "MLA checkpoint (kv_lora_rank set) is missing {name}; dlm will not guess \
+                 latent-attention dims."
+            ))
+        })
+    };
+    Ok(Some(MlaConfig {
+        q_lora_rank: raw.q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim: need(raw.qk_nope_head_dim, "qk_nope_head_dim")?,
+        qk_rope_head_dim: need(raw.qk_rope_head_dim, "qk_rope_head_dim")?,
+        v_head_dim: need(raw.v_head_dim, "v_head_dim")?,
+    }))
 }
 
 /// Derive validated [`MoeConfig`] from the raw config, or `None` for a dense
@@ -233,11 +393,13 @@ fn parse_rope_scaling(r: &RawRopeScaling) -> Result<Option<RopeScaling>> {
 /// count is refused rather than guessed at — routing every token through the
 /// wrong number of experts is silent garbage, the worst failure mode.
 fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
-    let (num_experts, naming) = match (raw.num_local_experts, raw.num_experts) {
-        (Some(n), _) => (n, MoeNaming::Mixtral),
-        (None, Some(n)) => (n, MoeNaming::Qwen),
-        (None, None) => return Ok(None),
-    };
+    let (num_experts, naming) =
+        match (raw.num_local_experts, raw.num_experts, raw.n_routed_experts) {
+            (Some(n), _, _) => (n, MoeNaming::Mixtral),
+            (None, Some(n), _) => (n, MoeNaming::Qwen),
+            (None, None, Some(n)) => (n, MoeNaming::DeepSeek),
+            (None, None, None) => return Ok(None),
+        };
     if num_experts == 0 {
         return Ok(None); // an expert count of 0 is just a dense model
     }
@@ -262,14 +424,37 @@ fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
                 "MoE config declares neither moe_intermediate_size nor intermediate_size".into(),
             )
         })?;
+    // DeepSeek states a shared-expert *count*; its shared FFN is that many
+    // `moe_intermediate_size` experts fused into one. Qwen states the width
+    // directly.
+    let shared_intermediate_size = match naming {
+        MoeNaming::DeepSeek => raw
+            .n_shared_experts
+            .filter(|n| *n > 0)
+            .map(|n| n * moe_intermediate_size),
+        _ => raw.shared_expert_intermediate_size,
+    };
+
+    // Only "every layer after the dense prefix" is implemented. A larger period
+    // would make some later layers dense too, and guessing wrong loads a routed
+    // layer as dense — a missing-tensor error at best, wrong weights at worst.
+    if let Some(freq) = raw.moe_layer_freq.filter(|f| *f != 1) {
+        return Err(DlmError::InvalidConfig(format!(
+            "moe_layer_freq {freq} is not implemented; dlm places a MoE layer at every \
+             layer after the first {} dense one(s), and will not guess a sparser pattern.",
+            raw.first_k_dense_replace.unwrap_or(0)
+        )));
+    }
+
     Ok(Some(MoeConfig {
         num_experts,
         experts_per_tok,
         moe_intermediate_size,
-        shared_intermediate_size: raw.shared_expert_intermediate_size,
+        shared_intermediate_size,
         // Mixtral always renormalizes; Qwen exposes the flag (default on).
         norm_topk_prob: raw.norm_topk_prob.unwrap_or(true),
         naming,
+        first_k_dense: raw.first_k_dense_replace.unwrap_or(0),
     }))
 }
 
@@ -292,6 +477,10 @@ pub enum MoeNaming {
     /// `mlp.gate`, `mlp.experts.{e}.{gate,up,down}_proj`, optional
     /// `mlp.shared_expert.*` gated by `mlp.shared_expert_gate`.
     Qwen,
+    /// DeepSeek-V2/V3: like Qwen, but the shared expert is `mlp.shared_experts`
+    /// (plural) and is **ungated** — it is added straight to the routed sum, with
+    /// no `shared_expert_gate` tensor in the checkpoint.
+    DeepSeek,
 }
 
 /// Validated MoE geometry, present only on Mixture-of-Experts checkpoints.
@@ -309,6 +498,34 @@ pub struct MoeConfig {
     pub norm_topk_prob: bool,
     /// Expert tensor naming family.
     pub naming: MoeNaming,
+    /// How many leading layers are **dense** rather than routed (DeepSeek's
+    /// `first_k_dense_replace`). `0` — every other MoE family — means every layer
+    /// is routed. Resolved per layer by [`BlockConfig::for_layer`].
+    pub first_k_dense: u32,
+}
+
+/// Validated Multi-head Latent Attention geometry (DeepSeek-V2/V3). Present only
+/// on MLA checkpoints; the attention path caches a compressed latent per token
+/// (`kv_lora_rank` + `qk_rope_head_dim`) instead of full per-head K/V.
+#[derive(Debug, Clone, Copy)]
+pub struct MlaConfig {
+    /// Query down-projection rank; `None` projects Q directly from the hidden.
+    pub q_lora_rank: Option<u32>,
+    /// Compressed KV latent width (what the cache stores per token).
+    pub kv_lora_rank: u32,
+    /// Per-head query/key dim without RoPE.
+    pub qk_nope_head_dim: u32,
+    /// Per-head query/key dim carrying the decoupled RoPE.
+    pub qk_rope_head_dim: u32,
+    /// Per-head value dim.
+    pub v_head_dim: u32,
+}
+
+impl MlaConfig {
+    /// Total per-head query/key dim (`nope + rope`).
+    pub fn qk_head_dim(&self) -> u32 {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
 }
 
 /// Validated model geometry consumed by the profiler and storage planner.
@@ -350,6 +567,32 @@ pub struct ModelConfig {
     /// Mixture-of-Experts geometry when the checkpoint is sparse; `None` for a
     /// dense model, which keeps the single-FFN path unchanged.
     pub moe: Option<MoeConfig>,
+    /// Multi-head Latent Attention geometry (DeepSeek-V2/V3); `None` for standard
+    /// GQA/MHA attention.
+    pub mla: Option<MlaConfig>,
+    /// Sliding-window attention span (Mistral); `None` is full causal attention.
+    pub sliding_window: Option<u32>,
+    /// Gemma applies RMSNorm as `(1 + weight)` rather than `weight`. When true the
+    /// loader bakes the `+1` into the norm weights so the kernels stay unchanged.
+    pub norm_add_one: bool,
+    /// Scalar applied to token embeddings after lookup (Gemma multiplies by
+    /// `sqrt(hidden_size)`); `None` leaves embeddings unscaled.
+    pub embed_scale: Option<f32>,
+    /// Gated-MLP activation (SiLU for most, GELU for Gemma).
+    pub activation: crate::forward::cpu::Activation,
+    /// Gemma2 windows only every `n`-th layer instead of all of them; `None`
+    /// applies [`sliding_window`](Self::sliding_window) uniformly.
+    pub sliding_window_pattern: Option<u32>,
+    /// Gemma2 attention-logit softcap (`tanh(score/cap)*cap`).
+    pub attn_logit_softcap: Option<f32>,
+    /// Gemma2 LM-head logit softcap, applied to the final logits before sampling.
+    pub final_logit_softcap: Option<f32>,
+    /// Attention-scale divisor when decoupled from `head_dim` (Gemma2).
+    pub query_pre_attn_scalar: Option<f32>,
+    /// Gemma2 carries an extra pre/post-FFN norm pair per layer, which also
+    /// changes where the other two norms apply (see
+    /// [`LayerTensors::is_gemma2_style`](crate::forward::LayerTensors::is_gemma2_style)).
+    pub gemma2_norms: bool,
 }
 
 impl ModelConfig {
@@ -436,6 +679,21 @@ impl ModelConfig {
         };
 
         let moe = build_moe_config(&raw)?;
+        let mla = build_mla_config(&raw)?;
+
+        // Gemma architecture variants: (1+w) RMSNorm, embedding scaling, GeGLU.
+        // Gemma2 adds logit softcapping, alternating window layers, a decoupled
+        // attention scale, and a second norm pair per layer.
+        let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
+        let is_gemma2 = model_type == "gemma2";
+        let is_gemma = model_type == "gemma" || is_gemma2;
+        let activation = match raw.hidden_activation.as_deref().or(raw.hidden_act.as_deref()) {
+            Some(a) if a.to_ascii_lowercase().contains("gelu") => {
+                crate::forward::cpu::Activation::GeluTanh
+            }
+            None if is_gemma => crate::forward::cpu::Activation::GeluTanh,
+            _ => crate::forward::cpu::Activation::Silu,
+        };
 
         let config = ModelConfig {
             hidden_size: raw.hidden_size,
@@ -463,6 +721,24 @@ impl ModelConfig {
             quant,
             packed_quant,
             moe,
+            mla,
+            // A window >= the model's own max context is the same as full
+            // attention; keep it as declared and let the kernel no-op it.
+            sliding_window: raw.sliding_window.filter(|&w| w > 0),
+            norm_add_one: is_gemma,
+            embed_scale: is_gemma.then(|| (raw.hidden_size as f32).sqrt()),
+            activation,
+            // HF hard-codes the alternation in the Gemma2 model class rather than
+            // the config (`is_sliding = not bool(layer_idx % 2)`), so default it
+            // here instead of requiring a key the checkpoints don't ship.
+            sliding_window_pattern: raw
+                .sliding_window_pattern
+                .or(if is_gemma2 { Some(2) } else { None })
+                .filter(|&n| n > 1),
+            attn_logit_softcap: raw.attn_logit_softcapping.filter(|c| *c > 0.0),
+            final_logit_softcap: raw.final_logit_softcapping.filter(|c| *c > 0.0),
+            query_pre_attn_scalar: raw.query_pre_attn_scalar.filter(|s| *s > 0.0),
+            gemma2_norms: is_gemma2,
         };
 
         config.validate()?;
@@ -482,6 +758,18 @@ impl ModelConfig {
         }
         if self.hidden_size == 0 {
             return Err(DlmError::InvalidConfig("hidden_size must be > 0".into()));
+        }
+        // MLA carries its own per-head dims (qk_nope/qk_rope/v), so the standard
+        // hidden÷heads and even-head-dim invariants don't apply; only the RoPE
+        // sub-dimension must be even.
+        if let Some(m) = &self.mla {
+            if m.qk_rope_head_dim % 2 != 0 {
+                return Err(DlmError::InvalidConfig(format!(
+                    "qk_rope_head_dim ({}) must be even (RoPE rotates dimension pairs)",
+                    m.qk_rope_head_dim
+                )));
+            }
+            return Ok(());
         }
         // Only the derived head_dim needs the divisibility guarantee; a config
         // that states head_dim outright is free to break the quotient relation.
@@ -507,6 +795,65 @@ impl ModelConfig {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    /// Attention-projection parameters for one layer: q + o (`h*h` each) and
+    /// k + v, scaled by the GQA ratio (`2 * kv_ratio * h*h`).
+    fn attn_params(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
+        (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64
+    }
+
+    /// Parameters in one routed MoE expert's SwiGLU triple (gate + up + down),
+    /// or `None` for a dense model. This is the unit that streams per
+    /// `(layer, expert)` on the GPU MoE path, so it sizes both the expert-cache
+    /// budget and the per-expert PCIe cost.
+    pub fn expert_params(&self) -> Option<u64> {
+        let h = self.hidden_size as u64;
+        self.moe
+            .as_ref()
+            .map(|m| 3 * h * m.moe_intermediate_size as u64)
+    }
+
+    /// Parameters that stay **resident per layer** on the streaming path: the
+    /// whole layer for a dense model, but for an MoE model only the *core*
+    /// (attention + router + optional shared expert + norms) — the routed experts
+    /// stream separately into the per-`(layer, expert)` cache and are *not*
+    /// resident. The VRAM planner sizes the resident layer window from this, so a
+    /// sparse layer isn't mis-planned as if it held all its experts at once.
+    pub fn resident_layer_params(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let norms = 2 * h;
+        let ffn = match &self.moe {
+            None => 3 * h * self.intermediate_size as u64,
+            Some(m) => {
+                let router = h * m.num_experts as u64;
+                let shared = m
+                    .shared_intermediate_size
+                    .map_or(0, |s| 3 * h * s as u64 + h);
+                // Core only — routed experts are excluded (they stream on demand).
+                router + shared
+            }
+        };
+        self.attn_params() + ffn + norms
+    }
+
+    /// How many routed experts a VRAM cache of `budget_bytes` can hold, in the
+    /// precision the experts land in VRAM (`self.quant`). Clamped so at least a
+    /// token's top-k stay resident (progress + intra-token reuse) and never more
+    /// than the model has across every layer. `None` for a dense model.
+    ///
+    /// This is what turns the old count-heuristic into a real VRAM budget: on a
+    /// fine-grained (128-expert) checkpoint an unbounded count would OOM the card.
+    pub fn expert_cache_capacity(&self, budget_bytes: u64) -> Option<usize> {
+        let m = self.moe.as_ref()?;
+        let per_expert =
+            (self.expert_params()? as f64 * self.quant.bytes_per_param()).ceil() as u64;
+        let fit = budget_bytes.checked_div(per_expert).unwrap_or(0) as usize;
+        let lo = m.experts_per_tok as usize;
+        let hi = m.num_experts as usize * self.num_layers as usize;
+        Some(fit.clamp(lo, hi))
+    }
+
     /// Rough total parameter count for the whole model, used to estimate the
     /// average size of one streamed transformer block.
     ///
@@ -517,10 +864,7 @@ impl ModelConfig {
     pub fn estimated_total_params(&self) -> u64 {
         let h = self.hidden_size as u64;
         let inter = self.intermediate_size as u64;
-        let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
 
-        // q (h*h) + o (h*h) + k,v scaled by the GQA ratio (2 * kv_ratio * h*h).
-        let attn = (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64;
         // FFN: one dense SwiGLU (3*h*inter), or per layer the full set of expert
         // FFNs plus an optional shared expert for MoE. The catalog path measures
         // real per-layer bytes; this estimate only backs the fallback planner.
@@ -536,10 +880,209 @@ impl ModelConfig {
                 experts + router + shared
             }
         };
-        let per_layer = attn + ffn;
+        let per_layer = self.attn_params() + ffn;
 
         let blocks = per_layer * self.num_layers as u64;
         let embed_and_head = 2 * self.vocab_size as u64 * h;
         blocks + embed_and_head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DeepSeek-V2/V3 spells its MoE fields differently from Mixtral and Qwen.
+    /// Reading only the other two spellings left `moe: None`, so every layer
+    /// loaded as dense and the first routed layer failed on a missing
+    /// `mlp.gate_proj` — the whole family was unloadable.
+    #[test]
+    fn deepseek_moe_config_is_recognized() {
+        // Shape of deepseek-ai/DeepSeek-V2-Lite-Chat's config.json.
+        let json = br#"{"model_type":"deepseek_v2","hidden_size":2048,
+            "num_attention_heads":16,"num_key_value_heads":16,"num_hidden_layers":27,
+            "vocab_size":102400,"intermediate_size":10944,"moe_intermediate_size":1408,
+            "n_routed_experts":64,"n_shared_experts":2,"num_experts_per_tok":6,
+            "first_k_dense_replace":1,"moe_layer_freq":1}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        let m = c.moe.expect("DeepSeek declares experts via n_routed_experts");
+        assert_eq!(m.num_experts, 64);
+        assert_eq!(m.experts_per_tok, 6);
+        assert_eq!(m.naming, MoeNaming::DeepSeek);
+        // The shared expert is a *count* of moe_intermediate_size experts fused
+        // into one: 2 × 1408. Reading it as a width would size it 1408.
+        assert_eq!(m.shared_intermediate_size, Some(2816));
+        assert_eq!(m.first_k_dense, 1, "layer 0 is dense, layers 1.. are routed");
+    }
+
+    /// A sparser MoE period is refused rather than guessed: loading a routed
+    /// layer as dense is a missing-tensor error at best, wrong weights at worst.
+    #[test]
+    fn unimplemented_moe_layer_freq_is_refused() {
+        let json = br#"{"model_type":"deepseek_v2","hidden_size":16,
+            "num_attention_heads":4,"num_hidden_layers":4,"vocab_size":32,
+            "intermediate_size":8,"moe_intermediate_size":4,
+            "n_routed_experts":8,"num_experts_per_tok":2,"moe_layer_freq":2}"#;
+        let err = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap_err();
+        assert!(
+            format!("{err}").contains("moe_layer_freq"),
+            "expected a moe_layer_freq refusal, got: {err}"
+        );
+    }
+
+    fn moe_config() -> ModelConfig {
+        // 8 experts, top-2, no shared expert (Mixtral-shaped).
+        let json = br#"{"hidden_size":16,"num_attention_heads":4,"num_key_value_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":8,
+            "num_local_experts":8,"num_experts_per_tok":2}"#;
+        ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap()
+    }
+
+    #[test]
+    fn resident_core_excludes_routed_experts() {
+        let c = moe_config();
+        let h = 16u64;
+        // One expert: 3 * h * moe_inter (= intermediate_size 8 for Mixtral).
+        assert_eq!(c.expert_params(), Some(3 * h * 8));
+        // The resident core must NOT include the 8 experts — only attn + router +
+        // norms. So it is far smaller than a full layer with all experts.
+        let core = c.resident_layer_params();
+        let one_expert = c.expert_params().unwrap();
+        assert!(
+            core < one_expert * 8,
+            "core {core} should exclude all 8 experts ({}/expert)",
+            one_expert
+        );
+        // Core = attn (q,o = h*h each; k,v full since MHA) + router (h*8) + 2 norms.
+        let expected_core = 4 * h * h + h * 8 + 2 * h;
+        assert_eq!(core, expected_core);
+    }
+
+    /// Every Gemma2 config Google publishes carries `hidden_act` *and*
+    /// `hidden_activation`. One field aliasing the other made serde reject the
+    /// whole file as a duplicate, so no Gemma2 checkpoint could be loaded at all.
+    #[test]
+    fn gemma2_config_with_both_activation_spellings_parses() {
+        use crate::forward::cpu::Activation;
+        // Verbatim shape of google/gemma-2-2b-it's config.json.
+        let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64,
+            "hidden_act":"gelu_pytorch_tanh","hidden_activation":"gelu_pytorch_tanh",
+            "attn_logit_softcapping":50.0,"final_logit_softcapping":30.0,
+            "query_pre_attn_scalar":256,"sliding_window":4096}"#;
+        let c = ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16)
+            .expect("real Gemma2 config must parse");
+        assert_eq!(c.activation, Activation::GeluTanh);
+        assert_eq!(c.attn_logit_softcap, Some(50.0));
+        assert_eq!(c.final_logit_softcap, Some(30.0));
+
+        // `hidden_act` alone (Gemma v1 / older exports) still resolves.
+        let only_act = br#"{"model_type":"llama","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64,
+            "hidden_act":"gelu_pytorch_tanh"}"#;
+        let c = ModelConfig::from_json_bytes(only_act, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.activation, Activation::GeluTanh);
+    }
+
+    #[test]
+    fn gemma_sets_norm_embed_and_activation() {
+        use crate::forward::cpu::Activation;
+        let gemma = br#"{"model_type":"gemma","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64,
+            "hidden_activation":"gelu_pytorch_tanh"}"#;
+        let c = ModelConfig::from_json_bytes(gemma, QuantScheme::Fp16).unwrap();
+        assert!(c.norm_add_one, "Gemma uses (1+w) RMSNorm");
+        assert_eq!(c.embed_scale, Some(4.0), "sqrt(hidden=16) = 4");
+        assert_eq!(c.activation, Activation::GeluTanh);
+
+        // Llama-style: no add-one, no embed scale, SiLU.
+        let llama = br#"{"model_type":"llama","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
+        let c = ModelConfig::from_json_bytes(llama, QuantScheme::Fp16).unwrap();
+        assert!(!c.norm_add_one);
+        assert_eq!(c.embed_scale, None);
+        assert_eq!(c.activation, Activation::Silu);
+
+        // Gemma2 inherits the Gemma norm/embed/activation rules.
+        let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
+        let c = ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).unwrap();
+        assert!(c.norm_add_one, "Gemma2 also uses (1+w) RMSNorm");
+        assert_eq!(c.embed_scale, Some(4.0));
+        assert_eq!(c.activation, Activation::GeluTanh);
+    }
+
+    /// Gemma2's distinguishing hyperparameters: alternating window layers (HF
+    /// hard-codes the period at 2 rather than shipping a config key), attention
+    /// and final logit softcaps, a decoupled attention scale, and the extra norm
+    /// pair. None of these may leak onto Gemma v1 or Llama.
+    #[test]
+    fn gemma2_sets_softcaps_window_pattern_and_norms() {
+        let gemma2 = br#"{"model_type":"gemma2","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":4,"vocab_size":32,"intermediate_size":64,
+            "sliding_window":4096,"attn_logit_softcapping":50.0,
+            "final_logit_softcapping":30.0,"query_pre_attn_scalar":144.0}"#;
+        let c = ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.sliding_window, Some(4096));
+        assert_eq!(c.sliding_window_pattern, Some(2), "HF hard-codes a period of 2");
+        assert_eq!(c.attn_logit_softcap, Some(50.0));
+        assert_eq!(c.final_logit_softcap, Some(30.0));
+        assert_eq!(c.query_pre_attn_scalar, Some(144.0));
+        assert!(c.gemma2_norms, "Gemma2 carries the pre/post-FFN norm pair");
+
+        // Gemma v1 gets none of it — same family, different block.
+        let gemma = br#"{"model_type":"gemma","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":2,"vocab_size":32,"intermediate_size":64}"#;
+        let c = ModelConfig::from_json_bytes(gemma, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.sliding_window_pattern, None);
+        assert_eq!(c.attn_logit_softcap, None);
+        assert!(!c.gemma2_norms);
+    }
+
+    #[test]
+    fn parses_yarn_rope_scaling() {
+        use crate::forward::cpu::RopeScaling;
+        let json = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64,
+            "rope_scaling":{"rope_type":"yarn","factor":4.0,
+                "original_max_position_embeddings":4096,"beta_fast":32,"beta_slow":1}}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        match c.rope_scaling {
+            Some(RopeScaling::Yarn { factor, original_max_position, mscale, .. }) => {
+                assert_eq!(factor, 4.0);
+                assert_eq!(original_max_position, 4096.0);
+                // Default attention factor = 0.1·ln(4)+1.
+                assert!((mscale - (0.1 * 4.0f32.ln() + 1.0)).abs() < 1e-6);
+            }
+            other => panic!("expected YaRN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_sliding_window() {
+        let with = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64,"sliding_window":4096}"#;
+        assert_eq!(
+            ModelConfig::from_json_bytes(with, QuantScheme::Fp16).unwrap().sliding_window,
+            Some(4096)
+        );
+        // Absent → full attention; a zero window is treated as absent.
+        let without = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64}"#;
+        assert_eq!(
+            ModelConfig::from_json_bytes(without, QuantScheme::Fp16).unwrap().sliding_window,
+            None
+        );
+    }
+
+    #[test]
+    fn dense_resident_core_is_the_whole_layer_ffn() {
+        let json = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
+            "vocab_size":32,"intermediate_size":64}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        assert_eq!(c.expert_params(), None);
+        let h = 16u64;
+        // Dense: attn + full SwiGLU (3*h*inter) + 2 norms.
+        assert_eq!(c.resident_layer_params(), 4 * h * h + 3 * h * 64 + 2 * h);
     }
 }

@@ -21,7 +21,7 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::kernel::ComputeKernel;
-use crate::model::MoeConfig;
+use crate::model::{MlaConfig, MoeConfig};
 
 /// RoPE frequency scaling, as declared by `rope_scaling` in `config.json`.
 ///
@@ -41,6 +41,18 @@ pub enum RopeScaling {
     /// Linear position interpolation (`rope_type: "linear"`): every frequency is
     /// divided by `factor`.
     Linear { factor: f32 },
+    /// YaRN (`rope_type: "yarn"`, DeepSeek / Qwen2.5-1M): interpolate low
+    /// frequencies by `factor` while extrapolating (keeping) high ones, ramping
+    /// between the correction dims set by `beta_fast`/`beta_slow`, plus an
+    /// attention temperature `mscale` folded into the rotation.
+    Yarn {
+        factor: f32,
+        original_max_position: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        /// Attention scaling `mscale` (`0.1·ln(factor)+1`), applied to cos/sin.
+        mscale: f32,
+    },
 }
 
 /// Shape + hyperparameters of one decoder block.
@@ -66,6 +78,34 @@ pub struct BlockConfig {
     /// is routed: `intermediate_size` still describes any dense/shared FFN, while
     /// [`MoeConfig::moe_intermediate_size`] sizes each routed expert.
     pub moe: Option<MoeConfig>,
+    /// Sliding-window attention span (Mistral): a query attends only the last
+    /// `window` positions. `None` is full causal attention. Bounds only the
+    /// attention *read*, not KV storage.
+    pub sliding_window: Option<usize>,
+    /// Gemma2 alternates windowed and global attention layers instead of applying
+    /// [`sliding_window`](Self::sliding_window) to all of them. `Some(n)` means a
+    /// layer is windowed only when `layer % n == 0` (Gemma2 ships `n = 2`, so
+    /// even layers are local and odd layers see full history). `None` applies the
+    /// window uniformly. Resolve per layer with [`Self::window_for_layer`].
+    pub sliding_window_pattern: Option<u32>,
+    /// Gemma2 caps attention logits at `tanh(score / cap) * cap` before the
+    /// softmax, bounding the scores a long context can produce. `None` elsewhere.
+    pub attn_logit_softcap: Option<f32>,
+    /// Divisor for the attention scale, when the model decouples it from
+    /// `head_dim` (Gemma2's `query_pre_attn_scalar` — 144 on the 27B while
+    /// `head_dim` is 128). `None` uses `head_dim`, the usual `1/sqrt(d)`.
+    pub query_pre_attn_scalar: Option<f32>,
+    /// The config declares the Gemma2 norm layout, so every layer **must** carry
+    /// the pre/post-FFN norm pair. Checked in
+    /// [`LayerTensors::validate`]: without it the block would silently fall back
+    /// to the Llama norm placement and produce quietly wrong output.
+    pub gemma2_norms: bool,
+    /// Gated-MLP activation: SiLU (SwiGLU) for Llama/Mistral/Qwen, GELU (GeGLU)
+    /// for Gemma. Defaults to SiLU.
+    pub activation: Activation,
+    /// Multi-head Latent Attention geometry (DeepSeek); `None` for standard
+    /// attention. When set, the attention sublayer takes the MLA path.
+    pub mla: Option<MlaConfig>,
 }
 
 impl BlockConfig {
@@ -74,14 +114,59 @@ impl BlockConfig {
         self.num_heads * self.head_dim
     }
 
-    /// Key/value projection output width (`num_kv_heads × head_dim`).
+    /// Per-token width the KV cache stores. Standard attention caches full K/V
+    /// (`num_kv_heads × head_dim`); **MLA** caches only the compressed latent plus
+    /// the shared decoupled-RoPE key (`kv_lora_rank + qk_rope_head_dim`), which is
+    /// the whole point of latent attention — a much smaller cache.
     pub fn kv_dim(&self) -> usize {
-        self.num_kv_heads * self.head_dim
+        match &self.mla {
+            Some(m) => (m.kv_lora_rank + m.qk_rope_head_dim) as usize,
+            None => self.num_kv_heads * self.head_dim,
+        }
     }
 
     /// Query heads per KV head (the GQA grouping factor).
     pub fn group_size(&self) -> usize {
         self.num_heads / self.num_kv_heads.max(1)
+    }
+
+    /// The sliding window that applies to `layer`, resolving Gemma2's alternating
+    /// pattern. With no pattern the window is uniform (Mistral); with `Some(n)`
+    /// only layers where `layer % n == 0` are windowed and the rest attend the
+    /// full history.
+    ///
+    /// Returned rather than stored so a kernel can specialize its (`Copy`)
+    /// `BlockConfig` per layer without threading a layer index through the whole
+    /// attention path.
+    pub fn window_for_layer(&self, layer: u32) -> Option<usize> {
+        match self.sliding_window_pattern {
+            Some(n) if n > 0 && layer % n != 0 => None,
+            _ => self.sliding_window,
+        }
+    }
+
+    /// This block's `BlockConfig` with the sliding window resolved for `layer`.
+    /// Kernels call this once per `run_block` so everything downstream — CPU
+    /// attention and the device kernels alike — reads one already-correct window.
+    pub fn for_layer(&self, layer: u32) -> Self {
+        Self {
+            sliding_window: self.window_for_layer(layer),
+            // A resolved config must not re-resolve: the window above is final.
+            sliding_window_pattern: None,
+            // DeepSeek's leading `first_k_dense_replace` layers carry a plain
+            // dense FFN even though the model as a whole is MoE, so those layers
+            // must look dense to everything downstream — loader, validation and
+            // the FFN dispatch alike.
+            moe: self.moe.filter(|m| layer >= m.first_k_dense),
+            ..*self
+        }
+    }
+
+    /// Attention score scale: `1/sqrt(query_pre_attn_scalar)` when the model
+    /// decouples it from `head_dim` (Gemma2), else the usual `1/sqrt(head_dim)`.
+    pub fn attn_scale(&self) -> f32 {
+        let d = self.query_pre_attn_scalar.unwrap_or(self.head_dim as f32);
+        1.0 / d.max(1.0).sqrt()
     }
 }
 
@@ -369,7 +454,9 @@ pub struct ExpertFfn {
 }
 
 impl ExpertFfn {
-    fn byte_size(&self) -> usize {
+    /// Approximate host bytes this expert's three matrices occupy in their native
+    /// dtype — used to budget the streamed-expert host cache.
+    pub fn byte_size(&self) -> usize {
         self.gate.as_bytes().len() + self.up.as_bytes().len() + self.down.as_bytes().len()
     }
 
@@ -438,6 +525,39 @@ pub struct LayerTensors {
     pub q_bias: Option<Vec<f32>>, // [q_dim]
     pub k_bias: Option<Vec<f32>>, // [kv_dim]
     pub v_bias: Option<Vec<f32>>, // [kv_dim]
+    /// Per-head Q/K RMSNorm weights (`[head_dim]`), applied after projection and
+    /// before RoPE. Qwen3 ships these (and drops the Qwen2 biases); `None` elsewhere.
+    pub q_norm: Option<Vec<f32>>, // [head_dim]
+    pub k_norm: Option<Vec<f32>>, // [head_dim]
+    /// Gemma2's extra pair of FFN norms. Their presence marks the **Gemma2 block
+    /// structure**, which differs from Llama/Gemma1 in where norms sit: Gemma2
+    /// normalizes each sublayer's *output* before the residual add and keeps a
+    /// separate pre-FFN norm, so `post_attention_layernorm` means "after
+    /// attention" here rather than "before the FFN". See [`decode_block`].
+    pub pre_feedforward_layernorm: Option<Vec<f32>>, // [hidden]
+    pub post_feedforward_layernorm: Option<Vec<f32>>, // [hidden]
+    /// Multi-head Latent Attention projections (DeepSeek). When set, the attention
+    /// sublayer takes the MLA path and `q_proj`/`k_proj`/`v_proj` are unused.
+    pub mla: Option<MlaWeights>,
+}
+
+/// Multi-head Latent Attention projection weights (DeepSeek). The layer's
+/// `o_proj` and `input_layernorm` are reused; these replace the standard q/k/v.
+#[derive(Debug, Clone, Default)]
+pub struct MlaWeights {
+    /// Query down-projection `[q_lora_rank, hidden]` + its RMSNorm `[q_lora_rank]`;
+    /// both `None` when the model projects Q straight from the hidden.
+    pub q_a_proj: Option<Weights>,
+    pub q_a_layernorm: Option<Vec<f32>>,
+    /// Query up-projection `[num_heads·qk_head_dim, q_lora_rank | hidden]`.
+    pub q_b_proj: Weights,
+    /// KV down-projection with the decoupled RoPE key
+    /// `[kv_lora_rank + qk_rope_head_dim, hidden]`.
+    pub kv_a_proj: Weights,
+    /// Compressed-latent RMSNorm `[kv_lora_rank]`.
+    pub kv_a_layernorm: Vec<f32>,
+    /// KV up-projection `[num_heads·(qk_nope_head_dim + v_head_dim), kv_lora_rank]`.
+    pub kv_b_proj: Weights,
 }
 
 impl LayerTensors {
@@ -468,6 +588,22 @@ impl LayerTensors {
             + bias(&self.v_bias)
     }
 
+    /// Whether this layer uses the **Gemma2 block structure** — norms on each
+    /// sublayer's output, plus a dedicated pre-FFN norm — rather than the
+    /// Llama/Gemma1 shape where `post_attention_layernorm` is the pre-FFN norm.
+    /// Keyed on the extra norm pair, which only Gemma2 checkpoints carry.
+    pub fn is_gemma2_style(&self) -> bool {
+        self.pre_feedforward_layernorm.is_some()
+    }
+
+    /// The norm applied to the FFN's input: Gemma2's dedicated
+    /// `pre_feedforward_layernorm`, else `post_attention_layernorm`.
+    pub fn ffn_input_norm(&self) -> &[f32] {
+        self.pre_feedforward_layernorm
+            .as_deref()
+            .unwrap_or(&self.post_attention_layernorm)
+    }
+
     /// The dense FFN triple, or an error if this layer is MoE. Used by GPU paths
     /// that do not yet route experts; the streaming GPU kernel handles MoE
     /// separately via its per-expert cache.
@@ -484,6 +620,7 @@ impl LayerTensors {
 
     /// The MoE block (router + routed experts + optional shared expert), or an
     /// error if this layer is dense.
+    #[allow(clippy::type_complexity)] // a borrow-tuple of the four MoE parts; a struct would only add indirection
     pub fn moe(&self) -> Result<(&Weights, &[ExpertFfn], Option<&ExpertFfn>, Option<&Weights>)> {
         match &self.ffn {
             Ffn::Moe { router, experts, shared, shared_gate } => {
@@ -497,6 +634,42 @@ impl LayerTensors {
 
     /// Validate every matrix against the config's expected dimensions.
     pub fn validate(&self, cfg: &BlockConfig) -> Result<()> {
+        // A Gemma2 config against a checkpoint without the FFN norm pair would
+        // fall back to the Llama norm placement and run quietly wrong, so refuse
+        // rather than guess (and refuse the reverse, which is just as wrong).
+        if cfg.gemma2_norms != self.is_gemma2_style() {
+            return Err(DlmError::InvalidConfig(format!(
+                "config declares gemma2_norms = {} but the layer {} the \
+                 pre/post-FFN norm pair Gemma2 requires; the two norm layouts place \
+                 `post_attention_layernorm` differently and are not interchangeable",
+                cfg.gemma2_norms,
+                if self.is_gemma2_style() { "carries" } else { "lacks" },
+            )));
+        }
+        if self.is_gemma2_style() {
+            for (name, norm) in [
+                ("pre_feedforward_layernorm", &self.pre_feedforward_layernorm),
+                ("post_feedforward_layernorm", &self.post_feedforward_layernorm),
+            ] {
+                match norm {
+                    Some(v) if v.len() == cfg.hidden_size => {}
+                    Some(v) => {
+                        return Err(DlmError::ShapeMismatch {
+                            expected: cfg.hidden_size,
+                            got: v.len(),
+                        })
+                    }
+                    None => {
+                        return Err(DlmError::InvalidConfig(format!(
+                            "Gemma2 layer is missing {name}"
+                        )))
+                    }
+                }
+            }
+        }
+        if let Some(m) = &cfg.mla {
+            return self.validate_mla(cfg, m);
+        }
         let checks = [
             ("q_proj", self.q_proj.len(), cfg.q_dim() * cfg.hidden_size),
             ("k_proj", self.k_proj.len(), cfg.kv_dim() * cfg.hidden_size),
@@ -509,6 +682,9 @@ impl LayerTensors {
             ("q_bias", self.q_bias.as_ref(), cfg.q_dim()),
             ("k_bias", self.k_bias.as_ref(), cfg.kv_dim()),
             ("v_bias", self.v_bias.as_ref(), cfg.kv_dim()),
+            // Qwen3 per-head Q/K norms are `[head_dim]` (shared across heads).
+            ("q_norm", self.q_norm.as_ref(), cfg.head_dim),
+            ("k_norm", self.k_norm.as_ref(), cfg.head_dim),
         ];
         for (name, bias, expected) in bias_checks {
             if let Some(b) = bias {
@@ -524,6 +700,44 @@ impl LayerTensors {
             if got != expected {
                 return Err(DlmError::QuantLayout(format!(
                     "LayerTensors.{name}: expected {expected} elements, got {got}"
+                )));
+            }
+        }
+        self.validate_ffn(cfg)?;
+        Ok(())
+    }
+
+    /// Validate the MLA projection weights against the latent-attention geometry
+    /// (`o_proj` is `[hidden, num_heads·v_head_dim]` here, not `[hidden, q_dim]`).
+    fn validate_mla(&self, cfg: &BlockConfig, m: &MlaConfig) -> Result<()> {
+        let mw = self.mla.as_ref().ok_or_else(|| {
+            DlmError::QuantLayout("layer configured for MLA but has no MLA weights".into())
+        })?;
+        let h = cfg.hidden_size;
+        let nh = cfg.num_heads;
+        let qk = m.qk_head_dim() as usize;
+        let latent = m.kv_lora_rank as usize;
+        let rope = m.qk_rope_head_dim as usize;
+        let vdim = m.v_head_dim as usize;
+        let q_in = m.q_lora_rank.map_or(h, |r| r as usize);
+        let mut checks = vec![
+            ("q_b_proj", mw.q_b_proj.len(), nh * qk * q_in),
+            ("kv_a_proj", mw.kv_a_proj.len(), (latent + rope) * h),
+            ("kv_a_layernorm", mw.kv_a_layernorm.len(), latent),
+            ("kv_b_proj", mw.kv_b_proj.len(), nh * (m.qk_nope_head_dim as usize + vdim) * latent),
+            ("o_proj", self.o_proj.len(), h * nh * vdim),
+            ("input_layernorm", self.input_layernorm.len(), h),
+            ("post_attention_layernorm", self.post_attention_layernorm.len(), h),
+        ];
+        if let Some(r) = m.q_lora_rank {
+            let r = r as usize;
+            checks.push(("q_a_proj", mw.q_a_proj.as_ref().map_or(0, |w| w.len()), r * h));
+            checks.push(("q_a_layernorm", mw.q_a_layernorm.as_ref().map_or(0, |v| v.len()), r));
+        }
+        for (name, got, expected) in checks {
+            if got != expected {
+                return Err(DlmError::QuantLayout(format!(
+                    "MLA {name}: expected {expected} elements, got {got}"
                 )));
             }
         }
@@ -616,12 +830,44 @@ impl LayerTensors {
     }
 }
 
+/// Device-resident K/V history for one layer on the GPU path, owned by the
+/// session's [`KvLayerCache`] (not the kernel) so batched sessions never share
+/// KV. Allocated lazily on first GPU use.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[derive(Debug)]
+struct GpuKvHandle {
+    keys: crate::gpu::device::DeviceBuffer,
+    values: crate::gpu::device::DeviceBuffer,
+}
+
 /// Real f32 K/V history for one layer (what attention reads). The paged
 /// `PagedKvCache` tracks the block bookkeeping; this holds the actual vectors.
-#[derive(Debug, Clone, Default)]
+///
+/// On the GPU kernels the host `store` holds only zero placeholders for length
+/// bookkeeping; the real K/V lives in the device buffers of [`gpu`](Self::gpu),
+/// which are **per-session** so continuous batching keeps each sequence's history
+/// isolated (the kernel is shared across sessions, the KV is not).
+#[derive(Debug, Default)]
 pub struct KvLayerCache {
     kv_dim: usize,
     store: KvStore,
+    /// Device K/V for the GPU path; `None` until the first GPU `run_block` for
+    /// this session+layer allocates it.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    gpu: Option<GpuKvHandle>,
+}
+
+impl Clone for KvLayerCache {
+    fn clone(&self) -> Self {
+        Self {
+            kv_dim: self.kv_dim,
+            store: self.store.clone(),
+            // GPU KV is per-session device memory; a clone (a KV snapshot for the
+            // prefix cache) starts with none and re-allocates on next GPU use.
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            gpu: None,
+        }
+    }
 }
 
 /// KV cache precision — a memory/quality knob. `None` is exact; the quantized
@@ -728,7 +974,69 @@ impl KvLayerCache {
                 value_scales: Vec::new(),
             },
         };
-        Self { kv_dim, store }
+        Self {
+            kv_dim,
+            store,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            gpu: None,
+        }
+    }
+
+    /// Device K/V pointers for this session+layer on the GPU path, allocating the
+    /// per-session buffers (sized for `capacity_tokens`) on first use. Returns
+    /// `(keys, values)` device pointers the kernel writes in place at the current
+    /// position and attends over. Because each session owns its own
+    /// [`KvLayerCache`], batched sessions never collide in KV — the fix for
+    /// running concurrent requests on the shared GPU kernel.
+    ///
+    /// `needs_values` is false on the **MLA** path, which caches one compressed
+    /// latent per token in `keys` and reconstructs K *and* V from it — there is no
+    /// separate value cache. Allocating one anyway would double the KV footprint
+    /// and give back exactly the memory MLA exists to save, so the returned
+    /// `values` pointer is a 1-element dummy the MLA kernel never reads.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub fn gpu_kv(
+        &mut self,
+        capacity_tokens: usize,
+        needs_values: bool,
+    ) -> Result<(*mut f32, *mut f32)> {
+        if self.gpu.is_none() {
+            let len = capacity_tokens * self.kv_dim.max(1);
+            let values_len = if needs_values { len } else { 1 };
+            let handle = GpuKvHandle {
+                keys: crate::gpu::device::DeviceBuffer::new(len)?,
+                values: crate::gpu::device::DeviceBuffer::new(values_len)?,
+            };
+            // A cache that already holds history is a **resumed prefix** (see
+            // `sync_from_device`): seed the device with it, or the kernel would
+            // attend over a freshly-zeroed buffer while `len()` claims the tokens
+            // are there. A fresh session has `len() == 0` and skips this.
+            let n = self.len();
+            if n > 0 {
+                let d = self.kv_dim;
+                if n > capacity_tokens {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "resumed prefix has {n} tokens but GPU KV capacity is {capacity_tokens}"
+                    )));
+                }
+                let mut keys = vec![0.0f32; n * d];
+                let mut values = vec![0.0f32; n * d];
+                for (i, (k, v)) in keys
+                    .chunks_exact_mut(d)
+                    .zip(values.chunks_exact_mut(d))
+                    .enumerate()
+                {
+                    self.row_f32(i, k, v);
+                }
+                handle.keys.upload(&keys)?;
+                if needs_values {
+                    handle.values.upload(&values)?;
+                }
+            }
+            self.gpu = Some(handle);
+        }
+        let h = self.gpu.as_ref().unwrap();
+        Ok((h.keys.as_mut_ptr(), h.values.as_mut_ptr()))
     }
 
     /// Empty (exact `f32`) history for a layer whose K/V width is `kv_dim`.
@@ -759,6 +1067,35 @@ impl KvLayerCache {
     /// True if empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Drop cached positions beyond `n`, keeping the first `n` (a no-op if already
+    /// `<= n`). The rollback hook a **persistent-KV** speculative session would use
+    /// to discard rejected draft tokens — the current speculative path re-prefills
+    /// a fresh cache each verification, so this is not yet on the hot path. On the
+    /// GPU path the device slots are simply overwritten at the reduced length, so
+    /// only the host length (which drives `num_positions`) needs shrinking.
+    pub fn truncate(&mut self, n: usize) {
+        let kv_dim = self.kv_dim;
+        match &mut self.store {
+            KvStore::Full { keys, values } => {
+                keys.truncate(n * kv_dim);
+                values.truncate(n * kv_dim);
+            }
+            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+                keys.truncate(n * kv_dim);
+                values.truncate(n * kv_dim);
+                key_scales.truncate(n);
+                value_scales.truncate(n);
+            }
+            KvStore::Int4 { keys, key_scales, values, value_scales } => {
+                let bytes = n * kv_dim.div_ceil(2);
+                keys.truncate(bytes);
+                values.truncate(bytes);
+                key_scales.truncate(n);
+                value_scales.truncate(n);
+            }
+        }
     }
 
     /// Append one position's key and value vectors.
@@ -794,6 +1131,18 @@ impl KvLayerCache {
         Ok(())
     }
 
+    /// The full `[kv_dim]` key vector cached at `pos` (exact `f32` store only).
+    /// MLA uses this to read the `[latent ; k_rope]` blob it packs into the key;
+    /// the quantized stores don't support it (MLA runs at exact KV precision).
+    pub fn position_key(&self, pos: usize) -> Result<&[f32]> {
+        match &self.store {
+            KvStore::Full { keys, .. } => Ok(&keys[pos * self.kv_dim..(pos + 1) * self.kv_dim]),
+            _ => Err(DlmError::InvalidConfig(
+                "MLA attention requires an exact (f32) KV cache".into(),
+            )),
+        }
+    }
+
     /// Dot of `q` with position `pos`'s key head (dequantized inline for int8/4).
     fn key_head_dot(&self, pos: usize, kv_head: usize, d: usize, q: &[f32]) -> f32 {
         let off = kv_head * d;
@@ -816,6 +1165,76 @@ impl KvLayerCache {
                     .sum()
             }
         }
+    }
+
+    /// Read cached row `pos` back as `f32` (dequantizing int8/int4), into
+    /// `key_out`/`value_out` of length `kv_dim`. The inverse of [`append`], used
+    /// to move a session's history onto the device when a prefix snapshot is
+    /// resumed on the GPU path.
+    ///
+    /// [`append`]: Self::append
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
+    fn row_f32(&self, pos: usize, key_out: &mut [f32], value_out: &mut [f32]) {
+        let d = self.kv_dim;
+        match &self.store {
+            KvStore::Full { keys, values } => {
+                let base = pos * d;
+                key_out.copy_from_slice(&keys[base..base + d]);
+                value_out.copy_from_slice(&values[base..base + d]);
+            }
+            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+                let base = pos * d;
+                let (ks, vs) = (key_scales[pos], value_scales[pos]);
+                for (j, o) in key_out.iter_mut().enumerate() {
+                    *o = keys[base + j] as f32 * ks;
+                }
+                for (j, o) in value_out.iter_mut().enumerate() {
+                    *o = values[base + j] as f32 * vs;
+                }
+            }
+            KvStore::Int4 { keys, key_scales, values, value_scales } => {
+                let byte_base = pos * d.div_ceil(2);
+                let (ks, vs) = (key_scales[pos], value_scales[pos]);
+                for (j, o) in key_out.iter_mut().enumerate() {
+                    *o = read_i4(keys, byte_base, j) * ks;
+                }
+                for (j, o) in value_out.iter_mut().enumerate() {
+                    *o = read_i4(values, byte_base, j) * vs;
+                }
+            }
+        }
+    }
+
+    /// Copy this session's **device** K/V back into the host store, replacing the
+    /// length placeholders the GPU path writes there.
+    ///
+    /// On the GPU kernels the real history lives in VRAM and the host cache holds
+    /// only zeros to keep lengths in step. A prefix-cache snapshot is host-side,
+    /// so without this it would capture those zeros and a resumed prefix would
+    /// attend over empty history — silently wrong output. Call before snapshotting.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub fn sync_from_device(&mut self) -> Result<()> {
+        let n = self.len();
+        let Some(h) = &self.gpu else { return Ok(()) };
+        if n == 0 {
+            return Ok(());
+        }
+        let d = self.kv_dim;
+        let mut keys = vec![0.0f32; n * d];
+        h.keys.download(&mut keys)?;
+        // MLA reconstructs V from the cached latent and allocates no value
+        // buffer, so there is nothing to read back for it.
+        let mut values = vec![0.0f32; n * d];
+        if h.values.len() >= n * d {
+            h.values.download(&mut values)?;
+        }
+        // Rewrite through `append` so every quantization variant is handled by
+        // the one code path that already knows how to store a row.
+        self.truncate(0);
+        for i in 0..n {
+            self.append(&keys[i * d..(i + 1) * d], &values[i * d..(i + 1) * d])?;
+        }
+        Ok(())
     }
 
     /// Add `w × value_head(pos)` into `out` (dequantized inline for int8/4).
@@ -900,8 +1319,12 @@ pub(crate) fn matvec_native(w: &Weights, x: &[f32], out_dim: usize, in_dim: usiz
 /// The LM head is [vocab≈128k, hidden] — ~1 GB streamed per token — and
 /// single-threaded it dominates decode latency (the GPU path still computes
 /// logits on the CPU). Output rows are independent, so split them across cores.
-/// ponytail: parallelize only large GEMVs; small per-layer projections aren't
-/// worth the thread hop. Threshold in MACs, not a tuned constant.
+/// Only large GEMVs are parallelized: below the threshold the thread hop costs
+/// more than the work it distributes, so a small per-layer projection is faster
+/// single-threaded. The threshold is expressed in MACs (`out_dim × in_dim`)
+/// rather than a tuned constant, so it tracks the actual work rather than one
+/// machine's timings. Both paths must produce identical results — pinned by
+/// `matvec_rows_agrees_across_the_parallel_threshold`.
 fn matvec_rows<F>(out_dim: usize, in_dim: usize, x: &[f32], row_dot: F) -> Vec<f32>
 where
     F: Fn(usize, &[f32]) -> f32 + Sync,
@@ -941,6 +1364,16 @@ pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Apply RMSNorm independently to each `head_dim`-wide head of `v` (Qwen3 Q/K
+/// norm). `weight` is `[head_dim]`, shared across the `num_heads` heads.
+fn head_rmsnorm(v: &mut [f32], num_heads: usize, head_dim: usize, weight: &[f32], eps: f32) {
+    for h in 0..num_heads {
+        let head = &mut v[h * head_dim..(h + 1) * head_dim];
+        let normed = rmsnorm(head, weight, eps);
+        head.copy_from_slice(&normed);
+    }
+}
+
 /// In-place numerically-stable softmax.
 fn softmax_inplace(v: &mut [f32]) {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -956,18 +1389,56 @@ fn softmax_inplace(v: &mut [f32]) {
     }
 }
 
+/// Gated-MLP activation function. Llama/Mistral/Qwen gate with SiLU (SwiGLU);
+/// Gemma gates with the tanh-approximate GELU (GeGLU). Must match the
+/// `DLM_ACT_*` constants in `src/gpu/kernels.cu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activation {
+    /// SiLU / swish: `x·σ(x)` — the SwiGLU default.
+    #[default]
+    Silu,
+    /// tanh-approximate GELU (`gelu_pytorch_tanh`): Gemma's GeGLU gate.
+    GeluTanh,
+}
+
+impl Activation {
+    /// Device tag handed to the CUDA kernel (`DLM_ACT_*`).
+    pub fn code(self) -> i32 {
+        match self {
+            Activation::Silu => 0,
+            Activation::GeluTanh => 1,
+        }
+    }
+}
+
 /// SiLU / swish activation.
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// One SwiGLU expert applied to `x`: `down · (silu(gate·x) ⊙ up·x)`, returning
+/// tanh-approximate GELU (`gelu_pytorch_tanh`), Gemma's gate activation.
+fn gelu_tanh(x: f32) -> f32 {
+    const C: f32 = 0.797_884_6; // sqrt(2/pi)
+    0.5 * x * (1.0 + (C * (x + 0.044715 * x * x * x)).tanh())
+}
+
+/// Apply the gate activation elementwise.
+#[inline]
+fn activate(act: Activation, x: f32) -> f32 {
+    match act {
+        Activation::Silu => silu(x),
+        Activation::GeluTanh => gelu_tanh(x),
+    }
+}
+
+/// One gated-MLP expert applied to `x`: `down · (act(gate·x) ⊙ up·x)`, returning
 /// the `hidden`-wide contribution to the residual (the caller scales and adds it).
-fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+/// `act` selects SwiGLU (SiLU) or Gemma's GeGLU (GELU).
+fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize, act: Activation) -> Vec<f32> {
     let gate = matvec_native(&f.gate, x, inter, hidden);
     let up = matvec_native(&f.up, x, inter, hidden);
-    let act: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
-    matvec_native(&f.down, &act, hidden, inter)
+    let combined: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| activate(act, g) * u).collect();
+    matvec_native(&f.down, &combined, hidden, inter)
 }
 
 /// Select the top-`k` experts by routing probability and return
@@ -998,10 +1469,39 @@ pub(crate) fn route_topk(logits: &[f32], k: usize, norm: bool) -> Vec<(usize, f3
     chosen
 }
 
+/// Add the Qwen2-MoE shared expert's contribution into `out`, gated by its
+/// sigmoid (`sigmoid(shared_gate · x)`; ungated → weight 1). No-op when the
+/// model has no shared expert. Shared by the resident and streamed MoE paths.
+fn add_shared_expert(
+    out: &mut [f32],
+    shared: Option<&ExpertFfn>,
+    shared_gate: Option<&Weights>,
+    x: &[f32],
+    cfg: &BlockConfig,
+    m: &MoeConfig,
+) {
+    if let Some(s) = shared {
+        let hidden = cfg.hidden_size;
+        let si = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as usize;
+        let g = match shared_gate {
+            Some(gate) => {
+                let logit = matvec_native(gate, x, 1, hidden)[0];
+                1.0 / (1.0 + (-logit).exp())
+            }
+            None => 1.0,
+        };
+        let down = swiglu_ffn(s, x, hidden, si, cfg.activation);
+        for (o, d) in out.iter_mut().zip(&down) {
+            *o += g * d;
+        }
+    }
+}
+
 /// The MoE feed-forward: route `x` (the post-attention-norm hidden) through the
 /// top-k experts, sum their SwiGLU outputs weighted by the gate, and add the
 /// shared expert (Qwen2-MoE) gated by its sigmoid. Returns the `hidden`-wide
-/// contribution to the residual.
+/// contribution to the residual. Experts are borrowed **resident** here (no
+/// per-token clone); the streamed host path uses [`moe_ffn_streaming`] instead.
 fn moe_ffn(
     router: &Weights,
     experts: &[ExpertFfn],
@@ -1024,26 +1524,52 @@ fn moe_ffn(
                 experts.len()
             ))
         })?;
-        let down = swiglu_ffn(expert, x, hidden, inter);
+        let down = swiglu_ffn(expert, x, hidden, inter, cfg.activation);
         for (o, d) in out.iter_mut().zip(&down) {
             *o += weight * d;
         }
     }
-    if let Some(s) = shared {
-        let si = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as usize;
-        // Sigmoid gate over the shared expert (Qwen2-MoE); ungated → weight 1.
-        let g = match shared_gate {
-            Some(gate) => {
-                let logit = matvec_native(gate, x, 1, hidden)[0];
-                1.0 / (1.0 + (-logit).exp())
-            }
-            None => 1.0,
-        };
-        let down = swiglu_ffn(s, x, hidden, si);
+    add_shared_expert(&mut out, shared, shared_gate, x, cfg, &m);
+    Ok(out)
+}
+
+/// The MoE feed-forward, fetching each routed expert **on demand** via
+/// `fetch_expert(e)` rather than requiring all experts resident — the CPU analog
+/// of the GPU per-`(layer, expert)` streaming path. This is what lets host
+/// streaming run a Mixtral/Qwen-MoE checkpoint without materializing every
+/// expert of every resident layer (which would blow host RAM). The router runs
+/// on the resident core; only the top-k experts a token selects are pulled.
+///
+/// Returns any expert `fetch_expert` fails on so the caller (host or GPU cache
+/// miss) can report the exact expert that couldn't be loaded.
+pub(crate) fn moe_ffn_streaming<F, E>(
+    router: &Weights,
+    shared: Option<&ExpertFfn>,
+    shared_gate: Option<&Weights>,
+    x: &[f32],
+    cfg: &BlockConfig,
+    mut fetch_expert: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(usize) -> Result<E>,
+    E: std::ops::Deref<Target = ExpertFfn>,
+{
+    let m = cfg.moe.ok_or_else(|| {
+        DlmError::QuantLayout("moe_ffn_streaming called on a layer without MoE config".into())
+    })?;
+    let hidden = cfg.hidden_size;
+    let inter = m.moe_intermediate_size as usize;
+    let logits = matvec_native(router, x, m.num_experts as usize, hidden);
+    let mut out = vec![0.0f32; hidden];
+    for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+        // `expert` may be an `Arc<ExpertFfn>` from a host cache — deref, don't clone.
+        let expert = fetch_expert(e)?;
+        let down = swiglu_ffn(&expert, x, hidden, inter, cfg.activation);
         for (o, d) in out.iter_mut().zip(&down) {
-            *o += g * d;
+            *o += weight * d;
         }
     }
+    add_shared_expert(&mut out, shared, shared_gate, x, cfg, &m);
     Ok(out)
 }
 
@@ -1055,12 +1581,43 @@ fn moe_ffn(
 /// resulting device array — so the two paths cannot drift apart, and a new
 /// scaling type is implemented in exactly one place.
 pub fn rope_inv_freqs(head_dim: usize, theta: f32, scaling: Option<RopeScaling>) -> Vec<f32> {
+    // YaRN correction range (constant across dims): the index band over which the
+    // ramp blends extrapolation (keep) into interpolation (÷factor). Mirrors HF
+    // `_compute_yarn_parameters`.
+    let yarn = if let Some(RopeScaling::Yarn {
+        factor,
+        original_max_position,
+        beta_fast,
+        beta_slow,
+        ..
+    }) = scaling
+    {
+        let find_dim = |num_rot: f32| {
+            head_dim as f32 * (original_max_position / (num_rot * 2.0 * std::f32::consts::PI)).ln()
+                / (2.0 * theta.ln())
+        };
+        let low = find_dim(beta_fast).floor().max(0.0);
+        let high = find_dim(beta_slow).ceil().min(head_dim as f32 - 1.0);
+        Some((factor, low, high))
+    } else {
+        None
+    };
     (0..head_dim / 2)
         .map(|i| {
             let base = theta.powf(-2.0 * i as f32 / head_dim as f32);
             match scaling {
                 None => base,
                 Some(RopeScaling::Linear { factor }) => base / factor,
+                Some(RopeScaling::Yarn { .. }) => {
+                    let (factor, low, high) = yarn.unwrap();
+                    let ramp = if (high - low).abs() < 1e-6 {
+                        if (i as f32) < low { 0.0 } else { 1.0 }
+                    } else {
+                        ((i as f32 - low) / (high - low)).clamp(0.0, 1.0)
+                    };
+                    // ramp: 0 (high-freq, keep) → 1 (low-freq, interpolate ÷factor).
+                    (base / factor) * ramp + base * (1.0 - ramp)
+                }
                 Some(RopeScaling::Llama3 {
                     factor,
                     low_freq_factor,
@@ -1088,15 +1645,27 @@ pub fn rope_inv_freqs(head_dim: usize, theta: f32, scaling: Option<RopeScaling>)
         .collect()
 }
 
+/// The YaRN attention temperature `mscale`, folded into cos/sin (1.0 for every
+/// other scaling). Scaling both cos and sin by `mscale` scales q and k by
+/// `mscale`, so attention logits pick up `mscale²` — exactly YaRN's attention
+/// factor. Kept as the single source of truth so CPU and GPU agree.
+pub fn rope_mscale(scaling: Option<RopeScaling>) -> f32 {
+    match scaling {
+        Some(RopeScaling::Yarn { mscale, .. }) => mscale,
+        _ => 1.0,
+    }
+}
+
 /// Apply rotary position embedding in place to a `[num_heads × head_dim]`
 /// vector at absolute `position` (NeoX split-half convention), using
-/// precomputed [`rope_inv_freqs`].
+/// precomputed [`rope_inv_freqs`]. `mscale` (YaRN) scales cos/sin; pass 1.0 otherwise.
 fn rope_inplace(
     vec: &mut [f32],
     num_heads: usize,
     head_dim: usize,
     position: usize,
     inv_freq: &[f32],
+    mscale: f32,
 ) {
     let half = head_dim / 2;
     for h in 0..num_heads {
@@ -1104,6 +1673,7 @@ fn rope_inplace(
         for i in 0..half {
             let angle = position as f32 * inv_freq[i];
             let (sin, cos) = angle.sin_cos();
+            let (sin, cos) = (sin * mscale, cos * mscale);
             let a = vec[base + i];
             let b = vec[base + i + half];
             vec[base + i] = a * cos - b * sin;
@@ -1125,26 +1695,39 @@ fn add_bias(v: &mut [f32], bias: Option<&Vec<f32>>) {
 /// Returns the concatenated per-head context (`q_dim` long).
 fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
     let d = cfg.head_dim;
-    let scale = 1.0 / (d as f32).sqrt();
+    let scale = cfg.attn_scale();
     let group = cfg.group_size();
     let positions = kv.len();
+    // Sliding-window attention (Mistral): a query attends only the most recent
+    // `window` positions (itself included). `None` — or a window at least as long
+    // as the history — is ordinary full causal attention.
+    let start = match cfg.sliding_window {
+        Some(w) if w > 0 => positions.saturating_sub(w),
+        _ => 0,
+    };
     let mut context = vec![0.0f32; cfg.q_dim()];
 
     for h in 0..cfg.num_heads {
         let kv_head = h / group;
         let qh = &q[h * d..(h + 1) * d];
 
-        // Scores over every cached position, then softmax.
-        let mut scores = vec![0.0f32; positions];
-        for (p, score) in scores.iter_mut().enumerate() {
-            *score = kv.key_head_dot(p, kv_head, d, qh) * scale;
+        // Scores over the attended window `[start, positions)`, then softmax.
+        let mut scores = vec![0.0f32; positions - start];
+        for (j, score) in scores.iter_mut().enumerate() {
+            *score = kv.key_head_dot(start + j, kv_head, d, qh) * scale;
+        }
+        // Gemma2 squashes logits into ±cap before the softmax.
+        if let Some(cap) = cfg.attn_logit_softcap {
+            for score in scores.iter_mut() {
+                *score = (*score / cap).tanh() * cap;
+            }
         }
         softmax_inplace(&mut scores);
 
-        // Weighted sum of values → this head's context.
+        // Weighted sum of the windowed values → this head's context.
         let out = &mut context[h * d..(h + 1) * d];
-        for (p, &w) in scores.iter().enumerate() {
-            kv.value_head_accumulate(p, kv_head, d, w, out);
+        for (j, &w) in scores.iter().enumerate() {
+            kv.value_head_accumulate(start + j, kv_head, d, w, out);
         }
     }
     context
@@ -1153,6 +1736,108 @@ fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
 /// Run one decoder block for a single token at absolute `position`, appending to
 /// `kv` and returning the updated hidden state. This is the CPU oracle for the
 /// GPU `ComputeKernel`.
+/// The Multi-head Latent Attention sublayer (DeepSeek). Projects the query and a
+/// compressed KV latent from the hidden, applies decoupled RoPE to the rope
+/// sub-dimensions, caches `[latent ; k_rope]` per token, and attends by
+/// reconstructing per-head K/V from each cached latent. Returns the post-attention
+/// hidden `h1`. The layer's `o_proj` and `input_layernorm` are reused.
+///
+/// (Internal-consistency correct — validated CPU↔GPU — pending a real DeepSeek
+/// checkpoint; the mscale/mscale_all_dim distinction is collapsed to one factor.)
+fn mla_attention_sublayer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    mw: &MlaWeights,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+) -> Result<Vec<f32>> {
+    let m = cfg
+        .mla
+        .ok_or_else(|| DlmError::InvalidConfig("mla_attention on a non-MLA layer".into()))?;
+    let h = cfg.hidden_size;
+    let nh = cfg.num_heads;
+    let nope = m.qk_nope_head_dim as usize;
+    let rope = m.qk_rope_head_dim as usize;
+    let vdim = m.v_head_dim as usize;
+    let qk = nope + rope;
+    let latent = m.kv_lora_rank as usize;
+
+    let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
+
+    // Query: optional low-rank down-projection + norm, then up-projection to
+    // [num_heads · qk], or a direct projection from the hidden.
+    let mut q = match (&mw.q_a_proj, &mw.q_a_layernorm) {
+        (Some(qa), Some(qn)) => {
+            let r = m.q_lora_rank.ok_or_else(|| {
+                DlmError::InvalidConfig("q_a_proj present but q_lora_rank unset".into())
+            })? as usize;
+            let c = rmsnorm(&matvec_native(qa, &normed, r, h), qn, cfg.rms_eps);
+            matvec_native(&mw.q_b_proj, &c, nh * qk, r)
+        }
+        _ => matvec_native(&mw.q_b_proj, &normed, nh * qk, h),
+    };
+
+    // KV down-projection → [latent | k_pe]; norm the latent, RoPE the shared k_pe.
+    let kv_a = matvec_native(&mw.kv_a_proj, &normed, latent + rope, h);
+    let c_kv = rmsnorm(&kv_a[..latent], &mw.kv_a_layernorm, cfg.rms_eps);
+    let mut k_pe = kv_a[latent..].to_vec();
+
+    let inv_freq = rope_inv_freqs(rope, cfg.rope_theta, cfg.rope_scaling);
+    // MLA folds YaRN's temperature into the softmax scale (below), so the rope
+    // itself is unscaled (mscale = 1.0) — only the rope sub-dims rotate.
+    for hh in 0..nh {
+        let base = hh * qk + nope;
+        rope_inplace(&mut q[base..base + rope], 1, rope, position, &inv_freq, 1.0);
+    }
+    rope_inplace(&mut k_pe, 1, rope, position, &inv_freq, 1.0);
+
+    // Cache [c_kv ; k_pe] as this token's key (values unused on the MLA path).
+    let mut key = c_kv;
+    key.extend_from_slice(&k_pe);
+    kv.append(&key, &vec![0.0; latent + rope])?;
+
+    let positions = kv.len();
+    let mscale = rope_mscale(cfg.rope_scaling);
+    let scale = mscale * mscale / (qk as f32).sqrt();
+
+    // Reconstruct every cached position's per-head K/V from its latent once.
+    let kv_up_dim = nh * (nope + vdim);
+    let mut recon: Vec<Vec<f32>> = Vec::with_capacity(positions);
+    let mut k_rope_cache: Vec<Vec<f32>> = Vec::with_capacity(positions);
+    for p in 0..positions {
+        let pk = kv.position_key(p)?;
+        k_rope_cache.push(pk[latent..].to_vec());
+        recon.push(matvec_native(&mw.kv_b_proj, &pk[..latent], kv_up_dim, latent));
+    }
+
+    let mut context = vec![0.0f32; nh * vdim];
+    for hh in 0..nh {
+        let q_nope = &q[hh * qk..hh * qk + nope];
+        let q_rope = &q[hh * qk + nope..hh * qk + qk];
+        let mut scores = vec![0.0f32; positions];
+        for (p, score) in scores.iter_mut().enumerate() {
+            let base = hh * (nope + vdim);
+            let k_nope = &recon[p][base..base + nope];
+            let dot = q_nope.iter().zip(k_nope).map(|(a, b)| a * b).sum::<f32>()
+                + q_rope.iter().zip(&k_rope_cache[p]).map(|(a, b)| a * b).sum::<f32>();
+            *score = dot * scale;
+        }
+        softmax_inplace(&mut scores);
+        let out = &mut context[hh * vdim..(hh + 1) * vdim];
+        for (p, &wgt) in scores.iter().enumerate() {
+            let base = hh * (nope + vdim) + nope;
+            for (o, &vv) in out.iter_mut().zip(&recon[p][base..base + vdim]) {
+                *o += wgt * vv;
+            }
+        }
+    }
+
+    // Output projection [hidden, num_heads · v_head_dim], into the residual.
+    let attn_out = matvec_native(&w.o_proj, &context, h, nh * vdim);
+    Ok(hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect())
+}
+
 pub fn decode_block(
     cfg: &BlockConfig,
     w: &LayerTensors,
@@ -1161,41 +1846,19 @@ pub fn decode_block(
     position: usize,
 ) -> Result<Vec<f32>> {
     w.validate(cfg)?;
-    if hidden.len() != cfg.hidden_size {
-        return Err(DlmError::ShapeMismatch {
-            expected: cfg.hidden_size,
-            got: hidden.len(),
-        });
-    }
-
-    // ── attention sublayer ──
-    let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
-    let mut q = matvec_native(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
-    let mut k = matvec_native(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
-    let mut v = matvec_native(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
-
-    add_bias(&mut q, w.q_bias.as_ref());
-    add_bias(&mut k, w.k_bias.as_ref());
-    add_bias(&mut v, w.v_bias.as_ref());
-
-    let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
-    rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, &inv_freq);
-    rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, &inv_freq);
-
-    kv.append(&k, &v)?;
-    let ctx = attention(cfg, &q, kv);
-    let attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
-
-    let mut h1: Vec<f32> = hidden
-        .iter()
-        .zip(&attn_out)
-        .map(|(&a, &b)| a + b)
-        .collect();
+    let mut h1 = match &w.mla {
+        Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
+        None => attention_sublayer(cfg, w, hidden, kv, position)?,
+    };
 
     // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
-    let normed2 = rmsnorm(&h1, &w.post_attention_layernorm, cfg.rms_eps);
-    let ffn_out = match &w.ffn {
-        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size),
+    // The FFN's input norm is `pre_feedforward_layernorm` on Gemma2 (whose
+    // `post_attention_layernorm` was already spent on the attention output) and
+    // `post_attention_layernorm` everywhere else.
+    let ffn_norm = w.ffn_input_norm();
+    let normed2 = rmsnorm(&h1, ffn_norm, cfg.rms_eps);
+    let mut ffn_out = match &w.ffn {
+        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size, cfg.activation),
         Ffn::Moe { router, experts, shared, shared_gate } => moe_ffn(
             router,
             experts,
@@ -1206,6 +1869,101 @@ pub fn decode_block(
         )?,
     };
 
+    // Gemma2 also normalizes the FFN output before the residual add.
+    if let Some(post_ffn) = &w.post_feedforward_layernorm {
+        ffn_out = rmsnorm(&ffn_out, post_ffn, cfg.rms_eps);
+    }
+    for (h, d) in h1.iter_mut().zip(&ffn_out) {
+        *h += *d;
+    }
+    Ok(h1)
+}
+
+/// The attention sublayer: RMSNorm → Q/K/V (+bias) → RoPE → append K/V → GQA over
+/// history → output projection, folded into the residual. Returns the post-attn
+/// hidden `h1` (the FFN sublayer's input before its own norm). Shared by
+/// [`decode_block`] and [`decode_block_streaming_moe`] so the two can't drift.
+fn attention_sublayer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+) -> Result<Vec<f32>> {
+    if hidden.len() != cfg.hidden_size {
+        return Err(DlmError::ShapeMismatch {
+            expected: cfg.hidden_size,
+            got: hidden.len(),
+        });
+    }
+    let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
+    let mut q = matvec_native(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
+    let mut k = matvec_native(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
+    let mut v = matvec_native(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
+
+    add_bias(&mut q, w.q_bias.as_ref());
+    add_bias(&mut k, w.k_bias.as_ref());
+    add_bias(&mut v, w.v_bias.as_ref());
+
+    // Qwen3 per-head Q/K RMSNorm, applied after projection and before RoPE.
+    if let Some(qn) = &w.q_norm {
+        head_rmsnorm(&mut q, cfg.num_heads, cfg.head_dim, qn, cfg.rms_eps);
+    }
+    if let Some(kn) = &w.k_norm {
+        head_rmsnorm(&mut k, cfg.num_kv_heads, cfg.head_dim, kn, cfg.rms_eps);
+    }
+
+    let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
+    let mscale = rope_mscale(cfg.rope_scaling);
+    rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, &inv_freq, mscale);
+    rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, &inv_freq, mscale);
+
+    kv.append(&k, &v)?;
+    let ctx = attention(cfg, &q, kv);
+    let mut attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
+
+    // Gemma2 normalizes the attention *output* before folding it into the
+    // residual; elsewhere `post_attention_layernorm` is the pre-FFN norm and the
+    // attention output goes in raw. See `LayerTensors::pre_feedforward_layernorm`.
+    if w.is_gemma2_style() {
+        attn_out = rmsnorm(&attn_out, &w.post_attention_layernorm, cfg.rms_eps);
+    }
+    Ok(hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect())
+}
+
+/// Run one decoder block whose layer is a **streamed MoE core** — attention +
+/// router + shared expert are resident in `w` (its `Ffn::Moe.experts` is empty),
+/// and each routed expert is pulled on demand through `fetch_expert`.
+///
+/// This is what makes host streaming viable for large MoE checkpoints: only the
+/// core stays resident per layer and only the top-k experts a token selects are
+/// materialized, instead of dragging every expert of every resident layer into
+/// RAM. Bit-for-bit equivalent to [`decode_block`] on the same weights when
+/// `fetch_expert` returns the same experts.
+pub fn decode_block_streaming_moe<F, E>(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+    fetch_expert: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(usize) -> Result<E>,
+    E: std::ops::Deref<Target = ExpertFfn>,
+{
+    let (router, _experts, shared, shared_gate) = w.moe()?;
+    // DeepSeek-V3 is MLA + MoE, so the streamed-MoE core takes the MLA attention
+    // path too when the layer declares it.
+    let mut h1 = match &w.mla {
+        Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
+        None => attention_sublayer(cfg, w, hidden, kv, position)?,
+    };
+    let normed2 = rmsnorm(&h1, w.ffn_input_norm(), cfg.rms_eps);
+    let mut ffn_out = moe_ffn_streaming(router, shared, shared_gate, &normed2, cfg, fetch_expert)?;
+    if let Some(post_ffn) = &w.post_feedforward_layernorm {
+        ffn_out = rmsnorm(&ffn_out, post_ffn, cfg.rms_eps);
+    }
     for (h, d) in h1.iter_mut().zip(&ffn_out) {
         *h += *d;
     }
@@ -1228,8 +1986,10 @@ impl CpuKernel {
     /// Build a kernel from a shared block config and one [`LayerTensors`] per
     /// layer, validating every layer's matrix dimensions up front.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>) -> Result<Self> {
-        for layer in &layers {
-            layer.validate(&cfg)?;
+        for (i, layer) in layers.iter().enumerate() {
+            // Per-layer config: a DeepSeek dense prefix layer is validated as
+            // dense even though the model is MoE overall.
+            layer.validate(&cfg.for_layer(i as u32))?;
         }
         Ok(Self { cfg, layers })
     }
@@ -1260,7 +2020,9 @@ impl ComputeKernel for CpuKernel {
         kv: &mut KvLayerCache,
         position: usize,
     ) -> Result<()> {
-        let out = decode_block(&self.cfg, &self.layers[layer as usize], hidden, kv, position)?;
+        // Resolve Gemma2's alternating window for this layer; a no-op elsewhere.
+        let cfg = self.cfg.for_layer(layer);
+        let out = decode_block(&cfg, &self.layers[layer as usize], hidden, kv, position)?;
         hidden.copy_from_slice(&out);
         Ok(())
     }
@@ -1270,6 +2032,340 @@ impl ComputeKernel for CpuKernel {
 mod tests {
     use super::*;
     use crate::model::MoeNaming;
+
+    #[test]
+    fn kv_truncate_rolls_back_positions() {
+        let mut kv = KvLayerCache::new(2);
+        for i in 0..5 {
+            kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+        }
+        kv.truncate(3);
+        assert_eq!(kv.len(), 3);
+        // The first 3 positions are intact: attention over the truncated cache
+        // equals a fresh cache built from just those positions.
+        let mut fresh = KvLayerCache::new(2);
+        for i in 0..3 {
+            fresh.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+        }
+        let cfg = BlockConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 2,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
+            ..Default::default()
+        };
+        approx(&attention(&cfg, &[1.0, 0.0], &kv), &attention(&cfg, &[1.0, 0.0], &fresh), 1e-6);
+        kv.truncate(10); // beyond len → no-op
+        assert_eq!(kv.len(), 3);
+    }
+
+    #[test]
+    fn kv_truncate_quantized() {
+        for q in [KvQuant::Int8, KvQuant::Int4] {
+            let mut kv = KvLayerCache::new_quant(2, q);
+            for i in 0..4 {
+                kv.append(&[i as f32, 1.0], &[i as f32, 2.0]).unwrap();
+            }
+            kv.truncate(2);
+            assert_eq!(kv.len(), 2, "{q:?}");
+        }
+    }
+
+    /// Sliding-window attention must attend *only* the last `window` positions:
+    /// a windowed run equals full attention computed over just that tail, and a
+    /// window at least as long as the history is identical to full attention.
+    #[test]
+    fn sliding_window_attends_only_recent_positions() {
+        let base = BlockConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 2,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
+        };
+        // Four cached positions with distinct K/V.
+        let fill = |from: usize| {
+            let mut kv = KvLayerCache::new(2);
+            for i in from..4 {
+                kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+            }
+            kv
+        };
+        let kv_all = fill(0);
+        let q = [1.0f32, 0.0];
+
+        let full = attention(&base, &q, &kv_all);
+        let mut win2 = base;
+        win2.sliding_window = Some(2);
+        let windowed = attention(&win2, &q, &kv_all);
+        assert_ne!(full, windowed, "window of 2 over 4 positions should differ from full");
+
+        // window=2 over all 4 positions == full attention over just the last 2.
+        approx(&windowed, &attention(&base, &q, &fill(2)), 1e-6);
+
+        // A window >= the history is exactly full attention.
+        let mut win_big = base;
+        win_big.sliding_window = Some(10);
+        approx(&attention(&win_big, &q, &kv_all), &full, 1e-6);
+    }
+
+
+    /// `matvec_rows` runs single-threaded below its size threshold and split
+    /// across cores above it. The two paths must agree exactly — a divergence
+    /// would make output depend on how big the matrix happened to be, which is
+    /// the kind of bug that only shows up on one layer of one model.
+    #[test]
+    fn matvec_rows_agrees_across_the_parallel_threshold() {
+        // Straddle the 1<<20 MAC threshold: `small` stays serial, `large` splits.
+        for (out_dim, in_dim) in [(4usize, 8usize), (2048usize, 1024usize)] {
+            let x: Vec<f32> = (0..in_dim).map(|i| ((i % 13) as f32) * 0.031 - 0.2).collect();
+            let row = |r: usize, v: &[f32]| -> f32 {
+                v.iter()
+                    .enumerate()
+                    .map(|(c, &xv)| xv * (((r * 31 + c * 7) % 17) as f32 * 0.01 - 0.08))
+                    .sum()
+            };
+            let got = matvec_rows(out_dim, in_dim, &x, row);
+            // Reference: the same dot products, computed serially right here.
+            let want: Vec<f32> = (0..out_dim).map(|r| row(r, &x)).collect();
+            assert_eq!(got.len(), want.len());
+            for (r, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "{out_dim}x{in_dim} row {r}: parallel {a} vs serial {b}"
+                );
+            }
+        }
+    }
+
+    /// `row_f32` is the inverse of `append` and the hinge of GPU prefix caching:
+    /// a resumed snapshot's history is read back through it and re-uploaded to
+    /// the device. If it disagreed with `append`'s storage layout, a resumed
+    /// prefix would attend over corrupted history — so round-trip every KV
+    /// precision, including the int4 nibble packing.
+    #[test]
+    fn kv_row_round_trips_through_every_precision() {
+        let d = 6usize;
+        let rows: Vec<(Vec<f32>, Vec<f32>)> = (0..3)
+            .map(|i| {
+                let k: Vec<f32> = (0..d).map(|j| (i as f32 + 1.0) * 0.3 - j as f32 * 0.11).collect();
+                let v: Vec<f32> = (0..d).map(|j| (j as f32) * 0.07 - (i as f32) * 0.19).collect();
+                (k, v)
+            })
+            .collect();
+
+        for (quant, tol) in [
+            (KvQuant::None, 1e-6f32),
+            // Quantized stores are lossy by construction; the tolerance tracks
+            // the per-row scale, not an arbitrary fudge.
+            (KvQuant::Int8, 0.01),
+            (KvQuant::Int4, 0.12),
+        ] {
+            let mut kv = KvLayerCache::new_quant(d, quant);
+            for (k, v) in &rows {
+                kv.append(k, v).unwrap();
+            }
+            assert_eq!(kv.len(), rows.len());
+            for (i, (k, v)) in rows.iter().enumerate() {
+                let (mut gk, mut gv) = (vec![0.0; d], vec![0.0; d]);
+                kv.row_f32(i, &mut gk, &mut gv);
+                for (a, b) in gk.iter().zip(k) {
+                    assert!((a - b).abs() <= tol, "{quant:?} key row {i}: {a} vs {b}");
+                }
+                for (a, b) in gv.iter().zip(v) {
+                    assert!((a - b).abs() <= tol, "{quant:?} value row {i}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
+    /// Gemma2 alternates local and global layers: with a period of 2 the even
+    /// layers are windowed and the odd ones see the whole history. Without a
+    /// pattern the window applies to every layer (Mistral).
+    #[test]
+    fn window_pattern_alternates_layers() {
+        let mut cfg = BlockConfig { sliding_window: Some(128), ..Default::default() };
+        assert_eq!(cfg.window_for_layer(0), Some(128), "uniform: every layer windowed");
+        assert_eq!(cfg.window_for_layer(1), Some(128));
+
+        cfg.sliding_window_pattern = Some(2);
+        assert_eq!(cfg.window_for_layer(0), Some(128), "even layers are local");
+        assert_eq!(cfg.window_for_layer(1), None, "odd layers see full history");
+        assert_eq!(cfg.window_for_layer(2), Some(128));
+        assert_eq!(cfg.window_for_layer(3), None);
+
+        // `for_layer` bakes the decision in and must not re-resolve afterwards.
+        let l1 = cfg.for_layer(1);
+        assert_eq!(l1.sliding_window, None);
+        assert_eq!(l1.window_for_layer(0), None, "already resolved; stays resolved");
+
+        // No window at all: the pattern is irrelevant.
+        let none = BlockConfig { sliding_window_pattern: Some(2), ..Default::default() };
+        assert_eq!(none.window_for_layer(0), None);
+    }
+
+    /// Gemma2 squashes attention logits through `tanh(s/cap)*cap` before the
+    /// softmax. The cap must bound the pre-softmax scores (so extreme logits
+    /// saturate instead of dominating) and must be a no-op when unset.
+    #[test]
+    fn attn_logit_softcap_bounds_scores() {
+        // Large, well-separated keys produce a near one-hot softmax uncapped.
+        let mut kv = KvLayerCache::new(2);
+        kv.append(&[40.0, 0.0], &[1.0, 0.0]).unwrap();
+        kv.append(&[0.0, 0.0], &[0.0, 1.0]).unwrap();
+        let q = [1.0f32, 0.0];
+
+        let plain = BlockConfig {
+            hidden_size: 2, num_heads: 1, num_kv_heads: 1, head_dim: 2,
+            rms_eps: 1e-5, ..Default::default()
+        };
+        let capped = BlockConfig { attn_logit_softcap: Some(1.0), ..plain };
+
+        let a = attention(&plain, &q, &kv);
+        let b = attention(&capped, &q, &kv);
+        // Uncapped, position 0 wins almost totally; capped, the gap is squashed
+        // so position 1 keeps real weight.
+        assert!(a[0] > 0.99, "uncapped should be ~one-hot on position 0, got {a:?}");
+        assert!(b[0] < a[0] - 0.05, "softcap should pull the winner down: {b:?} vs {a:?}");
+        assert!(b[1] > 0.05, "softcap should leave position 1 real weight, got {b:?}");
+
+        // A cap far above the scores changes nothing measurable.
+        let loose = BlockConfig { attn_logit_softcap: Some(1e6), ..plain };
+        approx(&attention(&loose, &q, &kv), &a, 1e-4);
+    }
+
+    /// Build a tiny dense layer; `gemma2` adds the FFN norm pair that switches
+    /// the block to the Gemma2 norm placement.
+    fn tiny_layer(h: usize, inter: usize, gemma2: bool) -> LayerTensors {
+        let lin = |n: usize, seed: f32| {
+            Weights::from_f32((0..n).map(|i| ((i as f32 * seed) % 0.7) - 0.35).collect())
+        };
+        LayerTensors {
+            q_proj: lin(h * h, 0.11),
+            k_proj: lin(h * h, 0.13),
+            v_proj: lin(h * h, 0.17),
+            o_proj: lin(h * h, 0.19),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: lin(inter * h, 0.23),
+                up: lin(inter * h, 0.29),
+                down: lin(h * inter, 0.31),
+            }),
+            input_layernorm: (0..h).map(|i| 1.0 + i as f32 * 0.01).collect(),
+            // Deliberately not all-ones: a norm applied in the wrong place must
+            // change the result, or the test proves nothing.
+            post_attention_layernorm: (0..h).map(|i| 0.7 + i as f32 * 0.03).collect(),
+            pre_feedforward_layernorm: gemma2
+                .then(|| (0..h).map(|i| 1.3 - i as f32 * 0.02).collect()),
+            post_feedforward_layernorm: gemma2
+                .then(|| (0..h).map(|i| 0.9 + i as f32 * 0.05).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// Gemma2 normalizes the **attention output** with `post_attention_layernorm`
+    /// before the residual add, where Llama/Gemma1 feed the attention output in
+    /// raw and spend that norm on the FFN input instead. Pinned against the
+    /// non-Gemma2 run of the same weights.
+    #[test]
+    fn gemma2_norms_the_attention_output() {
+        let (h, inter) = (4usize, 6usize);
+        let cfg = BlockConfig {
+            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
+            intermediate_size: inter, rope_theta: 10000.0, rms_eps: 1e-5,
+            ..Default::default()
+        };
+        let x: Vec<f32> = (0..h).map(|i| 0.2 + i as f32 * 0.1).collect();
+
+        let plain = tiny_layer(h, inter, false);
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let plain_h1 = attention_sublayer(&cfg, &plain, &x, &mut kv, 0).unwrap();
+        // Llama shape folds the attention output in raw, so recover it.
+        let attn_out: Vec<f32> = plain_h1.iter().zip(&x).map(|(a, b)| a - b).collect();
+
+        let g2 = tiny_layer(h, inter, true);
+        let cfg2 = BlockConfig { gemma2_norms: true, ..cfg };
+        let mut kv2 = KvLayerCache::new(cfg2.kv_dim());
+        let g2_h1 = attention_sublayer(&cfg2, &g2, &x, &mut kv2, 0).unwrap();
+
+        // Same attention, but normed before the residual add.
+        let normed = rmsnorm(&attn_out, &g2.post_attention_layernorm, cfg.rms_eps);
+        let expected: Vec<f32> = x.iter().zip(&normed).map(|(a, b)| a + b).collect();
+        approx(&g2_h1, &expected, 1e-5);
+        assert!(
+            g2_h1.iter().zip(&plain_h1).any(|(a, b)| (a - b).abs() > 1e-4),
+            "the two norm layouts must not coincide, or this proves nothing"
+        );
+    }
+
+    /// The FFN half: Gemma2 norms the FFN input with `pre_feedforward_layernorm`
+    /// (not `post_attention_layernorm`, already spent above) and norms the FFN
+    /// *output* before the residual add.
+    #[test]
+    fn gemma2_norms_the_ffn_input_and_output() {
+        let (h, inter) = (4usize, 6usize);
+        let cfg = BlockConfig {
+            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
+            intermediate_size: inter, rope_theta: 10000.0, rms_eps: 1e-5,
+            gemma2_norms: true,
+            ..Default::default()
+        };
+        let w = tiny_layer(h, inter, true);
+        let x: Vec<f32> = (0..h).map(|i| 0.2 + i as f32 * 0.1).collect();
+
+        let mut kv = KvLayerCache::new(cfg.kv_dim());
+        let got = decode_block(&cfg, &w, &x, &mut kv, 0).unwrap();
+
+        // Reference: attention half (checked above), then the FFN in Gemma2 order.
+        let mut kv_ref = KvLayerCache::new(cfg.kv_dim());
+        let h1 = attention_sublayer(&cfg, &w, &x, &mut kv_ref, 0).unwrap();
+        let normed = rmsnorm(&h1, w.pre_feedforward_layernorm.as_ref().unwrap(), cfg.rms_eps);
+        let ffn = swiglu_ffn(w.dense_ffn().unwrap(), &normed, h, inter, cfg.activation);
+        let ffn = rmsnorm(&ffn, w.post_feedforward_layernorm.as_ref().unwrap(), cfg.rms_eps);
+        let expected: Vec<f32> = h1.iter().zip(&ffn).map(|(a, b)| a + b).collect();
+        approx(&got, &expected, 1e-5);
+    }
+
+    /// A Gemma2 config against a checkpoint without the norm pair (or vice versa)
+    /// would run with the wrong norm placement, so it is refused, not guessed.
+    #[test]
+    fn mismatched_gemma2_norm_layout_is_refused() {
+        let (h, inter) = (4usize, 6usize);
+        let cfg = BlockConfig {
+            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
+            intermediate_size: inter, rms_eps: 1e-5, gemma2_norms: true,
+            ..Default::default()
+        };
+        assert!(tiny_layer(h, inter, false).validate(&cfg).is_err(), "gemma2 cfg, plain layer");
+        let plain_cfg = BlockConfig { gemma2_norms: false, ..cfg };
+        assert!(tiny_layer(h, inter, true).validate(&plain_cfg).is_err(), "plain cfg, gemma2 layer");
+        // Matching pairs are fine.
+        assert!(tiny_layer(h, inter, true).validate(&cfg).is_ok());
+        assert!(tiny_layer(h, inter, false).validate(&plain_cfg).is_ok());
+    }
+
+    /// `query_pre_attn_scalar` decouples the attention scale from `head_dim`
+    /// (Gemma2-27B: scale by 144 while head_dim is 128).
+    #[test]
+    fn query_pre_attn_scalar_overrides_head_dim_scale() {
+        let cfg = BlockConfig { head_dim: 4, ..Default::default() };
+        approx(&[cfg.attn_scale()], &[0.5], 1e-6); // 1/sqrt(4)
+        let scaled = BlockConfig { query_pre_attn_scalar: Some(16.0), ..cfg };
+        approx(&[scaled.attn_scale()], &[0.25], 1e-6); // 1/sqrt(16), not 1/sqrt(4)
+    }
 
     fn approx(a: &[f32], b: &[f32], eps: f32) {
         assert_eq!(a.len(), b.len());
@@ -1307,17 +2403,59 @@ mod tests {
     }
 
     #[test]
+    fn head_rmsnorm_normalizes_each_head() {
+        // Two heads of dim 2: [3,4] and [6,8] (= 2×[3,4], so same after norm).
+        let mut v = vec![3.0, 4.0, 6.0, 8.0];
+        head_rmsnorm(&mut v, 2, 2, &[1.0, 1.0], 1e-6);
+        approx(&v, &[0.8485, 1.1314, 0.8485, 1.1314], 1e-3);
+    }
+
+    #[test]
+    fn gelu_tanh_values() {
+        assert!(gelu_tanh(0.0).abs() < 1e-6); // 0 → 0
+        assert!(gelu_tanh(20.0) > 19.9); // ~x for large positive x
+        assert!(gelu_tanh(-20.0).abs() < 1e-3); // ~0 for large negative x
+        // GELU(1) ≈ 0.8412 (tanh approximation), distinct from SiLU(1) ≈ 0.7311.
+        assert!((gelu_tanh(1.0) - 0.8412).abs() < 1e-3);
+        assert_ne!(activate(Activation::GeluTanh, 1.0), activate(Activation::Silu, 1.0));
+    }
+
+    #[test]
+    fn yarn_blends_frequencies_within_bounds_and_sets_mscale() {
+        let (head_dim, theta) = (64, 10000.0f32);
+        let factor = 4.0f32;
+        let scaling = Some(RopeScaling::Yarn {
+            factor,
+            original_max_position: 4096.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            mscale: 0.1 * factor.ln() + 1.0,
+        });
+        let none = rope_inv_freqs(head_dim, theta, None);
+        let yarn = rope_inv_freqs(head_dim, theta, scaling);
+        // Every YaRN frequency is a convex blend of extrapolation (`none[i]`) and
+        // interpolation (`none[i]/factor`), so it lies between the two.
+        for i in 0..head_dim / 2 {
+            let (lo, hi) = (none[i] / factor - 1e-9, none[i] + 1e-6);
+            assert!(yarn[i] >= lo && yarn[i] <= hi, "yarn[{i}]={} not in [{lo},{hi}]", yarn[i]);
+        }
+        assert_ne!(yarn, none, "YaRN must actually change some frequencies");
+        assert!((rope_mscale(scaling) - (0.1 * factor.ln() + 1.0)).abs() < 1e-6);
+        assert_eq!(rope_mscale(None), 1.0);
+    }
+
+    #[test]
     fn rope_preserves_norm_and_is_identity_at_zero() {
         let inv = rope_inv_freqs(4, 10000.0, None);
         let mut v = vec![1.0, 2.0, 3.0, 4.0];
         let before: f32 = v.iter().map(|x| x * x).sum();
-        rope_inplace(&mut v, 1, 4, 5, &inv);
+        rope_inplace(&mut v, 1, 4, 5, &inv, 1.0);
         let after: f32 = v.iter().map(|x| x * x).sum();
         assert!((before - after).abs() < 1e-3, "rotation preserves norm");
 
         // Position 0 → no rotation.
         let mut w = vec![1.0, 2.0, 3.0, 4.0];
-        rope_inplace(&mut w, 1, 4, 0, &inv);
+        rope_inplace(&mut w, 1, 4, 0, &inv, 1.0);
         approx(&w, &[1.0, 2.0, 3.0, 4.0], 1e-6);
     }
 
@@ -1380,7 +2518,8 @@ mod tests {
             intermediate_size: 6,
             rope_theta: 10000.0,
             rms_eps: 1e-5,
-            rope_scaling: None, moe: None,
+            rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let hidden = vec![1.5, -2.0, 0.5, 3.0];
 
@@ -1416,7 +2555,8 @@ mod tests {
             head_dim: 2,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
@@ -1434,7 +2574,8 @@ mod tests {
             head_dim: 1,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
@@ -1452,7 +2593,8 @@ mod tests {
             head_dim: 2,
             intermediate_size: 6,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1486,7 +2628,8 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
@@ -1527,7 +2670,8 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
@@ -1552,7 +2696,8 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None,
+            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         };
         let w = LayerTensors::zeros(&cfg);
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -1572,9 +2717,10 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             rope_scaling: None,
-            moe: Some(m),
+            moe: Some(m), sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
         }
-    }
+}
 
     #[test]
     fn route_topk_selects_highest_and_renormalizes() {
@@ -1606,6 +2752,7 @@ mod tests {
             shared_intermediate_size: None,
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
+            first_k_dense: 0,
         });
         let hidden = vec![1.0f32, 1.0];
 
@@ -1656,6 +2803,7 @@ mod tests {
             shared_intermediate_size: None,
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
+            first_k_dense: 0,
         });
         let hidden = vec![0.7f32, -1.3];
         let mut w = LayerTensors::zeros(&cfg);
@@ -1680,8 +2828,8 @@ mod tests {
         // Independent expected: attention is all-zero so h1 == hidden; the FFN
         // input is rmsnorm(hidden, unit, eps); each expert's SwiGLU is weighted 0.5.
         let normed2 = rmsnorm(&hidden, &w.post_attention_layernorm, cfg.rms_eps);
-        let d0 = swiglu_ffn(&e0, &normed2, cfg.hidden_size, 2);
-        let d1 = swiglu_ffn(&e1, &normed2, cfg.hidden_size, 2);
+        let d0 = swiglu_ffn(&e0, &normed2, cfg.hidden_size, 2, cfg.activation);
+        let d1 = swiglu_ffn(&e1, &normed2, cfg.hidden_size, 2, cfg.activation);
         let expected: Vec<f32> = (0..cfg.hidden_size)
             .map(|i| hidden[i] + 0.5 * d0[i] + 0.5 * d1[i])
             .collect();
@@ -1699,6 +2847,7 @@ mod tests {
             shared_intermediate_size: Some(2),
             norm_topk_prob: true,
             naming: MoeNaming::Qwen,
+            first_k_dense: 0,
         });
         let hidden = vec![1.0f32, 0.4];
         let mut w = LayerTensors::zeros(&cfg);
@@ -1716,7 +2865,7 @@ mod tests {
         let out = decode_block(&cfg, &w, &hidden, &mut kv, 0).unwrap();
 
         let normed2 = rmsnorm(&hidden, &w.post_attention_layernorm, cfg.rms_eps);
-        let sh = swiglu_ffn(&shared, &normed2, cfg.hidden_size, 2);
+        let sh = swiglu_ffn(&shared, &normed2, cfg.hidden_size, 2, cfg.activation);
         let expected: Vec<f32> =
             (0..cfg.hidden_size).map(|i| hidden[i] + 0.5 * sh[i]).collect();
         approx(&out, &expected, 1e-6);

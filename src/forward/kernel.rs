@@ -39,6 +39,26 @@ pub trait ComputeKernel {
         position: usize,
     ) -> Result<()>;
 
+    /// Run block `layer` for a **batch** of sequences in one call: `hiddens[i]`,
+    /// `kvs[i]` and `positions[i]` are sequence `i`'s state. The default loops
+    /// [`run_block`](Self::run_block) per sequence — semantically identical, so any
+    /// kernel is correct without overriding. The GPU kernel overrides it to fuse
+    /// the per-sequence projection GEMVs into batched GEMMs, the throughput win
+    /// continuous batching is built for (attention stays per-sequence — each has
+    /// its own KV history/length).
+    fn run_block_batched(
+        &self,
+        layer: u32,
+        hiddens: &mut [&mut [f32]],
+        kvs: &mut [&mut KvLayerCache],
+        positions: &[usize],
+    ) -> Result<()> {
+        for ((hidden, kv), &position) in hiddens.iter_mut().zip(kvs.iter_mut()).zip(positions) {
+            self.run_block(layer, hidden, kv, position)?;
+        }
+        Ok(())
+    }
+
     /// Layer-streaming cache stats, if this kernel streams weights. Resident
     /// kernels (everything held in memory) return `None`; the streaming kernel
     /// overrides it so the server can surface hit rate / prefetch effectiveness.
@@ -73,6 +93,17 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         position: usize,
     ) -> Result<()> {
         (**self).run_block(layer, hidden, kv, position)
+    }
+
+    fn run_block_batched(
+        &self,
+        layer: u32,
+        hiddens: &mut [&mut [f32]],
+        kvs: &mut [&mut KvLayerCache],
+        positions: &[usize],
+    ) -> Result<()> {
+        // Forward to the concrete kernel so a borrowed GPU kernel keeps its fusion.
+        (**self).run_block_batched(layer, hiddens, kvs, positions)
     }
 }
 

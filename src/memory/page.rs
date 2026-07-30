@@ -70,3 +70,80 @@ fn query_page_size() -> usize {
 fn query_page_size() -> usize {
     4096
 }
+
+static TOTAL_RAM: OnceLock<Option<u64>> = OnceLock::new();
+
+/// Total physical system RAM in bytes, or `None` if the platform cannot say.
+///
+/// Queried the same way as [`page_size`] — a direct platform call, no new
+/// dependency — so budgets that would otherwise need a hard-coded ceiling can
+/// scale to the machine they run on.
+pub fn total_ram() -> Option<u64> {
+    *TOTAL_RAM.get_or_init(query_total_ram)
+}
+
+#[cfg(windows)]
+fn query_total_ram() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        dw_length: u32,
+        dw_memory_load: u32,
+        ull_total_phys: u64,
+        ull_avail_phys: u64,
+        ull_total_page_file: u64,
+        ull_avail_page_file: u64,
+        ull_total_virtual: u64,
+        ull_avail_virtual: u64,
+        ull_avail_extended_virtual: u64,
+    }
+
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    // SAFETY: `dw_length` must be set to the struct size before the call (the API
+    // uses it to version the layout); the call then fills the rest.
+    let mut status: MemoryStatusEx = unsafe { core::mem::zeroed() };
+    status.dw_length = core::mem::size_of::<MemoryStatusEx>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.ull_total_phys == 0 {
+        None
+    } else {
+        Some(status.ull_total_phys)
+    }
+}
+
+#[cfg(unix)]
+fn query_total_ram() -> Option<u64> {
+    // SAFETY: sysconf with a valid name is always safe; -1 signals "unknown",
+    // which we report as `None` rather than guessing.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pages <= 0 || page <= 0 {
+        return None;
+    }
+    (pages as u64).checked_mul(page as u64)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn query_total_ram() -> Option<u64> {
+    None
+}
+
+#[cfg(test)]
+mod ram_tests {
+    /// Whatever the platform reports must be sane: either "unknown" or a figure
+    /// big enough to be real RAM. A bogus small value would silently shrink every
+    /// budget derived from it.
+    #[test]
+    fn total_ram_is_absent_or_plausible() {
+        if let Some(bytes) = super::total_ram() {
+            assert!(
+                bytes >= 256 * 1024 * 1024,
+                "implausible total RAM reported: {bytes} bytes"
+            );
+            // Cached: a second call must agree.
+            assert_eq!(super::total_ram(), Some(bytes));
+        }
+    }
+}

@@ -109,7 +109,8 @@ fn tiny_cfg() -> BlockConfig {
         head_dim: 4,
         intermediate_size: 16,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+        sliding_window_pattern: None, attn_logit_softcap: None, query_pre_attn_scalar: None, gemma2_norms: false,
     }
 }
 
@@ -138,7 +139,7 @@ fn cpu_self_check() -> Result<usize> {
 
 /// GPU runtime probe: on a `cuda-kernels` build, run one block on both the CPU
 /// and GPU kernels and report the max divergence; otherwise note it was skipped.
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 fn gpu_self_check() {
     match gpu_parity_probe() {
         Ok(diff) => println!("  gpu parity   : ok (max |Δ| {diff:.2e} vs cpu)"),
@@ -146,14 +147,14 @@ fn gpu_self_check() {
     }
 }
 
-#[cfg(not(feature = "cuda-kernels"))]
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
 fn gpu_self_check() {
     println!("  gpu parity   : skipped (build with --features cuda-kernels)");
 }
 
 /// Build one layer, run it on CPU and GPU, return the max absolute difference.
 /// Errors if the GPU is unavailable at runtime (`GpuKernel::new` fails).
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 fn gpu_parity_probe() -> Result<f32> {
     use dlm::forward::{GpuKernel, KvLayerCache};
     let cfg = tiny_cfg();
@@ -344,12 +345,12 @@ fn generate_on_device(
             let generator = parts.into_cpu_generator()?;
             run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
         }
-        #[cfg(feature = "cuda-kernels")]
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
         Device::Gpu => {
             let generator = parts.into_gpu_generator()?;
             run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
         }
-        #[cfg(not(feature = "cuda-kernels"))]
+        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
     }
 }
@@ -426,7 +427,8 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         head_dim,
         intermediate_size: args.intermediate_size,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None,
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+        ..Default::default()
     };
 
     // Small random weights (RMSNorm keeps activations bounded).
@@ -466,6 +468,8 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         rms_eps: 1e-5,
         kv_config,
         kv_blocks,
+        embed_scale: None,
+        final_logit_softcap: None,
     })
 }
 
@@ -552,7 +556,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
             let secret = cluster_secret(&args);
             let worker =
-                dlm::distributed::Worker::new(parts.cfg, parts.layers)?.with_auth(secret.clone());
+                dlm::distributed::Worker::new(parts.cfg, parts.layers)?
+                    .with_auth(secret.clone())
+                    .with_io_timeout(args.worker_timeout_secs.map(std::time::Duration::from_secs));
             let listener = dlm::distributed::worker::bind(&listen)?;
             println!();
             println!("worker node  : listening on {listen} ({} layers)", config.num_layers);
@@ -588,6 +594,20 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 args.device
             };
 
+            // Prefix caching stores a KV *snapshot* taken from the host-side
+            // KvLayerCache. On the GPU compute kernels the real K/V lives in VRAM
+            // and the host cache holds only length placeholders, so a resumed
+            // prefix would read empty history and silently emit wrong output —
+            // refuse it rather than mislead. (Multi-GPU runs the CPU kernel with
+            // per-device dispatch, so its host KV is real and prefix caching is
+            // fine there.)
+            // (Prefix caching used to be refused here: the snapshot is host-side
+            // while the GPU keeps K/V in VRAM, so it captured only the length
+            // placeholders. The scheduler now takes the snapshot through
+            // `snapshot_synced`, which copies the device K/V back to the host
+            // first, and `gpu_kv` re-uploads it when a snapshot is resumed — so
+            // the GPU path is supported.)
+
             // Streaming path: keep only a window of layers resident and stream the
             // rest from disk, so a model can exceed the resident budget. Streams to
             // host RAM (CPU) or into VRAM (--device gpu).
@@ -622,7 +642,28 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     );
                 }
                 if device == Device::Gpu {
-                    return serve_streaming_gpu(store, &config, &args, window, ram_cache, &listen);
+                    // Batch KV is planned into the window; refuse if it left no room
+                    // for even one resident layer instead of OOMing mid-request.
+                    ensure_batch_kv_fits(
+                        plan.free_bytes,
+                        plan.safety_bytes,
+                        plan.kv_total_bytes,
+                        (window as u64).saturating_mul(plan.per_layer_weight_bytes),
+                        args.max_batch,
+                        args.context_length,
+                        "resident window",
+                    )?;
+                    let expert_cache = resolve_expert_cache_bytes(&args, &config, &plan, window);
+                    if config.is_moe() {
+                        println!(
+                            "  expert$    : {:.1} MiB VRAM for routed experts{}",
+                            expert_cache as f64 / (1024.0 * 1024.0),
+                            if args.expert_cache_gb.is_some() { "" } else { " (default: VRAM left after the layer window)" },
+                        );
+                    }
+                    return serve_streaming_gpu(
+                        store, &config, &args, window, ram_cache, expert_cache, &listen,
+                    );
                 }
                 let generator = dlm::loader::build_streaming_generator(
                     store,
@@ -670,11 +711,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         ids[stage], shard.start, shard.end, shard.len(),
                     );
                 }
-                let generator = parts.into_pipeline_parallel_generator(&ids)?;
-                let draft = draft_parts
-                    .map(|p| p.into_pipeline_parallel_generator(&ids[..1]))
-                    .transpose()?;
-                start_batched_server(generator, draft, &args, &config, &listen)
+                serve_multi_gpu(parts, draft_parts, &ids, &args, &config, &listen)
             } else if device == Device::Gpu {
                 serve_on_gpu(parts, draft_parts, &args, &config, &listen)
             } else {
@@ -692,28 +729,25 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 /// dies just because no GPU is present. On a CPU-only build, an explicit
 /// `--device gpu` passes through and the downstream `not(cuda-kernels)` arm
 /// reports the clearer "requires --features cuda-kernels" error.
-/// Error for a GPU request on a build without the CUDA compute kernels. On an
-/// AMD (`rocm`) build `--features cuda-kernels` is unsatisfiable — it pulls in
-/// `cuda` — so pointing AMD users at that flag is a dead end. Give them the real
-/// state (AMD compute isn't implemented yet, run on CPU) and keep the
-/// build-flag hint only for a plain CPU build that *could* enable it.
+/// Error for a GPU request on a build without any device compute kernels. Each
+/// vendor gets the flag that actually works for it: on an AMD (`rocm`) build
+/// `--features cuda-kernels` is unsatisfiable — it pulls in `cuda` — so pointing
+/// AMD users there is a dead end; they need `rocm-kernels`.
 fn gpu_compute_unavailable(what: &str) -> DlmError {
-    match gpu::active_vendor() {
-        gpu::GpuVendor::Amd => DlmError::InvalidConfig(format!(
-            "{what} on GPU is not supported on this AMD (ROCm) build — AMD GPU compute is \
-             not implemented yet. Run on CPU (drop --device gpu)."
-        )),
-        _ => DlmError::InvalidConfig(format!(
-            "{what} requires building with `--features cuda-kernels`"
-        )),
-    }
+    let feature = match gpu::active_vendor() {
+        gpu::GpuVendor::Amd => "rocm-kernels",
+        _ => "cuda-kernels",
+    };
+    DlmError::InvalidConfig(format!(
+        "{what} requires building with `--features {feature}`"
+    ))
 }
 
 fn resolve_device(requested: Device) -> Device {
     if requested == Device::Cpu {
         return Device::Cpu;
     }
-    #[cfg(feature = "cuda-kernels")]
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
     {
         if gpu::mem_get_info().is_ok() {
             Device::Gpu
@@ -725,7 +759,7 @@ fn resolve_device(requested: Device) -> Device {
             Device::Cpu
         }
     }
-    #[cfg(not(feature = "cuda-kernels"))]
+    #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
     {
         Device::Gpu
     }
@@ -745,7 +779,7 @@ fn resolve_device(requested: Device) -> Device {
 /// under Windows WDDM, and an outright OOM where there is no such paging.
 fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> VramPlan {
     let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
-    let profiler = build_profiler(args.context_length, args.safety_margin_gb);
+    let profiler = build_profiler(args.context_length, args.safety_margin_gb, args.max_batch as u32);
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
     if catalog.is_empty() {
@@ -760,6 +794,29 @@ fn resident_window(plan: &VramPlan, args: &ServeArgs) -> usize {
     args.resident_layers
         .unwrap_or(plan.layers_to_load as usize)
         .max(1)
+}
+
+/// VRAM budget (bytes) for the routed-expert cache on the GPU MoE streaming path.
+///
+/// `--expert-cache-gb` overrides it; otherwise it defaults to the VRAM left over
+/// after the resident core window — so the expert cache and the layer window
+/// together stay inside the plan's `usable` VRAM instead of the cache growing by
+/// an unbounded expert *count* (which OOMs a 128-expert card). `0` for dense.
+fn resolve_expert_cache_bytes(
+    args: &ServeArgs,
+    config: &ModelConfig,
+    plan: &VramPlan,
+    window: usize,
+) -> usize {
+    if !config.is_moe() {
+        return 0;
+    }
+    if let Some(gb) = args.expert_cache_gb {
+        return (gb.max(0.0) * GIB as f64) as usize;
+    }
+    // Whatever usable VRAM the resident core window doesn't take.
+    let window_bytes = (window as u64).saturating_mul(plan.per_layer_weight_bytes);
+    plan.usable_bytes.saturating_sub(window_bytes) as usize
 }
 
 /// Resolve the weight precision: the explicit `--quant`, else the checkpoint's
@@ -800,17 +857,85 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
 
 /// Build a VRAM profiler, overriding the default safety cushion when the user
 /// passed `--safety-margin-gb` (small cards claw back the fixed 1.5 GiB default).
-fn build_profiler(context_length: u32, safety_margin_gb: Option<f64>) -> VramProfiler {
-    let p = VramProfiler::new(context_length);
+fn build_profiler(context_length: u32, safety_margin_gb: Option<f64>, max_batch: u32) -> VramProfiler {
+    let p = VramProfiler::new(context_length).with_max_batch(max_batch);
     match safety_margin_gb {
         Some(gb) => p.with_safety_margin_bytes((gb.max(0.0) * GIB as f64) as u64),
         None => p,
     }
 }
 
+/// Refuse a serve config whose concurrent-batch KV reservation won't fit VRAM,
+/// with a message naming the levers to pull — rather than letting the engine OOM
+/// on the first token. `resident_bytes` is what sits in VRAM beside the KV caches
+/// (the streamed window, or the resident weights); `kv_reservation` already
+/// includes the `max_batch` multiplier. A no-op when everything fits.
+#[allow(clippy::too_many_arguments)]
+fn ensure_batch_kv_fits(
+    free: u64,
+    safety: u64,
+    kv_reservation: u64,
+    resident_bytes: u64,
+    max_batch: usize,
+    context: u32,
+    what: &str,
+) -> Result<()> {
+    let need = safety
+        .saturating_add(kv_reservation)
+        .saturating_add(resident_bytes);
+    if need > free {
+        let gib = |b: u64| b as f64 / GIB as f64;
+        return Err(DlmError::InvalidConfig(format!(
+            "--max-batch {max_batch} needs ~{:.1} GiB VRAM ({what} {:.1} + KV {:.1} for \
+             {max_batch}×{context} tokens + safety {:.1}) but only {:.1} GiB is free. \
+             Lower --max-batch or --context-length (or use --quant / a smaller model).",
+            gib(need),
+            gib(resident_bytes),
+            gib(kv_reservation),
+            gib(safety),
+            gib(free),
+        )));
+    }
+    Ok(())
+}
+
+/// Serve a model split across `gpu_ids`. On a `cuda-kernels` build each device
+/// computes its own layer shard ([`MultiGpuKernel`]); otherwise it falls back to
+/// the CPU-backed pipeline (device-affinity plumbing that no-ops off-GPU), so the
+/// split path stays exercisable without hardware.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+fn serve_multi_gpu(
+    parts: ModelParts,
+    draft_parts: Option<ModelParts>,
+    ids: &[u32],
+    args: &ServeArgs,
+    config: &ModelConfig,
+    listen: &str,
+) -> Result<()> {
+    println!("  compute    : gpu (each stage runs its shard on its device)");
+    let generator = parts.into_multi_gpu_generator(ids)?;
+    let draft = draft_parts.map(|p| p.into_multi_gpu_generator(&ids[..1])).transpose()?;
+    start_batched_server(generator, draft, args, config, listen)
+}
+
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+fn serve_multi_gpu(
+    parts: ModelParts,
+    draft_parts: Option<ModelParts>,
+    ids: &[u32],
+    args: &ServeArgs,
+    config: &ModelConfig,
+    listen: &str,
+) -> Result<()> {
+    println!("  compute    : cpu (device split plumbing; build with --features cuda-kernels for GPU)");
+    let generator = parts.into_pipeline_parallel_generator(ids)?;
+    let draft = draft_parts.map(|p| p.into_pipeline_parallel_generator(&ids[..1])).transpose()?;
+    start_batched_server(generator, draft, args, config, listen)
+}
+
 /// Serve with the GPU kernel (all layers resident in VRAM). Feature-gated on
 /// `cuda-kernels`; the draft model, if any, is also placed on the GPU.
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 fn serve_on_gpu(
     parts: ModelParts,
     draft_parts: Option<ModelParts>,
@@ -820,12 +945,26 @@ fn serve_on_gpu(
 ) -> Result<()> {
     println!();
     println!("device       : gpu ({})", gpu::active_vendor().label());
+    // All weights sit resident in VRAM; each batched request adds a full-context
+    // KV cache. Refuse up front if the batch won't fit rather than OOM mid-request.
+    let (free, _) = resolve_free_bytes(args.vram_budget_gb);
+    let profiler = build_profiler(args.context_length, args.safety_margin_gb, args.max_batch as u32);
+    let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
+    ensure_batch_kv_fits(
+        free,
+        profiler.safety_margin_bytes,
+        profiler.kv_total_bytes(config),
+        weights,
+        args.max_batch,
+        args.context_length,
+        "weights",
+    )?;
     let generator = parts.into_gpu_generator()?;
     let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
     start_batched_server(generator, draft, args, config, listen)
 }
 
-#[cfg(not(feature = "cuda-kernels"))]
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
 fn serve_on_gpu(
     _parts: ModelParts,
     _draft_parts: Option<ModelParts>,
@@ -838,13 +977,15 @@ fn serve_on_gpu(
 
 /// Serve with `--stream --device gpu`: stream a window of layer weights through
 /// VRAM (`StreamingGpuKernel`). Experimental — unvalidated on hardware.
-#[cfg(feature = "cuda-kernels")]
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+#[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
     store: MmapStore,
     config: &ModelConfig,
     args: &ServeArgs,
     window: usize,
     ram_cache: usize,
+    expert_cache: usize,
     listen: &str,
 ) -> Result<()> {
     println!("device       : gpu ({}) — VRAM layer streaming [experimental]", gpu::active_vendor().label());
@@ -855,17 +996,20 @@ fn serve_streaming_gpu(
             args.context_length,
             window,
             ram_cache,
+            expert_cache,
         )?;
     start_batched_server(generator, None, args, config, listen)
 }
 
-#[cfg(not(feature = "cuda-kernels"))]
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+#[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
     _store: MmapStore,
     _config: &ModelConfig,
     _args: &ServeArgs,
     _window: usize,
     _ram_cache: usize,
+    _expert_cache: usize,
     _listen: &str,
 ) -> Result<()> {
     Err(gpu_compute_unavailable("--stream --device gpu"))
@@ -1005,7 +1149,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             "dlm",
             128,
             created,
-            8, // max concurrent batch
+            args.max_batch.max(1), // max concurrent batch (--max-batch)
             args.prefix_cache_size,
         ),
         None => dlm::server::EngineService::start(
@@ -1015,7 +1159,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             "dlm",
             128,
             created,
-            8, // max concurrent batch
+            args.max_batch.max(1), // max concurrent batch (--max-batch)
             args.prefix_cache_size,
         ),
     }
@@ -1087,7 +1231,8 @@ fn report_plan(
     let catalog = mapped.as_ref().map(|(_, cat)| cat);
 
     // Resolve free VRAM: explicit budget > live device query > simulated 16 GiB.
-    let profiler = build_profiler(context_length, safety_margin_gb);
+    // `profile` plans for a single sequence (batch is a serve-time concern).
+    let profiler = build_profiler(context_length, safety_margin_gb, 1);
     let (free_bytes, free_source) = resolve_free_bytes(vram_budget_gb);
     println!("free VRAM    : {free_source}");
 
@@ -1208,11 +1353,28 @@ fn report_plan(
 /// Cap on the *defaulted* host-RAM layer cache. An explicit `--ram-cache-gb`
 /// overrides it in either direction.
 ///
-/// ponytail: a fixed ceiling, because dlm has no dependency that can ask the OS
-/// how much RAM is free. Sized so the default can hold a small quantized model
-/// outright while never silently claiming a big fraction of a modest box; raise
-/// it explicitly if you have the memory.
+/// Floor for the cap when the platform will not report its RAM — sized so the
+/// default can still hold a small quantized model outright while never silently
+/// claiming a big fraction of a modest box.
 const DEFAULT_RAM_CACHE_CAP: u64 = 4 * GIB;
+
+/// Share of physical RAM the *defaulted* cache may claim. The cache duplicates
+/// layer weights on top of the page cache, so it stays a minority of the box.
+const RAM_CACHE_SHARE: u64 = 4; // one quarter
+
+/// Ceiling on the defaulted host-RAM layer cache, scaled to the machine.
+///
+/// Asks the OS for physical RAM ([`total_ram`](dlm::memory::page::total_ram) —
+/// the same direct platform call [`page_size`] already uses, no dependency) and
+/// allows a quarter of it, never less than [`DEFAULT_RAM_CACHE_CAP`]. A fixed
+/// ceiling either wasted a large machine or overcommitted a small one; this does
+/// neither. An explicit `--ram-cache-gb` still overrides it in both directions.
+fn ram_cache_cap() -> u64 {
+    match dlm::memory::page::total_ram() {
+        Some(total) => (total / RAM_CACHE_SHARE).max(DEFAULT_RAM_CACHE_CAP),
+        None => DEFAULT_RAM_CACHE_CAP,
+    }
+}
 
 /// Host-RAM budget for the streaming layer cache.
 ///
@@ -1246,7 +1408,7 @@ fn resolve_ram_cache_bytes(args: &ServeArgs, quant: QuantScheme, plan: &VramPlan
     // reserves RAM the cache never fills.
     let whole_model = plan.per_layer_weight_bytes * plan.num_layers as u64;
     let with_headroom = whole_model + whole_model / 4; // +25%
-    with_headroom.min(DEFAULT_RAM_CACHE_CAP) as usize
+    with_headroom.min(ram_cache_cap()) as usize
 }
 
 fn resolve_free_bytes(vram_budget_gb: Option<f64>) -> (u64, String) {
@@ -1308,4 +1470,24 @@ fn sample_70b_config(quant: QuantScheme) -> ModelConfig {
         "max_position_embeddings": 8192
     }"#;
     ModelConfig::from_json_bytes(json, quant).expect("built-in sample config is valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_kv_fit_check_accepts_and_refuses() {
+        // Fits: free 10 GiB, need = safety 0.5 + KV 2 + resident 1 = 3.5.
+        assert!(ensure_batch_kv_fits(
+            10 * GIB, GIB / 2, 2 * GIB, GIB, 4, 2048, "weights"
+        )
+        .is_ok());
+
+        // Doesn't fit: an 8 GiB batch KV reservation blows a 4 GiB card.
+        let err = ensure_batch_kv_fits(4 * GIB, GIB, 8 * GIB, GIB, 16, 8192, "weights");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("--max-batch"), "message should name the lever: {msg}");
+    }
 }

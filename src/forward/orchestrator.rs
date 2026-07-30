@@ -77,6 +77,21 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         }
     }
 
+    /// Snapshot for the prefix cache, first pulling any **device**-resident K/V
+    /// back to the host.
+    ///
+    /// On the GPU kernels the real history lives in VRAM and the host caches hold
+    /// only length placeholders, so a plain [`snapshot`](Self::snapshot) would
+    /// capture zeros. This is the variant the prefix cache must use; on CPU
+    /// kernels it is exactly `snapshot()`.
+    pub fn snapshot_synced(&mut self) -> Result<KvSnapshot> {
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        for kv in &mut self.kv_layers {
+            kv.sync_from_device()?;
+        }
+        Ok(self.snapshot())
+    }
+
     /// Build an orchestrator resuming from `snapshot`'s KV history and position,
     /// reserving matching budget from `budget`. The caller prefills any suffix
     /// tokens that follow the snapshot via [`decode_token`](Self::decode_token).

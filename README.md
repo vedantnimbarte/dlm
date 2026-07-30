@@ -44,9 +44,12 @@ safety cushion on a small card to fit more layers).
 One line — downloads a prebuilt binary for your platform and installs it. No
 clone, no build, no Rust toolchain. Every download is checked against a published
 `.sha256` before it is unpacked or run, so a corrupted or truncated download is
-caught. Note this is an **integrity** check, not authenticity: the checksum is
-served from the same GitHub release as the binary, so it guards against corruption
-in transit, not a compromised release. Signed releases are on the roadmap.
+caught. That is an **integrity** check; for **authenticity**, the release
+workflow also signs each archive with [minisign](https://jedisct1.github.io/minisign/)
+and the installers verify the `.minisig` when a public key is configured. Set
+`MINISIGN_PUBKEY` in the installer (or export `DLM_MINISIGN_PUBKEY`) to the
+project key and install minisign to enable it; without a key the checksum still
+applies. A present-but-invalid signature aborts the install.
 
 **Linux / macOS** (installs to `~/.local/bin`):
 
@@ -280,7 +283,7 @@ cargo run -- profile
 Example output:
 
 ```
-dlm v0.2.1
+dlm v0.3.0
   gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
@@ -419,23 +422,36 @@ names. That covers:
 | Family | Status |
 |---|---|
 | Llama 2 / 3 / 3.1 / 3.2 | supported (incl. `llama3` RoPE scaling, GQA, tied embeddings) |
-| Mistral | supported |
+| Mistral | supported (incl. sliding-window attention) |
 | Qwen2 / Qwen2.5 | supported (incl. the Q/K/V attention biases) |
+| Qwen3 (dense) | supported — per-head Q/K RMSNorm |
+| Gemma (v1) | supported — `(1+w)` RMSNorm, GeGLU, `sqrt(hidden)` embedding scaling |
 | Mixtral (and Mixtral-layout MoE) | supported — top-k routing over `block_sparse_moe.experts.*` |
 | Qwen2-MoE / Qwen3-MoE | supported — routed experts + optional sigmoid-gated shared expert |
 | GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
-| DeepSeek-V2/V3 (MLA) | **not supported** — needs multi-head latent attention dlm does not implement |
-| Gemma, Qwen3 (dense) | **not supported** — they need norm variants dlm does not implement |
+| DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU. MLA + MoE runs on the streaming GPU path (the resident kernel holds no routed experts, so `--no-stream` refuses it) |
+| Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
 
 **MoE models** route each token through the top-k experts the router selects
 (softmax over all experts, then top-k, then renormalized — the Mixtral/Qwen
-recipe). On the GPU streaming path only the experts a token actually uses are
-pulled into VRAM, cached per `(layer, expert)` and reused across tokens — so a
-sparse model moves far less over PCIe than its total parameter count implies.
-Because expert choice is data-dependent it can't be prefetched like the layer
-cycle, so a cold expert still costs a stream; quantize (`--quant`) to keep the
-hot set resident. On CPU and host streaming, a layer's experts ride along with
-it. Expert weights honor `--quant` exactly like dense weights.
+recipe). **Both the GPU and the host (`--stream`) paths hold only a layer's
+*core* resident — attention, router, and the shared expert — and pull the top-k
+routed experts on demand**, cached per `(layer, expert)` and reused across
+tokens. So a sparse model keeps memory near its *active* parameter count, not its
+total: a Mixtral-8×7B layer inlines ~45 GB of experts, but only the two a token
+uses are materialized. On GPU the expert cache is a VRAM budget
+(`--expert-cache-gb`, defaulting to the VRAM left after the resident layer
+window) so a fine-grained (128-expert) model can't overrun the card; on the host
+it's a bounded RAM cache. Because expert choice is data-dependent it can't be
+prefetched like the layer cycle, so a cold expert still costs a load; quantize
+(`--quant`) to keep the hot set resident, and watch `dlm_stream_expert_*` in
+`/metrics` for the hit rate. Expert weights honor `--quant` like dense weights.
+
+Concurrent requests are continuously batched on every backend, including the GPU
+paths — each in-flight sequence owns its own KV history, so batched decoding is
+correct on the GPU as well as the CPU. KV lives in VRAM per sequence, so the KV
+footprint grows with the batch size; size `--context-length` and the batch for
+your card.
 
 An unsupported architecture fails with a clear `UnknownTensor` error at load
 rather than producing garbage. A config declaring a `rope_scaling` type dlm does
@@ -447,14 +463,11 @@ biases (`q_proj.bias`/`k_proj.bias`/`v_proj.bias`, which Qwen2 ships and Llama d
 not) are loaded when present, and `rope_scaling` (`linear`, `llama3`) is applied
 when the config declares it.
 
-**Quantized checkpoints (GPTQ/AWQ) are refused, not silently mis-loaded.** The
-4-bit dequantizer in [`src/quant/packed.rs`](src/quant/packed.rs) is round-trip
-tested against dlm's own packer, but has never been validated against a real
-export — and exporters disagree on the zero-point convention (AutoGPTQ stores
-`zero - 1`) and on act-order column permutation. Getting either wrong yields
-*plausible-looking but incorrect* weights, which is a far worse failure than an
-honest error. Use an fp16/bf16 checkpoint. (Re-enabling this needs a real GPTQ
-fixture plus a parity test — the code is still there behind the refusal.)
+**Already-quantized checkpoints (GPTQ/AWQ)** load directly — 4-bit GPTQ with
+`desc_act: false` is validated end-to-end against a real export, while act-order
+GPTQ and AWQ decode with a loud warning. See
+[Already-quantized checkpoints](#already-quantized-checkpoints-gptq) for what is
+verified, what is experimental, and what is still refused.
 
 ## Running the tests
 
@@ -498,13 +511,13 @@ The GPU path is vendor-neutral behind [`src/gpu`](src/gpu), selected by a Cargo
 feature. Everything above the backend (storage, profiler, pipeline) is identical
 across vendors.
 
-> **GPU compute status:** NVIDIA (CUDA) is the only backend with working compute
-> kernels today, and it is verified on real hardware against the CPU oracle
-> ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)). The `rocm` (AMD) feature
-> currently provides **memory management only** — VRAM query and pinned host
-> memory — and has **no compute kernels**, so on an AMD GPU inference falls back
-> to the CPU. **AMD GPU compute (a HIP port of `kernels.cu`) is planned, not yet
-> available.**
+> **GPU compute status:** The GPU stack is **backend-agnostic** — the same
+> kernels (`src/gpu/kernels.cu`) and orchestration run on **NVIDIA (CUDA)** via
+> `cuda-kernels` and **AMD (HIP)** via `rocm-kernels`; only the device runtime
+> (malloc/copy/streams) differs. CUDA is verified on real hardware against the CPU
+> oracle ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)). The HIP path type-checks
+> and compiles (`hipcc`), and needs the same parity run on an AMD card to be
+> declared verified — validate with `dlm doctor` before trusting output.
 
 | Feature | Vendor | Runtime | Env var |
 |---|---|---|---|
@@ -648,17 +661,24 @@ generally better than the same model through `--quant int4`, which rounds to
 nearest with no calibration. No `--quant` is needed (or accepted): the file's
 precision is already int4.
 
-Supported: **4-bit GPTQ with `desc_act: false`** and the classic `gptq`
-checkpoint format — the combination validated end-to-end against a real export
-([`tests/gptq_model.rs`](tests/gptq_model.rs)). These are refused by name rather
-than decoded on a guess, because a wrong assumption here yields weights that
-still generate fluent text that means nothing:
+Fully validated: **4-bit GPTQ with `desc_act: false`** and the classic `gptq`
+checkpoint format — validated end-to-end against a real export
+([`tests/gptq_model.rs`](tests/gptq_model.rs)), and relabeled straight into dlm's
+int4 layout.
+
+**Experimental (loud warning at load):** `desc_act: true` (act-order) GPTQ and
+**AWQ** now decode too, but **to f32** (act-order's `g_idx` groups and AWQ's
+nibble order don't fit dlm's flat int4 layout), and their conventions are checked
+only by dlm's internal round-trip, *not* against a real export. dlm accepts them
+with a warning — verify output with `dlm doctor` and your own prompts. Because
+they land as f32, they use ~8× the VRAM of an int4 layer; pair with `--quant int4`
+to re-shrink at some accuracy cost.
+
+Still refused:
 
 | refused | why |
 | --- | --- |
-| `desc_act: true` (act-order) | rows are permuted by `g_idx`; dlm does not un-permute them |
 | `checkpoint_format: gptq_v2` | stores the true zero-point; dlm decodes the classic `zero - 1` convention and has no v2 fixture to check against |
-| AWQ | packs nibbles in a permuted order dlm does not unpack |
 | non-4-bit | dlm decodes 4-bit only |
 
 ---
@@ -723,7 +743,9 @@ inference engine):
     the weights, the other the KV history.
   - `--prefix-cache-size N` — cache up to `N` prompt-prefix KV snapshots so
     requests sharing a prefix (e.g. a common system prompt) skip re-prefilling it.
-    Each entry holds its prefix's KV in RAM; `0` disables it.
+    Each entry holds its prefix's KV in RAM; `0` disables it. Works on CPU and
+    GPU: snapshots are host-side, so on the GPU path the device K/V is copied back
+    when a snapshot is taken and re-uploaded when one is resumed.
 
   **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a

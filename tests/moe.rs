@@ -147,11 +147,43 @@ fn run_family(family: Family) {
         dlm::loader::build_streaming_generator(store_b, &config, 32, 2, 1, false, 64 << 20).unwrap();
     let out_streaming = streaming.generate(&prompt, &gen_cfg).unwrap();
     assert_eq!(out_streaming, out_resident, "streamed MoE diverged from resident");
+
+    // Prove the host path actually *streams* experts (loads the core, pulls the
+    // top-k on demand) rather than holding every expert resident — the fix that
+    // makes large MoE viable on CPU. A miss means an expert was fetched on demand.
+    let stats = streaming.stream_stats().expect("streaming kernel reports stats");
+    assert!(
+        stats.expert_misses > 0,
+        "expected routed experts to be streamed on demand, got {stats:?}"
+    );
 }
 
 #[test]
 fn mixtral_moe_loads_and_runs() {
     run_family(Family::Mixtral);
+}
+
+/// Under `--quant int4`, the routed experts are quantized but the router stays in
+/// its native precision — quantizing the router can flip top-k routing, silently
+/// degrading the model, so it is kept exact.
+#[test]
+fn moe_router_stays_native_under_quant() {
+    use dlm::forward::Ffn;
+    let tmp = tempfile::tempdir().unwrap();
+    write_moe_checkpoint(tmp.path(), Family::Mixtral); // writes safetensors + config.json
+    // Re-load the config at int4 (the checkpoint itself is F32 floats on disk).
+    let config_json = std::fs::read(tmp.path().join("config.json")).unwrap();
+    let config = ModelConfig::from_json_bytes(&config_json, QuantScheme::Int4).unwrap();
+    let store = MmapStore::open_dir(tmp.path()).unwrap();
+    let parts = dlm::loader::load_model_parts(&store, &config, 32).unwrap();
+    match &parts.layers[0].ffn {
+        Ffn::Moe { router, experts, .. } => {
+            // dtype_code 3 == Int4. Router must NOT be int4; experts must be.
+            assert_ne!(router.dtype_code(), 3, "router should stay native under --quant int4");
+            assert_eq!(experts[0].gate.dtype_code(), 3, "experts should be quantized to int4");
+        }
+        _ => panic!("expected a MoE layer"),
+    }
 }
 
 #[test]

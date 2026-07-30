@@ -21,8 +21,9 @@ fn build_engine() -> Engine<CpuKernel> {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None,
-    };
+        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            ..Default::default()
+        };
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
     let fill = |n: usize, off: usize| -> Vec<f32> {
         (0..n).map(|i| (((i + off) % 13) as f32 - 6.0) * 0.02).collect()
