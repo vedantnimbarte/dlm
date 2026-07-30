@@ -58,12 +58,25 @@ function Get-Asset($asset) {
     }
 
     # Authenticity (opt-in): if a signing key is configured and minisign is on
-    # PATH, the archive's .minisig must verify. A present-but-bad signature
-    # aborts; a missing tool or key just falls back to the checksum above.
+    # PATH, the archive's .minisig must verify. A missing tool or key falls back
+    # to the checksum above; but once a key IS set, a signature that is missing,
+    # unfetchable or invalid all abort — configuring a key means "refuse anything
+    # I cannot prove came from the key holder", and accepting a missing .minisig
+    # would let anyone strip it to bypass the check.
     if ($MinisignPubkey) {
         if (Get-Command minisign -ErrorAction SilentlyContinue) {
             $sig = Join-Path $tmp "$asset.minisig"
-            Invoke-WebRequest -Uri "$base/$asset.minisig" -OutFile $sig -UseBasicParsing
+            try {
+                Invoke-WebRequest -Uri "$base/$asset.minisig" -OutFile $sig -UseBasicParsing
+            } catch {
+                throw @"
+no signature published for $asset, but DLM_MINISIGN_PUBKEY is set.
+
+This release was not signed, so its authenticity cannot be proven. Either
+install a signed release, or clear DLM_MINISIGN_PUBKEY to install with only
+the sha256 integrity check (which has already passed).
+"@
+            }
             $pub = Join-Path $tmp 'dlm.pub'
             Set-Content -Path $pub -Value $MinisignPubkey -Encoding ascii
             & minisign -Vm $zip -p $pub -x $sig *>$null
