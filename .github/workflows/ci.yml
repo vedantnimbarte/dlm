@@ -130,6 +130,12 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # The `rustfmt` component above was installed but never invoked, so the
+      # only formatting rule the project enforced was whatever each patch
+      # arrived with. Runs before clippy: it is the faster of the two and needs
+      # no build, so a formatting-only failure reports in seconds.
+      - name: Format
+        run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
