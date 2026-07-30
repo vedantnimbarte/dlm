@@ -123,8 +123,15 @@ This means the download was corrupted or tampered with. Aborting."
 
 # Verify $tmp/$1's minisign signature against MINISIGN_PUBKEY. The checksum
 # already guarantees integrity; this adds authenticity (it came from the key
-# holder). Opt-in and best-effort: skipped when no key is configured or minisign
-# isn't installed, but a *present* signature that fails to verify aborts.
+# holder). Opt-in: skipped when no key is configured or minisign isn't installed.
+#
+# Once a key IS configured, a signature that is missing, unfetchable or invalid
+# all abort. That is deliberate — configuring a key means "refuse anything I
+# cannot prove came from the key holder", and treating a missing .minisig as
+# permission to continue would let anyone strip the signature to bypass the
+# check. The messages below distinguish the cases, because the fix differs:
+# an unsigned release is the project's problem, a bad signature is an attack or
+# a corrupted mirror.
 verify_signature() {
   a="$1"
   [ -n "$MINISIGN_PUBKEY" ] || return 0
@@ -132,7 +139,15 @@ verify_signature() {
     info "note: minisign not installed — skipping signature (authenticity) check; sha256 integrity still verified. Install minisign to enable it."
     return 0
   fi
-  download "https://github.com/${REPO}/releases/latest/download/${a}.minisig" "$tmp/$a.minisig"
+  sig_url="https://github.com/${REPO}/releases/latest/download/${a}.minisig"
+  if ! curl -fsSL "$sig_url" -o "$tmp/$a.minisig" 2>/dev/null \
+     && ! wget -qO "$tmp/$a.minisig" "$sig_url" 2>/dev/null; then
+    err "no signature published for ${a}, but DLM_MINISIGN_PUBKEY is set.
+
+This release was not signed, so its authenticity cannot be proven. Either
+install a signed release, or unset DLM_MINISIGN_PUBKEY to install with only
+the sha256 integrity check (which has already passed)."
+  fi
   printf '%s\n' "$MINISIGN_PUBKEY" >"$tmp/dlm.pub"
   minisign -Vm "$tmp/$a" -p "$tmp/dlm.pub" -x "$tmp/$a.minisig" >/dev/null 2>&1 \
     || err "signature verification failed for $a — it is not signed by the expected key. Aborting."

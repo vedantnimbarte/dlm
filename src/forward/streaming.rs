@@ -842,6 +842,25 @@ mod tests {
         assert!(streaming.stats().evictions > 0, "expected eviction with a small window");
     }
 
+    /// Poll `cond` until it holds or `timeout` expires; returns whether it held.
+    ///
+    /// Prefetching happens on a background thread, so asserting on its progress
+    /// after a fixed sleep is a race: the sleep is either dead time on an idle
+    /// machine or too short on a loaded one. (It was too short — these assertions
+    /// failed under a busy CPU while passing in isolation.) Polling to a generous
+    /// deadline returns as soon as the worker is done and only spends the full
+    /// budget when something is genuinely wrong.
+    fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        cond()
+    }
+
     /// A source that sleeps on load, so a prefetch started during one block's
     /// compute has time to finish before the next block is requested.
     struct SlowSource(Vec<LayerTensors>);
@@ -865,7 +884,7 @@ mod tests {
         // Compute layer 0; this requests a prefetch of layer 1. With no further
         // run_block competing, the worker loads layer 1 uncontended.
         k.run_block(0, &mut h, &mut kv, 0).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        wait_until(std::time::Duration::from_secs(5), || k.stats().prefetched >= 1);
 
         let s = k.stats();
         assert!(s.prefetched >= 1, "background worker should have prefetched a layer: {s:?}");
@@ -879,7 +898,9 @@ mod tests {
         let mut h = vec![0.5f32; 8];
         let mut kv = KvLayerCache::new(c.kv_dim());
         k.run_block(0, &mut h, &mut kv, 0).unwrap(); // requests prefetch of 1,2,3
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        // Wait for the three to land, then assert the exact count — so this still
+        // catches over-prefetching, just without racing the worker.
+        wait_until(std::time::Duration::from_secs(5), || k.stats().prefetched >= 3);
         assert_eq!(k.stats().prefetched, 3, "depth-3 should prefetch three layers: {:?}", k.stats());
     }
 
@@ -923,7 +944,8 @@ mod tests {
         let mut h = vec![0.5f32; 8];
         let mut kv = KvLayerCache::new(c.kv_dim());
         k.run_block(0, &mut h, &mut kv, 0).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        // Wait for the one permitted prefetch, then assert nothing beyond it.
+        wait_until(std::time::Duration::from_secs(5), || k.stats().prefetched >= 1);
         assert_eq!(k.stats().prefetched, 1, "depth must clamp to window-1: {:?}", k.stats());
     }
 

@@ -463,14 +463,11 @@ biases (`q_proj.bias`/`k_proj.bias`/`v_proj.bias`, which Qwen2 ships and Llama d
 not) are loaded when present, and `rope_scaling` (`linear`, `llama3`) is applied
 when the config declares it.
 
-**Quantized checkpoints (GPTQ/AWQ) are refused, not silently mis-loaded.** The
-4-bit dequantizer in [`src/quant/packed.rs`](src/quant/packed.rs) is round-trip
-tested against dlm's own packer, but has never been validated against a real
-export — and exporters disagree on the zero-point convention (AutoGPTQ stores
-`zero - 1`) and on act-order column permutation. Getting either wrong yields
-*plausible-looking but incorrect* weights, which is a far worse failure than an
-honest error. Use an fp16/bf16 checkpoint. (Re-enabling this needs a real GPTQ
-fixture plus a parity test — the code is still there behind the refusal.)
+**Already-quantized checkpoints (GPTQ/AWQ)** load directly — 4-bit GPTQ with
+`desc_act: false` is validated end-to-end against a real export, while act-order
+GPTQ and AWQ decode with a loud warning. See
+[Already-quantized checkpoints](#already-quantized-checkpoints-gptq) for what is
+verified, what is experimental, and what is still refused.
 
 ## Running the tests
 

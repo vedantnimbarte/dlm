@@ -648,7 +648,13 @@ fn streaming_gpu_worker_prefetches() {
     // Compute layer 0 → requests a prefetch of layer 1; nothing else competes, so
     // the worker uploads it uncontended.
     k.run_block(0, &mut h, &mut kv, 0).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    // Poll to a deadline rather than sleeping a fixed span: the upload runs on a
+    // background thread, so a fixed sleep is dead time when idle and a flake when
+    // the CPU is busy.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while k.stats().prefetched < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert!(k.stats().prefetched >= 1, "GPU worker should prefetch a layer: {:?}", k.stats());
 }
 
