@@ -192,7 +192,10 @@ impl PackedFormat {
     /// True for the paths validated only by internal round-trip, not a real
     /// export — the loader warns for these (act-order GPTQ and AWQ).
     pub fn is_experimental(self) -> bool {
-        matches!(self, PackedFormat::Gptq { act_order: true } | PackedFormat::Awq)
+        matches!(
+            self,
+            PackedFormat::Gptq { act_order: true } | PackedFormat::Awq
+        )
     }
 }
 
@@ -242,7 +245,11 @@ fn check_quant_supported(q: &QuantizationConfig) -> Result<Option<PackedQuant>> 
             // `gptq_v2` stores the true zero-point; classic `gptq` stores zero-1.
             // dlm's decoder assumes the classic convention (verified against a real
             // export) and has no v2 fixture to check the other against.
-            match q.checkpoint_format.as_deref().map(|f| f.to_ascii_lowercase()) {
+            match q
+                .checkpoint_format
+                .as_deref()
+                .map(|f| f.to_ascii_lowercase())
+            {
                 None => {}
                 Some(ref f) if f == "gptq" => {}
                 Some(other) => {
@@ -393,13 +400,13 @@ fn build_mla_config(raw: &RawConfig) -> Result<Option<MlaConfig>> {
 /// count is refused rather than guessed at — routing every token through the
 /// wrong number of experts is silent garbage, the worst failure mode.
 fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
-    let (num_experts, naming) =
-        match (raw.num_local_experts, raw.num_experts, raw.n_routed_experts) {
-            (Some(n), _, _) => (n, MoeNaming::Mixtral),
-            (None, Some(n), _) => (n, MoeNaming::Qwen),
-            (None, None, Some(n)) => (n, MoeNaming::DeepSeek),
-            (None, None, None) => return Ok(None),
-        };
+    let (num_experts, naming) = match (raw.num_local_experts, raw.num_experts, raw.n_routed_experts)
+    {
+        (Some(n), _, _) => (n, MoeNaming::Mixtral),
+        (None, Some(n), _) => (n, MoeNaming::Qwen),
+        (None, None, Some(n)) => (n, MoeNaming::DeepSeek),
+        (None, None, None) => return Ok(None),
+    };
     if num_experts == 0 {
         return Ok(None); // an expert count of 0 is just a dense model
     }
@@ -687,7 +694,11 @@ impl ModelConfig {
         let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
         let is_gemma2 = model_type == "gemma2";
         let is_gemma = model_type == "gemma" || is_gemma2;
-        let activation = match raw.hidden_activation.as_deref().or(raw.hidden_act.as_deref()) {
+        let activation = match raw
+            .hidden_activation
+            .as_deref()
+            .or(raw.hidden_act.as_deref())
+        {
             Some(a) if a.to_ascii_lowercase().contains("gelu") => {
                 crate::forward::cpu::Activation::GeluTanh
             }
@@ -754,7 +765,9 @@ impl ModelConfig {
             ));
         }
         if self.num_layers == 0 {
-            return Err(DlmError::InvalidConfig("num_hidden_layers must be > 0".into()));
+            return Err(DlmError::InvalidConfig(
+                "num_hidden_layers must be > 0".into(),
+            ));
         }
         if self.hidden_size == 0 {
             return Err(DlmError::InvalidConfig("hidden_size must be > 0".into()));
@@ -905,14 +918,19 @@ mod tests {
             "n_routed_experts":64,"n_shared_experts":2,"num_experts_per_tok":6,
             "first_k_dense_replace":1,"moe_layer_freq":1}"#;
         let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
-        let m = c.moe.expect("DeepSeek declares experts via n_routed_experts");
+        let m = c
+            .moe
+            .expect("DeepSeek declares experts via n_routed_experts");
         assert_eq!(m.num_experts, 64);
         assert_eq!(m.experts_per_tok, 6);
         assert_eq!(m.naming, MoeNaming::DeepSeek);
         // The shared expert is a *count* of moe_intermediate_size experts fused
         // into one: 2 × 1408. Reading it as a width would size it 1408.
         assert_eq!(m.shared_intermediate_size, Some(2816));
-        assert_eq!(m.first_k_dense, 1, "layer 0 is dense, layers 1.. are routed");
+        assert_eq!(
+            m.first_k_dense, 1,
+            "layer 0 is dense, layers 1.. are routed"
+        );
     }
 
     /// A sparser MoE period is refused rather than guessed: loading a routed
@@ -1024,7 +1042,11 @@ mod tests {
             "final_logit_softcapping":30.0,"query_pre_attn_scalar":144.0}"#;
         let c = ModelConfig::from_json_bytes(gemma2, QuantScheme::Fp16).unwrap();
         assert_eq!(c.sliding_window, Some(4096));
-        assert_eq!(c.sliding_window_pattern, Some(2), "HF hard-codes a period of 2");
+        assert_eq!(
+            c.sliding_window_pattern,
+            Some(2),
+            "HF hard-codes a period of 2"
+        );
         assert_eq!(c.attn_logit_softcap, Some(50.0));
         assert_eq!(c.final_logit_softcap, Some(30.0));
         assert_eq!(c.query_pre_attn_scalar, Some(144.0));
@@ -1048,7 +1070,12 @@ mod tests {
                 "original_max_position_embeddings":4096,"beta_fast":32,"beta_slow":1}}"#;
         let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
         match c.rope_scaling {
-            Some(RopeScaling::Yarn { factor, original_max_position, mscale, .. }) => {
+            Some(RopeScaling::Yarn {
+                factor,
+                original_max_position,
+                mscale,
+                ..
+            }) => {
                 assert_eq!(factor, 4.0);
                 assert_eq!(original_max_position, 4096.0);
                 // Default attention factor = 0.1·ln(4)+1.
@@ -1063,14 +1090,18 @@ mod tests {
         let with = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
             "vocab_size":32,"intermediate_size":64,"sliding_window":4096}"#;
         assert_eq!(
-            ModelConfig::from_json_bytes(with, QuantScheme::Fp16).unwrap().sliding_window,
+            ModelConfig::from_json_bytes(with, QuantScheme::Fp16)
+                .unwrap()
+                .sliding_window,
             Some(4096)
         );
         // Absent → full attention; a zero window is treated as absent.
         let without = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,
             "vocab_size":32,"intermediate_size":64}"#;
         assert_eq!(
-            ModelConfig::from_json_bytes(without, QuantScheme::Fp16).unwrap().sliding_window,
+            ModelConfig::from_json_bytes(without, QuantScheme::Fp16)
+                .unwrap()
+                .sliding_window,
             None
         );
     }

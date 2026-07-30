@@ -8,4 +8,4 @@ pub mod openai;
 pub use distributed::DistributedEngine;
 pub use engine::EngineService;
 pub use http::{Body, HttpServer, Request, Response};
-pub use openai::{Engine, router, ChatMessage, Completion};
+pub use openai::{router, ChatMessage, Completion, Engine};

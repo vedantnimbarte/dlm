@@ -96,7 +96,9 @@ impl Sampler {
     pub fn repetition_penalty(&self) -> f32 {
         match self {
             Sampler::Greedy => 1.0,
-            Sampler::TopPK { repetition_penalty, .. } => *repetition_penalty,
+            Sampler::TopPK {
+                repetition_penalty, ..
+            } => *repetition_penalty,
         }
     }
 
@@ -105,7 +107,13 @@ impl Sampler {
     pub fn sample(&self, logits: &[f32], rng: &mut SplitMix64) -> u32 {
         match *self {
             Sampler::Greedy => argmax(logits),
-            Sampler::TopPK { temperature, top_p, top_k, min_p, .. } => {
+            Sampler::TopPK {
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                ..
+            } => {
                 if temperature <= 0.0 {
                     return argmax(logits);
                 }
@@ -119,14 +127,22 @@ impl Sampler {
 /// context (HF convention: divide positive logits by `penalty`, multiply
 /// negative ones). A `penalty` of `1.0` is a no-op. Applied in place before
 /// sampling.
-fn apply_repetition_penalty(logits: &mut [f32], seen: &std::collections::HashSet<u32>, penalty: f32) {
+fn apply_repetition_penalty(
+    logits: &mut [f32],
+    seen: &std::collections::HashSet<u32>,
+    penalty: f32,
+) {
     if penalty == 1.0 {
         return;
     }
     for &t in seen {
         let i = t as usize;
         if i < logits.len() {
-            logits[i] = if logits[i] > 0.0 { logits[i] / penalty } else { logits[i] * penalty };
+            logits[i] = if logits[i] > 0.0 {
+                logits[i] / penalty
+            } else {
+                logits[i] * penalty
+            };
         }
     }
 }
@@ -147,10 +163,16 @@ fn sample_topk_topp(
     // Candidate indices sorted by logit, descending.
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_unstable_by(|&a, &b| {
-        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     // top-k cap.
-    let k = if top_k > 0 { top_k.min(idx.len()) } else { idx.len() };
+    let k = if top_k > 0 {
+        top_k.min(idx.len())
+    } else {
+        idx.len()
+    };
     idx.truncate(k);
 
     // Softmax with temperature over the retained logits (subtract the max for
@@ -391,7 +413,11 @@ impl<K: ComputeKernel> Generator<K> {
         let kv_dim = self.kernel.kv_dim();
         // Per-sequence KV (one cache per layer) + hidden + absolute position.
         let mut kvs: Vec<Vec<KvLayerCache>> = (0..b)
-            .map(|_| (0..nl).map(|_| KvLayerCache::new_quant(kv_dim, self.kv_quant)).collect())
+            .map(|_| {
+                (0..nl)
+                    .map(|_| KvLayerCache::new_quant(kv_dim, self.kv_quant))
+                    .collect()
+            })
             .collect();
         let mut hidden = vec![vec![0.0f32; self.hidden_size]; b];
         let mut position = vec![0usize; b];
@@ -410,10 +436,14 @@ impl<K: ComputeKernel> Generator<K> {
             }
         }
 
-        let mut rngs: Vec<SplitMix64> = (0..b).map(|_| SplitMix64::new(cfg.sampler.seed())).collect();
+        let mut rngs: Vec<SplitMix64> = (0..b)
+            .map(|_| SplitMix64::new(cfg.sampler.seed()))
+            .collect();
         let penalty = cfg.sampler.repetition_penalty();
-        let mut seen: Vec<std::collections::HashSet<u32>> =
-            prompts.iter().map(|p| p.iter().copied().collect()).collect();
+        let mut seen: Vec<std::collections::HashSet<u32>> = prompts
+            .iter()
+            .map(|p| p.iter().copied().collect())
+            .collect();
         let mut out = vec![Vec::with_capacity(cfg.max_new_tokens); b];
         let mut done = vec![false; b];
 
@@ -442,7 +472,8 @@ impl<K: ComputeKernel> Generator<K> {
                 let mut hs: Vec<&mut [f32]> = hidden.iter_mut().map(|h| h.as_mut_slice()).collect();
                 let mut ks: Vec<&mut KvLayerCache> =
                     kvs.iter_mut().map(|seq| &mut seq[l]).collect();
-                self.kernel.run_block_batched(l as u32, &mut hs, &mut ks, &position)?;
+                self.kernel
+                    .run_block_batched(l as u32, &mut hs, &mut ks, &position)?;
             }
             for p in &mut position {
                 *p += 1;
@@ -511,12 +542,17 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
 impl<K: ComputeKernel> Generator<K> {
     /// Begin a step-wise generation: prefills `prompt` and leaves the session
     /// ready to emit the first continuation token via [`GenerationSession::step`].
-    pub fn start_session(&self, prompt: &[u32], sampler: Sampler) -> Result<GenerationSession<'_, K>> {
+    pub fn start_session(
+        &self,
+        prompt: &[u32],
+        sampler: Sampler,
+    ) -> Result<GenerationSession<'_, K>> {
         if prompt.is_empty() {
             return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         }
         let budget = crate::cache::PagedKvCache::new(self.kv_config, self.kv_total_blocks);
-        let mut orchestrator = crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
+        let mut orchestrator =
+            crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
         let mut hidden = vec![0.0f32; self.hidden_size];
         for &token in prompt {
             hidden = self.embed(token)?;
@@ -558,7 +594,9 @@ impl<K: ComputeKernel> Generator<K> {
         }
         let suffix = &prompt[start..];
         if suffix.is_empty() {
-            return Err(DlmError::InvalidConfig("resume suffix must be non-empty".into()));
+            return Err(DlmError::InvalidConfig(
+                "resume suffix must be non-empty".into(),
+            ));
         }
         let budget = PagedKvCache::new(self.kv_config, self.kv_total_blocks);
         let mut orchestrator = ForwardOrchestrator::resume(&self.kernel, budget, snapshot)?;
@@ -628,7 +666,12 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         // One identity (zero-weight) block: hidden passes through unchanged.
@@ -653,7 +696,10 @@ mod tests {
             head_dim: 2,
             block_size: 16,
         };
-        Generator::new(kernel, embedding, final_norm, lm_head, vocab, 1e-5, kv_config, 8).unwrap()
+        Generator::new(
+            kernel, embedding, final_norm, lm_head, vocab, 1e-5, kv_config, 8,
+        )
+        .unwrap()
     }
 
     /// Gemma2's final-logit softcap squashes logits through `tanh(l/cap)*cap`
@@ -684,7 +730,12 @@ mod tests {
         // A non-positive cap is treated as "off", not as a divide-by-zero.
         let off = counting_generator().with_final_logit_softcap(Some(0.0));
         assert_eq!(off.logits(&hidden), raw);
-        assert_eq!(counting_generator().with_final_logit_softcap(None).logits(&hidden), raw);
+        assert_eq!(
+            counting_generator()
+                .with_final_logit_softcap(None)
+                .logits(&hidden),
+            raw
+        );
     }
 
     #[test]
@@ -699,24 +750,52 @@ mod tests {
         let mut rng = SplitMix64::new(42);
 
         // temperature 0 collapses to greedy.
-        let zero = Sampler::TopPK { temperature: 0.0, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 1 };
+        let zero = Sampler::TopPK {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: 1,
+        };
         assert_eq!(zero.sample(&logits, &mut rng), 1);
 
         // top_k = 1 keeps only the argmax, so any draw returns it.
-        let k1 = Sampler::TopPK { temperature: 2.0, top_p: 1.0, top_k: 1, min_p: 0.0, repetition_penalty: 1.0, seed: 7 };
+        let k1 = Sampler::TopPK {
+            temperature: 2.0,
+            top_p: 1.0,
+            top_k: 1,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: 7,
+        };
         for _ in 0..20 {
             assert_eq!(k1.sample(&logits, &mut rng), 1);
         }
 
         // A dominant logit + tight nucleus keeps only that token.
         let peaked = [0.0f32, 0.0, 20.0, 0.0];
-        let nucleus = Sampler::TopPK { temperature: 1.0, top_p: 0.5, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 3 };
+        let nucleus = Sampler::TopPK {
+            temperature: 1.0,
+            top_p: 0.5,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: 3,
+        };
         for _ in 0..20 {
             assert_eq!(nucleus.sample(&peaked, &mut rng), 2);
         }
 
         // A fixed seed makes temperature sampling reproducible.
-        let s = Sampler::TopPK { temperature: 1.5, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 99 };
+        let s = Sampler::TopPK {
+            temperature: 1.5,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: 99,
+        };
         let mut a = SplitMix64::new(s.seed());
         let mut b = SplitMix64::new(s.seed());
         let seq_a: Vec<u32> = (0..8).map(|_| s.sample(&logits, &mut a)).collect();
@@ -726,16 +805,33 @@ mod tests {
         // min_p prunes tokens far below the top probability. With one dominant
         // logit and a high min_p, only the top token survives.
         let peaked = [0.0f32, 5.0, 0.0, 0.0];
-        let mp = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.5, repetition_penalty: 1.0, seed: 4 };
+        let mp = Sampler::TopPK {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.5,
+            repetition_penalty: 1.0,
+            seed: 4,
+        };
         for _ in 0..20 {
             assert_eq!(mp.sample(&peaked, &mut rng), 1);
         }
         // min_p = 0 disables the filter (flat logits → draws vary across tokens).
-        let off = Sampler::TopPK { temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: 1.0, seed: 4 };
+        let off = Sampler::TopPK {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: 4,
+        };
         let flat = [1.0f32, 1.0, 1.0, 1.0];
         let draws: std::collections::HashSet<u32> =
             (0..50).map(|_| off.sample(&flat, &mut rng)).collect();
-        assert!(draws.len() > 1, "min_p=0 should not collapse a flat distribution");
+        assert!(
+            draws.len() > 1,
+            "min_p=0 should not collapse a flat distribution"
+        );
     }
 
     #[test]
@@ -762,12 +858,20 @@ mod tests {
             max_new_tokens: 6,
             eos_token: None,
             sampler: Sampler::TopPK {
-                temperature: 1.0, top_p: 1.0, top_k: 0, min_p: 0.0, repetition_penalty: rp, seed: 1,
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: 0,
+                min_p: 0.0,
+                repetition_penalty: rp,
+                seed: 1,
             },
         };
         let base = gen.generate(&[0], &cfg(1.0)).unwrap();
         let penalized = gen.generate(&[0], &cfg(10.0)).unwrap();
-        assert_ne!(base, penalized, "repetition_penalty should change the sequence");
+        assert_ne!(
+            base, penalized,
+            "repetition_penalty should change the sequence"
+        );
     }
 
     /// A small random-weight generator with real attention, so output depends
@@ -781,19 +885,27 @@ mod tests {
             head_dim: 4,
             intermediate_size: 32,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let mut r = SplitMix64::new(42);
-        let mut vec = |n: usize| -> Vec<f32> {
-            (0..n).map(|_| r.next_f32() * 0.1 - 0.05).collect()
-        };
+        let mut vec =
+            |n: usize| -> Vec<f32> { (0..n).map(|_| r.next_f32() * 0.1 - 0.05).collect() };
         let layers = vec![LayerTensors {
             q_proj: Weights::from_f32(vec(cfg.q_dim() * hidden)),
             k_proj: Weights::from_f32(vec(cfg.kv_dim() * hidden)),
             v_proj: Weights::from_f32(vec(cfg.kv_dim() * hidden)),
             o_proj: Weights::from_f32(vec(hidden * cfg.q_dim())),
-            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(vec(cfg.intermediate_size * hidden)), up: Weights::from_f32(vec(cfg.intermediate_size * hidden)), down: Weights::from_f32(vec(hidden * cfg.intermediate_size)) }),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
+                up: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
+                down: Weights::from_f32(vec(hidden * cfg.intermediate_size)),
+            }),
             input_layernorm: std::vec::from_elem(1.0, hidden),
             post_attention_layernorm: std::vec::from_elem(1.0, hidden),
             ..Default::default()
@@ -806,7 +918,12 @@ mod tests {
             vec(vocab * hidden),
             vocab,
             1e-5,
-            KvCacheConfig { num_layers: 1, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+            KvCacheConfig {
+                num_layers: 1,
+                num_kv_heads: 2,
+                head_dim: 4,
+                block_size: 16,
+            },
             64,
         )
         .unwrap()
@@ -822,7 +939,11 @@ mod tests {
             let out = gen
                 .generate(
                     &[1, 2, 3],
-                    &GenerationConfig { max_new_tokens: 5, eos_token: None, sampler: Sampler::Greedy },
+                    &GenerationConfig {
+                        max_new_tokens: 5,
+                        eos_token: None,
+                        sampler: Sampler::Greedy,
+                    },
                 )
                 .unwrap();
             assert_eq!(out.len(), 5, "{quant:?}");
@@ -834,7 +955,11 @@ mod tests {
         // Each sequence in a batch must decode identically to running it alone —
         // batching is a throughput optimization, not a semantic change.
         let gen = attention_generator();
-        let cfg = GenerationConfig { max_new_tokens: 5, eos_token: None, sampler: Sampler::Greedy };
+        let cfg = GenerationConfig {
+            max_new_tokens: 5,
+            eos_token: None,
+            sampler: Sampler::Greedy,
+        };
         let p1: &[u32] = &[1, 2, 3];
         let p2: &[u32] = &[4, 5];
         let batched = gen.generate_batch(&[p1, p2], &cfg).unwrap();
@@ -859,7 +984,9 @@ mod tests {
         let prefix_sess = gen.start_session(&prefix, Sampler::Greedy).unwrap();
         let snap = prefix_sess.snapshot();
         assert_eq!(snap.position(), prefix.len());
-        let mut resumed = gen.resume_session(snap, &full_prompt, Sampler::Greedy).unwrap();
+        let mut resumed = gen
+            .resume_session(snap, &full_prompt, Sampler::Greedy)
+            .unwrap();
         let tokens_resumed: Vec<u32> = (0..n).map(|_| resumed.step().unwrap()).collect();
 
         // Resuming from the shared prefix is bit-for-bit identical to prefilling

@@ -479,13 +479,19 @@ mod tests {
         assert_eq!(a.context_length, 8192);
         assert_eq!(a.port, 8000);
         assert_eq!(a.host, "127.0.0.1");
-        assert_eq!(a.draft_model_path.unwrap().to_str().unwrap(), "/models/Llama-3-3B");
+        assert_eq!(
+            a.draft_model_path.unwrap().to_str().unwrap(),
+            "/models/Llama-3-3B"
+        );
         assert_eq!(a.draft_gamma, 6);
         assert_eq!(a.multi_gpu_ids, vec![0, 1]);
         assert_eq!(a.distributed_mode, DistributedMode::Master);
         assert_eq!(
             a.worker_nodes,
-            vec!["192.168.1.50:9001".to_string(), "192.168.1.51:9001".to_string()]
+            vec![
+                "192.168.1.50:9001".to_string(),
+                "192.168.1.51:9001".to_string()
+            ]
         );
     }
 
@@ -530,8 +536,8 @@ mod tests {
 
     #[test]
     fn generate_parses_prompt_and_defaults() {
-        let cli = Cli::try_parse_from(["dlm", "generate", "--prompt", "1,2,3", "--seed", "42"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["dlm", "generate", "--prompt", "1,2,3", "--seed", "42"]).unwrap();
         let Command::Generate(a) = cli.command else {
             panic!("expected generate");
         };
@@ -574,7 +580,12 @@ mod tests {
     #[test]
     fn rejects_unknown_distributed_mode() {
         assert!(Cli::try_parse_from([
-            "dlm", "serve", "--model-path", "/m", "--distributed-mode", "bogus"
+            "dlm",
+            "serve",
+            "--model-path",
+            "/m",
+            "--distributed-mode",
+            "bogus"
         ])
         .is_err());
     }

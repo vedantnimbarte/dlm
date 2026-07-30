@@ -176,8 +176,11 @@ fn build_chat_prompt(messages: &[ChatMessage]) -> String {
 }
 
 fn error_json(message: &str) -> Vec<u8> {
-    format!(r#"{{"error":{{"message":{:?},"type":"invalid_request_error"}}}}"#, message)
-        .into_bytes()
+    format!(
+        r#"{{"error":{{"message":{:?},"type":"invalid_request_error"}}}}"#,
+        message
+    )
+    .into_bytes()
 }
 
 /// Build an HTTP [`Handler`] serving the OpenAI endpoints from `engine`.
@@ -225,7 +228,9 @@ fn handle_chat<K: ComputeKernel>(engine: &Engine<K>, req: &Request) -> Response 
                 id: engine.new_id("chatcmpl"),
                 object: "chat.completion",
                 created: engine.created,
-                model: parsed.model.unwrap_or_else(|| engine.model_id().to_string()),
+                model: parsed
+                    .model
+                    .unwrap_or_else(|| engine.model_id().to_string()),
                 choices: vec![ChatChoice {
                     index: 0,
                     message: ChatMessage {
@@ -259,7 +264,9 @@ fn handle_completion<K: ComputeKernel>(engine: &Engine<K>, req: &Request) -> Res
                 id: engine.new_id("cmpl"),
                 object: "text_completion",
                 created: engine.created,
-                model: parsed.model.unwrap_or_else(|| engine.model_id().to_string()),
+                model: parsed
+                    .model
+                    .unwrap_or_else(|| engine.model_id().to_string()),
                 choices: vec![CompletionChoice {
                     index: 0,
                     text: c.text,

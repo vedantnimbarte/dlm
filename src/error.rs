@@ -27,7 +27,9 @@ pub enum DlmError {
     #[error("safetensors header is malformed: {0}")]
     SafetensorsHeader(String),
 
-    #[error("tensor {name:?} out of bounds: range {start}..{end} exceeds data section of {len} bytes")]
+    #[error(
+        "tensor {name:?} out of bounds: range {start}..{end} exceeds data section of {len} bytes"
+    )]
     TensorOutOfBounds {
         name: String,
         start: usize,

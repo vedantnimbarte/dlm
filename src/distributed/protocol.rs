@@ -110,7 +110,9 @@ struct Envelope {
 impl From<&Message> for Envelope {
     fn from(msg: &Message) -> Self {
         let body = match msg {
-            Message::Auth(token) => Body::Auth(AuthPb { token: token.clone() }),
+            Message::Auth(token) => Body::Auth(AuthPb {
+                token: token.clone(),
+            }),
             Message::RunShard { position, hidden } => Body::RunShard(RunShardPb {
                 position: *position,
                 hidden: hidden.clone(),
@@ -204,7 +206,13 @@ mod tests {
         // `repeated float` as raw LE f32, so equality is bit-for-bit.
         let hidden = vec![0.1f32, 0.2, 0.3, 1.0 / 3.0, std::f32::consts::PI];
         let mut buf = Vec::new();
-        write_message(&mut buf, &Message::ShardResult { hidden: hidden.clone() }).unwrap();
+        write_message(
+            &mut buf,
+            &Message::ShardResult {
+                hidden: hidden.clone(),
+            },
+        )
+        .unwrap();
         let Message::ShardResult { hidden: got } = read_message(&mut &buf[..]).unwrap() else {
             panic!("wrong message");
         };
@@ -233,10 +241,16 @@ mod tests {
     fn payload_is_valid_protobuf() {
         // The frame payload is now the Protobuf encoding of the Envelope, not the
         // old hand-rolled tag framing; an empty tensor still decodes cleanly.
-        let payload = encode(&Message::RunShard { position: 3, hidden: vec![] });
+        let payload = encode(&Message::RunShard {
+            position: 3,
+            hidden: vec![],
+        });
         assert_eq!(
             decode(&payload).unwrap(),
-            Message::RunShard { position: 3, hidden: vec![] }
+            Message::RunShard {
+                position: 3,
+                hidden: vec![]
+            }
         );
     }
 }

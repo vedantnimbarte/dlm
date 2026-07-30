@@ -59,7 +59,9 @@ fn gptq_checkpoint_answers_a_factual_prompt() {
 
     let store = MmapStore::open_dir(&dir).expect("safetensors");
     let tokenizer = BpeTokenizer::from_dir(&dir).expect("tokenizer");
-    let ids = tokenizer.encode("The capital of France is").expect("encode");
+    let ids = tokenizer
+        .encode("The capital of France is")
+        .expect("encode");
 
     let generator = load_model_parts(&store, &config, 128)
         .expect("load GPTQ model")

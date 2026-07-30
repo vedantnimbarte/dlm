@@ -91,7 +91,9 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
     let info_url = format!("{}/api/models/{}", base(), repo);
     let body = curl_json(&info_url, token)?;
     let info: ModelInfo = serde_json::from_slice(&body).map_err(|e| {
-        DlmError::Hub(format!("could not read model info for {repo}: {e} (private/gated? pass --token)"))
+        DlmError::Hub(format!(
+            "could not read model info for {repo}: {e} (private/gated? pass --token)"
+        ))
     })?;
 
     let wanted: Vec<&String> = info
@@ -112,7 +114,11 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
     std::fs::create_dir_all(&dir)
         .map_err(|e| DlmError::Hub(format!("cannot create {}: {e}", dir.display())))?;
 
-    println!("pulling {repo} → {} ({} files)", dir.display(), wanted.len());
+    println!(
+        "pulling {repo} → {} ({} files)",
+        dir.display(),
+        wanted.len()
+    );
     for file in &wanted {
         let url = format!("{}/{}/resolve/main/{}", base(), repo, file);
         let out = dir.join(file);
@@ -190,7 +196,9 @@ fn remote_size(url: &str, token: Option<&str>) -> Option<u64> {
         .lines()
         .filter_map(|l| {
             let (k, v) = l.split_once(':')?;
-            k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().ok())?
         })
         .next_back()
 }

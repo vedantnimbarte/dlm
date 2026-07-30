@@ -42,7 +42,10 @@ struct PrefixCache {
 
 impl PrefixCache {
     fn new(max_entries: usize) -> Self {
-        Self { max_entries, entries: Vec::new() }
+        Self {
+            max_entries,
+            entries: Vec::new(),
+        }
     }
 
     /// The snapshot of the longest cached prompt that is a strict prefix of
@@ -249,7 +252,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         sampler: Sampler,
     ) -> Result<()> {
         if prompt.is_empty() {
-            return Err(crate::error::DlmError::InvalidConfig("prompt is empty".into()));
+            return Err(crate::error::DlmError::InvalidConfig(
+                "prompt is empty".into(),
+            ));
         }
         self.pending.push_back(Pending {
             id,
@@ -286,7 +291,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     fn admit(&mut self) -> Result<Vec<u64>> {
         let mut zero_finished = Vec::new();
         while self.active.len() < self.max_batch {
-            let Some(p) = self.pending.pop_front() else { break };
+            let Some(p) = self.pending.pop_front() else {
+                break;
+            };
             if p.max_new_tokens == 0 {
                 zero_finished.push(p.id);
                 continue;
@@ -405,7 +412,6 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         Ok(results)
     }
 }
-
 
 #[cfg(test)]
 mod prefix_cache_tests {

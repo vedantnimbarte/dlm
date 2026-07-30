@@ -18,9 +18,9 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
-use std::ffi::c_void;
 use crate::forward::kernel::ComputeKernel;
 use crate::gpu::device::DeviceBuffer;
+use std::ffi::c_void;
 
 extern "C" {
     /// One decode block on the device (see `src/gpu/kernels.cu`). Returns a
@@ -479,11 +479,13 @@ impl GpuKernel {
         ))?;
         // MLA rotates only its qk_rope sub-dimension.
         let mla_inv_freq = match &cfg.mla {
-            Some(m) => Some(DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
-                m.qk_rope_head_dim as usize,
-                cfg.rope_theta,
-                cfg.rope_scaling,
-            ))?),
+            Some(m) => Some(DeviceBuffer::from_slice(
+                &crate::forward::cpu::rope_inv_freqs(
+                    m.qk_rope_head_dim as usize,
+                    cfg.rope_theta,
+                    cfg.rope_scaling,
+                ),
+            )?),
             None => None,
         };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
@@ -528,9 +530,7 @@ impl ComputeKernel for GpuKernel {
     ) -> Result<()> {
         let batch = hiddens.len();
         if batch <= 1 || batch > DLM_MAX_BATCH || self.cfg.mla.is_some() {
-            for ((hidden, kv), &position) in
-                hiddens.iter_mut().zip(kvs.iter_mut()).zip(positions)
-            {
+            for ((hidden, kv), &position) in hiddens.iter_mut().zip(kvs.iter_mut()).zip(positions) {
                 self.run_block(layer, hidden, kv, position)?;
             }
             return Ok(());
@@ -541,10 +541,18 @@ impl ComputeKernel for GpuKernel {
         let hidden_size = cfg.hidden_size;
         let kv_dim = cfg.kv_dim();
 
-        let mut slot_keys = DlmSlots { p: [std::ptr::null_mut(); DLM_MAX_BATCH] };
-        let mut slot_values = DlmSlots { p: [std::ptr::null_mut(); DLM_MAX_BATCH] };
-        let mut num_positions = DlmInts { v: [0; DLM_MAX_BATCH] };
-        let mut slot_positions = DlmInts { v: [0; DLM_MAX_BATCH] };
+        let mut slot_keys = DlmSlots {
+            p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+        };
+        let mut slot_values = DlmSlots {
+            p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+        };
+        let mut num_positions = DlmInts {
+            v: [0; DLM_MAX_BATCH],
+        };
+        let mut slot_positions = DlmInts {
+            v: [0; DLM_MAX_BATCH],
+        };
 
         // Stage every slot's hidden into one contiguous [batch, hidden] block.
         let mut staged = vec![0.0f32; batch * hidden_size];
@@ -618,7 +626,10 @@ impl ComputeKernel for GpuKernel {
             )
         };
         if code != 0 {
-            return Err(DlmError::Gpu { api: "dlm_decode_block_batched", code });
+            return Err(DlmError::Gpu {
+                api: "dlm_decode_block_batched",
+                code,
+            });
         }
         d_batch.download(&mut staged)?;
         for (b, hidden) in hiddens.iter_mut().enumerate() {
@@ -688,7 +699,10 @@ impl ComputeKernel for GpuKernel {
                         self.cfg.rms_eps,
                         w.w_dtype,
                         w.w_group_size,
-                        mw.q_a_proj.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()) as *const c_void,
+                        mw.q_a_proj
+                            .as_ref()
+                            .map_or(std::ptr::null(), |b| b.as_ptr())
+                            as *const c_void,
                         bias_ptr(&mw.q_a_layernorm),
                         mw.q_b_proj.as_ptr() as *const c_void,
                         mw.kv_a_proj.as_ptr() as *const c_void,
@@ -705,7 +719,10 @@ impl ComputeKernel for GpuKernel {
                     )
                 };
                 if code != 0 {
-                    return Err(DlmError::Gpu { api: "dlm_mla_attn", code });
+                    return Err(DlmError::Gpu {
+                        api: "dlm_mla_attn",
+                        code,
+                    });
                 }
                 let code = unsafe {
                     dlm_dense_ffn(
@@ -723,7 +740,10 @@ impl ComputeKernel for GpuKernel {
                     )
                 };
                 if code != 0 {
-                    return Err(DlmError::Gpu { api: "dlm_dense_ffn", code });
+                    return Err(DlmError::Gpu {
+                        api: "dlm_dense_ffn",
+                        code,
+                    });
                 }
             }
             _ => {
@@ -773,7 +793,10 @@ impl ComputeKernel for GpuKernel {
                     )
                 };
                 if code != 0 {
-                    return Err(DlmError::Gpu { api: "dlm_decode_block", code });
+                    return Err(DlmError::Gpu {
+                        api: "dlm_decode_block",
+                        code,
+                    });
                 }
             }
         }
@@ -839,7 +862,11 @@ impl MultiGpuKernel {
             }
             offset += count;
         }
-        Ok(Self { stages, devices: gpu_ids.to_vec(), layer_map })
+        Ok(Self {
+            stages,
+            devices: gpu_ids.to_vec(),
+            layer_map,
+        })
     }
 }
 

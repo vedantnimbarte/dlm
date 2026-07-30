@@ -278,9 +278,11 @@ mod tests {
         let deq = q.dequantize();
 
         for (g, chunk) in values.chunks(group_size).enumerate() {
-            let (min, max) = chunk.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
-                (lo.min(v), hi.max(v))
-            });
+            let (min, max) = chunk
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+                    (lo.min(v), hi.max(v))
+                });
             let scale = (max - min) / 15.0;
             for (j, &orig) in chunk.iter().enumerate() {
                 let got = deq[g * group_size + j];

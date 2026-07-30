@@ -7,23 +7,23 @@
 //!   engine. The inference/serving loop itself is Phase 3; this validates the
 //!   config and runs the planning pipeline so the setup is verifiable today.
 
-use dlm::forward::Weights;
 use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs,
     PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
 };
+use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 use dlm::loader::ModelParts;
-use dlm::tokenizer::BpeTokenizer;
 use dlm::memory::page_size;
 use dlm::model::{ModelConfig, QuantScheme};
 use dlm::pipeline::{DoubleBufferSchedule, HostPipeline, MmapWeightSource, TieredWeightSource};
 use dlm::profiler::{VramPlan, VramProfiler};
 use dlm::storage::{LayerCatalog, MmapStore};
 use dlm::swap::LayerSwapPlan;
+use dlm::tokenizer::BpeTokenizer;
 use dlm::{gpu, DlmError, Result};
 use std::path::Path;
 
@@ -45,7 +45,12 @@ fn main() -> Result<()> {
 
 /// `dlm completions <shell>` — print a completion script to stdout.
 fn run_completions(args: CompletionsArgs) -> Result<()> {
-    clap_complete::generate(args.shell, &mut Cli::command(), "dlm", &mut std::io::stdout());
+    clap_complete::generate(
+        args.shell,
+        &mut Cli::command(),
+        "dlm",
+        &mut std::io::stdout(),
+    );
     Ok(())
 }
 
@@ -58,7 +63,10 @@ fn run_search(args: SearchArgs) -> Result<()> {
     }
     for h in &hits {
         let task = h.task.as_deref().unwrap_or("-");
-        println!("{:<55} ⭳ {:<10} ♥ {:<6} {}", h.id, h.downloads, h.likes, task);
+        println!(
+            "{:<55} ⭳ {:<10} ♥ {:<6} {}",
+            h.id, h.downloads, h.likes, task
+        );
     }
     println!("\npull one with:  dlm pull <id>");
     Ok(())
@@ -109,8 +117,16 @@ fn tiny_cfg() -> BlockConfig {
         head_dim: 4,
         intermediate_size: 16,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-        sliding_window_pattern: None, attn_logit_softcap: None, query_pre_attn_scalar: None, gemma2_norms: false,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        sliding_window_pattern: None,
+        attn_logit_softcap: None,
+        query_pre_attn_scalar: None,
+        gemma2_norms: false,
     }
 }
 
@@ -127,12 +143,21 @@ fn cpu_self_check() -> Result<usize> {
         rng.vec(vocab * hidden, 0.02),
         vocab,
         1e-5,
-        KvCacheConfig { num_layers: 1, num_kv_heads: 1, head_dim: 4, block_size: 16 },
+        KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 4,
+            block_size: 16,
+        },
         8,
     )?;
     let out = generator.generate(
         &[1],
-        &GenerationConfig { max_new_tokens: 4, eos_token: None, sampler: Sampler::Greedy },
+        &GenerationConfig {
+            max_new_tokens: 4,
+            eos_token: None,
+            sampler: Sampler::Greedy,
+        },
     )?;
     Ok(out.len())
 }
@@ -165,9 +190,14 @@ fn gpu_parity_probe() -> Result<f32> {
         k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
         v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
         o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), s)),
-        ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)) }),
+        ffn: Ffn::Dense(ExpertFfn {
+            gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+            up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+            down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+        }),
         input_layernorm: vec![1.0; cfg.hidden_size],
-        post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
+        post_attention_layernorm: vec![1.0; cfg.hidden_size],
+        ..Default::default()
     };
     let cpu = CpuKernel::new(cfg, vec![layer.clone()])?;
     let gpu = GpuKernel::new(cfg, vec![layer], 8)?;
@@ -177,7 +207,11 @@ fn gpu_parity_probe() -> Result<f32> {
     let mut kg = KvLayerCache::new(cfg.kv_dim());
     cpu.run_block(0, &mut hc, &mut kc, 0)?;
     gpu.run_block(0, &mut hg, &mut kg, 0)?;
-    Ok(hc.iter().zip(&hg).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max))
+    Ok(hc
+        .iter()
+        .zip(&hg)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max))
 }
 
 /// Check that a checkpoint directory loads its config, maps its store, has the
@@ -186,16 +220,24 @@ fn checkpoint_check(dir: &Path) -> Result<String> {
     let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
     let store = MmapStore::open_dir(dir)?;
     if store.locate("model.embed_tokens.weight").is_none() {
-        return Err(DlmError::InvalidConfig("missing model.embed_tokens.weight".into()));
+        return Err(DlmError::InvalidConfig(
+            "missing model.embed_tokens.weight".into(),
+        ));
     }
     let tok = if dir.join("tokenizer.json").exists()
         || (dir.join("vocab.json").exists() && dir.join("merges.txt").exists())
     {
-        format!(", tokenizer {} tokens", BpeTokenizer::from_dir(dir)?.vocab_size())
+        format!(
+            ", tokenizer {} tokens",
+            BpeTokenizer::from_dir(dir)?.vocab_size()
+        )
     } else {
         ", no tokenizer (byte fallback)".to_string()
     };
-    Ok(format!("{} layers, vocab {}{tok}", config.num_layers, config.vocab_size))
+    Ok(format!(
+        "{} layers, vocab {}{tok}",
+        config.num_layers, config.vocab_size
+    ))
 }
 
 /// `dlm tokenize` — encode text and report the round-trip.
@@ -289,10 +331,16 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
             config.num_kv_heads,
             config.head_dim(),
         );
-        (dlm::loader::load_model_parts(&store, &config, max_context)?, false)
+        (
+            dlm::loader::load_model_parts(&store, &config, max_context)?,
+            false,
+        )
     } else {
         let parts = build_synthetic_parts(&args, max_context)?;
-        println!("generate     : demo with randomly-initialized weights (seed {})", args.seed);
+        println!(
+            "generate     : demo with randomly-initialized weights (seed {})",
+            args.seed
+        );
         println!(
             "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
             parts.vocab_size,
@@ -377,8 +425,7 @@ fn run_generation<K: ComputeKernel>(
 /// `vocab.json`+`merges.txt`), falling back to a raw byte tokenizer.
 fn serve_tokenizer(model_path: &Path) -> Result<BpeTokenizer> {
     let has_hf = model_path.join("tokenizer.json").exists();
-    let has_gpt2 =
-        model_path.join("vocab.json").exists() && model_path.join("merges.txt").exists();
+    let has_gpt2 = model_path.join("vocab.json").exists() && model_path.join("merges.txt").exists();
     if has_hf || has_gpt2 {
         BpeTokenizer::from_dir(model_path)
     } else {
@@ -427,7 +474,12 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         head_dim,
         intermediate_size: args.intermediate_size,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
         ..Default::default()
     };
 
@@ -440,9 +492,14 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
             k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, scale)),
             v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, scale)),
             o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), scale)),
-            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)), down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, scale)) }),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
+                up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
+                down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, scale)),
+            }),
             input_layernorm: vec![1.0; cfg.hidden_size],
-            post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
+            post_attention_layernorm: vec![1.0; cfg.hidden_size],
+            ..Default::default()
         })
         .collect();
 
@@ -535,7 +592,11 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     println!("  quant      : {quant:?}");
     println!("  mode       : {:?}", args.distributed_mode);
     if let Some(draft) = &args.draft_model_path {
-        println!("  draft model: {} (gamma {})", draft.display(), args.draft_gamma);
+        println!(
+            "  draft model: {} (gamma {})",
+            draft.display(),
+            args.draft_gamma
+        );
     }
     if !args.multi_gpu_ids.is_empty() {
         println!("  gpu ids    : {:?}", args.multi_gpu_ids);
@@ -546,7 +607,10 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     println!();
 
     let config = ModelConfig::from_path(&args.model_path, quant)?;
-    println!("model source : config.json in {}", args.model_path.display());
+    println!(
+        "model source : config.json in {}",
+        args.model_path.display()
+    );
     print_geometry(&config);
     let listen = format!("{}:{}", args.host, args.port);
 
@@ -555,13 +619,15 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // Serve this node's layer shard (the whole model here) to a master.
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
             let secret = cluster_secret(&args);
-            let worker =
-                dlm::distributed::Worker::new(parts.cfg, parts.layers)?
-                    .with_auth(secret.clone())
-                    .with_io_timeout(args.worker_timeout_secs.map(std::time::Duration::from_secs));
+            let worker = dlm::distributed::Worker::new(parts.cfg, parts.layers)?
+                .with_auth(secret.clone())
+                .with_io_timeout(args.worker_timeout_secs.map(std::time::Duration::from_secs));
             let listener = dlm::distributed::worker::bind(&listen)?;
             println!();
-            println!("worker node  : listening on {listen} ({} layers)", config.num_layers);
+            println!(
+                "worker node  : listening on {listen} ({} layers)",
+                config.num_layers
+            );
             println!(
                 "  auth       : {}",
                 if secret.is_some() {
@@ -614,21 +680,29 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             if args.stream {
                 if args.draft_model_path.is_some() {
                     return Err(DlmError::InvalidConfig(
-                        "--stream does not support speculative decoding (--draft-model-path) yet".into(),
+                        "--stream does not support speculative decoding (--draft-model-path) yet"
+                            .into(),
                     ));
                 }
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
                 let ram_cache = resolve_ram_cache_bytes(&args, quant, &plan);
                 println!();
-                let dest = if device == Device::Gpu { "VRAM" } else { "host RAM" };
+                let dest = if device == Device::Gpu {
+                    "VRAM"
+                } else {
+                    "host RAM"
+                };
                 println!(
                     "streaming    : {window} / {} layers resident in {dest}, rest streamed from disk",
                     config.num_layers,
                 );
                 let depth = args.prefetch_depth.min(window.saturating_sub(1));
                 if args.auto_prefetch {
-                    println!("  prefetch   : auto (depth tuned from load vs compute, ≤ {})", window.saturating_sub(1));
+                    println!(
+                        "  prefetch   : auto (depth tuned from load vs compute, ≤ {})",
+                        window.saturating_sub(1)
+                    );
                 } else if depth > 0 {
                     println!("  prefetch   : {depth} layer(s) ahead (overlaps load with compute)");
                 } else {
@@ -638,7 +712,11 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     println!(
                         "  ram cache  : {:.1} MiB of materialized layers held in host RAM{}",
                         ram_cache as f64 / (1024.0 * 1024.0),
-                        if args.ram_cache_gb.is_some() { "" } else { " (default: weights are quantized at load)" },
+                        if args.ram_cache_gb.is_some() {
+                            ""
+                        } else {
+                            " (default: weights are quantized at load)"
+                        },
                     );
                 }
                 if device == Device::Gpu {
@@ -658,11 +736,21 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         println!(
                             "  expert$    : {:.1} MiB VRAM for routed experts{}",
                             expert_cache as f64 / (1024.0 * 1024.0),
-                            if args.expert_cache_gb.is_some() { "" } else { " (default: VRAM left after the layer window)" },
+                            if args.expert_cache_gb.is_some() {
+                                ""
+                            } else {
+                                " (default: VRAM left after the layer window)"
+                            },
                         );
                     }
                     return serve_streaming_gpu(
-                        store, &config, &args, window, ram_cache, expert_cache, &listen,
+                        store,
+                        &config,
+                        &args,
+                        window,
+                        ram_cache,
+                        expert_cache,
+                        &listen,
                     );
                 }
                 let generator = dlm::loader::build_streaming_generator(
@@ -693,7 +781,11 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         )));
                     }
                     let dstore = MmapStore::open_dir(dir)?;
-                    Some(dlm::loader::load_model_parts(&dstore, &dcfg, args.context_length)?)
+                    Some(dlm::loader::load_model_parts(
+                        &dstore,
+                        &dcfg,
+                        args.context_length,
+                    )?)
                 }
                 None => None,
             };
@@ -702,13 +794,17 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 // Split the target across local GPUs (specs §3.3); the small,
                 // pinned draft stays on the first GPU.
                 let ids = args.multi_gpu_ids.clone();
-                let split = dlm::distributed::partition_layers(config.num_layers as usize, ids.len());
+                let split =
+                    dlm::distributed::partition_layers(config.num_layers as usize, ids.len());
                 println!();
                 println!("multi-gpu    : pipeline-parallel layer split (specs §3.3)");
                 for (stage, shard) in split.iter().enumerate() {
                     println!(
                         "  gpu {:<6}: layers {}..{} ({} layer(s))",
-                        ids[stage], shard.start, shard.end, shard.len(),
+                        ids[stage],
+                        shard.start,
+                        shard.end,
+                        shard.len(),
                     );
                 }
                 serve_multi_gpu(parts, draft_parts, &ids, &args, &config, &listen)
@@ -779,7 +875,11 @@ fn resolve_device(requested: Device) -> Device {
 /// under Windows WDDM, and an outright OOM where there is no such paging.
 fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> VramPlan {
     let (free_bytes, _) = resolve_free_bytes(args.vram_budget_gb);
-    let profiler = build_profiler(args.context_length, args.safety_margin_gb, args.max_batch as u32);
+    let profiler = build_profiler(
+        args.context_length,
+        args.safety_margin_gb,
+        args.max_batch as u32,
+    );
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
     if catalog.is_empty() {
@@ -839,7 +939,11 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
     // An already-packed 4-bit checkpoint is decoded as it is; there are no floats
     // left to quantize to something else, and re-quantizing 4-bit codes would only
     // throw away the calibration the export paid for.
-    if native == QuantScheme::Int4 && store.locate("model.layers.0.self_attn.q_proj.qweight").is_some() {
+    if native == QuantScheme::Int4
+        && store
+            .locate("model.layers.0.self_attn.q_proj.qweight")
+            .is_some()
+    {
         return Err(DlmError::UnsupportedQuant(format!(
             "--quant {scheme:?} cannot apply to an already-quantized 4-bit GPTQ checkpoint;              it is loaded at its own int4 precision. Omit --quant."
         )));
@@ -857,7 +961,11 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
 
 /// Build a VRAM profiler, overriding the default safety cushion when the user
 /// passed `--safety-margin-gb` (small cards claw back the fixed 1.5 GiB default).
-fn build_profiler(context_length: u32, safety_margin_gb: Option<f64>, max_batch: u32) -> VramProfiler {
+fn build_profiler(
+    context_length: u32,
+    safety_margin_gb: Option<f64>,
+    max_batch: u32,
+) -> VramProfiler {
     let p = VramProfiler::new(context_length).with_max_batch(max_batch);
     match safety_margin_gb {
         Some(gb) => p.with_safety_margin_bytes((gb.max(0.0) * GIB as f64) as u64),
@@ -914,7 +1022,9 @@ fn serve_multi_gpu(
 ) -> Result<()> {
     println!("  compute    : gpu (each stage runs its shard on its device)");
     let generator = parts.into_multi_gpu_generator(ids)?;
-    let draft = draft_parts.map(|p| p.into_multi_gpu_generator(&ids[..1])).transpose()?;
+    let draft = draft_parts
+        .map(|p| p.into_multi_gpu_generator(&ids[..1]))
+        .transpose()?;
     start_batched_server(generator, draft, args, config, listen)
 }
 
@@ -927,9 +1037,13 @@ fn serve_multi_gpu(
     config: &ModelConfig,
     listen: &str,
 ) -> Result<()> {
-    println!("  compute    : cpu (device split plumbing; build with --features cuda-kernels for GPU)");
+    println!(
+        "  compute    : cpu (device split plumbing; build with --features cuda-kernels for GPU)"
+    );
     let generator = parts.into_pipeline_parallel_generator(ids)?;
-    let draft = draft_parts.map(|p| p.into_pipeline_parallel_generator(&ids[..1])).transpose()?;
+    let draft = draft_parts
+        .map(|p| p.into_pipeline_parallel_generator(&ids[..1]))
+        .transpose()?;
     start_batched_server(generator, draft, args, config, listen)
 }
 
@@ -948,7 +1062,11 @@ fn serve_on_gpu(
     // All weights sit resident in VRAM; each batched request adds a full-context
     // KV cache. Refuse up front if the batch won't fit rather than OOM mid-request.
     let (free, _) = resolve_free_bytes(args.vram_budget_gb);
-    let profiler = build_profiler(args.context_length, args.safety_margin_gb, args.max_batch as u32);
+    let profiler = build_profiler(
+        args.context_length,
+        args.safety_margin_gb,
+        args.max_batch as u32,
+    );
     let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
     ensure_batch_kv_fits(
         free,
@@ -988,16 +1106,18 @@ fn serve_streaming_gpu(
     expert_cache: usize,
     listen: &str,
 ) -> Result<()> {
-    println!("device       : gpu ({}) — VRAM layer streaming [experimental]", gpu::active_vendor().label());
-    let generator =
-        dlm::loader::build_streaming_gpu_generator(
-            store,
-            config,
-            args.context_length,
-            window,
-            ram_cache,
-            expert_cache,
-        )?;
+    println!(
+        "device       : gpu ({}) — VRAM layer streaming [experimental]",
+        gpu::active_vendor().label()
+    );
+    let generator = dlm::loader::build_streaming_gpu_generator(
+        store,
+        config,
+        args.context_length,
+        window,
+        ram_cache,
+        expert_cache,
+    )?;
     start_batched_server(generator, None, args, config, listen)
 }
 
@@ -1036,10 +1156,8 @@ fn serve_distributed(
     listen: &str,
 ) -> Result<()> {
     let parts = dlm::loader::load_model_parts(&store, config, args.context_length)?;
-    let shards = dlm::distributed::partition_layers(
-        config.num_layers as usize,
-        args.worker_nodes.len(),
-    );
+    let shards =
+        dlm::distributed::partition_layers(config.num_layers as usize, args.worker_nodes.len());
     let routes: Vec<dlm::distributed::ShardRoute> = shards
         .iter()
         .zip(&args.worker_nodes)
@@ -1061,12 +1179,13 @@ fn serve_distributed(
     )?
     .with_auth(secret.clone());
 
-    let template = dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
-        DlmError::InvalidConfig(format!(
-            "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
-            args.chat_template
-        ))
-    })?;
+    let template =
+        dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
+            DlmError::InvalidConfig(format!(
+                "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
+                args.chat_template
+            ))
+        })?;
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1085,21 +1204,36 @@ fn serve_distributed(
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     println!("serving      : distributed (pipeline) API on http://{listen}");
-    println!("  master     : {} shard(s) across {} worker(s)", shards.len(), args.worker_nodes.len());
+    println!(
+        "  master     : {} shard(s) across {} worker(s)",
+        shards.len(),
+        args.worker_nodes.len()
+    );
     println!("  endpoints  : POST /v1/chat/completions (non-streaming, greedy), GET /v1/models");
     println!(
         "  auth       : {}",
-        if args.api_key.is_some() { "API key required" } else { "OPEN (set --api-key)" }
+        if args.api_key.is_some() {
+            "API key required"
+        } else {
+            "OPEN (set --api-key)"
+        }
     );
     println!(
         "  cluster    : worker link {}",
-        if secret.is_some() { "authenticated" } else { "UNAUTHENTICATED (set --cluster-secret)" }
+        if secret.is_some() {
+            "authenticated"
+        } else {
+            "UNAUTHENTICATED (set --cluster-secret)"
+        }
     );
     println!("  note       : distributed mode trades streaming/sampling/batching for");
     println!("               spanning the model across nodes; a dead worker runs locally.");
     // secured_router honors --api-key here; the batched path already did, this
     // path silently ignored it before.
-    server.serve(dlm::server::distributed::secured_router(engine, args.api_key.clone())) // blocks
+    server.serve(dlm::server::distributed::secured_router(
+        engine,
+        args.api_key.clone(),
+    )) // blocks
 }
 
 /// Build the batched (optionally speculative) streaming engine over any compute
@@ -1117,12 +1251,13 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let template = dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
-        DlmError::InvalidConfig(format!(
-            "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
-            args.chat_template
-        ))
-    })?;
+    let template =
+        dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
+            DlmError::InvalidConfig(format!(
+                "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
+                args.chat_template
+            ))
+        })?;
     // EOS: an explicit --eos-token overrides; otherwise auto-detect from the
     // model's config.json (`eos_token_id`, which may list several ids).
     let eos_tokens = match args.eos_token {
@@ -1168,7 +1303,11 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     .with_context_window(args.context_length as usize);
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
-    let mode = if speculative { "batched + speculative" } else { "batched" };
+    let mode = if speculative {
+        "batched + speculative"
+    } else {
+        "batched"
+    };
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
     println!("  openai     : POST /v1/chat/completions (stream), GET /v1/models");
     println!("  anthropic  : POST /v1/messages (stream), POST /v1/messages/count_tokens");
@@ -1176,10 +1315,16 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     if eos_tokens.is_empty() {
         println!("  stop       : max_tokens only (no eos_token_id in config; pass --eos-token)");
     } else {
-        println!("  stop       : eos {eos_tokens:?} + max_tokens, context {} tokens", args.context_length);
+        println!(
+            "  stop       : eos {eos_tokens:?} + max_tokens, context {} tokens",
+            args.context_length
+        );
     }
     if args.prefix_cache_size > 0 && !speculative {
-        println!("  prefix     : KV cache up to {} prompt prefixes", args.prefix_cache_size);
+        println!(
+            "  prefix     : KV cache up to {} prompt prefixes",
+            args.prefix_cache_size
+        );
     }
     if kv_quant != dlm::forward::KvQuant::None {
         let (label, frac) = match kv_quant {
@@ -1449,12 +1594,24 @@ fn print_plan(plan: &VramPlan) {
     println!("── VRAM PLAN ─────────────────────────────────");
     println!("  M_free           : {:>10.1} MiB", mib(plan.free_bytes));
     println!("  M_safety         : {:>10.1} MiB", mib(plan.safety_bytes));
-    println!("  M_kv_total       : {:>10.1} MiB", mib(plan.kv_total_bytes));
+    println!(
+        "  M_kv_total       : {:>10.1} MiB",
+        mib(plan.kv_total_bytes)
+    );
     println!("  pinned_zone      : {:>10.1} MiB", mib(plan.pinned_bytes));
-    println!("  M_layer_weight   : {:>10.1} MiB", mib(plan.per_layer_weight_bytes));
+    println!(
+        "  M_layer_weight   : {:>10.1} MiB",
+        mib(plan.per_layer_weight_bytes)
+    );
     println!("  usable           : {:>10.1} MiB", mib(plan.usable_bytes));
-    println!("  ▶ layers_to_load : {:>10} / {}", plan.layers_to_load, plan.num_layers);
-    println!("  ▶ resident       : {:>9.1}%", plan.resident_fraction() * 100.0);
+    println!(
+        "  ▶ layers_to_load : {:>10} / {}",
+        plan.layers_to_load, plan.num_layers
+    );
+    println!(
+        "  ▶ resident       : {:>9.1}%",
+        plan.resident_fraction() * 100.0
+    );
     println!("──────────────────────────────────────────────");
 }
 
@@ -1479,15 +1636,15 @@ mod tests {
     #[test]
     fn batch_kv_fit_check_accepts_and_refuses() {
         // Fits: free 10 GiB, need = safety 0.5 + KV 2 + resident 1 = 3.5.
-        assert!(ensure_batch_kv_fits(
-            10 * GIB, GIB / 2, 2 * GIB, GIB, 4, 2048, "weights"
-        )
-        .is_ok());
+        assert!(ensure_batch_kv_fits(10 * GIB, GIB / 2, 2 * GIB, GIB, 4, 2048, "weights").is_ok());
 
         // Doesn't fit: an 8 GiB batch KV reservation blows a 4 GiB card.
         let err = ensure_batch_kv_fits(4 * GIB, GIB, 8 * GIB, GIB, 16, 8192, "weights");
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("--max-batch"), "message should name the lever: {msg}");
+        assert!(
+            msg.contains("--max-batch"),
+            "message should name the lever: {msg}"
+        );
     }
 }

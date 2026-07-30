@@ -73,8 +73,14 @@ mod tests {
 
     #[test]
     fn classifies_llama_style_names() {
-        assert_eq!(classify("model.layers.0.self_attn.q_proj.weight"), TensorRole::Layer(0));
-        assert_eq!(classify("model.layers.79.mlp.down_proj.weight"), TensorRole::Layer(79));
+        assert_eq!(
+            classify("model.layers.0.self_attn.q_proj.weight"),
+            TensorRole::Layer(0)
+        );
+        assert_eq!(
+            classify("model.layers.79.mlp.down_proj.weight"),
+            TensorRole::Layer(79)
+        );
         assert_eq!(classify("model.embed_tokens.weight"), TensorRole::Embedding);
         assert_eq!(classify("lm_head.weight"), TensorRole::LmHead);
         assert_eq!(classify("model.norm.weight"), TensorRole::FinalNorm);
@@ -82,7 +88,10 @@ mod tests {
 
     #[test]
     fn classifies_gpt_style_names() {
-        assert_eq!(classify("transformer.h.11.attn.c_attn.weight"), TensorRole::Layer(11));
+        assert_eq!(
+            classify("transformer.h.11.attn.c_attn.weight"),
+            TensorRole::Layer(11)
+        );
         assert_eq!(classify("transformer.wte.weight"), TensorRole::Embedding);
         assert_eq!(classify("transformer.ln_f.weight"), TensorRole::FinalNorm);
     }

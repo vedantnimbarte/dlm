@@ -72,7 +72,8 @@ impl StreamMetrics {
         self.depth.store(s.depth as u64, Ordering::Relaxed);
         self.expert_hits.store(s.expert_hits, Ordering::Relaxed);
         self.expert_misses.store(s.expert_misses, Ordering::Relaxed);
-        self.expert_evictions.store(s.expert_evictions, Ordering::Relaxed);
+        self.expert_evictions
+            .store(s.expert_evictions, Ordering::Relaxed);
     }
 }
 
@@ -172,7 +173,15 @@ impl EngineService {
         let stream = Arc::new(StreamMetrics::default());
         let stream_loop = Arc::clone(&stream);
         std::thread::spawn(move || {
-            engine_loop(generator, draft, gamma, job_rx, max_batch, prefix_cache_size, stream_loop)
+            engine_loop(
+                generator,
+                draft,
+                gamma,
+                job_rx,
+                max_batch,
+                prefix_cache_size,
+                stream_loop,
+            )
         });
         Arc::new(Self {
             job_tx: Mutex::new(job_tx),
@@ -193,7 +202,9 @@ impl EngineService {
     /// Record a completed generation into the `/metrics` counters.
     fn record(&self, prompt_tokens: usize, completion_tokens: usize) {
         self.metrics.requests.fetch_add(1, Ordering::Relaxed);
-        self.metrics.prompt_tokens.fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+        self.metrics
+            .prompt_tokens
+            .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
         self.metrics
             .completion_tokens
             .fetch_add(completion_tokens as u64, Ordering::Relaxed);
@@ -238,14 +249,18 @@ impl EngineService {
     ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = self.job_tx.lock().unwrap_or_else(|e| e.into_inner()).send(Job {
-            id,
-            prompt,
-            max_new,
-            eos,
-            sampler,
-            sink,
-        });
+        let _ = self
+            .job_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(Job {
+                id,
+                prompt,
+                max_new,
+                eos,
+                sampler,
+                sink,
+            });
         out
     }
 
@@ -562,7 +577,10 @@ impl ChatTemplate {
             }
             ChatTemplate::ChatMl => {
                 for m in messages {
-                    p.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content));
+                    p.push_str(&format!(
+                        "<|im_start|>{}\n{}<|im_end|>\n",
+                        m.role, m.content
+                    ));
                 }
                 p.push_str("<|im_start|>assistant\n");
             }
@@ -751,7 +769,11 @@ enum Finish {
 
 /// Clamp a requested `max_tokens` to the context budget left after the prompt,
 /// or return an error message if the prompt already fills the window.
-fn fit_max_tokens(engine: &EngineService, prompt_len: usize, requested: usize) -> Result<usize, String> {
+fn fit_max_tokens(
+    engine: &EngineService,
+    prompt_len: usize,
+    requested: usize,
+) -> Result<usize, String> {
     if prompt_len >= engine.max_context {
         return Err(format!(
             "prompt is {prompt_len} tokens but the context window is {}",
@@ -875,7 +897,10 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             model,
             choices: vec![Choice {
                 index: 0,
-                message: RespMessage { role: "assistant", content: g.text },
+                message: RespMessage {
+                    role: "assistant",
+                    content: g.text,
+                },
                 finish_reason: match g.finish {
                     Finish::Length => "length",
                     _ => "stop",
@@ -1029,13 +1054,20 @@ fn stream_completion(
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("cmpl-{}", engine.next_id.load(Ordering::Relaxed));
         let created = engine.created;
-        let send_chunk = |w: &mut dyn std::io::Write, text: String, finish: Option<&'static str>| -> std::io::Result<()> {
+        let send_chunk = |w: &mut dyn std::io::Write,
+                          text: String,
+                          finish: Option<&'static str>|
+         -> std::io::Result<()> {
             let chunk = CompletionChunk {
                 id: id.clone(),
                 object: "text_completion",
                 created,
                 model: model.clone(),
-                choices: vec![CompletionChunkChoice { index: 0, text, finish_reason: finish }],
+                choices: vec![CompletionChunkChoice {
+                    index: 0,
+                    text,
+                    finish_reason: finish,
+                }],
                 usage: None,
             };
             let json = serde_json::to_string(&chunk).unwrap_or_default();
@@ -1135,9 +1167,11 @@ impl AnthropicContent {
     fn to_text(&self) -> String {
         match self {
             AnthropicContent::Text(s) => s.clone(),
-            AnthropicContent::Blocks(bs) => {
-                bs.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("")
-            }
+            AnthropicContent::Blocks(bs) => bs
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join(""),
         }
     }
 }
@@ -1219,11 +1253,17 @@ fn anthropic_prompt(
     if let Some(sys) = system {
         let text = sys.to_text();
         if !text.is_empty() {
-            messages.push(ChatMessage { role: "system".into(), content: text });
+            messages.push(ChatMessage {
+                role: "system".into(),
+                content: text,
+            });
         }
     }
     for m in msgs {
-        messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
+        messages.push(ChatMessage {
+            role: m.role.clone(),
+            content: m.content.to_text(),
+        });
     }
     engine.chat_template.apply(&messages)
 }
@@ -1240,7 +1280,9 @@ struct CountTokensRequest {
 fn handle_count_tokens(engine: &Arc<EngineService>, req: &Request) -> Response {
     let parsed: CountTokensRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
-        Err(e) => return Response::json(400, anthropic_error_json(&format!("invalid request: {e}"))),
+        Err(e) => {
+            return Response::json(400, anthropic_error_json(&format!("invalid request: {e}")))
+        }
     };
     if parsed.messages.is_empty() {
         return Response::json(400, anthropic_error_json("messages must not be empty"));
@@ -1258,7 +1300,9 @@ fn handle_count_tokens(engine: &Arc<EngineService>, req: &Request) -> Response {
 fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
     let parsed: MessagesRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
-        Err(e) => return Response::json(400, anthropic_error_json(&format!("invalid request: {e}"))),
+        Err(e) => {
+            return Response::json(400, anthropic_error_json(&format!("invalid request: {e}")))
+        }
     };
     if parsed.messages.is_empty() {
         return Response::json(400, anthropic_error_json("messages must not be empty"));
@@ -1305,7 +1349,10 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
         kind: "message",
         role: "assistant",
         model,
-        content: vec![TextBlock { kind: "text", text: g.text }],
+        content: vec![TextBlock {
+            kind: "text",
+            text: g.text,
+        }],
         stop_reason: match g.finish {
             Finish::Eos => "end_turn",
             Finish::Stop(_) => "stop_sequence",
@@ -1339,29 +1386,40 @@ fn stream_messages(
         let id = format!("msg-{}", engine.next_id.load(Ordering::Relaxed));
         let prompt_tokens = ids.len();
         // Anthropic frames carry both an `event:` line and a `data:` line.
-        let send = |w: &mut dyn std::io::Write, event: &str, data: serde_json::Value| -> std::io::Result<()> {
+        let send = |w: &mut dyn std::io::Write,
+                    event: &str,
+                    data: serde_json::Value|
+         -> std::io::Result<()> {
             write!(w, "event: {event}\ndata: {data}\n\n")?;
             w.flush()
         };
 
-        send(w, "message_start", serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
-            },
-        }))?;
-        send(w, "content_block_start", serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""},
-        }))?;
+        send(
+            w,
+            "message_start",
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+                },
+            }),
+        )?;
+        send(
+            w,
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }),
+        )?;
         send(w, "ping", serde_json::json!({"type": "ping"}))?;
 
         let mut completion_tokens = 0usize;
@@ -1383,17 +1441,25 @@ fn stream_messages(
                     completion_tokens += 1;
                     acc_ids.push(t);
                     let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
-                    let cut = if stops.is_empty() { None } else { earliest_stop(&full, &stops) };
+                    let cut = if stops.is_empty() {
+                        None
+                    } else {
+                        earliest_stop(&full, &stops)
+                    };
                     let visible = &full[..cut.unwrap_or(full.len())];
                     let vis_chars = visible.chars().count();
                     if vis_chars > sent_chars {
                         let delta: String = visible.chars().skip(sent_chars).collect();
                         sent_chars = vis_chars;
-                        send(w, "content_block_delta", serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": delta},
-                        }))?;
+                        send(
+                            w,
+                            "content_block_delta",
+                            serde_json::json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": delta},
+                            }),
+                        )?;
                     }
                     if cut.is_some() {
                         stop_reason = "stop_sequence";
@@ -1406,16 +1472,28 @@ fn stream_messages(
         }
         engine.record(prompt_tokens, completion_tokens);
 
-        send(w, "content_block_stop", serde_json::json!({
-            "type": "content_block_stop",
-            "index": 0,
-        }))?;
-        send(w, "message_delta", serde_json::json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
-            "usage": {"output_tokens": completion_tokens},
-        }))?;
-        send(w, "message_stop", serde_json::json!({"type": "message_stop"}))
+        send(
+            w,
+            "content_block_stop",
+            serde_json::json!({
+                "type": "content_block_stop",
+                "index": 0,
+            }),
+        )?;
+        send(
+            w,
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+                "usage": {"output_tokens": completion_tokens},
+            }),
+        )?;
+        send(
+            w,
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}),
+        )
     })
 }
 
@@ -1431,13 +1509,20 @@ fn stream_chat(
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed));
         let created = engine.created;
-        let send_chunk = |w: &mut dyn std::io::Write, delta: Delta, finish: Option<&'static str>| -> std::io::Result<()> {
+        let send_chunk = |w: &mut dyn std::io::Write,
+                          delta: Delta,
+                          finish: Option<&'static str>|
+         -> std::io::Result<()> {
             let chunk = Chunk {
                 id: id.clone(),
                 object: "chat.completion.chunk",
                 created,
                 model: model.clone(),
-                choices: vec![ChunkChoice { index: 0, delta, finish_reason: finish }],
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta,
+                    finish_reason: finish,
+                }],
                 usage: None,
             };
             let json = serde_json::to_string(&chunk).unwrap_or_default();
@@ -1446,7 +1531,14 @@ fn stream_chat(
         };
 
         // First chunk announces the assistant role.
-        send_chunk(w, Delta { role: Some("assistant"), content: None }, None)?;
+        send_chunk(
+            w,
+            Delta {
+                role: Some("assistant"),
+                content: None,
+            },
+            None,
+        )?;
 
         let prompt_tokens = ids.len();
         let mut completion_tokens = 0usize;
@@ -1480,7 +1572,14 @@ fn stream_chat(
                         if vis_chars > sent_chars {
                             let delta: String = visible.chars().skip(sent_chars).collect();
                             sent_chars = vis_chars;
-                            send_chunk(w, Delta { role: None, content: Some(delta) }, None)?;
+                            send_chunk(
+                                w,
+                                Delta {
+                                    role: None,
+                                    content: Some(delta),
+                                },
+                                None,
+                            )?;
                         }
                         if cut.is_some() {
                             finish = "stop";
@@ -1496,7 +1595,14 @@ fn stream_chat(
         }
         engine.record(prompt_tokens, completion_tokens);
 
-        send_chunk(w, Delta { role: None, content: None }, Some(finish))?;
+        send_chunk(
+            w,
+            Delta {
+                role: None,
+                content: None,
+            },
+            Some(finish),
+        )?;
 
         // When speculating, a final usage-only chunk carries the acceptance
         // stats (OpenAI-style: empty choices + a `usage` object).
@@ -1535,7 +1641,10 @@ mod tests {
         assert_eq!(ChatTemplate::parse("plain"), Some(ChatTemplate::Plain));
         assert!(ChatTemplate::parse("bogus").is_none());
 
-        let msgs = vec![ChatMessage { role: "user".into(), content: "hi".into() }];
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
 
         let cm = ChatTemplate::ChatMl.apply(&msgs);
         assert!(cm.contains("<|im_start|>user\nhi<|im_end|>"), "{cm}");
@@ -1543,19 +1652,31 @@ mod tests {
 
         let l3 = ChatTemplate::Llama3.apply(&msgs);
         assert!(l3.starts_with("<|begin_of_text|>"), "{l3}");
-        assert!(l3.contains("<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"), "{l3}");
-        assert!(l3.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"), "{l3}");
+        assert!(
+            l3.contains("<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"),
+            "{l3}"
+        );
+        assert!(
+            l3.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"),
+            "{l3}"
+        );
     }
 
     #[test]
     fn stop_helpers() {
         assert_eq!(normalize_stop(None), Vec::<String>::new());
-        assert_eq!(normalize_stop(Some(Stop::One("x".into()))), vec!["x".to_string()]);
+        assert_eq!(
+            normalize_stop(Some(Stop::One("x".into()))),
+            vec!["x".to_string()]
+        );
         assert_eq!(
             normalize_stop(Some(Stop::Many(vec!["a".into(), "".into()]))),
             vec!["a".to_string()]
         );
-        assert_eq!(earliest_stop("abcXYdef", &["XY".into(), "de".into()]), Some(3));
+        assert_eq!(
+            earliest_stop("abcXYdef", &["XY".into(), "de".into()]),
+            Some(3)
+        );
         assert_eq!(earliest_stop("abc", &["z".into()]), None);
     }
 
@@ -1581,13 +1702,22 @@ mod tests {
 
         let mut messages = Vec::new();
         if let Some(sys) = &req.system {
-            messages.push(ChatMessage { role: "system".into(), content: sys.to_text() });
+            messages.push(ChatMessage {
+                role: "system".into(),
+                content: sys.to_text(),
+            });
         }
         for m in &req.messages {
-            messages.push(ChatMessage { role: m.role.clone(), content: m.content.to_text() });
+            messages.push(ChatMessage {
+                role: m.role.clone(),
+                content: m.content.to_text(),
+            });
         }
         let prompt = ChatTemplate::Plain.apply(&messages);
-        assert!(prompt.starts_with("system: be terse\nuser: hi\n"), "{prompt}");
+        assert!(
+            prompt.starts_with("system: be terse\nuser: hi\n"),
+            "{prompt}"
+        );
         assert!(prompt.ends_with("assistant:"), "{prompt}");
     }
 }

@@ -55,7 +55,9 @@ const TOPK: usize = 2;
 /// Deterministic, small-magnitude, seed-varying fill so a wrong-tensor bug
 /// (e.g. swapping w1/w2, or reading the wrong expert) changes the output.
 fn fill(seed: usize, n: usize) -> Vec<f32> {
-    (0..n).map(|i| (((i * 7 + seed) % 17) as f32 - 8.0) * 0.01).collect()
+    (0..n)
+        .map(|i| (((i * 7 + seed) % 17) as f32 - 8.0) * 0.01)
+        .collect()
 }
 
 fn write_moe_checkpoint(dir: &std::path::Path, family: Family) -> ModelConfig {
@@ -63,8 +65,16 @@ fn write_moe_checkpoint(dir: &std::path::Path, family: Family) -> ModelConfig {
     let kv_dim = NKV * HD;
 
     let (router_name, expert_base, proj): (&str, &str, [&str; 3]) = match family {
-        Family::Mixtral => ("block_sparse_moe.gate", "block_sparse_moe.experts", ["w1", "w3", "w2"]),
-        Family::Qwen => ("mlp.gate", "mlp.experts", ["gate_proj", "up_proj", "down_proj"]),
+        Family::Mixtral => (
+            "block_sparse_moe.gate",
+            "block_sparse_moe.experts",
+            ["w1", "w3", "w2"],
+        ),
+        Family::Qwen => (
+            "mlp.gate",
+            "mlp.experts",
+            ["gate_proj", "up_proj", "down_proj"],
+        ),
     };
 
     let mut tensors: Vec<(String, Vec<f32>)> = Vec::new();
@@ -79,7 +89,10 @@ fn write_moe_checkpoint(dir: &std::path::Path, family: Family) -> ModelConfig {
         tensors.push((format!("{p}input_layernorm.weight"), vec![1.0; H]));
         tensors.push((format!("{p}post_attention_layernorm.weight"), vec![1.0; H]));
         // Router: [num_experts, hidden].
-        tensors.push((format!("{p}{router_name}.weight"), fill(s + 100, EXPERTS * H)));
+        tensors.push((
+            format!("{p}{router_name}.weight"),
+            fill(s + 100, EXPERTS * H),
+        ));
         // Routed experts, each a distinct SwiGLU triple.
         for e in 0..EXPERTS {
             let eb = format!("{p}{expert_base}.{e}.");
@@ -94,7 +107,10 @@ fn write_moe_checkpoint(dir: &std::path::Path, family: Family) -> ModelConfig {
             tensors.push((format!("{sb}gate_proj.weight"), fill(s + 200, INTER * H)));
             tensors.push((format!("{sb}up_proj.weight"), fill(s + 201, INTER * H)));
             tensors.push((format!("{sb}down_proj.weight"), fill(s + 202, H * INTER)));
-            tensors.push((format!("{p}mlp.shared_expert_gate.weight"), fill(s + 203, H)));
+            tensors.push((
+                format!("{p}mlp.shared_expert_gate.weight"),
+                fill(s + 203, H),
+            ));
         }
     }
     tensors.push(("model.norm.weight".into(), vec![1.0; H]));
@@ -134,24 +150,37 @@ fn run_family(family: Family) {
     let store_a = MmapStore::open_dir(tmp.path()).unwrap();
     let resident = dlm::loader::load_generator(&store_a, &config, 32).unwrap();
     let out_resident = resident.generate(&prompt, &gen_cfg).unwrap();
-    assert_eq!(out_resident.len(), gen_cfg.max_new_tokens, "MoE model produced no tokens");
+    assert_eq!(
+        out_resident.len(),
+        gen_cfg.max_new_tokens,
+        "MoE model produced no tokens"
+    );
 
     // Deterministic: greedy decode of the same prompt repeats exactly.
     let out_again = resident.generate(&prompt, &gen_cfg).unwrap();
-    assert_eq!(out_resident, out_again, "MoE greedy decode is not deterministic");
+    assert_eq!(
+        out_resident, out_again,
+        "MoE greedy decode is not deterministic"
+    );
 
     // Host-streaming a bounded window (2 of 3 layers resident) must emit the same
     // tokens — experts ride along with their layer on the host path.
     let store_b = MmapStore::open_dir(tmp.path()).unwrap();
     let streaming =
-        dlm::loader::build_streaming_generator(store_b, &config, 32, 2, 1, false, 64 << 20).unwrap();
+        dlm::loader::build_streaming_generator(store_b, &config, 32, 2, 1, false, 64 << 20)
+            .unwrap();
     let out_streaming = streaming.generate(&prompt, &gen_cfg).unwrap();
-    assert_eq!(out_streaming, out_resident, "streamed MoE diverged from resident");
+    assert_eq!(
+        out_streaming, out_resident,
+        "streamed MoE diverged from resident"
+    );
 
     // Prove the host path actually *streams* experts (loads the core, pulls the
     // top-k on demand) rather than holding every expert resident — the fix that
     // makes large MoE viable on CPU. A miss means an expert was fetched on demand.
-    let stats = streaming.stream_stats().expect("streaming kernel reports stats");
+    let stats = streaming
+        .stream_stats()
+        .expect("streaming kernel reports stats");
     assert!(
         stats.expert_misses > 0,
         "expected routed experts to be streamed on demand, got {stats:?}"
@@ -171,16 +200,26 @@ fn moe_router_stays_native_under_quant() {
     use dlm::forward::Ffn;
     let tmp = tempfile::tempdir().unwrap();
     write_moe_checkpoint(tmp.path(), Family::Mixtral); // writes safetensors + config.json
-    // Re-load the config at int4 (the checkpoint itself is F32 floats on disk).
+                                                       // Re-load the config at int4 (the checkpoint itself is F32 floats on disk).
     let config_json = std::fs::read(tmp.path().join("config.json")).unwrap();
     let config = ModelConfig::from_json_bytes(&config_json, QuantScheme::Int4).unwrap();
     let store = MmapStore::open_dir(tmp.path()).unwrap();
     let parts = dlm::loader::load_model_parts(&store, &config, 32).unwrap();
     match &parts.layers[0].ffn {
-        Ffn::Moe { router, experts, .. } => {
+        Ffn::Moe {
+            router, experts, ..
+        } => {
             // dtype_code 3 == Int4. Router must NOT be int4; experts must be.
-            assert_ne!(router.dtype_code(), 3, "router should stay native under --quant int4");
-            assert_eq!(experts[0].gate.dtype_code(), 3, "experts should be quantized to int4");
+            assert_ne!(
+                router.dtype_code(),
+                3,
+                "router should stay native under --quant int4"
+            );
+            assert_eq!(
+                experts[0].gate.dtype_code(),
+                3,
+                "experts should be quantized to int4"
+            );
         }
         _ => panic!("expected a MoE layer"),
     }

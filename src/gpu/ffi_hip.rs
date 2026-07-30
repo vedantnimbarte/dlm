@@ -128,7 +128,10 @@ pub(super) fn device_malloc(bytes: usize) -> Result<*mut c_void> {
     // SAFETY: valid out-pointer.
     let code = unsafe { hipMalloc(&mut raw, bytes.max(1)) };
     if code != HIP_SUCCESS {
-        return Err(DlmError::Gpu { api: "hipMalloc", code });
+        return Err(DlmError::Gpu {
+            api: "hipMalloc",
+            code,
+        });
     }
     Ok(raw)
 }
@@ -146,7 +149,10 @@ pub(super) fn copy_h2d(dst: *mut c_void, src: *const c_void, bytes: usize) -> Re
     // SAFETY: caller guarantees `bytes` valid on both sides.
     let code = unsafe { hipMemcpy(dst, src, bytes, HIP_MEMCPY_HOST_TO_DEVICE) };
     if code != HIP_SUCCESS {
-        return Err(DlmError::Gpu { api: "hipMemcpy(H2D)", code });
+        return Err(DlmError::Gpu {
+            api: "hipMemcpy(H2D)",
+            code,
+        });
     }
     Ok(())
 }
@@ -156,7 +162,10 @@ pub(super) fn copy_d2h(dst: *mut c_void, src: *const c_void, bytes: usize) -> Re
     // SAFETY: caller guarantees `bytes` valid on both sides.
     let code = unsafe { hipMemcpy(dst, src, bytes, HIP_MEMCPY_DEVICE_TO_HOST) };
     if code != HIP_SUCCESS {
-        return Err(DlmError::Gpu { api: "hipMemcpy(D2H)", code });
+        return Err(DlmError::Gpu {
+            api: "hipMemcpy(D2H)",
+            code,
+        });
     }
     Ok(())
 }
@@ -166,7 +175,10 @@ pub(super) fn synchronize() -> Result<()> {
     // SAFETY: no arguments.
     let code = unsafe { hipDeviceSynchronize() };
     if code != HIP_SUCCESS {
-        return Err(DlmError::Gpu { api: "hipDeviceSynchronize", code });
+        return Err(DlmError::Gpu {
+            api: "hipDeviceSynchronize",
+            code,
+        });
     }
     Ok(())
 }
@@ -181,7 +193,10 @@ pub(super) fn stream_create_nonblocking() -> Result<hipStream_t> {
     // SAFETY: `s` is a valid out-pointer.
     let code = unsafe { hipStreamCreateWithFlags(&mut s, HIP_STREAM_NON_BLOCKING) };
     if code != HIP_SUCCESS {
-        return Err(DlmError::Gpu { api: "hipStreamCreateWithFlags", code });
+        return Err(DlmError::Gpu {
+            api: "hipStreamCreateWithFlags",
+            code,
+        });
     }
     Ok(s)
 }
@@ -199,7 +214,10 @@ pub(super) fn stream_synchronize(stream: hipStream_t) -> Result<()> {
     // SAFETY: `stream` is a valid stream handle.
     let code = unsafe { hipStreamSynchronize(stream) };
     if code != HIP_SUCCESS {
-        return Err(DlmError::Gpu { api: "hipStreamSynchronize", code });
+        return Err(DlmError::Gpu {
+            api: "hipStreamSynchronize",
+            code,
+        });
     }
     Ok(())
 }
@@ -214,7 +232,10 @@ pub(super) fn copy_h2d_async(
     // SAFETY: caller guarantees `bytes` valid on both sides; `src` is pinned.
     let code = unsafe { hipMemcpyAsync(dst, src, bytes, HIP_MEMCPY_HOST_TO_DEVICE, stream) };
     if code != HIP_SUCCESS {
-        return Err(DlmError::Gpu { api: "hipMemcpyAsync(H2D)", code });
+        return Err(DlmError::Gpu {
+            api: "hipMemcpyAsync(H2D)",
+            code,
+        });
     }
     Ok(())
 }

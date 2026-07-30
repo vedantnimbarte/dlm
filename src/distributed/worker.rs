@@ -151,9 +151,13 @@ fn handle_connection(
         match read_message(&mut stream) {
             // A stray Auth after the handshake is a no-op (idempotent).
             Ok(Message::Auth(_)) => {}
-            Ok(Message::RunShard { position, mut hidden }) => {
+            Ok(Message::RunShard {
+                position,
+                mut hidden,
+            }) => {
                 if hidden.len() != hidden_size {
-                    let _ = write_message(&mut stream, &Message::Error("hidden size mismatch".into()));
+                    let _ =
+                        write_message(&mut stream, &Message::Error("hidden size mismatch".into()));
                     break;
                 }
                 let result = {

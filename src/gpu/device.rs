@@ -122,7 +122,9 @@ pub struct Stream {
 impl Stream {
     /// Create a non-blocking stream.
     pub fn new_nonblocking() -> Result<Self> {
-        Ok(Self { raw: backend::stream_create_nonblocking()? })
+        Ok(Self {
+            raw: backend::stream_create_nonblocking()?,
+        })
     }
 
     /// Block the calling thread until this stream's queued work completes. The

@@ -257,7 +257,11 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
     if content_length > MAX_BODY_BYTES {
         return write_response(
             reader.get_mut(),
-            Response::json(413, br#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#.to_vec()),
+            Response::json(
+                413,
+                br#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#
+                    .to_vec(),
+            ),
         );
     }
     // Read incrementally instead of pre-allocating the *declared* length: a
@@ -332,7 +336,10 @@ mod tests {
         let server = HttpServer::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().unwrap();
         let handler: Handler = Arc::new(|req: &Request| {
-            Response::json(200, format!(r#"{{"path":"{}","echo":{}}}"#, req.path, req.body_str()))
+            Response::json(
+                200,
+                format!(r#"{{"path":"{}","echo":{}}}"#, req.path, req.body_str()),
+            )
         });
         std::thread::spawn(move || server.serve(handler).unwrap());
 

@@ -123,9 +123,8 @@ impl VramProfiler {
     /// KV-cache bytes for a **single** layer across the full target context:
     /// `2 (K,V) × N_kv_heads × D_head × 2 bytes × L_context`.
     pub fn kv_bytes_per_layer(&self, config: &ModelConfig) -> u64 {
-        let per_token = 2 * config.num_kv_heads as u64
-            * config.head_dim() as u64
-            * KV_BYTES_PER_ELEMENT;
+        let per_token =
+            2 * config.num_kv_heads as u64 * config.head_dim() as u64 * KV_BYTES_PER_ELEMENT;
         per_token * self.target_context as u64
     }
 
@@ -145,8 +144,8 @@ impl VramProfiler {
     /// as if each unit held all its experts would size it many times too small.
     pub fn per_layer_weight_bytes(&self, config: &ModelConfig) -> u64 {
         if config.is_moe() {
-            return (config.resident_layer_params() as f64 * config.quant.bytes_per_param())
-                .ceil() as u64;
+            return (config.resident_layer_params() as f64 * config.quant.bytes_per_param()).ceil()
+                as u64;
         }
         let model_total_bytes =
             config.estimated_total_params() as f64 * config.quant.bytes_per_param();

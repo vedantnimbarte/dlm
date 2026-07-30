@@ -65,11 +65,7 @@ impl MmapShard {
 
         let header = SafetensorsHeader::parse(&mmap, file_len)?;
 
-        Ok(MmapShard {
-            path,
-            mmap,
-            header,
-        })
+        Ok(MmapShard { path, mmap, header })
     }
 
     /// Path this shard was mapped from.
@@ -106,12 +102,14 @@ impl MmapShard {
 
         // Defensive re-check; the header parser already validated ranges, but
         // this keeps the unsafe-free slice indexing panic-proof.
-        self.mmap.get(start..end).ok_or_else(|| DlmError::TensorOutOfBounds {
-            name: name.to_string(),
-            start,
-            end,
-            len: self.mmap.len(),
-        })
+        self.mmap
+            .get(start..end)
+            .ok_or_else(|| DlmError::TensorOutOfBounds {
+                name: name.to_string(),
+                start,
+                end,
+                len: self.mmap.len(),
+            })
     }
 
     /// Iterate over every tensor in this shard.
@@ -196,10 +194,7 @@ impl MmapStore {
 
     /// Total number of tensors across all shards.
     pub fn num_tensors(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| s.header().tensors.len())
-            .sum()
+        self.shards.iter().map(|s| s.header().tensors.len()).sum()
     }
 
     /// Resolve a tensor by name across all shards, returning the owning shard

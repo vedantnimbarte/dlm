@@ -4,11 +4,11 @@
 //! the real partitioning + per-layer dispatch on the CPU kernel — the same way
 //! `distributed.rs` validates the cross-node path over localhost.
 
-use dlm::forward::Weights;
 use dlm::cache::KvCacheConfig;
+use dlm::forward::Weights;
+use dlm::forward::{BlockConfig, ExpertFfn, Ffn, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 use dlm::loader::ModelParts;
-use dlm::forward::{BlockConfig, ExpertFfn, Ffn, LayerTensors};
 
 struct Rng(u64);
 impl Rng {
@@ -40,9 +40,14 @@ fn build_parts() -> ModelParts {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let mut rng = Rng::new(7);
     let s = 0.05;
     let layers = (0..num_layers)
@@ -51,9 +56,14 @@ fn build_parts() -> ModelParts {
             k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
             v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
             o_proj: Weights::from_f32(rng.vec(hidden * cfg.q_dim(), s)),
-            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)) }),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+                up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+                down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)),
+            }),
             input_layernorm: vec![1.0; hidden],
-            post_attention_layernorm: vec![1.0; hidden], ..Default::default()
+            post_attention_layernorm: vec![1.0; hidden],
+            ..Default::default()
         })
         .collect();
     ModelParts {
@@ -77,10 +87,18 @@ fn build_parts() -> ModelParts {
 }
 
 // build_parts uses the same seed each call, so two builds are identical models.
-fn greedy<K: dlm::forward::ComputeKernel>(gen: &Generator<K>, prompt: &[u32], n: usize) -> Vec<u32> {
+fn greedy<K: dlm::forward::ComputeKernel>(
+    gen: &Generator<K>,
+    prompt: &[u32],
+    n: usize,
+) -> Vec<u32> {
     gen.generate(
         prompt,
-        &GenerationConfig { max_new_tokens: n, eos_token: None, sampler: Sampler::Greedy },
+        &GenerationConfig {
+            max_new_tokens: n,
+            eos_token: None,
+            sampler: Sampler::Greedy,
+        },
     )
     .unwrap()
 }
@@ -121,6 +139,11 @@ fn single_gpu_id_is_whole_model_on_one_device() {
     let single = build_parts().into_cpu_generator().unwrap();
     // Device 0 (not an arbitrary id like 3) so this runs for real on any GPU
     // box; a single-element list still maps the whole model to one device.
-    let one_gpu = build_parts().into_pipeline_parallel_generator(&[0]).unwrap();
-    assert_eq!(greedy(&one_gpu, &[1, 2, 3], 6), greedy(&single, &[1, 2, 3], 6));
+    let one_gpu = build_parts()
+        .into_pipeline_parallel_generator(&[0])
+        .unwrap();
+    assert_eq!(
+        greedy(&one_gpu, &[1, 2, 3], 6),
+        greedy(&single, &[1, 2, 3], 6)
+    );
 }

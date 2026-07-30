@@ -9,8 +9,8 @@
 //! `exp`/`rsqrt`/`pow`).
 #![cfg(feature = "cuda-kernels")]
 
-use dlm::forward::Weights;
 use dlm::cache::{KvCacheConfig, PagedKvCache};
+use dlm::forward::Weights;
 use dlm::forward::{
     BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, ForwardOrchestrator, GpuKernel,
     KvLayerCache, LayerSource, LayerTensors, StreamingGpuKernel,
@@ -60,9 +60,14 @@ fn random_layers(cfg: &BlockConfig, num_layers: u32, seed: u64) -> Vec<LayerTens
             k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
             v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * cfg.hidden_size, s)),
             o_proj: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.q_dim(), s)),
-            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)), down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)) }),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+                up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
+                down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+            }),
             input_layernorm: vec![1.0; cfg.hidden_size],
-            post_attention_layernorm: vec![1.0; cfg.hidden_size], ..Default::default()
+            post_attention_layernorm: vec![1.0; cfg.hidden_size],
+            ..Default::default()
         })
         .collect()
 }
@@ -76,9 +81,14 @@ fn gpu_run_block_matches_cpu() {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let num_layers = 2u32;
 
     // Identical weights to both kernels.
@@ -93,8 +103,16 @@ fn gpu_run_block_matches_cpu() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_cpu = ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
-    let mut orch_gpu = ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
 
     // Same starting hidden state, decoded autoregressively on both.
     let mut hidden_cpu: Vec<f32> = (0..cfg.hidden_size)
@@ -140,9 +158,12 @@ fn gpu_batched_sessions_keep_independent_kv() {
         rope_theta: 10000.0,
         rms_eps: 1e-5,
         rope_scaling: None,
-        moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let num_layers = 3u32;
     let layers = random_layers(&cfg, num_layers, 0xB0A7);
     // One kernel, shared by both sessions via `&gpu` (as the server shares it).
@@ -156,9 +177,12 @@ fn gpu_batched_sessions_keep_independent_kv() {
 
     // Two distinct start states → distinct trajectories that would visibly
     // cross-contaminate if KV were shared.
-    let start_a: Vec<f32> = (0..cfg.hidden_size).map(|i| (i as f32) * 0.03 - 0.5).collect();
-    let start_b: Vec<f32> =
-        (0..cfg.hidden_size).map(|i| ((i * 3 % 29) as f32) * 0.02 - 0.3).collect();
+    let start_a: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| (i as f32) * 0.03 - 0.5)
+        .collect();
+    let start_b: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| ((i * 3 % 29) as f32) * 0.02 - 0.3)
+        .collect();
 
     let solo = |start: &[f32]| -> Vec<Vec<f32>> {
         let mut orch = ForwardOrchestrator::new(
@@ -178,17 +202,29 @@ fn gpu_batched_sessions_keep_independent_kv() {
     let solo_b = solo(&start_b);
 
     // Interleave A and B step-by-step on the SAME kernel.
-    let mut orch_a =
-        ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
-    let mut orch_b =
-        ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_a = ForwardOrchestrator::new(
+        &gpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_b = ForwardOrchestrator::new(
+        &gpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
     let mut ha = start_a.clone();
     let mut hb = start_b.clone();
     for step in 0..5 {
         orch_a.decode_token(&mut ha).unwrap();
         orch_b.decode_token(&mut hb).unwrap();
-        assert_eq!(ha, solo_a[step], "session A diverged when interleaved with B at step {step}");
-        assert_eq!(hb, solo_b[step], "session B diverged when interleaved with A at step {step}");
+        assert_eq!(
+            ha, solo_a[step],
+            "session A diverged when interleaved with B at step {step}"
+        );
+        assert_eq!(
+            hb, solo_b[step],
+            "session B diverged when interleaved with A at step {step}"
+        );
     }
 }
 
@@ -205,10 +241,16 @@ fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32,
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_cpu =
-        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
-    let mut orch_gpu =
-        ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
 
     let mut h_cpu: Vec<f32> = (0..cfg.hidden_size)
         .map(|i| ((i % 17) as f32) * 0.03 - 0.25)
@@ -246,9 +288,10 @@ fn gpu_sliding_window_matches_cpu() {
         rope_scaling: None,
         moe: None,
         sliding_window: Some(2),
-        activation: dlm::forward::Activation::Silu, mla: None,
-            ..Default::default()
-        };
+        activation: dlm::forward::Activation::Silu,
+        mla: None,
+        ..Default::default()
+    };
     let layers = random_layers(&cfg, 2, 0x5117);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "sliding-window");
 }
@@ -275,8 +318,8 @@ fn gpu_multi_gpu_matches_single_device() {
         sliding_window: None,
         activation: dlm::forward::Activation::Silu,
         mla: None,
-            ..Default::default()
-        };
+        ..Default::default()
+    };
     let num_layers = 4u32;
     let layers = random_layers(&cfg, num_layers, 0x11CE);
     let kv_cfg = KvCacheConfig {
@@ -285,24 +328,41 @@ fn gpu_multi_gpu_matches_single_device() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let start: Vec<f32> = (0..cfg.hidden_size).map(|i| (i as f32) * 0.03 - 0.5).collect();
+    let start: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| (i as f32) * 0.03 - 0.5)
+        .collect();
 
     let single = dlm::forward::GpuKernel::new(cfg, layers.clone(), 64).unwrap();
-    let mut orch = ForwardOrchestrator::new(single, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch = ForwardOrchestrator::new(
+        single,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
     let mut h_single = start.clone();
     for _ in 0..3 {
         orch.decode_token(&mut h_single).unwrap();
     }
 
     let multi = dlm::forward::MultiGpuKernel::new(cfg, layers, &[0, 1], 64).unwrap();
-    let mut orch = ForwardOrchestrator::new(multi, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch = ForwardOrchestrator::new(
+        multi,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
     let mut h_multi = start;
     for _ in 0..3 {
         orch.decode_token(&mut h_multi).unwrap();
     }
 
-    let max_diff = h_single.iter().zip(&h_multi).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < 1e-4, "multi-gpu diverged from single-gpu by {max_diff}");
+    let max_diff = h_single
+        .iter()
+        .zip(&h_multi)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1e-4,
+        "multi-gpu diverged from single-gpu by {max_diff}"
+    );
 }
 
 /// Multi-head Latent Attention (DeepSeek, dense FFN) must match the CPU oracle:
@@ -332,8 +392,8 @@ fn gpu_mla_matches_cpu() {
         sliding_window: None,
         activation: dlm::forward::Activation::Silu,
         mla: Some(mla),
-            ..Default::default()
-        };
+        ..Default::default()
+    };
     let (nh, qk, latent, rope, vdim, ql) = (2usize, 8usize, 8usize, 4usize, 4usize, 12usize);
     let nope = 4usize;
     let mut rng = Rng::new(0xDEEB);
@@ -384,9 +444,10 @@ fn gpu_yarn_rope_matches_cpu() {
         }),
         moe: None,
         sliding_window: None,
-        activation: dlm::forward::Activation::Silu, mla: None,
-            ..Default::default()
-        };
+        activation: dlm::forward::Activation::Silu,
+        mla: None,
+        ..Default::default()
+    };
     let layers = random_layers(&cfg, 2, 0x7A54);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "yarn-rope");
 }
@@ -407,9 +468,10 @@ fn gpu_qk_norm_matches_cpu() {
         rope_scaling: None,
         moe: None,
         sliding_window: None,
-        activation: dlm::forward::Activation::Silu, mla: None,
-            ..Default::default()
-        };
+        activation: dlm::forward::Activation::Silu,
+        mla: None,
+        ..Default::default()
+    };
     let mut layers = random_layers(&cfg, 2, 0x9317);
     for l in &mut layers {
         l.q_norm = Some((0..cfg.head_dim).map(|i| 0.9 + 0.02 * i as f32).collect());
@@ -433,9 +495,10 @@ fn gpu_gelu_activation_matches_cpu() {
         rope_scaling: None,
         moe: None,
         sliding_window: None,
-        activation: dlm::forward::Activation::GeluTanh, mla: None,
-            ..Default::default()
-        };
+        activation: dlm::forward::Activation::GeluTanh,
+        mla: None,
+        ..Default::default()
+    };
     let layers = random_layers(&cfg, 2, 0x6E10);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "gelu-activation");
 }
@@ -459,16 +522,21 @@ fn gpu_matches_cpu_with_int4_weights() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     // Quantize the same random weights both kernels would otherwise share.
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
         .into_iter()
         .map(|mut l| {
             let q = |w: &dlm::forward::Weights| {
                 let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
-                dlm::forward::Weights::quantize_int4(&floats, dlm::forward::QUANT_GROUP_SIZE).unwrap()
+                dlm::forward::Weights::quantize_int4(&floats, dlm::forward::QUANT_GROUP_SIZE)
+                    .unwrap()
             };
             l.q_proj = q(&l.q_proj);
             l.k_proj = q(&l.k_proj);
@@ -499,9 +567,13 @@ fn gpu_matches_cpu_with_int8_weights() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
         .into_iter()
         .map(|mut l| {
@@ -539,9 +611,13 @@ fn gpu_matches_cpu_at_realistic_hidden_size() {
         intermediate_size: 512,
         rope_theta: 10000.0,
         rms_eps: 1e-5,
-        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let layers = random_layers(&cfg, 2, 0xA11CE);
     assert_gpu_matches_cpu(cfg, layers, 2e-3, "hidden_size=2048");
 }
@@ -557,9 +633,13 @@ fn gpu_matches_cpu_with_qkv_biases() {
         intermediate_size: 128,
         rope_theta: 1_000_000.0,
         rms_eps: 1e-6,
-        rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let mut rng = Rng::new(0xB1A5);
     let mut layers = random_layers(&cfg, 2, 0xB1A5);
     for l in layers.iter_mut() {
@@ -588,9 +668,12 @@ fn gpu_matches_cpu_with_llama3_rope_scaling() {
             high_freq_factor: 4.0,
             original_max_position: 8192.0,
         }),
-        moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let layers = random_layers(&cfg, 2, 0x5CA1E);
     assert_gpu_matches_cpu(cfg, layers, 1e-3, "llama3 rope scaling");
 }
@@ -603,7 +686,12 @@ fn small_cfg() -> BlockConfig {
         head_dim: 8,
         intermediate_size: 64,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
         ..Default::default()
     }
 }
@@ -624,24 +712,42 @@ fn streaming_gpu_matches_resident() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_res = ForwardOrchestrator::new(resident, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
-    let mut orch_str = ForwardOrchestrator::new(streaming, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+    let mut orch_res = ForwardOrchestrator::new(
+        resident,
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_str = ForwardOrchestrator::new(
+        streaming,
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
 
-    let mut h_res: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.02 - 0.3).collect();
+    let mut h_res: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| i as f32 * 0.02 - 0.3)
+        .collect();
     let mut h_str = h_res.clone();
     for step in 0..4 {
         orch_res.decode_token(&mut h_res).unwrap();
         orch_str.decode_token(&mut h_str).unwrap();
-        let max_diff = h_res.iter().zip(&h_str).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_diff = h_res
+            .iter()
+            .zip(&h_str)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         // Same kernel + weights, only the *timing* of the upload differs.
-        assert!(max_diff < 1e-4, "step {step}: streaming GPU diverged by {max_diff}");
+        assert!(
+            max_diff < 1e-4,
+            "step {step}: streaming GPU diverged by {max_diff}"
+        );
     }
 }
 
 #[test]
 fn streaming_gpu_worker_prefetches() {
     let cfg = small_cfg();
-    let k = StreamingGpuKernel::new(cfg, VecSource(random_layers(&cfg, 4, 3)), 64, 4, None).unwrap();
+    let k =
+        StreamingGpuKernel::new(cfg, VecSource(random_layers(&cfg, 4, 3)), 64, 4, None).unwrap();
     let mut h: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.01).collect();
     let mut kv = KvLayerCache::new(cfg.kv_dim());
 
@@ -655,7 +761,11 @@ fn streaming_gpu_worker_prefetches() {
     while k.stats().prefetched < 1 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert!(k.stats().prefetched >= 1, "GPU worker should prefetch a layer: {:?}", k.stats());
+    assert!(
+        k.stats().prefetched >= 1,
+        "GPU worker should prefetch a layer: {:?}",
+        k.stats()
+    );
 }
 
 // ── Mixture-of-Experts GPU parity ──
@@ -738,9 +848,12 @@ fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
         rope_theta: 10000.0,
         rms_eps: 1e-5,
         rope_scaling: None,
-        moe: Some(m), sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        moe: Some(m),
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let num_layers = 6u32;
     let layers = random_moe_layers(&cfg, num_layers, 0x50FA);
 
@@ -755,19 +868,33 @@ fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_cpu =
-        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
-    let mut orch_gpu =
-        ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
 
-    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.02 - 0.3).collect();
+    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| i as f32 * 0.02 - 0.3)
+        .collect();
     let mut h_gpu = h_cpu.clone();
     for step in 0..4 {
         orch_cpu.decode_token(&mut h_cpu).unwrap();
         orch_gpu.decode_token(&mut h_gpu).unwrap();
-        let max_diff =
-            h_cpu.iter().zip(&h_gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max_diff < 2e-3, "{what}: step {step}: GPU MoE diverged by {max_diff}");
+        let max_diff = h_cpu
+            .iter()
+            .zip(&h_gpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "{what}: step {step}: GPU MoE diverged by {max_diff}"
+        );
     }
 }
 
@@ -834,8 +961,11 @@ fn streaming_gpu_gemma2_matches_cpu() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_cpu =
-        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 16), dlm::forward::KvQuant::None);
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
     let mut orch_str = ForwardOrchestrator::new(
         streaming,
         PagedKvCache::new(kv_cfg, 16),
@@ -920,7 +1050,14 @@ fn gemma2_fixture() -> (BlockConfig, Vec<LayerTensors>) {
 /// MLA dims used by both streaming cases: `head_dim == qk_nope + qk_rope`.
 fn mla_test_config(moe: Option<MoeConfig>) -> (BlockConfig, MlaShape) {
     use dlm::model::MlaConfig;
-    let shape = MlaShape { nh: 2, nope: 4, rope: 4, latent: 8, vdim: 4, ql: 12 };
+    let shape = MlaShape {
+        nh: 2,
+        nope: 4,
+        rope: 4,
+        latent: 8,
+        vdim: 4,
+        ql: 12,
+    };
     let cfg = BlockConfig {
         hidden_size: 16,
         num_heads: shape.nh,
@@ -940,8 +1077,8 @@ fn mla_test_config(moe: Option<MoeConfig>) -> (BlockConfig, MlaShape) {
             qk_rope_head_dim: shape.rope as u32,
             v_head_dim: shape.vdim as u32,
         }),
-            ..Default::default()
-        };
+        ..Default::default()
+    };
     (cfg, shape)
 }
 
@@ -1010,7 +1147,9 @@ fn random_mla_layers(
                     q_b_proj: Weights::from_f32(rng.vec(sh.nh * qk * sh.ql, s)),
                     kv_a_proj: Weights::from_f32(rng.vec((sh.latent + sh.rope) * h, s)),
                     kv_a_layernorm: vec![1.0; sh.latent],
-                    kv_b_proj: Weights::from_f32(rng.vec(sh.nh * (sh.nope + sh.vdim) * sh.latent, s)),
+                    kv_b_proj: Weights::from_f32(
+                        rng.vec(sh.nh * (sh.nope + sh.vdim) * sh.latent, s),
+                    ),
                 }),
                 ..Default::default()
             }
@@ -1050,19 +1189,33 @@ fn run_streaming_parity<S: LayerSource + 'static>(
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    let mut orch_cpu =
-        ForwardOrchestrator::new(cpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
-    let mut orch_gpu =
-        ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 32), dlm::forward::KvQuant::None);
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
 
-    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.02 - 0.3).collect();
+    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| i as f32 * 0.02 - 0.3)
+        .collect();
     let mut h_gpu = h_cpu.clone();
     for step in 0..4 {
         orch_cpu.decode_token(&mut h_cpu).unwrap();
         orch_gpu.decode_token(&mut h_gpu).unwrap();
-        let max_diff =
-            h_cpu.iter().zip(&h_gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max_diff < 2e-3, "{what}: step {step}: streaming GPU diverged by {max_diff}");
+        let max_diff = h_cpu
+            .iter()
+            .zip(&h_gpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "{what}: step {step}: streaming GPU diverged by {max_diff}"
+        );
     }
 }
 
@@ -1142,14 +1295,16 @@ fn gpu_resumed_prefix_matches_full_prefill() {
             PagedKvCache::new(kv_cfg, 16),
             dlm::forward::KvQuant::None,
         );
-        let mut h: Vec<f32> = (0..cfg.hidden_size).map(|i| (i as f32) * 0.02 - 0.3).collect();
+        let mut h: Vec<f32> = (0..cfg.hidden_size)
+            .map(|i| (i as f32) * 0.02 - 0.3)
+            .collect();
         let mut out = Vec::new();
         for step in 0..6 {
             if Some(step) == split {
                 // Round-trip the session through a synced snapshot.
                 let snap = orch.snapshot_synced().unwrap();
-                orch = ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap)
-                    .unwrap();
+                orch =
+                    ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap).unwrap();
             }
             orch.decode_token(&mut h).unwrap();
             out.push(h.clone());
@@ -1161,7 +1316,11 @@ fn gpu_resumed_prefix_matches_full_prefill() {
     // Resume mid-sequence, where there is real history to carry across.
     let resumed = run(Some(3));
     for (step, (a, b)) in straight.iter().zip(&resumed).enumerate() {
-        let max_diff = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_diff = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         assert!(
             max_diff < 1e-4,
             "step {step}: resumed prefix diverged from full prefill by {max_diff}"
@@ -1213,7 +1372,11 @@ fn gpu_batched_block_matches_sequential() {
     // Batched: all three stepped together through run_block_batched. Give the
     // slots different starting positions so their KV lengths diverge.
     let mut kvs: Vec<Vec<KvLayerCache>> = (0..starts.len())
-        .map(|_| (0..num_layers).map(|_| KvLayerCache::new(cfg.kv_dim())).collect())
+        .map(|_| {
+            (0..num_layers)
+                .map(|_| KvLayerCache::new(cfg.kv_dim()))
+                .collect()
+        })
         .collect();
     let mut hs: Vec<Vec<f32>> = starts.clone();
     for step in 0..4 {
@@ -1229,9 +1392,15 @@ fn gpu_batched_block_matches_sequential() {
     }
 
     for (b, (batched, alone)) in hs.iter().zip(&solo).enumerate() {
-        let max_diff =
-            batched.iter().zip(alone).map(|(a, c)| (a - c).abs()).fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-4, "slot {b}: batched diverged from solo by {max_diff}");
+        let max_diff = batched
+            .iter()
+            .zip(alone)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "slot {b}: batched diverged from solo by {max_diff}"
+        );
     }
 }
 

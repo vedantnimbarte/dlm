@@ -5,9 +5,9 @@
 //!   2. VRAM profiling math
 //!   3. page-locked host staging buffers + the linear swap cycle
 
-use dlm::memory::{page_size, PinnedBuffer};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 use dlm::memory::PinKind;
+use dlm::memory::{page_size, PinnedBuffer};
 use dlm::model::{ModelConfig, MoeNaming, QuantScheme};
 use dlm::pipeline::{
     fold_checksum, BufferId, DoubleBufferSchedule, HostPipeline, MmapWeightSource,
@@ -36,7 +36,8 @@ fn write_multi_tensor(dir: &std::path::Path, tensors: &[(&str, usize)]) -> std::
 
     let path = dir.join("model-00001-of-00001.safetensors");
     let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(&(header_bytes.len() as u64).to_le_bytes())
+        .unwrap();
     f.write_all(header_bytes).unwrap();
     f.write_all(&data).unwrap();
     f.flush().unwrap();
@@ -55,7 +56,8 @@ fn write_safetensors(dir: &std::path::Path, tensor: &str, data: &[u8]) -> std::p
 
     let path = dir.join("model-00001-of-00001.safetensors");
     let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(&(header_bytes.len() as u64).to_le_bytes())
+        .unwrap();
     f.write_all(header_bytes).unwrap();
     f.write_all(data).unwrap();
     f.flush().unwrap();
@@ -227,14 +229,16 @@ fn detects_moe_families_and_dense() {
 #[test]
 fn rejects_unsupported_quant_formats() {
     let base = r#""hidden_size":16,"num_attention_heads":4,"num_hidden_layers":2,"vocab_size":128"#;
-    let with_quant =
-        |q: &str| format!("{{{base},\"quantization_config\":{q}}}");
+    let with_quant = |q: &str| format!("{{{base},\"quantization_config\":{q}}}");
     let parse = |json: String| ModelConfig::from_json_bytes(json.as_bytes(), QuantScheme::Fp16);
 
     // AWQ — permuted nibble order, not decodable → refused, not silently wrong.
     assert!(parse(with_quant(r#"{"quant_method":"awq","bits":4}"#)).is_err());
     // GPTQ act-order — column permutation via g_idx not applied → refused.
-    assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":4,"desc_act":true}"#)).is_err());
+    assert!(parse(with_quant(
+        r#"{"quant_method":"gptq","bits":4,"desc_act":true}"#
+    ))
+    .is_err());
     // 8-bit quant — dequantizer is 4-bit only → refused.
     assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":8}"#)).is_err());
     // Unknown method → refused conservatively.
@@ -245,7 +249,10 @@ fn rejects_unsupported_quant_formats() {
     // packer, and exporters disagree on the zero-point convention (AutoGPTQ
     // stores `zero - 1`). A wrong zero-point yields fluent, confident nonsense —
     // strictly worse than an honest refusal.
-    assert!(parse(with_quant(r#"{"quant_method":"gptq","bits":4,"desc_act":false}"#)).is_err());
+    assert!(parse(with_quant(
+        r#"{"quant_method":"gptq","bits":4,"desc_act":false}"#
+    ))
+    .is_err());
 
     // No quantization_config at all — plain fp16/bf16, the supported path.
     assert!(parse(format!("{{{base}}}")).is_ok());
@@ -626,15 +633,24 @@ fn write_f32_model(dir: &std::path::Path, tensors: &[(String, Vec<f32>)]) {
 fn bytes_to_f32_decodes_float_dtypes() {
     use dlm::storage::{bytes_to_f32, Dtype};
 
-    let f32_bytes: Vec<u8> = [1.0f32, -2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-    assert_eq!(bytes_to_f32(&f32_bytes, Dtype::F32).unwrap(), vec![1.0, -2.0]);
+    let f32_bytes: Vec<u8> = [1.0f32, -2.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(
+        bytes_to_f32(&f32_bytes, Dtype::F32).unwrap(),
+        vec![1.0, -2.0]
+    );
 
     // F16: 1.0 = 0x3C00, 2.0 = 0x4000, -1.0 = 0xBC00
     let f16_bytes: Vec<u8> = [0x3C00u16, 0x4000, 0xBC00]
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    assert_eq!(bytes_to_f32(&f16_bytes, Dtype::F16).unwrap(), vec![1.0, 2.0, -1.0]);
+    assert_eq!(
+        bytes_to_f32(&f16_bytes, Dtype::F16).unwrap(),
+        vec![1.0, 2.0, -1.0]
+    );
 
     // BF16: 1.0 = 0x3F80
     let bf16_bytes: Vec<u8> = 0x3F80u16.to_le_bytes().to_vec();
@@ -736,27 +752,103 @@ fn loader_refuses_packed_4bit_projection() {
     let fill = |n: usize| -> Vec<f32> { (0..n).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect() };
 
     // Quantize q_proj: Linear(in=hidden, out=q_dim), one group.
-    let dense_in_by_out: Vec<f32> = (0..h * q_dim).map(|k| ((k % 9) as f32 - 4.0) * 0.03).collect();
-    let pcfg = PackedQuantConfig { in_features: h, out_features: q_dim, group_size: h };
+    let dense_in_by_out: Vec<f32> = (0..h * q_dim)
+        .map(|k| ((k % 9) as f32 - 4.0) * 0.03)
+        .collect();
+    let pcfg = PackedQuantConfig {
+        in_features: h,
+        out_features: q_dim,
+        group_size: h,
+    };
     let (qweight, qzeros, scales) = pack_gptq_4bit(&dense_in_by_out, &pcfg).unwrap();
 
     let entries: Vec<(String, &str, Vec<u8>, usize)> = vec![
-        ("model.embed_tokens.weight".into(), "F32", f32_bytes(&fill(vocab * h)), vocab * h),
+        (
+            "model.embed_tokens.weight".into(),
+            "F32",
+            f32_bytes(&fill(vocab * h)),
+            vocab * h,
+        ),
         // q_proj as a GPTQ-quantized triplet.
-        ("model.layers.0.self_attn.q_proj.qweight".into(), "I32", i32_bytes(&qweight), qweight.len()),
-        ("model.layers.0.self_attn.q_proj.qzeros".into(), "I32", i32_bytes(&qzeros), qzeros.len()),
-        ("model.layers.0.self_attn.q_proj.scales".into(), "F32", f32_bytes(&scales), scales.len()),
+        (
+            "model.layers.0.self_attn.q_proj.qweight".into(),
+            "I32",
+            i32_bytes(&qweight),
+            qweight.len(),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.qzeros".into(),
+            "I32",
+            i32_bytes(&qzeros),
+            qzeros.len(),
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.scales".into(),
+            "F32",
+            f32_bytes(&scales),
+            scales.len(),
+        ),
         // Remaining projections as plain floats.
-        ("model.layers.0.self_attn.k_proj.weight".into(), "F32", f32_bytes(&fill(kv_dim * h)), kv_dim * h),
-        ("model.layers.0.self_attn.v_proj.weight".into(), "F32", f32_bytes(&fill(kv_dim * h)), kv_dim * h),
-        ("model.layers.0.self_attn.o_proj.weight".into(), "F32", f32_bytes(&fill(h * q_dim)), h * q_dim),
-        ("model.layers.0.mlp.gate_proj.weight".into(), "F32", f32_bytes(&fill(inter * h)), inter * h),
-        ("model.layers.0.mlp.up_proj.weight".into(), "F32", f32_bytes(&fill(inter * h)), inter * h),
-        ("model.layers.0.mlp.down_proj.weight".into(), "F32", f32_bytes(&fill(h * inter)), h * inter),
-        ("model.layers.0.input_layernorm.weight".into(), "F32", f32_bytes(&vec![1.0; h]), h),
-        ("model.layers.0.post_attention_layernorm.weight".into(), "F32", f32_bytes(&vec![1.0; h]), h),
-        ("model.norm.weight".into(), "F32", f32_bytes(&vec![1.0; h]), h),
-        ("lm_head.weight".into(), "F32", f32_bytes(&fill(vocab * h)), vocab * h),
+        (
+            "model.layers.0.self_attn.k_proj.weight".into(),
+            "F32",
+            f32_bytes(&fill(kv_dim * h)),
+            kv_dim * h,
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight".into(),
+            "F32",
+            f32_bytes(&fill(kv_dim * h)),
+            kv_dim * h,
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight".into(),
+            "F32",
+            f32_bytes(&fill(h * q_dim)),
+            h * q_dim,
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            "F32",
+            f32_bytes(&fill(inter * h)),
+            inter * h,
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight".into(),
+            "F32",
+            f32_bytes(&fill(inter * h)),
+            inter * h,
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight".into(),
+            "F32",
+            f32_bytes(&fill(h * inter)),
+            h * inter,
+        ),
+        (
+            "model.layers.0.input_layernorm.weight".into(),
+            "F32",
+            f32_bytes(&vec![1.0; h]),
+            h,
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            "F32",
+            f32_bytes(&vec![1.0; h]),
+            h,
+        ),
+        (
+            "model.norm.weight".into(),
+            "F32",
+            f32_bytes(&vec![1.0; h]),
+            h,
+        ),
+        (
+            "lm_head.weight".into(),
+            "F32",
+            f32_bytes(&fill(vocab * h)),
+            vocab * h,
+        ),
     ];
     write_typed_model(tmp.path(), &entries);
 
@@ -793,7 +885,10 @@ fn loader_ties_lm_head_to_embedding_when_absent() {
         ("model.layers.0.mlp.up_proj.weight".into(), fill(h * h)),
         ("model.layers.0.mlp.down_proj.weight".into(), fill(h * h)),
         ("model.layers.0.input_layernorm.weight".into(), vec![1.0; h]),
-        ("model.layers.0.post_attention_layernorm.weight".into(), vec![1.0; h]),
+        (
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![1.0; h],
+        ),
         ("model.norm.weight".into(), vec![1.0; h]),
         // No lm_head.weight → should tie to the embedding.
     ];
@@ -821,7 +916,12 @@ fn orchestrator_drives_stub_kernel_with_kv_growth() {
 
     let kernel = StubKernel::new(3, 4, 2); // 3 layers, hidden 4, kv_dim 2
     let budget = PagedKvCache::new(
-        KvCacheConfig { num_layers: 3, num_kv_heads: 1, head_dim: 2, block_size: 16 },
+        KvCacheConfig {
+            num_layers: 3,
+            num_kv_heads: 1,
+            head_dim: 2,
+            block_size: 16,
+        },
         8,
     );
     let mut orch = ForwardOrchestrator::new(kernel, budget, dlm::forward::KvQuant::None);
@@ -856,13 +956,23 @@ fn orchestrator_runs_real_cpu_block_autoregressively() {
         head_dim: 2,
         intermediate_size: 6,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     // Two zero-weight (identity) layers → hidden passes through unchanged.
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg); 2]).unwrap();
     let budget = PagedKvCache::new(
-        KvCacheConfig { num_layers: 2, num_kv_heads: 1, head_dim: 2, block_size: 16 },
+        KvCacheConfig {
+            num_layers: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            block_size: 16,
+        },
         8,
     );
     let mut orch = ForwardOrchestrator::new(kernel, budget, dlm::forward::KvQuant::None);
@@ -889,7 +999,12 @@ fn orchestrator_validates_hidden_length() {
 
     let kernel = StubKernel::new(2, 4, 1);
     let budget = PagedKvCache::new(
-        KvCacheConfig { num_layers: 2, num_kv_heads: 1, head_dim: 1, block_size: 8 },
+        KvCacheConfig {
+            num_layers: 2,
+            num_kv_heads: 1,
+            head_dim: 1,
+            block_size: 8,
+        },
         4,
     );
     let mut orch = ForwardOrchestrator::new(kernel, budget, dlm::forward::KvQuant::None);
@@ -929,7 +1044,9 @@ fn swap_plan_tiles_all_layers_without_gaps() {
     assert_eq!(swap.num_passes(), 12); // ceil(80/7)
 
     // Staging buffer holds a full window of layer weights.
-    let staging = swap.allocate_staging_buffer(plan.per_layer_weight_bytes).unwrap();
+    let staging = swap
+        .allocate_staging_buffer(plan.per_layer_weight_bytes)
+        .unwrap();
     let needed = plan.per_layer_weight_bytes as usize * 7;
     assert!(staging.capacity() >= needed);
 }

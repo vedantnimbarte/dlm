@@ -22,12 +22,19 @@ fn start_server() -> SocketAddr {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
     let fill = |n: usize, off: usize| -> Vec<f32> {
-        (0..n).map(|i| (((i + off) % 13) as f32 - 6.0) * 0.02).collect()
+        (0..n)
+            .map(|i| (((i + off) % 13) as f32 - 6.0) * 0.02)
+            .collect()
     };
     let generator = Generator::new(
         kernel,
@@ -36,11 +43,25 @@ fn start_server() -> SocketAddr {
         fill(vocab * hidden, 7),
         vocab,
         1e-5,
-        KvCacheConfig { num_layers: 1, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+        KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 4,
+            block_size: 16,
+        },
         64,
     )
     .unwrap();
-    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm", 8, 0, 8, 0);
+    let engine = EngineService::start(
+        generator,
+        BpeTokenizer::bytes_only(),
+        vocab,
+        "dlm",
+        8,
+        0,
+        8,
+        0,
+    );
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     std::thread::spawn(move || server.serve(router(engine)).unwrap());
@@ -85,10 +106,17 @@ fn zero_temperature_matches_greedy() {
         s[..end].to_string()
     };
 
-    let greedy = request(addr, r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":5}"#);
+    let greedy = request(
+        addr,
+        r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":5}"#,
+    );
     let zero_temp = request(
         addr,
         r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":5,"temperature":0.0}"#,
     );
-    assert_eq!(content(&greedy), content(&zero_temp), "temp=0 must equal greedy");
+    assert_eq!(
+        content(&greedy),
+        content(&zero_temp),
+        "temp=0 must equal greedy"
+    );
 }

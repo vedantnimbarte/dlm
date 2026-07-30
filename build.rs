@@ -99,7 +99,10 @@ fn compile_cuda_kernels() {
     } else {
         cmd.args(["-Xcompiler", "-fPIC"]);
     }
-    let output = cmd.args(["-lib", "src/gpu/kernels.cu", "-o"]).arg(&lib_path).output();
+    let output = cmd
+        .args(["-lib", "src/gpu/kernels.cu", "-o"])
+        .arg(&lib_path)
+        .output();
 
     match output {
         Ok(o) if o.status.success() => {

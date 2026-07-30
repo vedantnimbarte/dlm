@@ -1,9 +1,9 @@
 //! Continuous batching must produce, per request, exactly the same tokens as
 //! running that request in isolation — regardless of interleaving or batch size.
 
-use dlm::forward::Weights;
 use dlm::batching::BatchScheduler;
 use dlm::cache::KvCacheConfig;
+use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, CpuKernel, ExpertFfn, Ffn, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 
@@ -35,9 +35,14 @@ fn build_generator() -> Generator<CpuKernel> {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let mut rng = Rng::new(7);
     let s = 0.05;
     let layers = vec![LayerTensors {
@@ -45,9 +50,14 @@ fn build_generator() -> Generator<CpuKernel> {
         k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
         v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
         o_proj: Weights::from_f32(rng.vec(hidden * cfg.q_dim(), s)),
-        ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)) }),
+        ffn: Ffn::Dense(ExpertFfn {
+            gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+            up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+            down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)),
+        }),
         input_layernorm: vec![1.0; hidden],
-        post_attention_layernorm: vec![1.0; hidden], ..Default::default()
+        post_attention_layernorm: vec![1.0; hidden],
+        ..Default::default()
     }];
     let kernel = CpuKernel::new(cfg, layers).unwrap();
     Generator::new(
@@ -57,7 +67,12 @@ fn build_generator() -> Generator<CpuKernel> {
         rng.vec(vocab * hidden, s),
         vocab,
         1e-5,
-        KvCacheConfig { num_layers: 1, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+        KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 4,
+            block_size: 16,
+        },
         64,
     )
     .unwrap()
@@ -66,7 +81,11 @@ fn build_generator() -> Generator<CpuKernel> {
 fn greedy(gen: &Generator<CpuKernel>, prompt: &[u32], n: usize) -> Vec<u32> {
     gen.generate(
         prompt,
-        &GenerationConfig { max_new_tokens: n, eos_token: None, sampler: Sampler::Greedy },
+        &GenerationConfig {
+            max_new_tokens: n,
+            eos_token: None,
+            sampler: Sampler::Greedy,
+        },
     )
     .unwrap()
 }
@@ -94,7 +113,11 @@ fn batched_requests_match_isolated_generation() {
     assert_eq!(results.len(), requests.len());
     for (f, (id, prompt, n)) in results.iter().zip(&requests) {
         assert_eq!(f.id, *id);
-        assert_eq!(f.tokens, greedy(&generator, prompt, *n), "request {id} diverged");
+        assert_eq!(
+            f.tokens,
+            greedy(&generator, prompt, *n),
+            "request {id} diverged"
+        );
         assert_eq!(f.tokens.len(), *n);
     }
 }

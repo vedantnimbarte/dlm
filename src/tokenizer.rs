@@ -252,7 +252,11 @@ impl BpeTokenizer {
     /// (`pieces[i]` has id `i`), as shipped in a `tokenizer.json` Unigram model.
     /// `byte_fallback` decomposes unmatched characters into `<0xNN>` byte pieces
     /// (Gemma/Llama); `unk_id` is the last resort.
-    pub fn from_unigram(pieces: Vec<(String, f32)>, byte_fallback: bool, unk_id: Option<u32>) -> Self {
+    pub fn from_unigram(
+        pieces: Vec<(String, f32)>,
+        byte_fallback: bool,
+        unk_id: Option<u32>,
+    ) -> Self {
         let mut encoder = HashMap::new();
         let mut decoder = HashMap::new();
         let mut scores = HashMap::new();
@@ -273,7 +277,12 @@ impl BpeTokenizer {
             byte_decoder,
             special_encoder: HashMap::new(),
             special_decoder: HashMap::new(),
-            unigram: Some(UnigramState { scores, max_piece_len, byte_fallback, unk_id }),
+            unigram: Some(UnigramState {
+                scores,
+                max_piece_len,
+                byte_fallback,
+                unk_id,
+            }),
             spm: None,
             bos_id: None,
         }
@@ -317,11 +326,10 @@ impl BpeTokenizer {
             path: path.to_path_buf(),
             source,
         })?;
-        let hf: HfTokenizer =
-            serde_json::from_slice(&bytes).map_err(|source| DlmError::Json {
-                context: "tokenizer.json".to_string(),
-                source,
-            })?;
+        let hf: HfTokenizer = serde_json::from_slice(&bytes).map_err(|source| DlmError::Json {
+            context: "tokenizer.json".to_string(),
+            source,
+        })?;
         let specials: Vec<(String, u32)> = hf
             .added_tokens
             .into_iter()
@@ -427,7 +435,9 @@ impl BpeTokenizer {
                         for chunk in pretokenize(&chunk_text) {
                             for symbol in self.bpe(chunk.as_bytes()) {
                                 let id = self.encoder.get(&symbol).ok_or_else(|| {
-                                    DlmError::Tokenizer(format!("token {symbol:?} not in vocabulary"))
+                                    DlmError::Tokenizer(format!(
+                                        "token {symbol:?} not in vocabulary"
+                                    ))
                                 })?;
                                 ids.push(*id);
                             }
@@ -518,7 +528,8 @@ impl BpeTokenizer {
                     continue;
                 }
                 let piece: String = norm[j..i].iter().collect();
-                if let (Some(&score), Some(&id)) = (u.scores.get(&piece), self.encoder.get(&piece)) {
+                if let (Some(&score), Some(&id)) = (u.scores.get(&piece), self.encoder.get(&piece))
+                {
                     let cand = best[j] + score;
                     if cand > best[i] {
                         best[i] = cand;
@@ -727,7 +738,10 @@ impl BpeTokenizer {
             // Find the adjacent pair with the lowest merge rank.
             let mut best: Option<(usize, u32)> = None;
             for i in 0..symbols.len() - 1 {
-                if let Some(&rank) = self.merges.get(&(symbols[i].clone(), symbols[i + 1].clone())) {
+                if let Some(&rank) = self
+                    .merges
+                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                {
                     if best.map_or(true, |(_, r)| rank < r) {
                         best = Some((i, rank));
                     }
@@ -819,7 +833,10 @@ fn detect_spm(
     let mut prepend = false;
     walk_spm_nodes(normalizer, &mut escapes, &mut prepend);
     walk_spm_nodes(pre_tokenizer, &mut escapes, &mut prepend);
-    escapes.then_some(SpmBpe { prepend, byte_fallback })
+    escapes.then_some(SpmBpe {
+        prepend,
+        byte_fallback,
+    })
 }
 
 /// Recurse through a normalizer/pre-tokenizer node (or a `Sequence` of them),
@@ -1201,6 +1218,9 @@ mod tests {
         )
         .unwrap();
         let tok = BpeTokenizer::from_hf_json(&path).unwrap();
-        assert_eq!(tok.decode(&tok.encode("hello world").unwrap()).unwrap(), "hello world");
+        assert_eq!(
+            tok.decode(&tok.encode("hello world").unwrap()).unwrap(),
+            "hello world"
+        );
     }
 }

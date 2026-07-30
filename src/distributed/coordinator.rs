@@ -123,12 +123,28 @@ impl Coordinator {
 
     fn logits(&self, hidden: &[f32]) -> Vec<f32> {
         let normed = rmsnorm(hidden, &self.final_norm, self.cfg.rms_eps);
-        matvec(&self.lm_head, &normed, self.vocab_size, self.cfg.hidden_size)
+        matvec(
+            &self.lm_head,
+            &normed,
+            self.vocab_size,
+            self.cfg.hidden_size,
+        )
     }
 
-    fn run_local_shard(&mut self, shard: LayerShard, hidden: &mut [f32], position: usize) -> Result<()> {
+    fn run_local_shard(
+        &mut self,
+        shard: LayerShard,
+        hidden: &mut [f32],
+        position: usize,
+    ) -> Result<()> {
         for l in shard.start..shard.end {
-            let out = decode_block(&self.cfg, &self.layers[l], hidden, &mut self.kv[l], position)?;
+            let out = decode_block(
+                &self.cfg,
+                &self.layers[l],
+                hidden,
+                &mut self.kv[l],
+                position,
+            )?;
             hidden.copy_from_slice(&out);
         }
         Ok(())
