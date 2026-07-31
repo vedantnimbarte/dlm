@@ -412,6 +412,54 @@ fn gpt2_family_fixture_parses_its_own_key_names() {
     assert_round_trip(&tok, "gpt2");
 }
 
+/// Falcon: parallel attention/FFN, multi-query, LayerNorm, ungated MLP.
+///
+/// `multi_query` is a *flag*, not a count -- a loader that reads
+/// `num_key_value_heads` and finds nothing would fall back to 71 KV heads
+/// instead of 1 and mis-shape every K/V projection.
+#[test]
+fn falcon_family_fixture() {
+    let Some(dir) = fixture("falcon") else {
+        eprintln!("skipping falcon: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("falcon config.json");
+    assert_eq!(cfg.num_attention_heads, 71);
+    assert_eq!(cfg.num_kv_heads, 1, "multi_query means one shared KV head");
+    assert!(cfg.parallel_residual, "falcon-7b sets parallel_attn");
+    assert_eq!(cfg.norm_kind, dlm::forward::cpu::NormKind::Layer);
+    assert_eq!(cfg.ffn_kind, dlm::forward::cpu::FfnKind::Plain);
+    assert!(!cfg.learned_positions, "Falcon uses RoPE, not wpe");
+
+    let tok = BpeTokenizer::from_dir(&dir).expect("falcon tokenizer");
+    assert_round_trip(&tok, "falcon");
+}
+
+/// The two Falcon variants dlm refuses rather than mis-decodes. Both would
+/// otherwise load and emit fluent, wrong text.
+#[test]
+fn falcon_alibi_and_new_decoder_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = r#""model_type":"falcon","hidden_size":64,"num_attention_heads":8,
+                  "num_hidden_layers":2,"vocab_size":128,"layer_norm_epsilon":1e-5"#;
+    for (extra, want) in [
+        (r#""alibi":true"#, "ALiBi"),
+        (
+            r#""new_decoder_architecture":true"#,
+            "new_decoder_architecture",
+        ),
+    ] {
+        std::fs::write(
+            dir.path().join("config.json"),
+            format!("{{{base},{extra}}}"),
+        )
+        .unwrap();
+        let err = ModelConfig::from_path(dir.path(), QuantScheme::Fp16)
+            .expect_err("must be refused, not silently mis-decoded");
+        assert!(format!("{err}").contains(want), "{err}");
+    }
+}
+
 /// Qwen is the control: genuinely byte-level BPE with `add_bos_token: false`.
 /// If SentencePiece detection ever over-fires, this is what catches it — the
 /// regression that would silently break every model that was working.

@@ -264,6 +264,13 @@ fn load_linear_rows(
     Ok(w)
 }
 
+/// True if this checkpoint uses Falcon's `transformer.h.{i}` tree.
+fn is_falcon_tree(store: &MmapStore) -> bool {
+    store
+        .locate("transformer.h.0.self_attention.query_key_value.weight")
+        .is_some()
+}
+
 /// True if this checkpoint uses GPT-2's `h.{i}` / `wte` / `ln_f` tensor tree.
 fn is_gpt2_tree(store: &MmapStore) -> bool {
     store.locate("wte.weight").is_some() && store.locate("h.0.attn.c_attn.weight").is_some()
@@ -478,6 +485,7 @@ impl ModelParts {
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
+        let head_norm = self.cfg.norm_kind;
         let kernel = CpuKernel::new(self.cfg, self.layers)?;
         Ok(Generator::new(
             kernel,
@@ -490,7 +498,7 @@ impl ModelParts {
             self.kv_blocks,
         )?
         .with_embed_scale(embed_scale)
-        .with_gpt2_head(wpe, ln_f_bias)
+        .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap))
     }
 
@@ -672,6 +680,66 @@ pub(crate) fn load_layer_tensors_opt(
     let intermediate = cfg.intermediate_size;
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     // load_linear takes (in_features, out_features) of the underlying Linear.
+    // Falcon: `transformer.h.{i}`, a fused `query_key_value`, an ungated MLP, and
+    // -- with `parallel_attn` -- a single `input_layernorm` feeding both
+    // sublayers. Weights are plain `nn.Linear` `[out, in]`, so they slice rather
+    // than transpose; the Conv1D transposition is GPT-2's problem, not Falcon's.
+    if is_falcon_tree(store) {
+        let p = format!("transformer.h.{layer}");
+        let qkv = format!("{p}.self_attention.query_key_value");
+        let fused = q_dim + 2 * kv_dim;
+        // `parallel_attn` reuses the one norm for the FFN too. Copying it into
+        // both slots keeps `ffn_input_norm` working without a special case, and
+        // the parallel-residual flag is what actually changes the dataflow.
+        let ln = load_tensor(store, &format!("{p}.input_layernorm.weight"), hidden)?;
+        let ln_bias = load_optional(store, &format!("{p}.input_layernorm.bias"), hidden)?;
+        return Ok(LayerTensors {
+            q_proj: load_linear_rows(store, &qkv, hidden, fused, 0, q_dim, quant)?,
+            k_proj: load_linear_rows(store, &qkv, hidden, fused, q_dim, kv_dim, quant)?,
+            v_proj: load_linear_rows(store, &qkv, hidden, fused, q_dim + kv_dim, kv_dim, quant)?,
+            o_proj: load_linear(
+                store,
+                &format!("{p}.self_attention.dense"),
+                q_dim,
+                hidden,
+                quant,
+                packed,
+            )?,
+            o_bias: load_optional(store, &format!("{p}.self_attention.dense.bias"), hidden)?,
+            ffn: Ffn::Dense(ExpertFfn {
+                // Ungated, so `gate` is never read.
+                gate: Weights::F32(Vec::new()),
+                up: load_linear(
+                    store,
+                    &format!("{p}.mlp.dense_h_to_4h"),
+                    hidden,
+                    intermediate,
+                    quant,
+                    packed,
+                )?,
+                down: load_linear(
+                    store,
+                    &format!("{p}.mlp.dense_4h_to_h"),
+                    intermediate,
+                    hidden,
+                    quant,
+                    packed,
+                )?,
+                up_bias: load_optional(
+                    store,
+                    &format!("{p}.mlp.dense_h_to_4h.bias"),
+                    intermediate,
+                )?,
+                down_bias: load_optional(store, &format!("{p}.mlp.dense_4h_to_h.bias"), hidden)?,
+            }),
+            input_layernorm: ln.clone(),
+            post_attention_layernorm: ln,
+            input_layernorm_bias: ln_bias.clone(),
+            post_attention_layernorm_bias: ln_bias,
+            ..Default::default()
+        });
+    }
+
     // GPT-2 uses a different tensor tree entirely (`h.{i}`, `attn.c_attn`,
     // `mlp.c_fc`), so it returns before anything reads a `model.layers.{i}.*`
     // name -- the FFN and both norms are loaded generically below and would fail
@@ -1273,12 +1341,17 @@ fn load_streaming_pieces(
     let vocab = config.vocab_size as usize;
 
     let gpt2 = is_gpt2_tree(&store);
-    let embedding = if gpt2 {
+    let falcon = is_falcon_tree(&store);
+    let embedding = if falcon {
+        load_tensor(&store, "transformer.word_embeddings.weight", vocab * hidden)?
+    } else if gpt2 {
         load_tensor(&store, "wte.weight", vocab * hidden)?
     } else {
         load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?
     };
-    let final_norm = if gpt2 {
+    let final_norm = if falcon {
+        load_tensor(&store, "transformer.ln_f.weight", hidden)?
+    } else if gpt2 {
         load_tensor(&store, "ln_f.weight", hidden)?
     } else {
         load_norm(&store, "model.norm.weight", hidden, config.norm_add_one)?
@@ -1427,12 +1500,17 @@ pub fn load_model_parts(
     }
 
     let gpt2 = is_gpt2_tree(store);
-    let embedding = if gpt2 {
+    let falcon = is_falcon_tree(store);
+    let embedding = if falcon {
+        load_tensor(store, "transformer.word_embeddings.weight", vocab * hidden)?
+    } else if gpt2 {
         load_tensor(store, "wte.weight", vocab * hidden)?
     } else {
         load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?
     };
-    let final_norm = if gpt2 {
+    let final_norm = if falcon {
+        load_tensor(store, "transformer.ln_f.weight", hidden)?
+    } else if gpt2 {
         load_tensor(store, "ln_f.weight", hidden)?
     } else {
         load_norm(store, "model.norm.weight", hidden, config.norm_add_one)?
@@ -1458,7 +1536,9 @@ pub fn load_model_parts(
     } else {
         None
     };
-    let final_norm_bias = if gpt2 {
+    let final_norm_bias = if falcon {
+        load_optional(store, "transformer.ln_f.bias", hidden)?
+    } else if gpt2 {
         load_optional(store, "ln_f.bias", hidden)?
     } else {
         None

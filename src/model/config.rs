@@ -167,6 +167,23 @@ struct RawConfig {
     /// Gemma2 decouples the attention scale from `head_dim` (144 on the 27B).
     #[serde(default)]
     query_pre_attn_scalar: Option<f32>,
+    /// Falcon: one KV head shared by every query head.
+    #[serde(default)]
+    multi_query: Option<bool>,
+    /// Falcon: attention and the FFN read the same norm and sum into one
+    /// residual. False on `falcon-rw-*`, which is sequential.
+    #[serde(default)]
+    parallel_attn: Option<bool>,
+    /// Falcon: ALiBi positional bias instead of RoPE. dlm does not implement it,
+    /// so a checkpoint declaring it is refused rather than run without it --
+    /// dropping a positional scheme yields fluent nonsense, not an error.
+    #[serde(default)]
+    alibi: Option<bool>,
+    /// Falcon-40B's grouped-KV layout, which interleaves query_key_value by head
+    /// group rather than concatenating Q|K|V. Refused: slicing it as a concat
+    /// loads plausible, wrong weights.
+    #[serde(default)]
+    new_decoder_architecture: Option<bool>,
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -725,6 +742,30 @@ impl ModelConfig {
             model_type.as_str(),
             "falcon" | "refinedweb" | "refinedwebmodel"
         );
+        // Two Falcon variants dlm cannot decode correctly, refused up front. Both
+        // would otherwise load and run: a dropped positional scheme and a
+        // mis-sliced fused tensor each produce fluent, wrong output rather than
+        // an error, which is the failure this project refuses to ship.
+        if is_falcon {
+            if raw.alibi.unwrap_or(false) {
+                return Err(DlmError::InvalidConfig(
+                    "this Falcon checkpoint uses ALiBi positional bias (`alibi: true`, e.g. \
+                     falcon-rw-*), which dlm does not implement. Running it without ALiBi \
+                     would not error -- it would silently mis-place every token. Use a \
+                     variant with `alibi: false`."
+                        .into(),
+                ));
+            }
+            if raw.new_decoder_architecture.unwrap_or(false) {
+                return Err(DlmError::InvalidConfig(
+                    "this Falcon checkpoint sets `new_decoder_architecture` (Falcon-40B), whose \
+                     query_key_value is interleaved by head group rather than concatenated \
+                     Q|K|V. dlm splits the concatenated layout; slicing the interleaved one \
+                     loads plausible but incorrect weights."
+                        .into(),
+                ));
+            }
+        }
         let norm_kind = if is_gpt2 || is_falcon {
             crate::forward::cpu::NormKind::Layer
         } else {
@@ -746,7 +787,15 @@ impl ModelConfig {
             hidden_size: raw.hidden_size,
             num_attention_heads: raw.num_attention_heads,
             // Default to full multi-head attention when kv-heads is unspecified.
-            num_kv_heads: raw.num_key_value_heads.unwrap_or(raw.num_attention_heads),
+            num_kv_heads: raw.num_key_value_heads.unwrap_or_else(|| {
+                // Falcon states this as a flag, not a count: `multi_query` means
+                // one KV head shared by every query head.
+                if is_falcon && raw.multi_query.unwrap_or(false) {
+                    1
+                } else {
+                    raw.num_attention_heads
+                }
+            }),
             num_layers: raw.num_hidden_layers,
             vocab_size: raw.vocab_size,
             intermediate_size: raw
@@ -774,9 +823,11 @@ impl ModelConfig {
             sliding_window: raw.sliding_window.filter(|&w| w > 0),
             norm_add_one: is_gemma,
             norm_kind,
-            parallel_residual: is_falcon,
+            parallel_residual: is_falcon && raw.parallel_attn.unwrap_or(true),
             learned_positions: is_gpt2,
-            ffn_kind: if is_gpt2 {
+            // Falcon's MLP is `dense_4h_to_h(gelu(dense_h_to_4h(x)))` -- ungated,
+            // like GPT-2 and unlike every Llama-descended family.
+            ffn_kind: if is_gpt2 || is_falcon {
                 crate::forward::cpu::FfnKind::Plain
             } else {
                 crate::forward::cpu::FfnKind::Gated

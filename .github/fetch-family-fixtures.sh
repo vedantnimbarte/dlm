@@ -63,4 +63,8 @@ fetch phi-3       microsoft/Phi-3-mini-4k-instruct            # fused qkv/gate_u
 # The one family that is not Llama-descended: LayerNorm, learned positions, an
 # ungated MLP, and a config whose every key is spelled differently.
 fetch gpt2        openai-community/gpt2                       # n_embd/n_head/n_layer
+# Parallel attention/FFN, multi-query, LayerNorm, ungated MLP. Config only --
+# the weights are 14 GB, which is why this family is config-verified rather than
+# run end-to-end (see RELEASING.md).
+fetch falcon      tiiuae/falcon-7b                            # multi_query flag
 echo "done: $(du -sh "$dest" | cut -f1) total"

@@ -74,6 +74,14 @@ release is a claim, and these bound it.
   advertises it on the streaming GPU path; that has never been executed against
   real weights, because a 4 GB card cannot meaningfully stream a 30 GB
   checkpoint. The synthetic GPU parity tests pass, which is not the same claim.
+- **Falcon has never been run.** The loader, config handling and refusals are in
+  place and covered by a real `falcon-7b` config fixture, but no Falcon
+  checkpoint has been executed: the smallest variant with `alibi: false` is
+  14 GB, and the 1B `falcon-rw-*` uses ALiBi, which dlm refuses. So Falcon is
+  *config-verified*, not *output-verified* — a weaker claim than Phi-3 (whose
+  weight mapping is proven by a same-weights-twice equivalence test) or GPT-2
+  (which answers correctly on the real checkpoint). Run check 2 against a Falcon
+  before claiming it works.
 - **Llama 2 is untested.** It shares Mistral's SentencePiece tokenizer shape,
   which is verified, so it is expected to work — expected, not demonstrated.
 

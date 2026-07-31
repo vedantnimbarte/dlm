@@ -44,6 +44,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Previously only the byte count was checked, which catches truncation and
   nothing else. A file that fails is deleted, so the next `pull` refetches it
   rather than treating it as already complete.
+- **Falcon support** (config-verified). Parallel attention/FFN, multi-query,
+  LayerNorm, ungated MLP, fused `query_key_value`. ALiBi variants and
+  Falcon-40B's interleaved layout are refused rather than mis-decoded.
 - **GPT-2 support.** The first family dlm supports that is not Llama-descended:
   LayerNorm rather than RMSNorm, learned position embeddings instead of RoPE, an
   ungated MLP, biases on every projection, and `Conv1D` weights stored

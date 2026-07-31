@@ -343,15 +343,18 @@ impl<K: ComputeKernel> Generator<K> {
 
     /// Scale token embeddings by `scale` after lookup (Gemma uses `sqrt(hidden)`).
     /// `None` leaves them unscaled.
-    /// Attach GPT-2's learned position embeddings and LayerNorm final norm.
-    pub fn with_gpt2_head(
+    /// Attach learned position embeddings and the final-norm kind.
+    ///
+    /// `norm_kind` is passed explicitly rather than inferred from the presence of
+    /// `position_embedding`: Falcon needs a LayerNorm head and has no `wpe`, so
+    /// inferring one from the other would silently give it an RMSNorm head.
+    pub fn with_head(
         mut self,
         position_embedding: Option<Vec<f32>>,
         final_norm_bias: Option<Vec<f32>>,
+        norm_kind: crate::forward::cpu::NormKind,
     ) -> Self {
-        if position_embedding.is_some() {
-            self.final_norm_kind = crate::forward::cpu::NormKind::Layer;
-        }
+        self.final_norm_kind = norm_kind;
         self.position_embedding = position_embedding;
         self.final_norm_bias = final_norm_bias;
         self
