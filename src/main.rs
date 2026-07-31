@@ -1381,12 +1381,19 @@ fn install_signal_handler() -> dlm::server::Shutdown {
             }
         }
 
+        // Cast through `*const ()` rather than straight to the integer
+        // `sighandler_t`: a direct function-item-to-integer cast is
+        // `clippy::fn_to_numeric_cast_any`, and it is a lint worth heeding —
+        // the item type is zero-sized, so which address you get is not
+        // something the cast makes obvious.
+        let handler_addr = on_signal as *const () as libc::sighandler_t;
+
         // SAFETY: `signal` with a valid signal number and an `extern "C"` handler
         // is defined behaviour. `on_signal` touches only an `AtomicBool`, which is
         // async-signal-safe; everything else is deferred to the watcher below.
         unsafe {
-            libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-            libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handler_addr);
+            libc::signal(libc::SIGINT, handler_addr);
         }
 
         let watcher = shutdown.clone();
