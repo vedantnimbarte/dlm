@@ -153,6 +153,64 @@ const MAX_CONNECTIONS: usize = 256;
 /// How long a shed client is asked to wait before retrying, in seconds.
 const RETRY_AFTER_SECS: u32 = 1;
 
+/// How long in-flight requests are given to finish after shutdown is triggered.
+///
+/// Shorter than the grace period supervisors allow before `SIGKILL` (Docker and
+/// Kubernetes both default to 10s), so the drain completes on its own terms
+/// rather than being killed halfway.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// A trigger that stops a running [`HttpServer`] and drains it.
+///
+/// Cloneable and cheap: hand one to a signal handler and keep another for the
+/// server. Triggering is idempotent.
+#[derive(Clone)]
+pub struct Shutdown {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    /// The address the server is listening on, published once it is serving.
+    ///
+    /// `TcpListener::accept` blocks, and there is no portable way to interrupt
+    /// it. Setting the flag alone would not be noticed until the *next*
+    /// connection arrived, which on an idle server is never. So the trigger also
+    /// dials the listener itself: the loop wakes, sees the flag, and breaks.
+    addr: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Shutdown {
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            addr: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// True once [`trigger`](Self::trigger) has been called.
+    pub fn is_triggered(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Stop the server: set the flag, then wake the blocked `accept`.
+    pub fn trigger(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        // Best-effort wake. If the connection fails the server is already down,
+        // or it is mid-accept and will observe the flag on its next pass.
+        if let Some(addr) = *self.addr.lock().unwrap() {
+            let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+        }
+    }
+
+    /// Record where the server is listening, so `trigger` knows what to dial.
+    fn bind_addr(&self, addr: SocketAddr) {
+        *self.addr.lock().unwrap() = Some(addr);
+    }
+}
+
 /// Decrements the live-connection counter on drop.
 ///
 /// The counter is incremented before the connection thread is spawned and must be
@@ -215,9 +273,35 @@ impl HttpServer {
     /// Concurrency is capped at [`MAX_CONNECTIONS`]. Past the cap the connection is
     /// answered with `503 Service Unavailable` and a `Retry-After`, then closed —
     /// shedding, not queueing, and not a silent TCP reset.
+    ///
+    /// Runs until the process ends. To stop cleanly, use
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown).
     pub fn serve(self, handler: Handler) -> Result<()> {
+        self.serve_with_shutdown(handler, Shutdown::new())
+    }
+
+    /// Serve until `shutdown` is triggered, then drain in-flight requests.
+    ///
+    /// `SIGTERM` is how every supervisor stops a process — `docker stop`,
+    /// systemd, a Kubernetes pod eviction — and each follows it with `SIGKILL`
+    /// after a grace period. Without this the server had no stop path at all: the
+    /// accept loop ran until the process died, cutting in-flight generations and
+    /// leaving SSE streams without their terminating chunk, so every deploy
+    /// dropped live requests.
+    ///
+    /// On trigger the listener stops accepting and existing connections are given
+    /// up to [`DRAIN_TIMEOUT`] to finish. Requests already being served run to
+    /// completion; new ones are refused by closing the socket, because a client
+    /// that reconnects to a load balancer will be routed to a live instance.
+    pub fn serve_with_shutdown(self, handler: Handler, shutdown: Shutdown) -> Result<()> {
         let live = Arc::new(AtomicUsize::new(0));
+        // The waker connects to this to break `accept`'s block.
+        shutdown.bind_addr(self.local_addr()?);
+
         for stream in self.listener.incoming() {
+            if shutdown.is_triggered() {
+                break;
+            }
             let Ok(mut stream) = stream else { continue };
 
             // Over the cap: answer with a status the client can act on. A bare
@@ -241,6 +325,13 @@ impl HttpServer {
                     // Per-connection errors are non-fatal; drop the connection.
                 }
             });
+        }
+
+        // Drain. Requests already in flight keep their slot until they finish, so
+        // waiting for the counter to reach zero is waiting for them.
+        let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+        while live.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
         }
         Ok(())
     }
@@ -570,6 +661,72 @@ mod tests {
     }
 
     // ---- `A9`: the hardening constants, none of which had a test ----
+
+    /// `A7`: triggering shutdown stops the accept loop on an *idle* server.
+    ///
+    /// The flag alone is not enough — `accept` blocks, so an idle server would
+    /// never notice it. `trigger` therefore dials the listener to wake it. Without
+    /// that this test hangs, which is the whole point of it.
+    #[test]
+    fn shutdown_stops_an_idle_server() {
+        let server = HttpServer::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let shutdown = Shutdown::new();
+        let handler: Handler = Arc::new(|_: &Request| Response::text(200, "ok"));
+
+        let s = shutdown.clone();
+        let joined = std::thread::spawn(move || server.serve_with_shutdown(handler, s).unwrap());
+
+        // Serve one request so we know it is up, then stop it.
+        assert!(round_trip(addr, "GET /x HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 200"));
+        assert!(!shutdown.is_triggered());
+        shutdown.trigger();
+        assert!(shutdown.is_triggered());
+
+        // `serve_with_shutdown` must return rather than block forever.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !joined.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            joined.is_finished(),
+            "serve_with_shutdown did not return after trigger"
+        );
+        joined.join().unwrap();
+    }
+
+    /// `A7`: a request already being served runs to completion during the drain.
+    ///
+    /// Shutdown that cut in-flight work would be a crash with extra steps; the
+    /// point is that `docker stop` stops dropping live requests.
+    #[test]
+    fn shutdown_drains_a_request_already_in_flight() {
+        let server = HttpServer::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let shutdown = Shutdown::new();
+
+        // Handler is slow enough that shutdown lands while it is still running.
+        let handler: Handler = Arc::new(|_: &Request| {
+            std::thread::sleep(Duration::from_millis(300));
+            Response::text(200, "finished")
+        });
+
+        let s = shutdown.clone();
+        std::thread::spawn(move || server.serve_with_shutdown(handler, s).unwrap());
+
+        let client = std::thread::spawn(move || round_trip(addr, "GET /slow HTTP/1.1\r\n\r\n"));
+
+        // Trigger while the handler is mid-flight.
+        std::thread::sleep(Duration::from_millis(60));
+        shutdown.trigger();
+
+        let resp = client.join().unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "in-flight request was cut: {resp}"
+        );
+        assert!(resp.contains("finished"), "{resp}");
+    }
 
     /// `MAX_LINE_BYTES`: a client that streams bytes and never sends `\n` must not
     /// drive unbounded allocation in `read_line`.

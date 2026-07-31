@@ -1344,7 +1344,63 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         println!("  auth       : bearer token required on /v1/*");
     }
     let router = dlm::server::engine::secured_router(engine, args.api_key.clone());
-    server.serve(router) // blocks
+    let shutdown = install_signal_handler();
+    server.serve_with_shutdown(router, shutdown) // blocks until signalled
+}
+
+/// Return a [`Shutdown`] wired to `SIGTERM`/`SIGINT` where the platform allows.
+///
+/// `SIGTERM` is how supervisors stop a process — `docker stop`, systemd, a
+/// Kubernetes eviction — each followed by `SIGKILL` after a grace period. Without
+/// a handler the server died mid-generation and cut SSE streams without their
+/// terminating chunk, so every deploy dropped live requests.
+///
+/// **Unix only.** `libc` is already a Unix-only dependency and the standard
+/// library exposes no portable signal API. On Windows the handle is returned
+/// untriggered, so `serve_with_shutdown` behaves exactly like `serve` did — no
+/// regression, just no graceful path. Wiring `SetConsoleCtrlHandler` would mean a
+/// new dependency for the one platform least likely to run this under a
+/// supervisor.
+fn install_signal_handler() -> dlm::server::Shutdown {
+    let shutdown = dlm::server::Shutdown::new();
+
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        // The handler runs in a signal context, where almost nothing is legal to
+        // call. It may only touch an atomic — so it sets a flag, and a watcher
+        // thread does the real work (dialing the listener to wake `accept`).
+        static FLAG: OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+        let flag = FLAG
+            .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone();
+
+        extern "C" fn on_signal(_sig: libc::c_int) {
+            if let Some(f) = FLAG.get() {
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        // SAFETY: `signal` with a valid signal number and an `extern "C"` handler
+        // is defined behaviour. `on_signal` touches only an `AtomicBool`, which is
+        // async-signal-safe; everything else is deferred to the watcher below.
+        unsafe {
+            libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
+            libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
+        }
+
+        let watcher = shutdown.clone();
+        std::thread::spawn(move || loop {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("dlm: shutdown signal received; draining in-flight requests");
+                watcher.trigger();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+    }
+
+    shutdown
 }
 
 /// Shared planner/reporter: map the model (if a dir is given), profile it, size
