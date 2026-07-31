@@ -524,6 +524,8 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
     Ok(ModelParts {
+        position_embedding: None,
+        final_norm_bias: None,
         cfg,
         layers,
         embedding,

@@ -380,6 +380,38 @@ fn phi3_family_fixture() {
     assert_round_trip(&tok, "phi-3");
 }
 
+/// GPT-2: the one family that is not Llama-descended.
+///
+/// Its config spells every core dimension differently (`n_embd`, `n_head`,
+/// `n_layer`) and ships **both** `n_ctx` and `n_positions` -- aliasing both
+/// makes serde reject the file as a duplicate field, which is exactly the bug
+/// that made every Gemma2 config unparseable. This fixture is what stops that
+/// being reintroduced.
+#[test]
+fn gpt2_family_fixture_parses_its_own_key_names() {
+    let Some(dir) = fixture("gpt2") else {
+        eprintln!("skipping gpt2: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::F32).expect("gpt2 config.json");
+    assert_eq!(cfg.hidden_size, 768, "n_embd");
+    assert_eq!(cfg.num_attention_heads, 12, "n_head");
+    assert_eq!(cfg.num_layers, 12, "n_layer");
+    assert_eq!(cfg.vocab_size, 50257);
+    // GPT-2 predates GQA: kv heads equal attention heads.
+    assert_eq!(cfg.num_kv_heads, cfg.num_attention_heads);
+    // LayerNorm, learned positions, ungated MLP -- the three ways its block
+    // differs from every other family dlm supports.
+    assert_eq!(cfg.norm_kind, dlm::forward::cpu::NormKind::Layer);
+    assert!(cfg.learned_positions, "GPT-2 uses wpe, not RoPE");
+    assert_eq!(cfg.ffn_kind, dlm::forward::cpu::FfnKind::Plain);
+    assert!(!cfg.parallel_residual, "that is Falcon, not GPT-2");
+
+    let tok = BpeTokenizer::from_dir(&dir).expect("gpt2 tokenizer");
+    assert_pieces(&tok, &["The", "Ġcapital", "Ġof", "ĠFrance", "Ġis"], "gpt2");
+    assert_round_trip(&tok, "gpt2");
+}
+
 /// Qwen is the control: genuinely byte-level BPE with `add_bos_token: false`.
 /// If SentencePiece detection ever over-fires, this is what catches it — the
 /// regression that would silently break every model that was working.

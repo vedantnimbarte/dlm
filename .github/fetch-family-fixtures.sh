@@ -60,4 +60,7 @@ fetch mixtral     NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO # block_sparse_moe
 # covered by tests/phi3_fused.rs, which needs no checkpoint; this is the config
 # half.
 fetch phi-3       microsoft/Phi-3-mini-4k-instruct            # fused qkv/gate_up
+# The one family that is not Llama-descended: LayerNorm, learned positions, an
+# ungated MLP, and a config whose every key is spelled differently.
+fetch gpt2        openai-community/gpt2                       # n_embd/n_head/n_layer
 echo "done: $(du -sh "$dest" | cut -f1) total"

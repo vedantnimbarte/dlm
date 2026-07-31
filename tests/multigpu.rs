@@ -69,6 +69,8 @@ fn build_parts() -> ModelParts {
         })
         .collect();
     ModelParts {
+        position_embedding: None,
+        final_norm_bias: None,
         cfg,
         layers,
         embedding: rng.vec(vocab * hidden, s),

@@ -516,9 +516,16 @@ impl ExpertFfn {
     }
 
     /// Validate the three matrices against `[inter, hidden]` / `[hidden, inter]`.
-    fn validate(&self, label: &str, hidden: usize, inter: usize) -> Result<()> {
+    fn validate(&self, label: &str, hidden: usize, inter: usize, kind: FfnKind) -> Result<()> {
+        // GPT-2's MLP is ungated: there is no gate matrix in the checkpoint, so
+        // requiring one would reject a well-formed layer. `kind` comes from the
+        // block config, so a gated family still cannot smuggle an absent gate past.
+        let gate_expected = match kind {
+            FfnKind::Gated => inter * hidden,
+            FfnKind::Plain => 0,
+        };
         for (name, got, expected) in [
-            ("gate", self.gate.len(), inter * hidden),
+            ("gate", self.gate.len(), gate_expected),
             ("up", self.up.len(), inter * hidden),
             ("down", self.down.len(), hidden * inter),
         ] {
@@ -855,7 +862,7 @@ impl LayerTensors {
     fn validate_ffn(&self, cfg: &BlockConfig) -> Result<()> {
         let h = cfg.hidden_size;
         match (&self.ffn, cfg.moe) {
-            (Ffn::Dense(f), None) => f.validate("ffn", h, cfg.intermediate_size),
+            (Ffn::Dense(f), None) => f.validate("ffn", h, cfg.intermediate_size, cfg.ffn_kind),
             (
                 Ffn::Moe {
                     router,
@@ -875,11 +882,11 @@ impl LayerTensors {
                     )));
                 }
                 for (e, ffn) in experts.iter().enumerate() {
-                    ffn.validate(&format!("expert[{e}]"), h, inter)?;
+                    ffn.validate(&format!("expert[{e}]"), h, inter, FfnKind::Gated)?;
                 }
                 match (shared, m.shared_intermediate_size) {
                     (Some(s), Some(si)) => {
-                        s.validate("shared_expert", h, si as usize)?;
+                        s.validate("shared_expert", h, si as usize, FfnKind::Gated)?;
                         if let Some(g) = shared_gate {
                             if g.len() != h {
                                 return Err(DlmError::QuantLayout(format!(

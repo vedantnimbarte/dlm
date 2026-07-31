@@ -15,7 +15,7 @@
 
 use crate::cache::{KvCacheConfig, PagedKvCache};
 use crate::error::{DlmError, Result};
-use crate::forward::cpu::{matvec, rmsnorm, KvLayerCache};
+use crate::forward::cpu::{matvec, KvLayerCache};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
 
 /// Index of the largest logit (greedy pick; first max wins on ties).
@@ -272,6 +272,17 @@ pub struct Generator<K: ComputeKernel> {
     /// Scalar applied to each token embedding after lookup (Gemma multiplies by
     /// `sqrt(hidden)`); `None` leaves embeddings unscaled.
     embed_scale: Option<f32>,
+    /// GPT-2's learned absolute position embeddings (`wpe`), `[max_pos, hidden]`.
+    ///
+    /// GPT-2 encodes position by *adding* this to the token embedding before the
+    /// first block, and applies no rotary at all. Leaving it out is not a subtle
+    /// loss of quality -- the model then has no positional signal whatsoever and
+    /// degenerates into repeating one token.
+    position_embedding: Option<Vec<f32>>,
+    /// Bias for the final norm. Present only when that norm is a LayerNorm.
+    final_norm_bias: Option<Vec<f32>>,
+    /// Which normalization the final norm uses; must match the blocks'.
+    final_norm_kind: crate::forward::cpu::NormKind,
     /// Gemma2 caps the final logits at `tanh(l/cap)*cap` before sampling, which
     /// changes the distribution (it compresses the tail toward the cap), so it is
     /// part of correctness rather than a stylistic knob. `None` elsewhere.
@@ -316,6 +327,9 @@ impl<K: ComputeKernel> Generator<K> {
             kv_total_blocks,
             kv_quant: crate::forward::KvQuant::None,
             embed_scale: None,
+            position_embedding: None,
+            final_norm_bias: None,
+            final_norm_kind: crate::forward::cpu::NormKind::Rms,
             final_logit_softcap: None,
         })
     }
@@ -329,6 +343,20 @@ impl<K: ComputeKernel> Generator<K> {
 
     /// Scale token embeddings by `scale` after lookup (Gemma uses `sqrt(hidden)`).
     /// `None` leaves them unscaled.
+    /// Attach GPT-2's learned position embeddings and LayerNorm final norm.
+    pub fn with_gpt2_head(
+        mut self,
+        position_embedding: Option<Vec<f32>>,
+        final_norm_bias: Option<Vec<f32>>,
+    ) -> Self {
+        if position_embedding.is_some() {
+            self.final_norm_kind = crate::forward::cpu::NormKind::Layer;
+        }
+        self.position_embedding = position_embedding;
+        self.final_norm_bias = final_norm_bias;
+        self
+    }
+
     pub fn with_embed_scale(mut self, scale: Option<f32>) -> Self {
         self.embed_scale = scale;
         self
@@ -356,7 +384,7 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// Embed a token id into a fresh hidden vector.
-    fn embed(&self, token: u32) -> Result<Vec<f32>> {
+    fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
         let idx = token as usize;
         if idx >= self.vocab_size {
             return Err(DlmError::InvalidConfig(format!(
@@ -371,12 +399,29 @@ impl<K: ComputeKernel> Generator<K> {
                 *x *= scale;
             }
         }
+        // GPT-2: add the learned position embedding. Clamped rather than wrapped
+        // past the trained range -- a wrapped position is silently wrong, while a
+        // clamped one degrades predictably at the edge.
+        if let Some(wpe) = &self.position_embedding {
+            let rows = wpe.len() / self.hidden_size;
+            let row = position.min(rows.saturating_sub(1));
+            let base = row * self.hidden_size;
+            for (x, p) in v.iter_mut().zip(&wpe[base..base + self.hidden_size]) {
+                *x += p;
+            }
+        }
         Ok(v)
     }
 
     /// Project a hidden state to vocabulary logits via final norm + LM head.
     fn logits(&self, hidden: &[f32]) -> Vec<f32> {
-        let normed = rmsnorm(hidden, &self.final_norm, self.rms_eps);
+        let normed = crate::forward::cpu::norm(
+            hidden,
+            &self.final_norm,
+            self.final_norm_bias.as_deref(),
+            self.rms_eps,
+            self.final_norm_kind,
+        );
         let mut out = matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
         if let Some(cap) = self.final_logit_softcap {
             for l in out.iter_mut() {
@@ -427,7 +472,7 @@ impl<K: ComputeKernel> Generator<K> {
         // first decode step samples from) and `position[s]` is the next position.
         for (s, prompt) in prompts.iter().enumerate() {
             for &tok in *prompt {
-                let mut h = self.embed(tok)?;
+                let mut h = self.embed(tok, position[s])?;
                 for (l, kv) in kvs[s].iter_mut().enumerate() {
                     self.kernel.run_block(l as u32, &mut h, kv, position[s])?;
                 }
@@ -462,7 +507,7 @@ impl<K: ComputeKernel> Generator<K> {
                     done[s] = true;
                     continue;
                 }
-                hidden[s] = self.embed(next)?;
+                hidden[s] = self.embed(next, position[s])?;
             }
             if done.iter().all(|&d| d) {
                 break;
@@ -499,7 +544,7 @@ impl<K: ComputeKernel> Generator<K> {
         // Prefill: run every prompt token, carrying the last hidden state.
         let mut hidden = vec![0.0f32; self.hidden_size];
         for &token in prompt {
-            hidden = self.embed(token)?;
+            hidden = self.embed(token, orch.position())?;
             orch.decode_token(&mut hidden)?;
         }
 
@@ -518,7 +563,7 @@ impl<K: ComputeKernel> Generator<K> {
             if cfg.eos_token == Some(next) {
                 break;
             }
-            hidden = self.embed(next)?;
+            hidden = self.embed(next, orch.position())?;
             orch.decode_token(&mut hidden)?;
         }
         Ok(generated)
@@ -555,7 +600,7 @@ impl<K: ComputeKernel> Generator<K> {
             crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
         let mut hidden = vec![0.0f32; self.hidden_size];
         for &token in prompt {
-            hidden = self.embed(token)?;
+            hidden = self.embed(token, orchestrator.position())?;
             orchestrator.decode_token(&mut hidden)?;
         }
         Ok(GenerationSession {
@@ -602,7 +647,7 @@ impl<K: ComputeKernel> Generator<K> {
         let mut orchestrator = ForwardOrchestrator::resume(&self.kernel, budget, snapshot)?;
         let mut hidden = vec![0.0f32; self.hidden_size];
         for &token in suffix {
-            hidden = self.embed(token)?;
+            hidden = self.embed(token, orchestrator.position())?;
             orchestrator.decode_token(&mut hidden)?;
         }
         Ok(GenerationSession {
@@ -641,7 +686,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
         let next = self.sampler.sample(&logits, &mut self.rng);
         self.seen.insert(next);
-        self.last_hidden = self.generator.embed(next)?;
+        self.last_hidden = self.generator.embed(next, self.orchestrator.position())?;
         self.orchestrator.decode_token(&mut self.last_hidden)?;
         Ok(next)
     }

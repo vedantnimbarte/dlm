@@ -54,21 +54,31 @@ struct RawConfig {
     /// both are present, matching transformers' Gemma2Config.
     #[serde(default)]
     hidden_activation: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "activation_function")]
     hidden_act: Option<String>,
+    /// GPT-2 spells the core dimensions `n_embd`/`n_head`/`n_layer`/`n_positions`.
+    /// They mean the same things, so they are aliases rather than a second config
+    /// path -- a second path is a second place for every later field to be
+    /// forgotten.
+    #[serde(alias = "n_embd")]
     hidden_size: u32,
+    #[serde(alias = "n_head")]
     num_attention_heads: u32,
     #[serde(default)]
     num_key_value_heads: Option<u32>,
+    #[serde(alias = "n_layer")]
     num_hidden_layers: u32,
     vocab_size: u32,
     #[serde(default)]
     intermediate_size: Option<u32>,
-    #[serde(default)]
+    /// Aliased to `n_positions` only, **not** `n_ctx`: GPT-2 ships both with the
+    /// same value, and serde rejects a doubly-matched field -- the exact shape of
+    /// the bug that made every Gemma2 config unparseable.
+    #[serde(default, alias = "n_positions")]
     max_position_embeddings: Option<u32>,
     #[serde(default)]
     rope_theta: Option<f32>,
-    #[serde(default)]
+    #[serde(default, alias = "layer_norm_epsilon")]
     rms_norm_eps: Option<f32>,
     /// Explicit per-head dimension. Most models omit it (it is then
     /// `hidden_size / num_attention_heads`), but some declare a `head_dim` that

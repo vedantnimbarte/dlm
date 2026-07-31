@@ -115,7 +115,7 @@ jobs:
       - name: Require every fixture (a silent skip would prove nothing)
         run: |
           for f in gemma-2 llama-2 mistral deepseek-v2 qwen2.5 \
-                   llama-3 gemma-1 qwen3 qwen2-moe mixtral phi-3; do
+                   llama-3 gemma-1 qwen3 qwen2-moe mixtral phi-3 gpt2; do
             test -s "models/fixtures/$f/config.json"
             test -s "models/fixtures/$f/tokenizer.json"
           done
