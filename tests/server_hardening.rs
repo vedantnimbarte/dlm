@@ -69,7 +69,9 @@ fn start_server(api_key: Option<&str>) -> SocketAddr {
 fn request(addr: SocketAddr, path: &str, headers: &str, body: &str) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
     let raw = format!(
-        "POST {path} HTTP/1.1\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+        // Explicitly single-shot: this helper reads to EOF, so a persistent
+        // connection would block it until the server's read timeout.
+        "POST {path} HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(raw.as_bytes()).unwrap();
@@ -114,7 +116,8 @@ fn api_key_gates_v1_endpoints() {
     .starts_with("HTTP/1.1 200"));
     // Health stays open.
     let mut s = TcpStream::connect(addr).unwrap();
-    s.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+    s.write_all(b"GET /health HTTP/1.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
     let mut r = String::new();
     s.read_to_string(&mut r).unwrap();
     assert!(r.starts_with("HTTP/1.1 200"), "{r}");
@@ -123,7 +126,7 @@ fn api_key_gates_v1_endpoints() {
 /// Issue a bare GET and return the raw response.
 fn get(addr: SocketAddr, target: &str, headers: &str) -> String {
     let mut s = TcpStream::connect(addr).unwrap();
-    s.write_all(format!("GET {target} HTTP/1.1\r\n{headers}\r\n").as_bytes())
+    s.write_all(format!("GET {target} HTTP/1.1\r\nConnection: close\r\n{headers}\r\n").as_bytes())
         .unwrap();
     let mut r = String::new();
     s.read_to_string(&mut r).unwrap();
@@ -196,7 +199,9 @@ fn oversized_body_is_rejected() {
     // A Content-Length past the cap is refused before the body is read.
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
-        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n")
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nConnection: close\r\nContent-Length: 999999999\r\n\r\n",
+        )
         .unwrap();
     let mut resp = String::new();
     stream.read_to_string(&mut resp).unwrap();

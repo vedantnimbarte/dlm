@@ -66,7 +66,10 @@ fn start_server() -> SocketAddr {
 fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
     let raw = format!(
-        "{method} {path} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        // `Connection: close` is explicit: these helpers read to EOF, so a
+        // persistent connection would leave them blocking until the server's
+        // read timeout rather than returning a response.
+        "{method} {path} HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(raw.as_bytes()).unwrap();

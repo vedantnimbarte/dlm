@@ -121,7 +121,8 @@ fn post_auth(addr: SocketAddr, path: &str, body: &str, key: Option<&str>) -> Str
         .map(|k| format!("Authorization: Bearer {k}\r\n"))
         .unwrap_or_default();
     let raw = format!(
-        "POST {path} HTTP/1.1\r\nContent-Type: application/json\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+        // Explicitly single-shot: this helper reads to EOF.
+        "POST {path} HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\n{auth}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(raw.as_bytes()).unwrap();
@@ -187,7 +188,8 @@ fn distributed_api_key_gates_completions() {
     // Health stays public.
     let health = {
         let mut s = TcpStream::connect(addr).unwrap();
-        s.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
         let mut r = String::new();
         s.read_to_string(&mut r).unwrap();
         r
