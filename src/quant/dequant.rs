@@ -1,6 +1,6 @@
 //! 4-bit group-affine dequantization kernel (AWQ/GPTQ-style).
 //!
-//! `dlm` streams 4-bit quantized weights (`specs.md` §3.1: 0.5 bytes/param) to
+//! `dlm` streams 4-bit quantized weights (: 0.5 bytes/param) to
 //! keep the model small on disk and on the PCIe bus. Before a layer can be used
 //! in a matmul it must be expanded back to a floating form — that expansion is
 //! this module.

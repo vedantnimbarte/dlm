@@ -1,4 +1,4 @@
-//! GPU layer-streaming compute kernel (`specs.md` §2.2/§3.2) — the combined path
+//! GPU layer-streaming compute kernel — the combined path
 //! that actually delivers the product thesis: **run a model larger than VRAM on
 //! the GPU** by keeping only a bounded window of layer *weights* resident in VRAM
 //! and streaming the rest in over PCIe on demand, while each layer's KV history

@@ -1,4 +1,4 @@
-//! `dlm` binary — command-line entry point (`specs.md` §4).
+//! `dlm` binary — command-line entry point.
 //!
 //! Two subcommands:
 //! * `dlm profile` — map/estimate a model and print the VRAM plan, KV-cache
@@ -794,13 +794,13 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             };
 
             if !args.multi_gpu_ids.is_empty() {
-                // Split the target across local GPUs (specs §3.3); the small,
+                // Split the target across local GPUs; the small,
                 // pinned draft stays on the first GPU.
                 let ids = args.multi_gpu_ids.clone();
                 let split =
                     dlm::distributed::partition_layers(config.num_layers as usize, ids.len());
                 println!();
-                println!("multi-gpu    : pipeline-parallel layer split (specs §3.3)");
+                println!("multi-gpu    : pipeline-parallel layer split");
                 for (stage, shard) in split.iter().enumerate() {
                     println!(
                         "  gpu {:<6}: layers {}..{} ({} layer(s))",
@@ -1495,7 +1495,7 @@ fn report_plan(
         swap.staging_bytes(plan.per_layer_weight_bytes) as f64 / (1024.0 * 1024.0),
     );
 
-    // Build the double-buffered A/B schedule (specs §3.2).
+    // Build the double-buffered A/B schedule.
     let sched = DoubleBufferSchedule::from_swap_plan(&swap);
     println!(
         "pipeline     : {} steps, {} overlapped (DMA hidden under compute)",

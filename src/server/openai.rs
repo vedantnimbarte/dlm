@@ -1,4 +1,4 @@
-//! OpenAI-compatible API surface (`PRD.md` §3.1): `/v1/chat/completions`,
+//! OpenAI-compatible API surface: `/v1/chat/completions`,
 //! `/v1/completions`, `/v1/models`.
 //!
 //! Wraps a [`Generator`] + [`BpeTokenizer`] into an [`Engine`] and exposes a

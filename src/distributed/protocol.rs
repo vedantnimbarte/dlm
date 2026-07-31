@@ -1,8 +1,8 @@
-//! Wire protocol for the distributed pipeline (`specs.md` §3.4).
+//! Wire protocol for the distributed pipeline.
 //!
 //! Messages are **Protocol Buffers** (encoded with `prost`), sent as a
 //! length-prefixed frame over any `Read`/`Write` (TCP in practice). Per
-//! `specs.md` §3.4, multi-dimensional tensors ride in a flat `repeated float`
+//!, multi-dimensional tensors ride in a flat `repeated float`
 //! field — proto3 packs these as raw little-endian `f32`, so a value computed on
 //! a worker round-trips **bit-for-bit** and a distributed forward pass matches a
 //! local one exactly.

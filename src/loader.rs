@@ -482,7 +482,7 @@ impl ModelParts {
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
-    /// parallelism, `specs.md` §3.3) and build a generator over the resulting
+    /// parallelism,) and build a generator over the resulting
     /// [`PipelineParallelKernel`]. Off-GPU it runs on the CPU kernel with the
     /// same layer partition, so output equals [`into_cpu_generator`].
     ///

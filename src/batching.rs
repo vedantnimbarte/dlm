@@ -1,4 +1,4 @@
-//! Continuous batching (`PRD.md` §3.3).
+//! Continuous batching.
 //!
 //! Instead of running requests one after another, the scheduler keeps up to
 //! `max_batch` generations **in flight at once** and advances every active one

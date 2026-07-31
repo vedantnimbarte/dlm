@@ -1,4 +1,4 @@
-//! Layer-streaming compute kernel (`specs.md` §2.2 / §3.2).
+//! Layer-streaming compute kernel.
 //!
 //! This is what makes `dlm` run a model bigger than the resident budget: rather
 //! than holding every layer's weights in memory ([`CpuKernel`]), a
@@ -8,7 +8,7 @@
 //! caches them in an LRU sized to the window, and evicts the least-recently-used
 //! layer when the window is full — so peak memory is `window × per-layer`, not
 //! the whole model. Hot layers survive across token steps (the tiered CPU-RAM
-//! cache of `specs.md` §2.3).
+//! cache of).
 //!
 //! Because the kernel is stateless given (weights, KV, position), the output is
 //! **identical for any window size** — the window is purely a memory/throughput

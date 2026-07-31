@@ -1,4 +1,4 @@
-//! PagedAttention KV cache manager (`specs.md` §2.3).
+//! PagedAttention KV cache manager.
 //!
 //! The Key-Value history is the memory that *grows* during generation, and
 //! contiguous allocation fragments VRAM badly as sequences start, grow, and
@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 /// A physical block index into the KV pool.
 pub type BlockId = u32;
 
-/// Bytes per KV element (FP16 cache, per `specs.md` §3.1).
+/// Bytes per KV element (FP16 cache, per).
 const KV_DTYPE_BYTES: u64 = 2;
 
 /// Geometry of the KV cache: how big one block is, in bytes.

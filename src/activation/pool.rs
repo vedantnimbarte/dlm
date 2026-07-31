@@ -1,4 +1,4 @@
-//! Residual activation pool (`specs.md` §2.3).
+//! Residual activation pool.
 //!
 //! Layer streaming frees a block's weights the moment its compute finishes — but
 //! the **residual stream** (the running hidden state that each transformer block

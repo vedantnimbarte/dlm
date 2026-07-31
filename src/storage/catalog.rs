@@ -4,7 +4,7 @@
 //! ([`crate::model::naming`]), and tallies real on-disk byte sizes into:
 //!   * per-transformer-block totals (the Streaming Zone working set), and
 //!   * a single pinned overhead figure (Embedding + LM Head + norms that live
-//!     permanently in the Pinned Zone, §2.1).
+//!     permanently in the Pinned Zone,).
 //!
 //! Feeding these measured sizes to the profiler replaces the parameter-count
 //! *estimate* used at bootstrap with the checkpoint's actual geometry.

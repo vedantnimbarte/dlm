@@ -1,4 +1,4 @@
-//! Command-line interface definitions (`specs.md` §4).
+//! Command-line interface definitions.
 //!
 //! The `clap` (derive) types live here in the library so argument parsing is
 //! unit-testable without spawning the binary. `main.rs` parses a [`Cli`] and
@@ -179,7 +179,7 @@ impl KvQuantArg {
     }
 }
 
-/// Arguments for `dlm serve` (mirrors the `specs.md` §4 schema).
+/// Arguments for `dlm serve` (mirrors the schema).
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Model directory containing `config.json` + `*.safetensors` shards.

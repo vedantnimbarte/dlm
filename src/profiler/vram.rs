@@ -1,4 +1,4 @@
-//! Dynamic VRAM profiling math engine (`specs.md` §3.1).
+//! Dynamic VRAM profiling math engine.
 //!
 //! Implements the layer-budget formula:
 //!
@@ -24,10 +24,10 @@ use crate::gpu;
 use crate::model::{ModelConfig, QuantScheme};
 use crate::storage::LayerCatalog;
 
-/// Default safety cushion: 1.5 GiB, per `specs.md` §3.1 (`M_safety`).
+/// Default safety cushion: 1.5 GiB, per (`M_safety`).
 pub const DEFAULT_SAFETY_MARGIN_BYTES: u64 = 3 * 512 * 1024 * 1024; // 1.5 * 2^30
 
-/// Bytes per KV element. KV cache is stored FP16 (`specs.md` §3.1: "2 bytes").
+/// Bytes per KV element. KV cache is stored FP16 (: "2 bytes").
 const KV_BYTES_PER_ELEMENT: u64 = 2;
 
 /// Configurable inputs to the VRAM math.
@@ -229,7 +229,7 @@ impl VramProfiler {
 
         let raw = usable / per_layer_weight;
         // Streaming requires at least one layer slot resident; cap at the model
-        // size. Matches `specs.md` §3.1 `max(1, min(calc, num_layers))`.
+        // size. Matches `max(1, min(calc, num_layers))`.
         let layers_to_load = raw.clamp(1, num_layers as u64) as u32;
 
         VramPlan {

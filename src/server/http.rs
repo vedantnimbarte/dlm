@@ -1,6 +1,6 @@
 //! A minimal, dependency-free HTTP/1.1 server (`std::net`, thread-per-request).
 //!
-//! `dlm`'s OpenAI-compatible API (`specs.md` §3.4 / `PRD.md` §3.1) needs an HTTP
+//! `dlm`'s OpenAI-compatible API needs an HTTP
 //! surface. Rather than pull in an async stack, this is a small blocking server:
 //! it parses a request, dispatches to a handler closure, and writes the
 //! response. It is sufficient for the local, single-node serving `dlm` targets

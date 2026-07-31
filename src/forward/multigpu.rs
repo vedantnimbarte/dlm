@@ -1,11 +1,11 @@
-//! Multi-device pipeline parallelism (`specs.md` §3.3).
+//! Multi-device pipeline parallelism.
 //!
 //! Splits a model's transformer layers into contiguous per-GPU stages (via
 //! [`partition_layers`]) and, per token, flows the hidden state stage by stage:
 //! before running a layer it makes that layer's assigned GPU the current device
 //! ([`gpu::set_device`]), so each block executes on the GPU that owns it and only
 //! the `hidden_size`-float residual crosses the boundary between stages — exactly
-//! the ring-pipeline data path of `specs.md` §3.3, at single-token decode
+//! the ring-pipeline data path of, at single-token decode
 //! granularity.
 //!
 //! It wraps **any** [`ComputeKernel`], so the whole generation / server /

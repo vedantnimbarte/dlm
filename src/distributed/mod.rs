@@ -1,4 +1,4 @@
-//! Distributed multi-server topology (`specs.md` §3.4): a master coordinator
+//! Distributed multi-server topology: a master coordinator
 //! streaming a pipelined forward pass across worker nodes, with heartbeats and a
 //! local CPU-RAM fallback for fault tolerance.
 //!
