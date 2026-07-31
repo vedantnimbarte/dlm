@@ -16,9 +16,9 @@
 
 use crate::error::{DlmError, Result};
 use crate::memory::page::round_up_to_page;
-use std::alloc::{dealloc, Layout};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 use std::alloc::alloc_zeroed;
+use std::alloc::{dealloc, Layout};
 use std::ptr::NonNull;
 
 /// Which allocator produced a buffer's backing store.

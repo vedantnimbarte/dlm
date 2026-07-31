@@ -346,7 +346,9 @@ impl HostExpertCache {
 
     fn insert(&mut self, key: (u32, u32), expert: Arc<ExpertFfn>) {
         while self.map.len() >= self.capacity {
-            let Some(evict) = self.order.pop_front() else { break };
+            let Some(evict) = self.order.pop_front() else {
+                break;
+            };
             if evict == key {
                 self.order.push_back(evict);
                 if self.order.len() <= 1 {
@@ -381,7 +383,11 @@ struct Shared<S: LayerSource> {
 /// new value). Relaxed and racy on purpose — it only feeds a heuristic.
 fn ewma(slot: &AtomicU64, sample: u64) {
     let old = slot.load(Ordering::Relaxed);
-    let new = if old == 0 { sample } else { (old * 3 + sample) / 4 };
+    let new = if old == 0 {
+        sample
+    } else {
+        (old * 3 + sample) / 4
+    };
     slot.store(new, Ordering::Relaxed);
 }
 
@@ -498,8 +504,10 @@ impl<S: LayerSource + 'static> StreamingKernel<S> {
         // like the GPU expert cache — host RAM is more forgiving than VRAM.
         let expert_capacity = cfg.moe.map_or(1, |m| {
             let per_tok = m.experts_per_tok as usize;
-            (per_tok * resident_layers.max(1) * 2)
-                .clamp(per_tok.max(1), m.num_experts as usize * resident_layers.max(1))
+            (per_tok * resident_layers.max(1) * 2).clamp(
+                per_tok.max(1),
+                m.num_experts as usize * resident_layers.max(1),
+            )
         });
         let shared = Arc::new(Shared {
             cfg,
@@ -643,7 +651,11 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         // following blocks' compute (layers run strictly in order, wrapping per
         // token). Already-resident/in-flight layers de-dupe cheaply. `depth` is
         // fixed or, under auto, sized to the current load/compute ratio.
-        let depth = if self.auto { self.auto_depth() } else { self.prefetch_depth };
+        let depth = if self.auto {
+            self.auto_depth()
+        } else {
+            self.prefetch_depth
+        };
         if let Some(tx) = &self.prefetch_tx {
             for ahead in 1..=depth {
                 let _ = tx.send((layer + ahead) % self.num_layers);
@@ -655,14 +667,9 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
             // Streamed MoE: `tensors` is the resident core; pull each selected
             // routed expert on demand through the host expert cache.
             let shared = &self.shared;
-            decode_block_streaming_moe(
-                &shared.cfg,
-                &tensors,
-                hidden,
-                kv,
-                position,
-                |e| shared.ensure_expert(layer, e as u32),
-            )?
+            decode_block_streaming_moe(&shared.cfg, &tensors, hidden, kv, position, |e| {
+                shared.ensure_expert(layer, e as u32)
+            })?
         } else {
             decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?
         };
@@ -677,8 +684,8 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forward::Weights;
     use crate::forward::CpuKernel;
+    use crate::forward::Weights;
     use crate::forward::{ExpertFfn, Ffn};
 
     /// In-memory layer source for tests.
@@ -700,10 +707,15 @@ mod tests {
             head_dim: 4,
             intermediate_size: 16,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         }
-}
+    }
 
     /// A source that counts how many times it actually materialized a layer.
     struct CountingSource(Vec<LayerTensors>, AtomicU64);
@@ -734,7 +746,11 @@ mod tests {
             assert!(Arc::ptr_eq(&first, &src.load_expert(0, 3).unwrap()));
         }
         assert_eq!(src.expert_stats(), (5, 1), "5 hits, 1 miss");
-        assert_eq!(src.inner_for_test().1.load(Ordering::Relaxed), 1, "loaded once");
+        assert_eq!(
+            src.inner_for_test().1.load(Ordering::Relaxed),
+            1,
+            "loaded once"
+        );
         // A zero budget disables caching (every call delegates).
         let nocache = CachedLayerSource::new(CountingSource(Vec::new(), AtomicU64::new(0)), 0);
         for _ in 0..3 {
@@ -809,9 +825,14 @@ mod tests {
                     k_proj: Weights::from_f32(vec![s; c.kv_dim() * c.hidden_size]),
                     v_proj: Weights::from_f32(vec![s; c.kv_dim() * c.hidden_size]),
                     o_proj: Weights::from_f32(vec![s; c.hidden_size * c.q_dim()]),
-                    ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]), up: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]), down: Weights::from_f32(vec![s; c.hidden_size * c.intermediate_size]) }),
+                    ffn: Ffn::Dense(ExpertFfn {
+                        gate: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
+                        up: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
+                        down: Weights::from_f32(vec![s; c.hidden_size * c.intermediate_size]),
+                    }),
                     input_layernorm: vec![1.0; c.hidden_size],
-                    post_attention_layernorm: vec![1.0; c.hidden_size], ..Default::default()
+                    post_attention_layernorm: vec![1.0; c.hidden_size],
+                    ..Default::default()
                 }
             })
             .collect()
@@ -833,13 +854,20 @@ mod tests {
 
         for position in 0..4 {
             for layer in 0..6 {
-                resident.run_block(layer, &mut h_res, &mut kv_res, position).unwrap();
-                streaming.run_block(layer, &mut h_str, &mut kv_str, position).unwrap();
+                resident
+                    .run_block(layer, &mut h_res, &mut kv_res, position)
+                    .unwrap();
+                streaming
+                    .run_block(layer, &mut h_str, &mut kv_str, position)
+                    .unwrap();
             }
         }
         assert_eq!(h_res, h_str, "streamed forward diverged from resident");
         assert!(streaming.resident_len() <= 2, "window exceeded capacity");
-        assert!(streaming.stats().evictions > 0, "expected eviction with a small window");
+        assert!(
+            streaming.stats().evictions > 0,
+            "expected eviction with a small window"
+        );
     }
 
     /// Poll `cond` until it holds or `timeout` expires; returns whether it held.
@@ -884,10 +912,15 @@ mod tests {
         // Compute layer 0; this requests a prefetch of layer 1. With no further
         // run_block competing, the worker loads layer 1 uncontended.
         k.run_block(0, &mut h, &mut kv, 0).unwrap();
-        wait_until(std::time::Duration::from_secs(5), || k.stats().prefetched >= 1);
+        wait_until(std::time::Duration::from_secs(5), || {
+            k.stats().prefetched >= 1
+        });
 
         let s = k.stats();
-        assert!(s.prefetched >= 1, "background worker should have prefetched a layer: {s:?}");
+        assert!(
+            s.prefetched >= 1,
+            "background worker should have prefetched a layer: {s:?}"
+        );
     }
 
     #[test]
@@ -898,10 +931,17 @@ mod tests {
         let mut h = vec![0.5f32; 8];
         let mut kv = KvLayerCache::new(c.kv_dim());
         k.run_block(0, &mut h, &mut kv, 0).unwrap(); // requests prefetch of 1,2,3
-        // Wait for the three to land, then assert the exact count — so this still
-        // catches over-prefetching, just without racing the worker.
-        wait_until(std::time::Duration::from_secs(5), || k.stats().prefetched >= 3);
-        assert_eq!(k.stats().prefetched, 3, "depth-3 should prefetch three layers: {:?}", k.stats());
+                                                     // Wait for the three to land, then assert the exact count — so this still
+                                                     // catches over-prefetching, just without racing the worker.
+        wait_until(std::time::Duration::from_secs(5), || {
+            k.stats().prefetched >= 3
+        });
+        assert_eq!(
+            k.stats().prefetched,
+            3,
+            "depth-3 should prefetch three layers: {:?}",
+            k.stats()
+        );
     }
 
     #[test]
@@ -932,7 +972,11 @@ mod tests {
         for layer in 0..6 {
             k.run_block(layer, &mut h, &mut kv, 0).unwrap();
         }
-        assert_eq!(k.current_prefetch_depth(), 2, "fixed depth must not be auto-tuned");
+        assert_eq!(
+            k.current_prefetch_depth(),
+            2,
+            "fixed depth must not be auto-tuned"
+        );
     }
 
     #[test]
@@ -945,8 +989,15 @@ mod tests {
         let mut kv = KvLayerCache::new(c.kv_dim());
         k.run_block(0, &mut h, &mut kv, 0).unwrap();
         // Wait for the one permitted prefetch, then assert nothing beyond it.
-        wait_until(std::time::Duration::from_secs(5), || k.stats().prefetched >= 1);
-        assert_eq!(k.stats().prefetched, 1, "depth must clamp to window-1: {:?}", k.stats());
+        wait_until(std::time::Duration::from_secs(5), || {
+            k.stats().prefetched >= 1
+        });
+        assert_eq!(
+            k.stats().prefetched,
+            1,
+            "depth must clamp to window-1: {:?}",
+            k.stats()
+        );
     }
 
     #[test]
@@ -964,6 +1015,9 @@ mod tests {
             }
         }
         let s = k.stats();
-        assert!(s.hits > s.misses, "prefetch should make hits dominate: {s:?}");
+        assert!(
+            s.hits > s.misses,
+            "prefetch should make hits dominate: {s:?}"
+        );
     }
 }

@@ -1,0 +1,16 @@
+# Commits that changed formatting only, and never meaning. `git blame` should
+# look straight through them to whoever last touched a line's behaviour.
+#
+# GitHub applies this file automatically. Locally it is opt-in, once per clone:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Add a revision here only if it is provably inert -- a formatter run, a
+# whitespace sweep, a rename with no edits. A commit that changed one line of
+# logic on the way past does not belong in this file.
+
+# Reformat the tree with rustfmt (2026-07-31). CI installed the rustfmt
+# component from the start and never ran it; this is the accumulated drift
+# (493 hunks, 52 files) settled in one pass, with `cargo fmt --all -- --check`
+# added in the following commit so it cannot accumulate again.
+c6526ccb5f6076e523c571e9b701207c752b3918

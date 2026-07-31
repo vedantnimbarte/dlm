@@ -86,7 +86,10 @@ impl LayerRamCache {
             self.insert_new(layer, bytes);
         }
         // Borrow is taken after all mutation completes.
-        Ok(self.entries.get(&layer).expect("resident after get_or_load"))
+        Ok(self
+            .entries
+            .get(&layer)
+            .expect("resident after get_or_load"))
     }
 
     /// Whether a layer is currently resident (does not affect LRU order).

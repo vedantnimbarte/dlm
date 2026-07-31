@@ -18,12 +18,19 @@ fn build_generator() -> Generator<CpuKernel> {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
     let fill = |n: usize, off: usize| -> Vec<f32> {
-        (0..n).map(|i| (((i + off) % 13) as f32 - 6.0) * 0.02).collect()
+        (0..n)
+            .map(|i| (((i + off) % 13) as f32 - 6.0) * 0.02)
+            .collect()
     };
     Generator::new(
         kernel,
@@ -32,7 +39,12 @@ fn build_generator() -> Generator<CpuKernel> {
         fill(vocab * hidden, 7),
         vocab,
         1e-5,
-        KvCacheConfig { num_layers: 1, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+        KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 4,
+            block_size: 16,
+        },
         128,
     )
     .unwrap()
@@ -125,10 +137,16 @@ fn streaming_chat_emits_sse_chunks() {
 
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     assert!(resp.contains("Content-Type: text/event-stream"), "{resp}");
-    assert!(resp.contains(r#""object":"chat.completion.chunk""#), "{resp}");
+    assert!(
+        resp.contains(r#""object":"chat.completion.chunk""#),
+        "{resp}"
+    );
     // Role chunk + 4 token chunks + final chunk + [DONE] → several SSE frames.
     let data_frames = resp.matches("data: ").count();
-    assert!(data_frames >= 5, "expected several SSE frames, got {data_frames}\n{resp}");
+    assert!(
+        data_frames >= 5,
+        "expected several SSE frames, got {data_frames}\n{resp}"
+    );
     assert!(resp.trim_end().ends_with("data: [DONE]"), "{resp}");
 }
 
@@ -155,7 +173,10 @@ fn plain_usage_omits_speculative() {
 
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     // No draft model → no speculative block at all.
-    assert!(!resp.contains("speculative"), "plain path must omit speculative usage:\n{resp}");
+    assert!(
+        !resp.contains("speculative"),
+        "plain path must omit speculative usage:\n{resp}"
+    );
 }
 
 #[test]
@@ -166,7 +187,10 @@ fn speculative_stream_emits_usage_chunk() {
 
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     // A final usage-only chunk precedes [DONE] when speculating.
-    assert!(resp.contains(r#""usage""#), "expected a usage chunk:\n{resp}");
+    assert!(
+        resp.contains(r#""usage""#),
+        "expected a usage chunk:\n{resp}"
+    );
     assert!(resp.contains(r#""acceptance_rate""#), "{resp}");
     assert!(resp.trim_end().ends_with("data: [DONE]"), "{resp}");
 }
@@ -200,11 +224,17 @@ fn streaming_messages_emits_anthropic_sse_events() {
 fn eos_token_ends_the_turn() {
     use dlm::generate::{GenerationConfig, Sampler};
     // The server renders the Plain template into this exact prompt.
-    let prompt = BpeTokenizer::bytes_only().encode("user: Hi\nassistant:").unwrap();
+    let prompt = BpeTokenizer::bytes_only()
+        .encode("user: Hi\nassistant:")
+        .unwrap();
     let first = build_generator()
         .generate(
             &prompt,
-            &GenerationConfig { max_new_tokens: 1, eos_token: None, sampler: Sampler::Greedy },
+            &GenerationConfig {
+                max_new_tokens: 1,
+                eos_token: None,
+                sampler: Sampler::Greedy,
+            },
         )
         .unwrap()[0];
 
@@ -226,11 +256,17 @@ fn eos_token_ends_the_turn() {
 #[test]
 fn any_eos_in_the_set_ends_the_turn() {
     use dlm::generate::{GenerationConfig, Sampler};
-    let prompt = BpeTokenizer::bytes_only().encode("user: Hi\nassistant:").unwrap();
+    let prompt = BpeTokenizer::bytes_only()
+        .encode("user: Hi\nassistant:")
+        .unwrap();
     let first = build_generator()
         .generate(
             &prompt,
-            &GenerationConfig { max_new_tokens: 1, eos_token: None, sampler: Sampler::Greedy },
+            &GenerationConfig {
+                max_new_tokens: 1,
+                eos_token: None,
+                sampler: Sampler::Greedy,
+            },
         )
         .unwrap()[0];
 
@@ -245,17 +281,28 @@ fn any_eos_in_the_set_ends_the_turn() {
 #[test]
 fn context_window_guards_and_clamps() {
     // "user: Hi\nassistant:" prompt length under the byte tokenizer.
-    let prompt_len = BpeTokenizer::bytes_only().encode("user: Hi\nassistant:").unwrap().len();
+    let prompt_len = BpeTokenizer::bytes_only()
+        .encode("user: Hi\nassistant:")
+        .unwrap()
+        .len();
 
     // Prompt already exceeds the window → 400 (Anthropic error shape).
     let tight = start_server_cfg(vec![], prompt_len - 1);
-    let resp = post(tight, "/v1/messages", r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":8}"#);
+    let resp = post(
+        tight,
+        "/v1/messages",
+        r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":8}"#,
+    );
     assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
     assert!(resp.contains("context window"), "{resp}");
 
     // Room for only 2 more tokens → max_tokens clamped to the budget.
     let clamped = start_server_cfg(vec![], prompt_len + 2);
-    let resp = post(clamped, "/v1/messages", r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":16}"#);
+    let resp = post(
+        clamped,
+        "/v1/messages",
+        r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":16}"#,
+    );
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     assert!(resp.contains(r#""output_tokens":2"#), "{resp}");
 }
@@ -266,8 +313,14 @@ fn count_tokens_reports_input_tokens() {
     let body = r#"{"messages":[{"role":"user","content":"Hi"}]}"#;
     let resp = post(addr, "/v1/messages/count_tokens", body);
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
-    let expected = BpeTokenizer::bytes_only().encode("user: Hi\nassistant:").unwrap().len();
-    assert!(resp.contains(&format!(r#""input_tokens":{expected}"#)), "{resp}");
+    let expected = BpeTokenizer::bytes_only()
+        .encode("user: Hi\nassistant:")
+        .unwrap()
+        .len();
+    assert!(
+        resp.contains(&format!(r#""input_tokens":{expected}"#)),
+        "{resp}"
+    );
 }
 
 #[test]
@@ -290,9 +343,14 @@ fn start_streaming_server() -> SocketAddr {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     struct Src {
         cfg: BlockConfig,
         n: u32,
@@ -314,11 +372,25 @@ fn start_streaming_server() -> SocketAddr {
         fill(vocab * hidden),
         vocab,
         1e-5,
-        KvCacheConfig { num_layers: layers_n, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+        KvCacheConfig {
+            num_layers: layers_n,
+            num_kv_heads: 2,
+            head_dim: 4,
+            block_size: 16,
+        },
         128,
     )
     .unwrap();
-    let engine = EngineService::start(generator, BpeTokenizer::bytes_only(), vocab, "dlm-stream", 16, 0, 4, 0);
+    let engine = EngineService::start(
+        generator,
+        BpeTokenizer::bytes_only(),
+        vocab,
+        "dlm-stream",
+        16,
+        0,
+        4,
+        0,
+    );
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     std::thread::spawn(move || server.serve(router(engine)).unwrap());
@@ -330,7 +402,10 @@ fn metrics_reports_streaming_stats() {
     let addr = start_streaming_server();
     // Resident kernels omit the streaming block; before any request it's absent.
     let m0 = get(addr, "/metrics");
-    assert!(!m0.contains("dlm_stream_layer_"), "streaming gauges before traffic:\n{m0}");
+    assert!(
+        !m0.contains("dlm_stream_layer_"),
+        "streaming gauges before traffic:\n{m0}"
+    );
 
     // Drive a completion so the engine loop publishes the kernel's stream stats.
     let body = r#"{"messages":[{"role":"user","content":"Hi"}],"max_tokens":4}"#;

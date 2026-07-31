@@ -41,9 +41,9 @@ use std::thread::JoinHandle;
 // Restating the `extern` block let this path keep calling the old ABI after the
 // kernel signature changed — a silent mismatch the compiler only warns about.
 use crate::forward::gpu::{
-    bias_ptr, dlm_apply_expert, dlm_decode_block, dlm_dense_ffn, dlm_mla_attn, dlm_moe_attn,
-    dlm_apply_experts, dlm_moe_matvec, dlm_moe_norm, upload_bias, upload_weight, DlmPtrs,
-    DlmWeights, GpuMla, DLM_MAX_TOPK,
+    bias_ptr, dlm_apply_expert, dlm_apply_experts, dlm_decode_block, dlm_dense_ffn, dlm_mla_attn,
+    dlm_moe_attn, dlm_moe_matvec, dlm_moe_norm, upload_bias, upload_weight, DlmPtrs, DlmWeights,
+    GpuMla, DLM_MAX_TOPK,
 };
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -239,7 +239,10 @@ impl GpuWeights {
         let ffn = match &t.ffn {
             crate::forward::Ffn::Moe { .. } => {
                 let (router, experts, shared, shared_gate) = t.moe()?;
-                debug_assert!(experts.is_empty(), "GPU core must be loaded without routed experts");
+                debug_assert!(
+                    experts.is_empty(),
+                    "GPU core must be loaded without routed experts"
+                );
                 let (sg_dtype, sg_group) = shared_gate
                     .map(|g| (g.dtype_code(), g.group_size() as i32))
                     .unwrap_or((0, 0));
@@ -439,7 +442,9 @@ impl GpuExpertCache {
     fn insert(&mut self, key: (u32, u32), expert: Arc<GpuExpert>) {
         while self.map.len() >= self.capacity {
             // True LRU: evict the front (least-recently-used).
-            let Some(evict) = self.order.pop_front() else { break };
+            let Some(evict) = self.order.pop_front() else {
+                break;
+            };
             if evict == key {
                 // Don't evict the entry we're about to insert; try the next.
                 self.order.push_back(evict);
@@ -568,7 +573,11 @@ impl<S: LayerSource> GpuShared<S> {
     /// count a token actually consumes — so prefetch doesn't churn the LRU.
     fn prefetch_experts(&self, layer: u32) {
         let Some(m) = self.cfg.moe else { return };
-        let hot = self.history.lock().unwrap().hot(layer, m.experts_per_tok as usize);
+        let hot = self
+            .history
+            .lock()
+            .unwrap()
+            .hot(layer, m.experts_per_tok as usize);
         for e in hot {
             let _ = self.ensure_expert(layer, e);
         }
@@ -635,8 +644,10 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         let expert_capacity = expert_cache_capacity.unwrap_or_else(|| {
             cfg.moe.map_or(1, |m| {
                 let per_tok = m.experts_per_tok as usize;
-                (per_tok * resident_layers.max(1) * 4)
-                    .clamp(per_tok.max(1), m.num_experts as usize * resident_layers.max(1))
+                (per_tok * resident_layers.max(1) * 4).clamp(
+                    per_tok.max(1),
+                    m.num_experts as usize * resident_layers.max(1),
+                )
             })
         });
         let shared = Arc::new(GpuShared {
@@ -660,8 +671,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                         break;
                     }
                     let _ = shared.ensure(layer, true); // best-effort
-                    // Warm this layer's likely experts while it's still ahead of
-                    // compute; no-op for dense models and cold (unseen) layers.
+                                                        // Warm this layer's likely experts while it's still ahead of
+                                                        // compute; no-op for dense models and cold (unseen) layers.
                     shared.prefetch_experts(layer);
                 }
             })
@@ -674,11 +685,13 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         // MLA rotates only its decoupled qk_rope sub-dimension (same rule as the
         // resident `GpuKernel`).
         let mla_inv_freq = match &cfg.mla {
-            Some(m) => Some(DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
-                m.qk_rope_head_dim as usize,
-                cfg.rope_theta,
-                cfg.rope_scaling,
-            ))?),
+            Some(m) => Some(DeviceBuffer::from_slice(
+                &crate::forward::cpu::rope_inv_freqs(
+                    m.qk_rope_head_dim as usize,
+                    cfg.rope_theta,
+                    cfg.rope_scaling,
+                ),
+            )?),
             None => None,
         };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
@@ -762,7 +775,10 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             )
         };
         if code != 0 {
-            return Err(DlmError::Gpu { api: "dlm_moe_attn", code });
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_attn",
+                code,
+            });
         }
         self.run_moe_ffn(layer, w, d_hidden)
     }
@@ -804,7 +820,10 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             )
         };
         if code != 0 {
-            return Err(DlmError::Gpu { api: "dlm_moe_matvec", code });
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_matvec",
+                code,
+            });
         }
 
         // 3. Stream in the selected experts, then apply them all in one grouped
@@ -827,10 +846,18 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             w[0].0.w_dtype == w[1].0.w_dtype && w[0].0.w_group_size == w[1].0.w_group_size
         });
         if !experts.is_empty() && experts.len() <= DLM_MAX_TOPK && uniform_dtype {
-            let mut gate = DlmPtrs { p: [std::ptr::null(); DLM_MAX_TOPK] };
-            let mut up = DlmPtrs { p: [std::ptr::null(); DLM_MAX_TOPK] };
-            let mut down = DlmPtrs { p: [std::ptr::null(); DLM_MAX_TOPK] };
-            let mut weights = DlmWeights { w: [0.0; DLM_MAX_TOPK] };
+            let mut gate = DlmPtrs {
+                p: [std::ptr::null(); DLM_MAX_TOPK],
+            };
+            let mut up = DlmPtrs {
+                p: [std::ptr::null(); DLM_MAX_TOPK],
+            };
+            let mut down = DlmPtrs {
+                p: [std::ptr::null(); DLM_MAX_TOPK],
+            };
+            let mut weights = DlmWeights {
+                w: [0.0; DLM_MAX_TOPK],
+            };
             for (i, (expert, weight)) in experts.iter().enumerate() {
                 gate.p[i] = expert.gate.as_ptr() as *const c_void;
                 up.p[i] = expert.up.as_ptr() as *const c_void;
@@ -853,7 +880,10 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 )
             };
             if code != 0 {
-                return Err(DlmError::Gpu { api: "dlm_apply_experts", code });
+                return Err(DlmError::Gpu {
+                    api: "dlm_apply_experts",
+                    code,
+                });
             }
         } else {
             for (expert, weight) in &experts {
@@ -872,7 +902,10 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                     )
                 };
                 if code != 0 {
-                    return Err(DlmError::Gpu { api: "dlm_apply_expert", code });
+                    return Err(DlmError::Gpu {
+                        api: "dlm_apply_expert",
+                        code,
+                    });
                 }
             }
         }
@@ -893,13 +926,18 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                         )
                     };
                     if code != 0 {
-                        return Err(DlmError::Gpu { api: "dlm_moe_matvec", code });
+                        return Err(DlmError::Gpu {
+                            api: "dlm_moe_matvec",
+                            code,
+                        });
                     }
                     1.0 / (1.0 + (-logit[0]).exp())
                 }
                 None => 1.0,
             };
-            let sinter = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as i32;
+            let sinter = m
+                .shared_intermediate_size
+                .unwrap_or(m.moe_intermediate_size) as i32;
             let code = unsafe {
                 dlm_apply_expert(
                     cfg.hidden_size as i32,
@@ -915,7 +953,10 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 )
             };
             if code != 0 {
-                return Err(DlmError::Gpu { api: "dlm_apply_expert", code });
+                return Err(DlmError::Gpu {
+                    api: "dlm_apply_expert",
+                    code,
+                });
             }
         }
         Ok(())
@@ -1009,7 +1050,9 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                     cfg.rms_eps,
                     w.w_dtype,
                     w.w_group_size,
-                    mw.q_a_proj.as_ref().map_or(std::ptr::null(), |b| b.as_ptr())
+                    mw.q_a_proj
+                        .as_ref()
+                        .map_or(std::ptr::null(), |b| b.as_ptr())
                         as *const std::ffi::c_void,
                     bias_ptr(&mw.q_a_layernorm),
                     mw.q_b_proj.as_ptr() as *const std::ffi::c_void,
@@ -1030,7 +1073,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 )
             };
             if code != 0 {
-                return Err(DlmError::Gpu { api: "dlm_mla_attn", code });
+                return Err(DlmError::Gpu {
+                    api: "dlm_mla_attn",
+                    code,
+                });
             }
             match &w.ffn {
                 GpuFfn::Dense(f) => {
@@ -1050,7 +1096,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         )
                     };
                     if code != 0 {
-                        return Err(DlmError::Gpu { api: "dlm_dense_ffn", code });
+                        return Err(DlmError::Gpu {
+                            api: "dlm_dense_ffn",
+                            code,
+                        });
                     }
                 }
                 GpuFfn::Moe { .. } => {
@@ -1065,7 +1114,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         )
                     };
                     if code != 0 {
-                        return Err(DlmError::Gpu { api: "dlm_moe_norm", code });
+                        return Err(DlmError::Gpu {
+                            api: "dlm_moe_norm",
+                            code,
+                        });
                     }
                     self.run_moe_ffn(layer, &w, d_hidden)?;
                 }
@@ -1118,12 +1170,21 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         )
                     };
                     if code != 0 {
-                        return Err(DlmError::Gpu { api: "dlm_decode_block", code });
+                        return Err(DlmError::Gpu {
+                            api: "dlm_decode_block",
+                            code,
+                        });
                     }
                 }
                 GpuFfn::Moe { .. } => {
                     self.run_moe_block(
-                        layer, &w, kv_keys, kv_values, d_hidden, num_positions, position,
+                        layer,
+                        &w,
+                        kv_keys,
+                        kv_values,
+                        d_hidden,
+                        num_positions,
+                        position,
                     )?;
                 }
             }
@@ -1200,7 +1261,11 @@ mod tests {
         let mru = simulate(layers, capacity, cycles, true);
 
         // LRU: every layer misses, every pass — a 0% hit rate by construction.
-        assert_eq!(lru, layers * cycles, "LRU should miss everything on a cyclic scan");
+        assert_eq!(
+            lru,
+            layers * cycles,
+            "LRU should miss everything on a cyclic scan"
+        );
         // MRU: only the layers that cannot fit miss.
         let steady = mru - layers; // discount the cold first pass
         let ceiling = (layers as usize - capacity + 1) as u32 * (cycles - 1);
@@ -1208,7 +1273,10 @@ mod tests {
             steady <= ceiling,
             "MRU steady-state misses {steady} should be <= {ceiling} (~N-capacity per pass)"
         );
-        assert!(mru * 3 < lru, "MRU ({mru}) should miss far less than LRU ({lru})");
+        assert!(
+            mru * 3 < lru,
+            "MRU ({mru}) should miss far less than LRU ({lru})"
+        );
     }
 
     /// Never pick the entry being inserted, even if a concurrent load put it at
@@ -1229,8 +1297,12 @@ mod tests {
     fn expert_history_ranks_hot_experts_per_layer() {
         let mut h = super::ExpertHistory::default();
         // Layer 0: expert 5 picked 3×, expert 2 twice, expert 9 once.
-        for _ in 0..3 { h.record(0, 5); }
-        for _ in 0..2 { h.record(0, 2); }
+        for _ in 0..3 {
+            h.record(0, 5);
+        }
+        for _ in 0..2 {
+            h.record(0, 2);
+        }
         h.record(0, 9);
         // Layer 1: different hot set — must not bleed into layer 0.
         h.record(1, 7);
@@ -1238,7 +1310,11 @@ mod tests {
         h.record(1, 1);
 
         assert_eq!(h.hot(0, 2), vec![5, 2], "top-2 by frequency, desc");
-        assert_eq!(h.hot(0, 10), vec![5, 2, 9], "n larger than the set returns all, ranked");
+        assert_eq!(
+            h.hot(0, 10),
+            vec![5, 2, 9],
+            "n larger than the set returns all, ranked"
+        );
         assert_eq!(h.hot(1, 2), vec![7, 1], "layer 1 is independent");
         assert!(h.hot(3, 4).is_empty(), "an unseen layer has no hot experts");
     }

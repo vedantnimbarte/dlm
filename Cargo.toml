@@ -2,7 +2,15 @@
 name = "dlm"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.75"
+# Verified by the `msrv` CI job, which builds on exactly this toolchain.
+#
+# Was 1.75, which had silently stopped being true: `clap_lex 1.1.0` arrives
+# through clap's unpinned `"4"` requirement and declares `rust-version = "1.85"`
+# (it is edition2024, which Cargo could not even parse before 1.85). Raising the
+# floor to match strands nobody — 1.75 through 1.84 already could not build dlm,
+# manifest claim notwithstanding. That is what an unverified MSRV buys: not
+# support for old toolchains, just a promise to users that breaks on contact.
+rust-version = "1.85"
 description = "dlm (Dynamic LLM) — run massive LLMs on consumer GPUs by dynamically streaming transformer layers in and out of VRAM"
 license = "Apache-2.0"
 
@@ -45,7 +53,11 @@ rocm-kernels = ["rocm"]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 memmap2 = "0.9"
-# pinned to 0.14.1: the last release whose MSRV matches this crate's rust-version (1.75).
+# Pinned when the MSRV was 1.75, as the last release that still built on it.
+# That reason is gone — the floor is 1.85 now (see `rust-version`), which prost
+# clears comfortably — so this pin is no longer load-bearing and can be relaxed
+# to "0.14" whenever someone wants the newer patch releases. Left exact here
+# only to keep a formatting-and-CI branch from moving dependency versions.
 prost = "=0.14.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

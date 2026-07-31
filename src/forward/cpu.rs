@@ -198,13 +198,21 @@ pub enum Weights {
     /// buffer and the kernel still takes a single pointer per matrix. See
     /// [`QuantLayout`] for the offsets; element count and group size are all the
     /// kernel needs to find the scales.
-    Int4 { blob: Vec<u8>, group_size: usize, num_elements: usize },
+    Int4 {
+        blob: Vec<u8>,
+        group_size: usize,
+        num_elements: usize,
+    },
     /// 8-bit group-affine codes quantized from the checkpoint at load
     /// (`--quant int8`): half of bf16's VRAM and PCIe per layer. Coarser than the
     /// original weights but far finer than int4 — 256 levels per group instead of
     /// 16 — so it is the conservative choice when int4 costs too much accuracy.
     /// Same blob layout as [`Weights::Int4`], one code per byte.
-    Int8 { blob: Vec<u8>, group_size: usize, num_elements: usize },
+    Int8 {
+        blob: Vec<u8>,
+        group_size: usize,
+        num_elements: usize,
+    },
 }
 
 /// Byte offsets within a quantized [`Weights`] blob.
@@ -226,7 +234,12 @@ impl QuantLayout {
         let scales_off = code_bytes.div_ceil(4) * 4; // f32 alignment
         let num_groups = n.div_ceil(group_size.max(1));
         let zeros_off = scales_off + num_groups * 4;
-        Self { scales_off, zeros_off, num_groups, total_bytes: zeros_off + num_groups * 4 }
+        Self {
+            scales_off,
+            zeros_off,
+            num_groups,
+            total_bytes: zeros_off + num_groups * 4,
+        }
     }
 
     /// Offsets for `n` 4-bit codes (packed two per byte).
@@ -291,12 +304,16 @@ impl Weights {
             Weights::F32(v) => v[i],
             Weights::Bf16(v) => bf16_to_f32(v[i]),
             Weights::F16(v) => crate::storage::f16_to_f32(v[i]),
-            Weights::Int4 { blob, group_size, num_elements } => {
-                int4_get(blob, *group_size, *num_elements, i)
-            }
-            Weights::Int8 { blob, group_size, num_elements } => {
-                int8_get(blob, *group_size, *num_elements, i)
-            }
+            Weights::Int4 {
+                blob,
+                group_size,
+                num_elements,
+            } => int4_get(blob, *group_size, *num_elements, i),
+            Weights::Int8 {
+                blob,
+                group_size,
+                num_elements,
+            } => int8_get(blob, *group_size, *num_elements, i),
         }
     }
 
@@ -329,7 +346,11 @@ impl Weights {
             blob[layout.scales_off + g * 4..][..4].copy_from_slice(&s.to_le_bytes());
             blob[layout.zeros_off + g * 4..][..4].copy_from_slice(&z.to_le_bytes());
         }
-        Ok(Weights::Int4 { blob, group_size, num_elements: n })
+        Ok(Weights::Int4 {
+            blob,
+            group_size,
+            num_elements: n,
+        })
     }
 
     /// Assemble an int4 [`Weights`] from codes and per-group scales/zeros that are
@@ -369,7 +390,11 @@ impl Weights {
             blob[layout.scales_off + g * 4..][..4].copy_from_slice(&s.to_le_bytes());
             blob[layout.zeros_off + g * 4..][..4].copy_from_slice(&z.to_le_bytes());
         }
-        Ok(Weights::Int4 { blob, group_size, num_elements: n })
+        Ok(Weights::Int4 {
+            blob,
+            group_size,
+            num_elements: n,
+        })
     }
 
     /// Quantize float weights to 8-bit group-affine codes, in the same blob
@@ -384,7 +409,11 @@ impl Weights {
             blob[layout.scales_off + g * 4..][..4].copy_from_slice(&s.to_le_bytes());
             blob[layout.zeros_off + g * 4..][..4].copy_from_slice(&z.to_le_bytes());
         }
-        Ok(Weights::Int8 { blob, group_size, num_elements: n })
+        Ok(Weights::Int8 {
+            blob,
+            group_size,
+            num_elements: n,
+        })
     }
 
     /// Dtype tag handed to the CUDA kernel so it can decode elements in-register.
@@ -513,22 +542,22 @@ impl Default for Ffn {
 
 #[derive(Debug, Clone, Default)]
 pub struct LayerTensors {
-    pub q_proj: Weights,   // [q_dim, hidden]
-    pub k_proj: Weights,   // [kv_dim, hidden]
-    pub v_proj: Weights,   // [kv_dim, hidden]
-    pub o_proj: Weights,   // [hidden, q_dim]
+    pub q_proj: Weights, // [q_dim, hidden]
+    pub k_proj: Weights, // [kv_dim, hidden]
+    pub v_proj: Weights, // [kv_dim, hidden]
+    pub o_proj: Weights, // [hidden, q_dim]
     /// Feed-forward block: dense MLP or routed experts.
     pub ffn: Ffn,
     pub input_layernorm: Vec<f32>,          // [hidden]
     pub post_attention_layernorm: Vec<f32>, // [hidden]
     /// Attention projection biases (Qwen2 et al.); `None` for Llama/Mistral.
     pub q_bias: Option<Vec<f32>>, // [q_dim]
-    pub k_bias: Option<Vec<f32>>, // [kv_dim]
-    pub v_bias: Option<Vec<f32>>, // [kv_dim]
+    pub k_bias: Option<Vec<f32>>,           // [kv_dim]
+    pub v_bias: Option<Vec<f32>>,           // [kv_dim]
     /// Per-head Q/K RMSNorm weights (`[head_dim]`), applied after projection and
     /// before RoPE. Qwen3 ships these (and drops the Qwen2 biases); `None` elsewhere.
     pub q_norm: Option<Vec<f32>>, // [head_dim]
-    pub k_norm: Option<Vec<f32>>, // [head_dim]
+    pub k_norm: Option<Vec<f32>>,           // [head_dim]
     /// Gemma2's extra pair of FFN norms. Their presence marks the **Gemma2 block
     /// structure**, which differs from Llama/Gemma1 in where norms sit: Gemma2
     /// normalizes each sublayer's *output* before the residual add and keeps a
@@ -569,7 +598,12 @@ impl LayerTensors {
         let bias = |b: &Option<Vec<f32>>| b.as_ref().map_or(0, std::mem::size_of_val);
         let ffn = match &self.ffn {
             Ffn::Dense(f) => f.byte_size(),
-            Ffn::Moe { router, experts, shared, shared_gate } => {
+            Ffn::Moe {
+                router,
+                experts,
+                shared,
+                shared_gate,
+            } => {
                 router.as_bytes().len()
                     + experts.iter().map(ExpertFfn::byte_size).sum::<usize>()
                     + shared.as_ref().map_or(0, ExpertFfn::byte_size)
@@ -623,9 +657,12 @@ impl LayerTensors {
     #[allow(clippy::type_complexity)] // a borrow-tuple of the four MoE parts; a struct would only add indirection
     pub fn moe(&self) -> Result<(&Weights, &[ExpertFfn], Option<&ExpertFfn>, Option<&Weights>)> {
         match &self.ffn {
-            Ffn::Moe { router, experts, shared, shared_gate } => {
-                Ok((router, experts, shared.as_ref(), shared_gate.as_ref()))
-            }
+            Ffn::Moe {
+                router,
+                experts,
+                shared,
+                shared_gate,
+            } => Ok((router, experts, shared.as_ref(), shared_gate.as_ref())),
             Ffn::Dense(_) => Err(DlmError::InvalidConfig(
                 "expected a Mixture-of-Experts layer but found a dense FFN".into(),
             )),
@@ -643,13 +680,20 @@ impl LayerTensors {
                  pre/post-FFN norm pair Gemma2 requires; the two norm layouts place \
                  `post_attention_layernorm` differently and are not interchangeable",
                 cfg.gemma2_norms,
-                if self.is_gemma2_style() { "carries" } else { "lacks" },
+                if self.is_gemma2_style() {
+                    "carries"
+                } else {
+                    "lacks"
+                },
             )));
         }
         if self.is_gemma2_style() {
             for (name, norm) in [
                 ("pre_feedforward_layernorm", &self.pre_feedforward_layernorm),
-                ("post_feedforward_layernorm", &self.post_feedforward_layernorm),
+                (
+                    "post_feedforward_layernorm",
+                    &self.post_feedforward_layernorm,
+                ),
             ] {
                 match norm {
                     Some(v) if v.len() == cfg.hidden_size => {}
@@ -675,8 +719,16 @@ impl LayerTensors {
             ("k_proj", self.k_proj.len(), cfg.kv_dim() * cfg.hidden_size),
             ("v_proj", self.v_proj.len(), cfg.kv_dim() * cfg.hidden_size),
             ("o_proj", self.o_proj.len(), cfg.hidden_size * cfg.q_dim()),
-            ("input_layernorm", self.input_layernorm.len(), cfg.hidden_size),
-            ("post_attention_layernorm", self.post_attention_layernorm.len(), cfg.hidden_size),
+            (
+                "input_layernorm",
+                self.input_layernorm.len(),
+                cfg.hidden_size,
+            ),
+            (
+                "post_attention_layernorm",
+                self.post_attention_layernorm.len(),
+                cfg.hidden_size,
+            ),
         ];
         let bias_checks = [
             ("q_bias", self.q_bias.as_ref(), cfg.q_dim()),
@@ -724,15 +776,31 @@ impl LayerTensors {
             ("q_b_proj", mw.q_b_proj.len(), nh * qk * q_in),
             ("kv_a_proj", mw.kv_a_proj.len(), (latent + rope) * h),
             ("kv_a_layernorm", mw.kv_a_layernorm.len(), latent),
-            ("kv_b_proj", mw.kv_b_proj.len(), nh * (m.qk_nope_head_dim as usize + vdim) * latent),
+            (
+                "kv_b_proj",
+                mw.kv_b_proj.len(),
+                nh * (m.qk_nope_head_dim as usize + vdim) * latent,
+            ),
             ("o_proj", self.o_proj.len(), h * nh * vdim),
             ("input_layernorm", self.input_layernorm.len(), h),
-            ("post_attention_layernorm", self.post_attention_layernorm.len(), h),
+            (
+                "post_attention_layernorm",
+                self.post_attention_layernorm.len(),
+                h,
+            ),
         ];
         if let Some(r) = m.q_lora_rank {
             let r = r as usize;
-            checks.push(("q_a_proj", mw.q_a_proj.as_ref().map_or(0, |w| w.len()), r * h));
-            checks.push(("q_a_layernorm", mw.q_a_layernorm.as_ref().map_or(0, |v| v.len()), r));
+            checks.push((
+                "q_a_proj",
+                mw.q_a_proj.as_ref().map_or(0, |w| w.len()),
+                r * h,
+            ));
+            checks.push((
+                "q_a_layernorm",
+                mw.q_a_layernorm.as_ref().map_or(0, |v| v.len()),
+                r,
+            ));
         }
         for (name, got, expected) in checks {
             if got != expected {
@@ -753,7 +821,15 @@ impl LayerTensors {
         let h = cfg.hidden_size;
         match (&self.ffn, cfg.moe) {
             (Ffn::Dense(f), None) => f.validate("ffn", h, cfg.intermediate_size),
-            (Ffn::Moe { router, experts, shared, shared_gate }, Some(m)) => {
+            (
+                Ffn::Moe {
+                    router,
+                    experts,
+                    shared,
+                    shared_gate,
+                },
+                Some(m),
+            ) => {
                 let n = m.num_experts as usize;
                 let inter = m.moe_intermediate_size as usize;
                 if router.len() != n * h {
@@ -909,7 +985,10 @@ enum KvStore {
 
 impl Default for KvStore {
     fn default() -> Self {
-        KvStore::Full { keys: Vec::new(), values: Vec::new() }
+        KvStore::Full {
+            keys: Vec::new(),
+            values: Vec::new(),
+        }
     }
 }
 
@@ -952,7 +1031,11 @@ fn quantize_i4(x: &[f32]) -> (Vec<u8>, f32) {
 fn read_i4(packed: &[u8], base: usize, i: usize) -> f32 {
     let byte = packed[base + i / 2];
     let nib = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
-    let code = if nib >= 8 { nib as i16 - 16 } else { nib as i16 };
+    let code = if nib >= 8 {
+        nib as i16 - 16
+    } else {
+        nib as i16
+    };
     code as f32
 }
 
@@ -960,7 +1043,10 @@ impl KvLayerCache {
     /// Empty history at the given precision for a layer of width `kv_dim`.
     pub fn new_quant(kv_dim: usize, quant: KvQuant) -> Self {
         let store = match quant {
-            KvQuant::None => KvStore::Full { keys: Vec::new(), values: Vec::new() },
+            KvQuant::None => KvStore::Full {
+                keys: Vec::new(),
+                values: Vec::new(),
+            },
             KvQuant::Int8 => KvStore::Int8 {
                 keys: Vec::new(),
                 key_scales: Vec::new(),
@@ -1082,13 +1168,23 @@ impl KvLayerCache {
                 keys.truncate(n * kv_dim);
                 values.truncate(n * kv_dim);
             }
-            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+            KvStore::Int8 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => {
                 keys.truncate(n * kv_dim);
                 values.truncate(n * kv_dim);
                 key_scales.truncate(n);
                 value_scales.truncate(n);
             }
-            KvStore::Int4 { keys, key_scales, values, value_scales } => {
+            KvStore::Int4 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => {
                 let bytes = n * kv_dim.div_ceil(2);
                 keys.truncate(bytes);
                 values.truncate(bytes);
@@ -1111,7 +1207,12 @@ impl KvLayerCache {
                 keys.extend_from_slice(key);
                 values.extend_from_slice(value);
             }
-            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+            KvStore::Int8 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => {
                 let (qk, ks) = quantize_i8(key);
                 let (qv, vs) = quantize_i8(value);
                 keys.extend_from_slice(&qk);
@@ -1119,7 +1220,12 @@ impl KvLayerCache {
                 values.extend_from_slice(&qv);
                 value_scales.push(vs);
             }
-            KvStore::Int4 { keys, key_scales, values, value_scales } => {
+            KvStore::Int4 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => {
                 let (qk, ks) = quantize_i4(key);
                 let (qv, vs) = quantize_i4(value);
                 keys.extend_from_slice(&qk);
@@ -1149,14 +1255,24 @@ impl KvLayerCache {
         match &self.store {
             KvStore::Full { keys, .. } => {
                 let base = pos * self.kv_dim + off;
-                q.iter().zip(&keys[base..base + d]).map(|(&a, &b)| a * b).sum()
+                q.iter()
+                    .zip(&keys[base..base + d])
+                    .map(|(&a, &b)| a * b)
+                    .sum()
             }
-            KvStore::Int8 { keys, key_scales, .. } => {
+            KvStore::Int8 {
+                keys, key_scales, ..
+            } => {
                 let base = pos * self.kv_dim + off;
                 let s = key_scales[pos];
-                q.iter().zip(&keys[base..base + d]).map(|(&a, &b)| a * (b as f32 * s)).sum()
+                q.iter()
+                    .zip(&keys[base..base + d])
+                    .map(|(&a, &b)| a * (b as f32 * s))
+                    .sum()
             }
-            KvStore::Int4 { keys, key_scales, .. } => {
+            KvStore::Int4 {
+                keys, key_scales, ..
+            } => {
                 let s = key_scales[pos];
                 let byte_base = pos * self.kv_dim.div_ceil(2);
                 q.iter()
@@ -1182,7 +1298,12 @@ impl KvLayerCache {
                 key_out.copy_from_slice(&keys[base..base + d]);
                 value_out.copy_from_slice(&values[base..base + d]);
             }
-            KvStore::Int8 { keys, key_scales, values, value_scales } => {
+            KvStore::Int8 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => {
                 let base = pos * d;
                 let (ks, vs) = (key_scales[pos], value_scales[pos]);
                 for (j, o) in key_out.iter_mut().enumerate() {
@@ -1192,7 +1313,12 @@ impl KvLayerCache {
                     *o = values[base + j] as f32 * vs;
                 }
             }
-            KvStore::Int4 { keys, key_scales, values, value_scales } => {
+            KvStore::Int4 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => {
                 let byte_base = pos * d.div_ceil(2);
                 let (ks, vs) = (key_scales[pos], value_scales[pos]);
                 for (j, o) in key_out.iter_mut().enumerate() {
@@ -1247,14 +1373,22 @@ impl KvLayerCache {
                     *o += w * vv;
                 }
             }
-            KvStore::Int8 { values, value_scales, .. } => {
+            KvStore::Int8 {
+                values,
+                value_scales,
+                ..
+            } => {
                 let base = pos * self.kv_dim + off;
                 let s = value_scales[pos];
                 for (o, &vv) in out.iter_mut().zip(&values[base..base + d]) {
                     *o += w * (vv as f32 * s);
                 }
             }
-            KvStore::Int4 { values, value_scales, .. } => {
+            KvStore::Int4 {
+                values,
+                value_scales,
+                ..
+            } => {
                 let s = value_scales[pos];
                 let byte_base = pos * self.kv_dim.div_ceil(2);
                 for (j, o) in out.iter_mut().enumerate() {
@@ -1294,22 +1428,26 @@ pub(crate) fn matvec_native(w: &Weights, x: &[f32], out_dim: usize, in_dim: usiz
                 .map(|(&h, &xj)| crate::storage::f16_to_f32(h) * xj)
                 .sum()
         }),
-        Weights::Int4 { blob, group_size, num_elements } => {
-            matvec_rows(out_dim, in_dim, x, |o, x| {
-                let base = o * in_dim;
-                (0..in_dim)
-                    .map(|j| int4_get(blob, *group_size, *num_elements, base + j) * x[j])
-                    .sum()
-            })
-        }
-        Weights::Int8 { blob, group_size, num_elements } => {
-            matvec_rows(out_dim, in_dim, x, |o, x| {
-                let base = o * in_dim;
-                (0..in_dim)
-                    .map(|j| int8_get(blob, *group_size, *num_elements, base + j) * x[j])
-                    .sum()
-            })
-        }
+        Weights::Int4 {
+            blob,
+            group_size,
+            num_elements,
+        } => matvec_rows(out_dim, in_dim, x, |o, x| {
+            let base = o * in_dim;
+            (0..in_dim)
+                .map(|j| int4_get(blob, *group_size, *num_elements, base + j) * x[j])
+                .sum()
+        }),
+        Weights::Int8 {
+            blob,
+            group_size,
+            num_elements,
+        } => matvec_rows(out_dim, in_dim, x, |o, x| {
+            let base = o * in_dim;
+            (0..in_dim)
+                .map(|j| int8_get(blob, *group_size, *num_elements, base + j) * x[j])
+                .sum()
+        }),
     }
 }
 
@@ -1358,10 +1496,7 @@ pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len() as f32;
     let mean_sq = x.iter().map(|&v| v * v).sum::<f32>() / n;
     let inv = 1.0 / (mean_sq + eps).sqrt();
-    x.iter()
-        .zip(weight)
-        .map(|(&v, &w)| v * inv * w)
-        .collect()
+    x.iter().zip(weight).map(|(&v, &w)| v * inv * w).collect()
 }
 
 /// Apply RMSNorm independently to each `head_dim`-wide head of `v` (Qwen3 Q/K
@@ -1437,7 +1572,11 @@ fn activate(act: Activation, x: f32) -> f32 {
 fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize, act: Activation) -> Vec<f32> {
     let gate = matvec_native(&f.gate, x, inter, hidden);
     let up = matvec_native(&f.up, x, inter, hidden);
-    let combined: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| activate(act, g) * u).collect();
+    let combined: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&g, &u)| activate(act, g) * u)
+        .collect();
     matvec_native(&f.down, &combined, hidden, inter)
 }
 
@@ -1454,7 +1593,9 @@ pub(crate) fn route_topk(logits: &[f32], k: usize, norm: bool) -> Vec<(usize, f3
     let mut idx: Vec<usize> = (0..probs.len()).collect();
     // Partial order is enough; NaN sorts last via unwrap_or(Equal).
     idx.sort_unstable_by(|&a, &b| {
-        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     idx.truncate(k.min(probs.len()));
     let mut chosen: Vec<(usize, f32)> = idx.into_iter().map(|e| (e, probs[e])).collect();
@@ -1482,7 +1623,9 @@ fn add_shared_expert(
 ) {
     if let Some(s) = shared {
         let hidden = cfg.hidden_size;
-        let si = m.shared_intermediate_size.unwrap_or(m.moe_intermediate_size) as usize;
+        let si = m
+            .shared_intermediate_size
+            .unwrap_or(m.moe_intermediate_size) as usize;
         let g = match shared_gate {
             Some(gate) => {
                 let logit = matvec_native(gate, x, 1, hidden)[0];
@@ -1611,7 +1754,11 @@ pub fn rope_inv_freqs(head_dim: usize, theta: f32, scaling: Option<RopeScaling>)
                 Some(RopeScaling::Yarn { .. }) => {
                     let (factor, low, high) = yarn.unwrap();
                     let ramp = if (high - low).abs() < 1e-6 {
-                        if (i as f32) < low { 0.0 } else { 1.0 }
+                        if (i as f32) < low {
+                            0.0
+                        } else {
+                            1.0
+                        }
                     } else {
                         ((i as f32 - low) / (high - low)).clamp(0.0, 1.0)
                     };
@@ -1808,7 +1955,12 @@ fn mla_attention_sublayer(
     for p in 0..positions {
         let pk = kv.position_key(p)?;
         k_rope_cache.push(pk[latent..].to_vec());
-        recon.push(matvec_native(&mw.kv_b_proj, &pk[..latent], kv_up_dim, latent));
+        recon.push(matvec_native(
+            &mw.kv_b_proj,
+            &pk[..latent],
+            kv_up_dim,
+            latent,
+        ));
     }
 
     let mut context = vec![0.0f32; nh * vdim];
@@ -1820,7 +1972,11 @@ fn mla_attention_sublayer(
             let base = hh * (nope + vdim);
             let k_nope = &recon[p][base..base + nope];
             let dot = q_nope.iter().zip(k_nope).map(|(a, b)| a * b).sum::<f32>()
-                + q_rope.iter().zip(&k_rope_cache[p]).map(|(a, b)| a * b).sum::<f32>();
+                + q_rope
+                    .iter()
+                    .zip(&k_rope_cache[p])
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>();
             *score = dot * scale;
         }
         softmax_inplace(&mut scores);
@@ -1858,8 +2014,19 @@ pub fn decode_block(
     let ffn_norm = w.ffn_input_norm();
     let normed2 = rmsnorm(&h1, ffn_norm, cfg.rms_eps);
     let mut ffn_out = match &w.ffn {
-        Ffn::Dense(f) => swiglu_ffn(f, &normed2, cfg.hidden_size, cfg.intermediate_size, cfg.activation),
-        Ffn::Moe { router, experts, shared, shared_gate } => moe_ffn(
+        Ffn::Dense(f) => swiglu_ffn(
+            f,
+            &normed2,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            cfg.activation,
+        ),
+        Ffn::Moe {
+            router,
+            experts,
+            shared,
+            shared_gate,
+        } => moe_ffn(
             router,
             experts,
             shared.as_ref(),
@@ -1915,8 +2082,22 @@ fn attention_sublayer(
 
     let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
     let mscale = rope_mscale(cfg.rope_scaling);
-    rope_inplace(&mut q, cfg.num_heads, cfg.head_dim, position, &inv_freq, mscale);
-    rope_inplace(&mut k, cfg.num_kv_heads, cfg.head_dim, position, &inv_freq, mscale);
+    rope_inplace(
+        &mut q,
+        cfg.num_heads,
+        cfg.head_dim,
+        position,
+        &inv_freq,
+        mscale,
+    );
+    rope_inplace(
+        &mut k,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        position,
+        &inv_freq,
+        mscale,
+    );
 
     kv.append(&k, &v)?;
     let ctx = attention(cfg, &q, kv);
@@ -2037,7 +2218,8 @@ mod tests {
     fn kv_truncate_rolls_back_positions() {
         let mut kv = KvLayerCache::new(2);
         for i in 0..5 {
-            kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+            kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32])
+                .unwrap();
         }
         kv.truncate(3);
         assert_eq!(kv.len(), 3);
@@ -2045,7 +2227,9 @@ mod tests {
         // equals a fresh cache built from just those positions.
         let mut fresh = KvLayerCache::new(2);
         for i in 0..3 {
-            fresh.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+            fresh
+                .append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32])
+                .unwrap();
         }
         let cfg = BlockConfig {
             hidden_size: 2,
@@ -2062,7 +2246,11 @@ mod tests {
             mla: None,
             ..Default::default()
         };
-        approx(&attention(&cfg, &[1.0, 0.0], &kv), &attention(&cfg, &[1.0, 0.0], &fresh), 1e-6);
+        approx(
+            &attention(&cfg, &[1.0, 0.0], &kv),
+            &attention(&cfg, &[1.0, 0.0], &fresh),
+            1e-6,
+        );
         kv.truncate(10); // beyond len → no-op
         assert_eq!(kv.len(), 3);
     }
@@ -2094,14 +2282,17 @@ mod tests {
             rms_eps: 1e-5,
             rope_scaling: None,
             moe: None,
-            sliding_window: None, activation: Default::default(), mla: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         // Four cached positions with distinct K/V.
         let fill = |from: usize| {
             let mut kv = KvLayerCache::new(2);
             for i in from..4 {
-                kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32]).unwrap();
+                kv.append(&[i as f32, 1.0], &[(i as f32) * 10.0, i as f32])
+                    .unwrap();
             }
             kv
         };
@@ -2112,7 +2303,10 @@ mod tests {
         let mut win2 = base;
         win2.sliding_window = Some(2);
         let windowed = attention(&win2, &q, &kv_all);
-        assert_ne!(full, windowed, "window of 2 over 4 positions should differ from full");
+        assert_ne!(
+            full, windowed,
+            "window of 2 over 4 positions should differ from full"
+        );
 
         // window=2 over all 4 positions == full attention over just the last 2.
         approx(&windowed, &attention(&base, &q, &fill(2)), 1e-6);
@@ -2123,7 +2317,6 @@ mod tests {
         approx(&attention(&win_big, &q, &kv_all), &full, 1e-6);
     }
 
-
     /// `matvec_rows` runs single-threaded below its size threshold and split
     /// across cores above it. The two paths must agree exactly — a divergence
     /// would make output depend on how big the matrix happened to be, which is
@@ -2132,7 +2325,9 @@ mod tests {
     fn matvec_rows_agrees_across_the_parallel_threshold() {
         // Straddle the 1<<20 MAC threshold: `small` stays serial, `large` splits.
         for (out_dim, in_dim) in [(4usize, 8usize), (2048usize, 1024usize)] {
-            let x: Vec<f32> = (0..in_dim).map(|i| ((i % 13) as f32) * 0.031 - 0.2).collect();
+            let x: Vec<f32> = (0..in_dim)
+                .map(|i| ((i % 13) as f32) * 0.031 - 0.2)
+                .collect();
             let row = |r: usize, v: &[f32]| -> f32 {
                 v.iter()
                     .enumerate()
@@ -2162,8 +2357,12 @@ mod tests {
         let d = 6usize;
         let rows: Vec<(Vec<f32>, Vec<f32>)> = (0..3)
             .map(|i| {
-                let k: Vec<f32> = (0..d).map(|j| (i as f32 + 1.0) * 0.3 - j as f32 * 0.11).collect();
-                let v: Vec<f32> = (0..d).map(|j| (j as f32) * 0.07 - (i as f32) * 0.19).collect();
+                let k: Vec<f32> = (0..d)
+                    .map(|j| (i as f32 + 1.0) * 0.3 - j as f32 * 0.11)
+                    .collect();
+                let v: Vec<f32> = (0..d)
+                    .map(|j| (j as f32) * 0.07 - (i as f32) * 0.19)
+                    .collect();
                 (k, v)
             })
             .collect();
@@ -2198,8 +2397,15 @@ mod tests {
     /// pattern the window applies to every layer (Mistral).
     #[test]
     fn window_pattern_alternates_layers() {
-        let mut cfg = BlockConfig { sliding_window: Some(128), ..Default::default() };
-        assert_eq!(cfg.window_for_layer(0), Some(128), "uniform: every layer windowed");
+        let mut cfg = BlockConfig {
+            sliding_window: Some(128),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.window_for_layer(0),
+            Some(128),
+            "uniform: every layer windowed"
+        );
         assert_eq!(cfg.window_for_layer(1), Some(128));
 
         cfg.sliding_window_pattern = Some(2);
@@ -2211,10 +2417,17 @@ mod tests {
         // `for_layer` bakes the decision in and must not re-resolve afterwards.
         let l1 = cfg.for_layer(1);
         assert_eq!(l1.sliding_window, None);
-        assert_eq!(l1.window_for_layer(0), None, "already resolved; stays resolved");
+        assert_eq!(
+            l1.window_for_layer(0),
+            None,
+            "already resolved; stays resolved"
+        );
 
         // No window at all: the pattern is irrelevant.
-        let none = BlockConfig { sliding_window_pattern: Some(2), ..Default::default() };
+        let none = BlockConfig {
+            sliding_window_pattern: Some(2),
+            ..Default::default()
+        };
         assert_eq!(none.window_for_layer(0), None);
     }
 
@@ -2230,21 +2443,40 @@ mod tests {
         let q = [1.0f32, 0.0];
 
         let plain = BlockConfig {
-            hidden_size: 2, num_heads: 1, num_kv_heads: 1, head_dim: 2,
-            rms_eps: 1e-5, ..Default::default()
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            rms_eps: 1e-5,
+            ..Default::default()
         };
-        let capped = BlockConfig { attn_logit_softcap: Some(1.0), ..plain };
+        let capped = BlockConfig {
+            attn_logit_softcap: Some(1.0),
+            ..plain
+        };
 
         let a = attention(&plain, &q, &kv);
         let b = attention(&capped, &q, &kv);
         // Uncapped, position 0 wins almost totally; capped, the gap is squashed
         // so position 1 keeps real weight.
-        assert!(a[0] > 0.99, "uncapped should be ~one-hot on position 0, got {a:?}");
-        assert!(b[0] < a[0] - 0.05, "softcap should pull the winner down: {b:?} vs {a:?}");
-        assert!(b[1] > 0.05, "softcap should leave position 1 real weight, got {b:?}");
+        assert!(
+            a[0] > 0.99,
+            "uncapped should be ~one-hot on position 0, got {a:?}"
+        );
+        assert!(
+            b[0] < a[0] - 0.05,
+            "softcap should pull the winner down: {b:?} vs {a:?}"
+        );
+        assert!(
+            b[1] > 0.05,
+            "softcap should leave position 1 real weight, got {b:?}"
+        );
 
         // A cap far above the scores changes nothing measurable.
-        let loose = BlockConfig { attn_logit_softcap: Some(1e6), ..plain };
+        let loose = BlockConfig {
+            attn_logit_softcap: Some(1e6),
+            ..plain
+        };
         approx(&attention(&loose, &q, &kv), &a, 1e-4);
     }
 
@@ -2284,8 +2516,13 @@ mod tests {
     fn gemma2_norms_the_attention_output() {
         let (h, inter) = (4usize, 6usize);
         let cfg = BlockConfig {
-            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
-            intermediate_size: inter, rope_theta: 10000.0, rms_eps: 1e-5,
+            hidden_size: h,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 2,
+            intermediate_size: inter,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
             ..Default::default()
         };
         let x: Vec<f32> = (0..h).map(|i| 0.2 + i as f32 * 0.1).collect();
@@ -2297,7 +2534,10 @@ mod tests {
         let attn_out: Vec<f32> = plain_h1.iter().zip(&x).map(|(a, b)| a - b).collect();
 
         let g2 = tiny_layer(h, inter, true);
-        let cfg2 = BlockConfig { gemma2_norms: true, ..cfg };
+        let cfg2 = BlockConfig {
+            gemma2_norms: true,
+            ..cfg
+        };
         let mut kv2 = KvLayerCache::new(cfg2.kv_dim());
         let g2_h1 = attention_sublayer(&cfg2, &g2, &x, &mut kv2, 0).unwrap();
 
@@ -2306,7 +2546,10 @@ mod tests {
         let expected: Vec<f32> = x.iter().zip(&normed).map(|(a, b)| a + b).collect();
         approx(&g2_h1, &expected, 1e-5);
         assert!(
-            g2_h1.iter().zip(&plain_h1).any(|(a, b)| (a - b).abs() > 1e-4),
+            g2_h1
+                .iter()
+                .zip(&plain_h1)
+                .any(|(a, b)| (a - b).abs() > 1e-4),
             "the two norm layouts must not coincide, or this proves nothing"
         );
     }
@@ -2318,8 +2561,13 @@ mod tests {
     fn gemma2_norms_the_ffn_input_and_output() {
         let (h, inter) = (4usize, 6usize);
         let cfg = BlockConfig {
-            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
-            intermediate_size: inter, rope_theta: 10000.0, rms_eps: 1e-5,
+            hidden_size: h,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 2,
+            intermediate_size: inter,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
             gemma2_norms: true,
             ..Default::default()
         };
@@ -2332,9 +2580,17 @@ mod tests {
         // Reference: attention half (checked above), then the FFN in Gemma2 order.
         let mut kv_ref = KvLayerCache::new(cfg.kv_dim());
         let h1 = attention_sublayer(&cfg, &w, &x, &mut kv_ref, 0).unwrap();
-        let normed = rmsnorm(&h1, w.pre_feedforward_layernorm.as_ref().unwrap(), cfg.rms_eps);
+        let normed = rmsnorm(
+            &h1,
+            w.pre_feedforward_layernorm.as_ref().unwrap(),
+            cfg.rms_eps,
+        );
         let ffn = swiglu_ffn(w.dense_ffn().unwrap(), &normed, h, inter, cfg.activation);
-        let ffn = rmsnorm(&ffn, w.post_feedforward_layernorm.as_ref().unwrap(), cfg.rms_eps);
+        let ffn = rmsnorm(
+            &ffn,
+            w.post_feedforward_layernorm.as_ref().unwrap(),
+            cfg.rms_eps,
+        );
         let expected: Vec<f32> = h1.iter().zip(&ffn).map(|(a, b)| a + b).collect();
         approx(&got, &expected, 1e-5);
     }
@@ -2345,13 +2601,27 @@ mod tests {
     fn mismatched_gemma2_norm_layout_is_refused() {
         let (h, inter) = (4usize, 6usize);
         let cfg = BlockConfig {
-            hidden_size: h, num_heads: 2, num_kv_heads: 2, head_dim: 2,
-            intermediate_size: inter, rms_eps: 1e-5, gemma2_norms: true,
+            hidden_size: h,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 2,
+            intermediate_size: inter,
+            rms_eps: 1e-5,
+            gemma2_norms: true,
             ..Default::default()
         };
-        assert!(tiny_layer(h, inter, false).validate(&cfg).is_err(), "gemma2 cfg, plain layer");
-        let plain_cfg = BlockConfig { gemma2_norms: false, ..cfg };
-        assert!(tiny_layer(h, inter, true).validate(&plain_cfg).is_err(), "plain cfg, gemma2 layer");
+        assert!(
+            tiny_layer(h, inter, false).validate(&cfg).is_err(),
+            "gemma2 cfg, plain layer"
+        );
+        let plain_cfg = BlockConfig {
+            gemma2_norms: false,
+            ..cfg
+        };
+        assert!(
+            tiny_layer(h, inter, true).validate(&plain_cfg).is_err(),
+            "plain cfg, gemma2 layer"
+        );
         // Matching pairs are fine.
         assert!(tiny_layer(h, inter, true).validate(&cfg).is_ok());
         assert!(tiny_layer(h, inter, false).validate(&plain_cfg).is_ok());
@@ -2361,9 +2631,15 @@ mod tests {
     /// (Gemma2-27B: scale by 144 while head_dim is 128).
     #[test]
     fn query_pre_attn_scalar_overrides_head_dim_scale() {
-        let cfg = BlockConfig { head_dim: 4, ..Default::default() };
+        let cfg = BlockConfig {
+            head_dim: 4,
+            ..Default::default()
+        };
         approx(&[cfg.attn_scale()], &[0.5], 1e-6); // 1/sqrt(4)
-        let scaled = BlockConfig { query_pre_attn_scalar: Some(16.0), ..cfg };
+        let scaled = BlockConfig {
+            query_pre_attn_scalar: Some(16.0),
+            ..cfg
+        };
         approx(&[scaled.attn_scale()], &[0.25], 1e-6); // 1/sqrt(16), not 1/sqrt(4)
     }
 
@@ -2415,9 +2691,12 @@ mod tests {
         assert!(gelu_tanh(0.0).abs() < 1e-6); // 0 → 0
         assert!(gelu_tanh(20.0) > 19.9); // ~x for large positive x
         assert!(gelu_tanh(-20.0).abs() < 1e-3); // ~0 for large negative x
-        // GELU(1) ≈ 0.8412 (tanh approximation), distinct from SiLU(1) ≈ 0.7311.
+                                                // GELU(1) ≈ 0.8412 (tanh approximation), distinct from SiLU(1) ≈ 0.7311.
         assert!((gelu_tanh(1.0) - 0.8412).abs() < 1e-3);
-        assert_ne!(activate(Activation::GeluTanh, 1.0), activate(Activation::Silu, 1.0));
+        assert_ne!(
+            activate(Activation::GeluTanh, 1.0),
+            activate(Activation::Silu, 1.0)
+        );
     }
 
     #[test]
@@ -2437,7 +2716,11 @@ mod tests {
         // interpolation (`none[i]/factor`), so it lies between the two.
         for i in 0..head_dim / 2 {
             let (lo, hi) = (none[i] / factor - 1e-9, none[i] + 1e-6);
-            assert!(yarn[i] >= lo && yarn[i] <= hi, "yarn[{i}]={} not in [{lo},{hi}]", yarn[i]);
+            assert!(
+                yarn[i] >= lo && yarn[i] <= hi,
+                "yarn[{i}]={} not in [{lo},{hi}]",
+                yarn[i]
+            );
         }
         assert_ne!(yarn, none, "YaRN must actually change some frequencies");
         assert!((rope_mscale(scaling) - (0.1 * factor.ln() + 1.0)).abs() < 1e-6);
@@ -2465,7 +2748,12 @@ mod tests {
         // freq_i = theta^(-2i/head_dim)
         approx(
             &inv,
-            &[1.0, 10000f32.powf(-0.25), 10000f32.powf(-0.5), 10000f32.powf(-0.75)],
+            &[
+                1.0,
+                10000f32.powf(-0.25),
+                10000f32.powf(-0.5),
+                10000f32.powf(-0.75),
+            ],
             1e-6,
         );
     }
@@ -2500,11 +2788,17 @@ mod tests {
                 assert!((sc - p / 8.0).abs() < 1e-9, "low-freq wrong: {p} -> {sc}");
             } else {
                 // Mid band → strictly between the two extremes.
-                assert!(sc >= p / 8.0 - 1e-9 && sc <= p + 1e-9, "mid-band out of range");
+                assert!(
+                    sc >= p / 8.0 - 1e-9 && sc <= p + 1e-9,
+                    "mid-band out of range"
+                );
             }
         }
         // Scaling must actually change something, or the test proves nothing.
-        assert!(plain.iter().zip(&scaled).any(|(&p, &s)| (p - s).abs() > 1e-9));
+        assert!(plain
+            .iter()
+            .zip(&scaled)
+            .any(|(&p, &s)| (p - s).abs() > 1e-9));
     }
 
     #[test]
@@ -2518,7 +2812,11 @@ mod tests {
             intermediate_size: 6,
             rope_theta: 10000.0,
             rms_eps: 1e-5,
-            rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let hidden = vec![1.5, -2.0, 0.5, 3.0];
@@ -2555,7 +2853,12 @@ mod tests {
             head_dim: 2,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -2574,7 +2877,12 @@ mod tests {
             head_dim: 1,
             intermediate_size: 2,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let mut kv = KvLayerCache::new(cfg.kv_dim());
@@ -2593,7 +2901,12 @@ mod tests {
             head_dim: 2,
             intermediate_size: 6,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let w = LayerTensors::zeros(&cfg);
@@ -2628,21 +2941,34 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut quant = KvLayerCache::new_quantized(cfg.kv_dim());
         for p in 0..5usize {
-            let k: Vec<f32> = (0..cfg.kv_dim()).map(|i| ((p + i) % 7) as f32 * 0.3 - 1.0).collect();
-            let v: Vec<f32> = (0..cfg.kv_dim()).map(|i| ((p * 2 + i) % 5) as f32 * 0.5).collect();
+            let k: Vec<f32> = (0..cfg.kv_dim())
+                .map(|i| ((p + i) % 7) as f32 * 0.3 - 1.0)
+                .collect();
+            let v: Vec<f32> = (0..cfg.kv_dim())
+                .map(|i| ((p * 2 + i) % 5) as f32 * 0.5)
+                .collect();
             full.append(&k, &v).unwrap();
             quant.append(&k, &v).unwrap();
         }
         assert_eq!(full.len(), quant.len());
         let q: Vec<f32> = (0..cfg.q_dim()).map(|i| (i % 3) as f32 * 0.2).collect();
         // int8 KV attention stays well within a small tolerance of exact f32.
-        approx(&attention(&cfg, &q, &full), &attention(&cfg, &q, &quant), 0.05);
+        approx(
+            &attention(&cfg, &q, &full),
+            &attention(&cfg, &q, &quant),
+            0.05,
+        );
     }
 
     #[test]
@@ -2670,14 +2996,23 @@ mod tests {
             head_dim: 4,
             intermediate_size: 8,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let mut full = KvLayerCache::new(cfg.kv_dim());
         let mut q4 = KvLayerCache::new_quant(cfg.kv_dim(), KvQuant::Int4);
         for p in 0..5usize {
-            let k: Vec<f32> = (0..cfg.kv_dim()).map(|i| ((p + i) % 7) as f32 * 0.3 - 1.0).collect();
-            let v: Vec<f32> = (0..cfg.kv_dim()).map(|i| ((p * 2 + i) % 5) as f32 * 0.5).collect();
+            let k: Vec<f32> = (0..cfg.kv_dim())
+                .map(|i| ((p + i) % 7) as f32 * 0.3 - 1.0)
+                .collect();
+            let v: Vec<f32> = (0..cfg.kv_dim())
+                .map(|i| ((p * 2 + i) % 5) as f32 * 0.5)
+                .collect();
             full.append(&k, &v).unwrap();
             q4.append(&k, &v).unwrap();
         }
@@ -2696,7 +3031,12 @@ mod tests {
             head_dim: 2,
             intermediate_size: 4,
             rope_theta: 10000.0,
-            rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
+            rms_eps: 1e-5,
+            rope_scaling: None,
+            moe: None,
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         };
         let w = LayerTensors::zeros(&cfg);
@@ -2717,25 +3057,37 @@ mod tests {
             rope_theta: 10000.0,
             rms_eps: 1e-5,
             rope_scaling: None,
-            moe: Some(m), sliding_window: None, activation: Default::default(), mla: None,
+            moe: Some(m),
+            sliding_window: None,
+            activation: Default::default(),
+            mla: None,
             ..Default::default()
         }
-}
+    }
 
     #[test]
     fn route_topk_selects_highest_and_renormalizes() {
         // Softmax over all, then top-2. idx1 is largest, idx0 next, idx2 dropped.
         let logits = [1.0f32, 2.0, 0.0];
         let chosen = route_topk(&logits, 2, true);
-        assert_eq!(chosen.iter().map(|&(e, _)| e).collect::<Vec<_>>(), vec![1, 0]);
+        assert_eq!(
+            chosen.iter().map(|&(e, _)| e).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
         let sum: f32 = chosen.iter().map(|&(_, w)| w).sum();
-        assert!((sum - 1.0).abs() < 1e-6, "renormalized weights must sum to 1");
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "renormalized weights must sum to 1"
+        );
 
         // Without renorm the kept probs are the raw softmax values (sum < 1,
         // since the dropped expert carried some mass).
         let raw = route_topk(&logits, 2, false);
         let raw_sum: f32 = raw.iter().map(|&(_, w)| w).sum();
-        assert!(raw_sum < 0.9999, "unnormalized top-k must sum below 1: {raw_sum}");
+        assert!(
+            raw_sum < 0.9999,
+            "unnormalized top-k must sum below 1: {raw_sum}"
+        );
         // Relative ratio of the two kept weights is preserved by renormalization.
         assert!((chosen[0].1 / chosen[1].1 - raw[0].1 / raw[1].1).abs() < 1e-5);
     }
@@ -2762,7 +3114,10 @@ mod tests {
             up: Weights::from_f32(vec![0.5, 0.5, 0.5, 0.5]),
             down: Weights::from_f32(vec![1.0, 0.0, 0.0, 1.0]),
         };
-        if let Ffn::Moe { router, experts, .. } = &mut w.ffn {
+        if let Ffn::Moe {
+            router, experts, ..
+        } = &mut w.ffn
+        {
             // logit0 = 10*(n0+n1), logit1 = -10*(n0+n1) ⇒ expert 0 wins decisively.
             *router = Weights::from_f32(vec![10.0, 10.0, -10.0, -10.0]);
             experts[0] = e0;
@@ -2774,7 +3129,10 @@ mod tests {
 
         // Expert 0 actually contributed — output moved off the residual.
         assert!(
-            with_zero_e1.iter().zip(&hidden).any(|(a, b)| (a - b).abs() > 1e-6),
+            with_zero_e1
+                .iter()
+                .zip(&hidden)
+                .any(|(a, b)| (a - b).abs() > 1e-6),
             "selected expert had no effect"
         );
 
@@ -2817,7 +3175,10 @@ mod tests {
             up: Weights::from_f32(vec![0.2, -0.5, 0.3, 0.4]),
             down: Weights::from_f32(vec![-0.2, 0.7, 0.5, 0.1]),
         };
-        if let Ffn::Moe { router, experts, .. } = &mut w.ffn {
+        if let Ffn::Moe {
+            router, experts, ..
+        } = &mut w.ffn
+        {
             *router = Weights::zeros(4); // equal logits ⇒ equal 0.5 weights
             experts[0] = e0.clone();
             experts[1] = e1.clone();
@@ -2857,7 +3218,12 @@ mod tests {
             down: Weights::from_f32(vec![0.9, 0.2, -0.1, 0.4]),
         };
         // Routed experts stay zero, so only the shared expert contributes.
-        if let Ffn::Moe { shared: s, shared_gate, .. } = &mut w.ffn {
+        if let Ffn::Moe {
+            shared: s,
+            shared_gate,
+            ..
+        } = &mut w.ffn
+        {
             *s = Some(shared.clone());
             *shared_gate = Some(Weights::zeros(cfg.hidden_size)); // gate logit 0 ⇒ 0.5
         }
@@ -2866,8 +3232,9 @@ mod tests {
 
         let normed2 = rmsnorm(&hidden, &w.post_attention_layernorm, cfg.rms_eps);
         let sh = swiglu_ffn(&shared, &normed2, cfg.hidden_size, 2, cfg.activation);
-        let expected: Vec<f32> =
-            (0..cfg.hidden_size).map(|i| hidden[i] + 0.5 * sh[i]).collect();
+        let expected: Vec<f32> = (0..cfg.hidden_size)
+            .map(|i| hidden[i] + 0.5 * sh[i])
+            .collect();
         approx(&out, &expected, 1e-6);
     }
 }

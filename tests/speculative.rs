@@ -1,8 +1,8 @@
 //! Speculative decoding must produce exactly the target-greedy sequence.
 
-use dlm::forward::Weights;
 use dlm::batching::BatchScheduler;
 use dlm::cache::KvCacheConfig;
+use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, CpuKernel, ExpertFfn, Ffn, LayerTensors};
 use dlm::generate::{GenerationConfig, Generator, Sampler};
 use dlm::speculative::{SpeculativeDecoder, SpeculativeSession};
@@ -37,9 +37,14 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let mut rng = Rng::new(seed);
     let s = 0.05;
     let layers = vec![LayerTensors {
@@ -47,9 +52,14 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
         k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
         v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * hidden, s)),
         o_proj: Weights::from_f32(rng.vec(hidden * cfg.q_dim(), s)),
-        ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)), down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)) }),
+        ffn: Ffn::Dense(ExpertFfn {
+            gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+            up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
+            down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)),
+        }),
         input_layernorm: vec![1.0; hidden],
-        post_attention_layernorm: vec![1.0; hidden], ..Default::default()
+        post_attention_layernorm: vec![1.0; hidden],
+        ..Default::default()
     }];
     let kernel = CpuKernel::new(cfg, layers).unwrap();
     let embedding = rng.vec(vocab * hidden, s);
@@ -61,7 +71,12 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
         lm_head,
         vocab,
         1e-5,
-        KvCacheConfig { num_layers: 1, num_kv_heads: 2, head_dim: 4, block_size: 16 },
+        KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 4,
+            block_size: 16,
+        },
         64,
     )
     .unwrap()
@@ -70,7 +85,11 @@ fn build_generator(seed: u64) -> Generator<CpuKernel> {
 fn greedy(gen: &Generator<CpuKernel>, prompt: &[u32], n: usize) -> Vec<u32> {
     gen.generate(
         prompt,
-        &GenerationConfig { max_new_tokens: n, eos_token: None, sampler: Sampler::Greedy },
+        &GenerationConfig {
+            max_new_tokens: n,
+            eos_token: None,
+            sampler: Sampler::Greedy,
+        },
     )
     .unwrap()
 }
@@ -85,7 +104,10 @@ fn speculative_output_equals_target_greedy() {
     let spec = decoder.generate(&prompt, n).unwrap();
     let reference = greedy(&build_generator(1), &prompt, n);
 
-    assert_eq!(spec.tokens, reference, "speculative diverged from target-greedy");
+    assert_eq!(
+        spec.tokens, reference,
+        "speculative diverged from target-greedy"
+    );
     assert_eq!(spec.tokens.len(), n);
 }
 
@@ -129,11 +151,8 @@ fn session_round_by_round_equals_target_greedy() {
 fn speculative_scheduler_matches_greedy_across_requests() {
     let target = build_generator(1);
     let draft = build_generator(2); // different draft: exactness must still hold
-    let requests: Vec<(u64, Vec<u32>, usize)> = vec![
-        (1, vec![1, 2, 3], 7),
-        (2, vec![7], 5),
-        (3, vec![4, 5], 6),
-    ];
+    let requests: Vec<(u64, Vec<u32>, usize)> =
+        vec![(1, vec![1, 2, 3], 7), (2, vec![7], 5), (3, vec![4, 5], 6)];
 
     // max_batch = 2 forces staggered admission while speculating.
     let mut sched = BatchScheduler::with_speculative(&target, &draft, 2, 4);
@@ -145,7 +164,11 @@ fn speculative_scheduler_matches_greedy_across_requests() {
 
     assert_eq!(results.len(), requests.len());
     for (f, (id, prompt, n)) in results.iter().zip(&requests) {
-        assert_eq!(f.tokens, greedy(&target, prompt, *n), "request {id} diverged");
+        assert_eq!(
+            f.tokens,
+            greedy(&target, prompt, *n),
+            "request {id} diverged"
+        );
         assert_eq!(f.tokens.len(), *n);
     }
     // Every retired slot contributed to the acceptance stats.
@@ -157,7 +180,7 @@ fn speculative_scheduler_matches_greedy_across_requests() {
 fn speculative_scheduler_respects_eos() {
     let target = build_generator(1);
     let draft = build_generator(1); // identical draft → full acceptance
-    // The token greedy decoding would emit second, used as EOS.
+                                    // The token greedy decoding would emit second, used as EOS.
     let two = greedy(&target, &[1, 2], 2);
     let eos = two[1];
 

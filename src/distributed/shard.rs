@@ -50,7 +50,13 @@ mod tests {
     #[test]
     fn partitions_evenly() {
         let s = partition_layers(8, 2);
-        assert_eq!(s, vec![LayerShard { start: 0, end: 4 }, LayerShard { start: 4, end: 8 }]);
+        assert_eq!(
+            s,
+            vec![
+                LayerShard { start: 0, end: 4 },
+                LayerShard { start: 4, end: 8 }
+            ]
+        );
     }
 
     #[test]

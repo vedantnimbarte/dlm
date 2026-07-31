@@ -1,4 +1,10 @@
 /target
 /models
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is COMMITTED, deliberately. dlm ships binaries -- prebuilt release
+# assets and `cargo install` -- and the convention for an application is to lock
+# its dependency graph rather than re-resolve it per build. Ignoring it meant
+# every CI run and every published binary was built against whatever crates.io
+# happened to serve that day, and it is how the MSRV broke unnoticed: clap's
+# `"4"` drifted to a clap_lex that requires 1.85 while the manifest still said
+# 1.75. Nothing observed the change because nothing recorded the old answer.

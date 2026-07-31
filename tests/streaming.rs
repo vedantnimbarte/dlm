@@ -42,7 +42,9 @@ fn write_checkpoint(dir: &std::path::Path) -> ModelConfig {
     let kv_dim = nkv * hd;
     // Layer-varying weights so a wrong-layer eviction bug would change output.
     let fill = |seed: usize, n: usize| -> Vec<f32> {
-        (0..n).map(|i| (((i + seed) % 13) as f32 - 6.0) * 0.01).collect()
+        (0..n)
+            .map(|i| (((i + seed) % 13) as f32 - 6.0) * 0.01)
+            .collect()
     };
 
     let mut tensors: Vec<(String, Vec<f32>)> = Vec::new();
@@ -99,8 +101,7 @@ fn planned_window_fits_free_vram_at_real_layer_size() {
     // passing without ever exercising the arithmetic under test.
     let profiler = dlm::profiler::VramProfiler::new(128).with_safety_margin_bytes(0);
     // Room for the KV, the pinned zone, and exactly 3 of the 6 layers.
-    let free =
-        profiler.kv_total_bytes(&config) + catalog.pinned_bytes() + per_layer * 3;
+    let free = profiler.kv_total_bytes(&config) + catalog.pinned_bytes() + per_layer * 3;
 
     // native == config.quant: no quantize-at-load rescale, so the catalog's
     // measured block size is what the window is planned against.
@@ -168,7 +169,8 @@ fn streaming_generation_matches_resident() {
     // 64 MiB host-RAM layer cache on, so this also covers the cached source path:
     // caching must not change what the model emits.
     let streaming =
-        dlm::loader::build_streaming_generator(store_b, &config, 32, 2, 1, false, 64 << 20).unwrap();
+        dlm::loader::build_streaming_generator(store_b, &config, 32, 2, 1, false, 64 << 20)
+            .unwrap();
     let out_streaming = streaming.generate(&prompt, &cfg).unwrap();
 
     assert_eq!(

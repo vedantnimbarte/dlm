@@ -27,9 +27,8 @@ use dlm::tokenizer::BpeTokenizer;
 use std::path::PathBuf;
 
 fn model_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(
-        std::env::var("DLM_TEST_MODEL").unwrap_or_else(|_| "models".to_string()),
-    );
+    let dir =
+        PathBuf::from(std::env::var("DLM_TEST_MODEL").unwrap_or_else(|_| "models".to_string()));
     (dir.join("config.json").exists() && dir.join("model.safetensors").exists()).then_some(dir)
 }
 
@@ -113,7 +112,8 @@ fn eos_tokens_include_the_generation_config_set() {
 
     let config = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("config");
     let gen: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("generation_config.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(dir.join("generation_config.json")).unwrap())
+            .unwrap();
 
     let declared: Vec<u32> = match &gen["eos_token_id"] {
         serde_json::Value::Number(n) => vec![n.as_u64().unwrap() as u32],

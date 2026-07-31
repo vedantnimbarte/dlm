@@ -24,7 +24,7 @@
 //! Populate with `.github/fetch-family-fixtures.sh`; each family skips when its
 //! directory is absent, so a fresh clone still runs the rest of the suite.
 
-use dlm::model::{MoeNaming, ModelConfig, QuantScheme};
+use dlm::model::{ModelConfig, MoeNaming, QuantScheme};
 use dlm::tokenizer::BpeTokenizer;
 use std::path::PathBuf;
 
@@ -56,7 +56,9 @@ fn assert_pieces(tok: &BpeTokenizer, pieces: &[&str], family: &str) {
             .unwrap_or_else(|| panic!("{family}: vocabulary has no piece {p:?}"));
         want.push(id);
     }
-    let got = tok.encode(PROMPT).unwrap_or_else(|e| panic!("{family}: encode failed: {e}"));
+    let got = tok
+        .encode(PROMPT)
+        .unwrap_or_else(|e| panic!("{family}: encode failed: {e}"));
     assert_eq!(got, want, "{family}: wrong segmentation of {PROMPT:?}");
 }
 
@@ -90,12 +92,23 @@ fn gemma2_family_fixture() {
     assert_eq!(cfg.attn_logit_softcap, Some(50.0));
     assert_eq!(cfg.final_logit_softcap, Some(30.0));
     assert_eq!(cfg.sliding_window, Some(4096));
-    assert_eq!(cfg.sliding_window_pattern, Some(2), "alternating local/global");
+    assert_eq!(
+        cfg.sliding_window_pattern,
+        Some(2),
+        "alternating local/global"
+    );
 
     let tok = BpeTokenizer::from_dir(&dir).expect("gemma-2 tokenizer");
-    assert_pieces(&tok, &["The", "▁capital", "▁of", "▁France", "▁is"], "gemma-2");
+    assert_pieces(
+        &tok,
+        &["The", "▁capital", "▁of", "▁France", "▁is"],
+        "gemma-2",
+    );
     assert_round_trip(&tok, "gemma-2");
-    assert!(tok.bos_id().is_some(), "gemma-2 is trained with <bos> always present");
+    assert!(
+        tok.bos_id().is_some(),
+        "gemma-2 is trained with <bos> always present"
+    );
 }
 
 /// Llama 2: `Sequence[Prepend(▁), Replace(" " -> ▁)]` with a null pre-tokenizer.
@@ -108,7 +121,11 @@ fn llama2_family_fixture() {
         return;
     };
     let tok = BpeTokenizer::from_dir(&dir).expect("llama-2 tokenizer");
-    assert_pieces(&tok, &["▁The", "▁capital", "▁of", "▁France", "▁is"], "llama-2");
+    assert_pieces(
+        &tok,
+        &["▁The", "▁capital", "▁of", "▁France", "▁is"],
+        "llama-2",
+    );
     assert_round_trip(&tok, "llama-2");
 }
 
@@ -126,10 +143,17 @@ fn mistral_family_fixture() {
     // is v0.2 — so the checkpoint says `null` and dlm must not invent one. (The
     // windowed path is covered by the gemma-2 fixture, which declares 4096 with
     // an alternating pattern.)
-    assert_eq!(cfg.sliding_window, None, "v0.2 declares no window; dlm must not add one");
+    assert_eq!(
+        cfg.sliding_window, None,
+        "v0.2 declares no window; dlm must not add one"
+    );
 
     let tok = BpeTokenizer::from_dir(&dir).expect("mistral tokenizer");
-    assert_pieces(&tok, &["▁The", "▁capital", "▁of", "▁France", "▁is"], "mistral");
+    assert_pieces(
+        &tok,
+        &["▁The", "▁capital", "▁of", "▁France", "▁is"],
+        "mistral",
+    );
     assert_round_trip(&tok, "mistral");
 }
 
@@ -150,7 +174,10 @@ fn deepseek_family_fixture() {
     assert_eq!(moe.first_k_dense, 1, "layer 0 is dense, layers 1.. routed");
     // A shared-expert *count* (2) times the routed width (1408), not a width.
     assert_eq!(moe.shared_intermediate_size, Some(2816));
-    assert!(cfg.mla.is_some(), "DeepSeek-V2 uses Multi-head Latent Attention");
+    assert!(
+        cfg.mla.is_some(),
+        "DeepSeek-V2 uses Multi-head Latent Attention"
+    );
 
     let tok = BpeTokenizer::from_dir(&dir).expect("deepseek tokenizer");
     assert_round_trip(&tok, "deepseek-v2");
@@ -168,6 +195,10 @@ fn qwen_family_fixture_stays_byte_level() {
     let tok = BpeTokenizer::from_dir(&dir).expect("qwen tokenizer");
     assert_eq!(tok.bos_id(), None, "Qwen sets add_bos_token: false");
     // Byte-level: the space rides along as `Ġ`, and there is no ▁ piece at all.
-    assert_pieces(&tok, &["The", "Ġcapital", "Ġof", "ĠFrance", "Ġis"], "qwen2.5");
+    assert_pieces(
+        &tok,
+        &["The", "Ġcapital", "Ġof", "ĠFrance", "Ġis"],
+        "qwen2.5",
+    );
     assert_round_trip(&tok, "qwen2.5");
 }

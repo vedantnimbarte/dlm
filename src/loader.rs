@@ -41,10 +41,16 @@ use crate::storage::{bytes_to_f32, Dtype, MmapStore};
 pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
     // An already-packed 4-bit checkpoint (GPTQ) has no float `.weight` to probe —
     // its precision is int4 by construction.
-    if store.locate("model.layers.0.self_attn.q_proj.qweight").is_some() {
+    if store
+        .locate("model.layers.0.self_attn.q_proj.qweight")
+        .is_some()
+    {
         return Ok(QuantScheme::Int4);
     }
-    let probe = ["model.layers.0.self_attn.q_proj.weight", "model.embed_tokens.weight"];
+    let probe = [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.embed_tokens.weight",
+    ];
     let dtype = probe
         .iter()
         .find_map(|n| store.locate(n).map(|(_, info)| info.dtype))
@@ -175,7 +181,6 @@ fn load_native(
     }
     Ok(w)
 }
-
 
 /// Load a linear layer's weight as dense row-major `[out, in]`, transparently
 /// handling both float (`{base}.weight`) and GPTQ-style quantized
@@ -381,7 +386,8 @@ impl ModelParts {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
-        let kernel = crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
+        let kernel =
+            crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
         Ok(Generator::new(
             kernel,
             self.embedding,
@@ -523,21 +529,53 @@ pub(crate) fn load_layer_tensors_opt(
     // load_linear takes (in_features, out_features) of the underlying Linear.
     let ffn = match cfg.moe {
         None => Ffn::Dense(ExpertFfn {
-            gate: load_linear(store, &name("mlp.gate_proj"), hidden, intermediate, quant, packed)?,
-            up: load_linear(store, &name("mlp.up_proj"), hidden, intermediate, quant, packed)?,
-            down: load_linear(store, &name("mlp.down_proj"), intermediate, hidden, quant, packed)?,
+            gate: load_linear(
+                store,
+                &name("mlp.gate_proj"),
+                hidden,
+                intermediate,
+                quant,
+                packed,
+            )?,
+            up: load_linear(
+                store,
+                &name("mlp.up_proj"),
+                hidden,
+                intermediate,
+                quant,
+                packed,
+            )?,
+            down: load_linear(
+                store,
+                &name("mlp.down_proj"),
+                intermediate,
+                hidden,
+                quant,
+                packed,
+            )?,
         }),
         Some(_) => load_moe_ffn(store, cfg, layer, quant, packed, include_experts)?,
     };
     let input_layernorm = load_norm(store, &name("input_layernorm.weight"), hidden, norm_add_one)?;
-    let post_attention_layernorm =
-        load_norm(store, &name("post_attention_layernorm.weight"), hidden, norm_add_one)?;
+    let post_attention_layernorm = load_norm(
+        store,
+        &name("post_attention_layernorm.weight"),
+        hidden,
+        norm_add_one,
+    )?;
 
     // MLA (DeepSeek) replaces q/k/v with latent projections and a wider o_proj.
     let tensors = if let Some(m) = &cfg.mla {
         let vdim = m.v_head_dim as usize;
         LayerTensors {
-            o_proj: load_linear(store, &name("self_attn.o_proj"), cfg.num_heads * vdim, hidden, quant, packed)?,
+            o_proj: load_linear(
+                store,
+                &name("self_attn.o_proj"),
+                cfg.num_heads * vdim,
+                hidden,
+                quant,
+                packed,
+            )?,
             ffn,
             input_layernorm,
             post_attention_layernorm,
@@ -546,10 +584,38 @@ pub(crate) fn load_layer_tensors_opt(
         }
     } else {
         LayerTensors {
-            q_proj: load_linear(store, &name("self_attn.q_proj"), hidden, q_dim, quant, packed)?,
-            k_proj: load_linear(store, &name("self_attn.k_proj"), hidden, kv_dim, quant, packed)?,
-            v_proj: load_linear(store, &name("self_attn.v_proj"), hidden, kv_dim, quant, packed)?,
-            o_proj: load_linear(store, &name("self_attn.o_proj"), q_dim, hidden, quant, packed)?,
+            q_proj: load_linear(
+                store,
+                &name("self_attn.q_proj"),
+                hidden,
+                q_dim,
+                quant,
+                packed,
+            )?,
+            k_proj: load_linear(
+                store,
+                &name("self_attn.k_proj"),
+                hidden,
+                kv_dim,
+                quant,
+                packed,
+            )?,
+            v_proj: load_linear(
+                store,
+                &name("self_attn.v_proj"),
+                hidden,
+                kv_dim,
+                quant,
+                packed,
+            )?,
+            o_proj: load_linear(
+                store,
+                &name("self_attn.o_proj"),
+                q_dim,
+                hidden,
+                quant,
+                packed,
+            )?,
             ffn,
             input_layernorm,
             post_attention_layernorm,
@@ -605,9 +671,28 @@ fn load_mla(
         Some(r) => {
             let r = r as usize;
             (
-                Some(load_linear(store, &name("self_attn.q_a_proj"), h, r, quant, packed)?),
-                Some(load_norm(store, &name("self_attn.q_a_layernorm.weight"), r, norm_add_one)?),
-                load_linear(store, &name("self_attn.q_b_proj"), r, nh * qk, quant, packed)?,
+                Some(load_linear(
+                    store,
+                    &name("self_attn.q_a_proj"),
+                    h,
+                    r,
+                    quant,
+                    packed,
+                )?),
+                Some(load_norm(
+                    store,
+                    &name("self_attn.q_a_layernorm.weight"),
+                    r,
+                    norm_add_one,
+                )?),
+                load_linear(
+                    store,
+                    &name("self_attn.q_b_proj"),
+                    r,
+                    nh * qk,
+                    quant,
+                    packed,
+                )?,
             )
         }
         None => (
@@ -620,8 +705,20 @@ fn load_mla(
         q_a_proj,
         q_a_layernorm,
         q_b_proj,
-        kv_a_proj: load_linear(store, &name("self_attn.kv_a_proj_with_mqa"), h, latent + rope, quant, packed)?,
-        kv_a_layernorm: load_norm(store, &name("self_attn.kv_a_layernorm.weight"), latent, norm_add_one)?,
+        kv_a_proj: load_linear(
+            store,
+            &name("self_attn.kv_a_proj_with_mqa"),
+            h,
+            latent + rope,
+            quant,
+            packed,
+        )?,
+        kv_a_layernorm: load_norm(
+            store,
+            &name("self_attn.kv_a_layernorm.weight"),
+            latent,
+            norm_add_one,
+        )?,
         kv_b_proj: load_linear(
             store,
             &name("self_attn.kv_b_proj"),
@@ -687,9 +784,30 @@ fn load_expert(
     packed: Option<PackedQuant>,
 ) -> Result<ExpertFfn> {
     Ok(ExpertFfn {
-        gate: load_linear(store, &format!("{base}.{}", proj.0), hidden, inter, quant, packed)?,
-        up: load_linear(store, &format!("{base}.{}", proj.1), hidden, inter, quant, packed)?,
-        down: load_linear(store, &format!("{base}.{}", proj.2), inter, hidden, quant, packed)?,
+        gate: load_linear(
+            store,
+            &format!("{base}.{}", proj.0),
+            hidden,
+            inter,
+            quant,
+            packed,
+        )?,
+        up: load_linear(
+            store,
+            &format!("{base}.{}", proj.1),
+            hidden,
+            inter,
+            quant,
+            packed,
+        )?,
+        down: load_linear(
+            store,
+            &format!("{base}.{}", proj.2),
+            inter,
+            hidden,
+            quant,
+            packed,
+        )?,
     })
 }
 
@@ -720,13 +838,20 @@ pub(crate) fn load_moe_ffn(
     // float checkpoint that `--quant` would quantize, load the router in its
     // native dtype instead. (A packed GPTQ checkpoint's router keeps its own
     // calibrated int4 codes — there is no float to fall back to.)
-    let router_quant = if packed.is_none() && matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
+    let router_quant = if packed.is_none() && matches!(quant, QuantScheme::Int4 | QuantScheme::Int8)
+    {
         QuantScheme::Fp16 // sentinel: load_native reads the real dtype, doesn't quantize
     } else {
         quant
     };
-    let router =
-        load_linear(store, &names.router, hidden, m.num_experts as usize, router_quant, packed)?;
+    let router = load_linear(
+        store,
+        &names.router,
+        hidden,
+        m.num_experts as usize,
+        router_quant,
+        packed,
+    )?;
     let experts = if include_experts {
         (0..m.num_experts)
             .map(|e| {
@@ -753,7 +878,12 @@ pub(crate) fn load_moe_ffn(
         _ => (None, None),
     };
 
-    Ok(Ffn::Moe { router, experts, shared, shared_gate })
+    Ok(Ffn::Moe {
+        router,
+        experts,
+        shared,
+        shared_gate,
+    })
 }
 
 /// A [`LayerSource`] that streams layer weights out of a memory-mapped
@@ -775,8 +905,15 @@ impl LayerSource for MmapLayerSource {
         self.num_layers
     }
     fn load_layer(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
-        load_layer_tensors(&self.store, &self.cfg, layer, self.quant, self.packed, self.norm_add_one)
-            .map(std::sync::Arc::new)
+        load_layer_tensors(
+            &self.store,
+            &self.cfg,
+            layer,
+            self.quant,
+            self.packed,
+            self.norm_add_one,
+        )
+        .map(std::sync::Arc::new)
     }
     fn load_layer_core(&self, layer: u32) -> Result<std::sync::Arc<LayerTensors>> {
         // Core only (no routed experts) for the per-expert streaming GPU path.
@@ -792,9 +929,10 @@ impl LayerSource for MmapLayerSource {
         .map(std::sync::Arc::new)
     }
     fn load_expert(&self, layer: u32, expert: u32) -> Result<std::sync::Arc<ExpertFfn>> {
-        let m = self.cfg.moe.ok_or_else(|| {
-            DlmError::InvalidConfig("load_expert on a dense model".into())
-        })?;
+        let m = self
+            .cfg
+            .moe
+            .ok_or_else(|| DlmError::InvalidConfig("load_expert on a dense model".into()))?;
         let names = moe_names(m.naming, layer);
         let base = format!("{}.{expert}", names.experts_base);
         load_expert(

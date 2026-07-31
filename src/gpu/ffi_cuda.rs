@@ -190,7 +190,10 @@ pub(super) fn stream_create_nonblocking() -> Result<cudaStream_t> {
     // SAFETY: `s` is a valid out-pointer.
     let code = unsafe { cudaStreamCreateWithFlags(&mut s, CUDA_STREAM_NON_BLOCKING) };
     if code != CUDA_SUCCESS {
-        return Err(DlmError::Gpu { api: "cudaStreamCreateWithFlags", code });
+        return Err(DlmError::Gpu {
+            api: "cudaStreamCreateWithFlags",
+            code,
+        });
     }
     Ok(s)
 }
@@ -208,7 +211,10 @@ pub(super) fn stream_synchronize(stream: cudaStream_t) -> Result<()> {
     // SAFETY: `stream` is a valid stream handle.
     let code = unsafe { cudaStreamSynchronize(stream) };
     if code != CUDA_SUCCESS {
-        return Err(DlmError::Gpu { api: "cudaStreamSynchronize", code });
+        return Err(DlmError::Gpu {
+            api: "cudaStreamSynchronize",
+            code,
+        });
     }
     Ok(())
 }
@@ -222,10 +228,12 @@ pub(super) fn copy_h2d_async(
     stream: cudaStream_t,
 ) -> Result<()> {
     // SAFETY: caller guarantees `bytes` valid on both sides; `src` is pinned.
-    let code =
-        unsafe { cudaMemcpyAsync(dst, src, bytes, CUDA_MEMCPY_HOST_TO_DEVICE, stream) };
+    let code = unsafe { cudaMemcpyAsync(dst, src, bytes, CUDA_MEMCPY_HOST_TO_DEVICE, stream) };
     if code != CUDA_SUCCESS {
-        return Err(DlmError::Gpu { api: "cudaMemcpyAsync(H2D)", code });
+        return Err(DlmError::Gpu {
+            api: "cudaMemcpyAsync(H2D)",
+            code,
+        });
     }
     Ok(())
 }

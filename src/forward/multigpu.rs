@@ -134,7 +134,8 @@ mod tests {
 
         for position in 0..3 {
             for layer in 0..6 {
-                bare.run_block(layer, &mut h_bare, &mut kv_bare, position).unwrap();
+                bare.run_block(layer, &mut h_bare, &mut kv_bare, position)
+                    .unwrap();
                 wrapped
                     .run_block(layer, &mut h_wrapped, &mut kv_wrapped, position)
                     .unwrap();

@@ -3,8 +3,8 @@
 //! the test exercises the HTTP layer + coordinator without real workers — the
 //! networked pipeline itself is covered by tests/distributed.rs.
 
-use dlm::forward::Weights;
 use dlm::distributed::{partition_layers, Coordinator, ShardRoute};
+use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ExpertFfn, Ffn, LayerTensors};
 use dlm::server::engine::ChatTemplate;
 use dlm::server::{distributed, DistributedEngine, HttpServer};
@@ -41,9 +41,14 @@ fn coordinator() -> Coordinator {
         head_dim: 4,
         intermediate_size: 32,
         rope_theta: 10000.0,
-        rms_eps: 1e-5, rope_scaling: None, moe: None, sliding_window: None, activation: Default::default(), mla: None,
-            ..Default::default()
-        };
+        rms_eps: 1e-5,
+        rope_scaling: None,
+        moe: None,
+        sliding_window: None,
+        activation: Default::default(),
+        mla: None,
+        ..Default::default()
+    };
     let mut r = Rng::new(9);
     let layers: Vec<LayerTensors> = (0..num_layers)
         .map(|_| LayerTensors {
@@ -51,16 +56,24 @@ fn coordinator() -> Coordinator {
             k_proj: Weights::from_f32(r.vec(cfg.kv_dim() * hidden)),
             v_proj: Weights::from_f32(r.vec(cfg.kv_dim() * hidden)),
             o_proj: Weights::from_f32(r.vec(hidden * cfg.q_dim())),
-            ffn: Ffn::Dense(ExpertFfn { gate: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)), up: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)), down: Weights::from_f32(r.vec(hidden * cfg.intermediate_size)) }),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)),
+                up: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)),
+                down: Weights::from_f32(r.vec(hidden * cfg.intermediate_size)),
+            }),
             input_layernorm: vec![1.0; hidden],
-            post_attention_layernorm: vec![1.0; hidden], ..Default::default()
+            post_attention_layernorm: vec![1.0; hidden],
+            ..Default::default()
         })
         .collect();
 
     // Two shards, both local (no worker_addr) — the coordinator runs them itself.
     let routes: Vec<ShardRoute> = partition_layers(num_layers, 2)
         .into_iter()
-        .map(|shard| ShardRoute { shard, worker_addr: None })
+        .map(|shard| ShardRoute {
+            shard,
+            worker_addr: None,
+        })
         .collect();
 
     Coordinator::new(
@@ -157,11 +170,17 @@ fn distributed_api_key_gates_completions() {
 
     // No key → 401.
     let resp = post(addr, "/v1/chat/completions", body);
-    assert!(resp.starts_with("HTTP/1.1 401"), "unauth should be 401: {resp}");
+    assert!(
+        resp.starts_with("HTTP/1.1 401"),
+        "unauth should be 401: {resp}"
+    );
 
     // Correct key → 200.
     let ok = post_auth(addr, "/v1/chat/completions", body, Some("sk-secret"));
-    assert!(ok.starts_with("HTTP/1.1 200 OK"), "authed should be 200: {ok}");
+    assert!(
+        ok.starts_with("HTTP/1.1 200 OK"),
+        "authed should be 200: {ok}"
+    );
 
     // Health stays public.
     let health = {

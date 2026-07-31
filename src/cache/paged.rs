@@ -183,7 +183,8 @@ impl PagedKvCache {
         // Commit: pull blocks from the pool and extend the sequence's table.
         let seq = self.sequences.entry(seq_id).or_default();
         for _ in 0..to_alloc {
-            seq.blocks.push(self.free.pop().expect("checked capacity above"));
+            seq.blocks
+                .push(self.free.pop().expect("checked capacity above"));
         }
         seq.length = new_len;
         Ok(())
@@ -299,10 +300,14 @@ mod tests {
     fn exhaustion_is_atomic_and_reported() {
         let mut cache = PagedKvCache::new(cfg(), 2); // 32 tokens capacity
         cache.append_tokens(1, 16).unwrap(); // 1 block, 1 free left
-        // 40 more → 56 tokens → needs 4 blocks total, have 1, want 3 more, 1 free.
+                                             // 40 more → 56 tokens → needs 4 blocks total, have 1, want 3 more, 1 free.
         let err = cache.append_tokens(1, 40).unwrap_err();
         match err {
-            DlmError::KvCacheExhausted { requested, free, total } => {
+            DlmError::KvCacheExhausted {
+                requested,
+                free,
+                total,
+            } => {
                 assert_eq!(requested, 3);
                 assert_eq!(free, 1);
                 assert_eq!(total, 2);

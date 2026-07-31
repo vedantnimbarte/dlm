@@ -121,14 +121,18 @@ pub fn dequantize_gptq_4bit(
             None => i / gs,
         };
         if g >= groups {
-            return Err(DlmError::QuantLayout(format!("g_idx[{i}] = {g} out of range 0..{groups}")));
+            return Err(DlmError::QuantLayout(format!(
+                "g_idx[{i}] = {g} out of range 0..{groups}"
+            )));
         }
         let w_row = i / NIBBLES_PER_WORD;
         let w_nib = i % NIBBLES_PER_WORD;
         for j in 0..out {
             let q = nibble(qweight[w_row * out + j], w_nib) as f32;
-            let z = nibble(qzeros[g * zeros_per_row + j / NIBBLES_PER_WORD], j % NIBBLES_PER_WORD)
-                as f32;
+            let z = nibble(
+                qzeros[g * zeros_per_row + j / NIBBLES_PER_WORD],
+                j % NIBBLES_PER_WORD,
+            ) as f32;
             let s = scales[g * out + j];
             // Transpose into row-major [out, in].
             dense[j * inf + i] = (q - z) * s;
@@ -213,12 +217,18 @@ pub fn pack_awq_4bit(
                 mn = mn.min(v);
                 mx = mx.max(v);
             }
-            let scale = if (mx - mn).abs() < f32::EPSILON { 1.0 } else { (mx - mn) / MAX_CODE };
+            let scale = if (mx - mn).abs() < f32::EPSILON {
+                1.0
+            } else {
+                (mx - mn) / MAX_CODE
+            };
             let z = (-mn / scale).round().clamp(0.0, MAX_CODE) as u32;
             scales[g * out + j] = scale;
             zeros[g * out + j] = z;
             for i in g * gs..(g + 1) * gs {
-                let q = (dense_in_by_out[i * out + j] / scale + z as f32).round().clamp(0.0, MAX_CODE);
+                let q = (dense_in_by_out[i * out + j] / scale + z as f32)
+                    .round()
+                    .clamp(0.0, MAX_CODE);
                 codes[i * out + j] = q as u32;
             }
         }
@@ -305,7 +315,10 @@ pub fn unpack_gptq_4bit(
     // over [out, in] map to them 1:1 because in_features % group_size == 0.
     for g in 0..groups {
         for j in 0..out {
-            let z = nibble(qzeros[g * zeros_per_row + j / NIBBLES_PER_WORD], j % NIBBLES_PER_WORD);
+            let z = nibble(
+                qzeros[g * zeros_per_row + j / NIBBLES_PER_WORD],
+                j % NIBBLES_PER_WORD,
+            );
             // +1: AutoGPTQ stores zero-1 (see above).
             out_zeros[j * groups + g] = z as f32 + 1.0;
             out_scales[j * groups + g] = scales[g * out + j];
@@ -440,15 +453,25 @@ mod tests {
     /// path, and a permuted `g_idx` actually changes the result (it's consulted).
     #[test]
     fn actorder_gidx_is_used() {
-        let cfg = PackedQuantConfig { in_features: 16, out_features: 8, group_size: 8 };
-        let dense: Vec<f32> =
-            (0..cfg.in_features * cfg.out_features).map(|k| (k as f32 % 11.0) * 0.1 - 0.5).collect();
+        let cfg = PackedQuantConfig {
+            in_features: 16,
+            out_features: 8,
+            group_size: 8,
+        };
+        let dense: Vec<f32> = (0..cfg.in_features * cfg.out_features)
+            .map(|k| (k as f32 % 11.0) * 0.1 - 0.5)
+            .collect();
         let (qw, qz, sc) = pack_gptq_4bit(&dense, &cfg).unwrap();
 
         let none = dequantize_gptq_4bit(&qw, &qz, &sc, &cfg, None).unwrap();
-        let identity: Vec<i32> = (0..cfg.in_features).map(|i| (i / cfg.group_size) as i32).collect();
+        let identity: Vec<i32> = (0..cfg.in_features)
+            .map(|i| (i / cfg.group_size) as i32)
+            .collect();
         let with_id = dequantize_gptq_4bit(&qw, &qz, &sc, &cfg, Some(&identity)).unwrap();
-        assert_eq!(none, with_id, "identity g_idx must match the contiguous path");
+        assert_eq!(
+            none, with_id,
+            "identity g_idx must match the contiguous path"
+        );
 
         // Send input row 0 to group 1's scale/zero → a different dequant.
         let mut perm = identity.clone();
@@ -462,9 +485,14 @@ mod tests {
     /// AWQ export, which the loader warns about.)
     #[test]
     fn awq_round_trips() {
-        let cfg = PackedQuantConfig { in_features: 16, out_features: 8, group_size: 8 };
-        let dense: Vec<f32> =
-            (0..cfg.in_features * cfg.out_features).map(|k| ((k % 13) as f32 - 6.0) * 0.1).collect();
+        let cfg = PackedQuantConfig {
+            in_features: 16,
+            out_features: 8,
+            group_size: 8,
+        };
+        let dense: Vec<f32> = (0..cfg.in_features * cfg.out_features)
+            .map(|k| ((k % 13) as f32 - 6.0) * 0.1)
+            .collect();
         let (qw, qz, sc) = pack_awq_4bit(&dense, &cfg).unwrap();
         let deq = dequantize_awq_4bit(&qw, &qz, &sc, &cfg).unwrap();
         for i in 0..cfg.in_features {
@@ -472,7 +500,10 @@ mod tests {
                 let scale = sc[(i / cfg.group_size) * cfg.out_features + j];
                 let orig = dense[i * cfg.out_features + j];
                 let got = deq[j * cfg.in_features + i];
-                assert!((orig - got).abs() <= scale / 2.0 + 1e-4, "awq ({i},{j}): {orig} vs {got}");
+                assert!(
+                    (orig - got).abs() <= scale / 2.0 + 1e-4,
+                    "awq ({i},{j}): {orig} vs {got}"
+                );
             }
         }
     }

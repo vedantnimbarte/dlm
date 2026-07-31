@@ -47,7 +47,9 @@ const VDIM: usize = 4;
 const QK: usize = NOPE + ROPE;
 
 fn fill(seed: usize, n: usize) -> Vec<f32> {
-    (0..n).map(|i| (((i * 7 + seed) % 17) as f32 - 8.0) * 0.02).collect()
+    (0..n)
+        .map(|i| (((i * 7 + seed) % 17) as f32 - 8.0) * 0.02)
+        .collect()
 }
 
 fn write_mla_checkpoint(dir: &std::path::Path) -> ModelConfig {
@@ -59,11 +61,25 @@ fn write_mla_checkpoint(dir: &std::path::Path) -> ModelConfig {
         let a = |name: &str, n: usize, seed: usize| (format!("{p}{name}"), fill(seed, n));
         // MLA projections.
         t.push(a("self_attn.q_a_proj.weight", Q_LORA * H, s));
-        t.push((format!("{p}self_attn.q_a_layernorm.weight"), vec![1.0; Q_LORA]));
+        t.push((
+            format!("{p}self_attn.q_a_layernorm.weight"),
+            vec![1.0; Q_LORA],
+        ));
         t.push(a("self_attn.q_b_proj.weight", NH * QK * Q_LORA, s + 1));
-        t.push(a("self_attn.kv_a_proj_with_mqa.weight", (KV_LORA + ROPE) * H, s + 2));
-        t.push((format!("{p}self_attn.kv_a_layernorm.weight"), vec![1.0; KV_LORA]));
-        t.push(a("self_attn.kv_b_proj.weight", NH * (NOPE + VDIM) * KV_LORA, s + 3));
+        t.push(a(
+            "self_attn.kv_a_proj_with_mqa.weight",
+            (KV_LORA + ROPE) * H,
+            s + 2,
+        ));
+        t.push((
+            format!("{p}self_attn.kv_a_layernorm.weight"),
+            vec![1.0; KV_LORA],
+        ));
+        t.push(a(
+            "self_attn.kv_b_proj.weight",
+            NH * (NOPE + VDIM) * KV_LORA,
+            s + 3,
+        ));
         t.push(a("self_attn.o_proj.weight", H * NH * VDIM, s + 4));
         t.push((format!("{p}input_layernorm.weight"), vec![1.0; H]));
         t.push((format!("{p}post_attention_layernorm.weight"), vec![1.0; H]));
@@ -104,7 +120,11 @@ fn mla_loads_and_runs_deterministically() {
     let out = gen.generate(&prompt, &gen_cfg).unwrap();
     assert_eq!(out.len(), 8, "MLA model produced no tokens");
     // Greedy decode of the same prompt repeats exactly.
-    assert_eq!(out, gen.generate(&prompt, &gen_cfg).unwrap(), "MLA decode not deterministic");
+    assert_eq!(
+        out,
+        gen.generate(&prompt, &gen_cfg).unwrap(),
+        "MLA decode not deterministic"
+    );
 }
 
 /// The compressed-latent KV path with no query low-rank (direct `q_proj`) also
@@ -119,9 +139,20 @@ fn mla_without_q_lora_runs() {
         let s = i + 2;
         let a = |name: &str, n: usize, seed: usize| (format!("{p}{name}"), fill(seed, n));
         t.push(a("self_attn.q_proj.weight", NH * QK * H, s)); // direct query projection
-        t.push(a("self_attn.kv_a_proj_with_mqa.weight", (KV_LORA + ROPE) * H, s + 2));
-        t.push((format!("{p}self_attn.kv_a_layernorm.weight"), vec![1.0; KV_LORA]));
-        t.push(a("self_attn.kv_b_proj.weight", NH * (NOPE + VDIM) * KV_LORA, s + 3));
+        t.push(a(
+            "self_attn.kv_a_proj_with_mqa.weight",
+            (KV_LORA + ROPE) * H,
+            s + 2,
+        ));
+        t.push((
+            format!("{p}self_attn.kv_a_layernorm.weight"),
+            vec![1.0; KV_LORA],
+        ));
+        t.push(a(
+            "self_attn.kv_b_proj.weight",
+            NH * (NOPE + VDIM) * KV_LORA,
+            s + 3,
+        ));
         t.push(a("self_attn.o_proj.weight", H * NH * VDIM, s + 4));
         t.push((format!("{p}input_layernorm.weight"), vec![1.0; H]));
         t.push((format!("{p}post_attention_layernorm.weight"), vec![1.0; H]));
@@ -145,7 +176,14 @@ fn mla_without_q_lora_runs() {
     let store = MmapStore::open_dir(tmp.path()).unwrap();
     let gen = dlm::loader::load_generator(&store, &config, 32).unwrap();
     let out = gen
-        .generate(&[1, 2, 3], &GenerationConfig { max_new_tokens: 5, eos_token: None, sampler: Sampler::Greedy })
+        .generate(
+            &[1, 2, 3],
+            &GenerationConfig {
+                max_new_tokens: 5,
+                eos_token: None,
+                sampler: Sampler::Greedy,
+            },
+        )
         .unwrap();
     assert_eq!(out.len(), 5);
 }
