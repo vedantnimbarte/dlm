@@ -120,6 +120,76 @@ fn api_key_gates_v1_endpoints() {
     assert!(r.starts_with("HTTP/1.1 200"), "{r}");
 }
 
+/// Issue a bare GET and return the raw response.
+fn get(addr: SocketAddr, target: &str, headers: &str) -> String {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.write_all(format!("GET {target} HTTP/1.1\r\n{headers}\r\n").as_bytes())
+        .unwrap();
+    let mut r = String::new();
+    s.read_to_string(&mut r).unwrap();
+    r
+}
+
+/// `A2`: `is_public_path` has always exempted `/healthz`, but no router served
+/// it, so a Kubernetes liveness probe pointed there got an unauthenticated 404
+/// and restarted a healthy process. Every exempted path must also route.
+#[test]
+fn every_public_path_is_routed_and_open() {
+    for key in [None, Some("secret")] {
+        let addr = start_server(key);
+        for path in ["/", "/health", "/healthz"] {
+            let r = get(addr, path, "");
+            assert!(
+                r.starts_with("HTTP/1.1 200"),
+                "{path} with api_key={key:?} should be 200 and open, got: {r}"
+            );
+        }
+    }
+}
+
+/// `A4`: routing and the auth exemption both compare the path by equality, so a
+/// query string used to make `/health` unrecognisable — it 401'd under a key —
+/// and `/v1/models?x=1` 404'd.
+#[test]
+fn query_strings_do_not_break_routing_or_the_auth_exemption() {
+    let addr = start_server(Some("secret"));
+
+    // Public path with a query is still public.
+    let r = get(addr, "/health?probe=1", "");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+
+    // Guarded path with a query still authenticates normally.
+    let r = get(
+        addr,
+        "/v1/models?limit=1",
+        "Authorization: Bearer secret\r\n",
+    );
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+
+    // ...and is still guarded.
+    let r = get(addr, "/v1/models?limit=1", "");
+    assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+}
+
+/// Both auth dialects are accepted on a guarded route: `Authorization: Bearer`
+/// (OpenAI) and `x-api-key` (Anthropic), so either SDK works unchanged.
+#[test]
+fn both_auth_header_dialects_are_accepted() {
+    let addr = start_server(Some("secret"));
+    for headers in [
+        "Authorization: Bearer secret\r\n",
+        "x-api-key: secret\r\n",
+        // Scheme is matched case-insensitively, as RFC 7235 requires.
+        "Authorization: bearer secret\r\n",
+    ] {
+        let r = get(addr, "/v1/models", headers);
+        assert!(r.starts_with("HTTP/1.1 200"), "{headers:?} -> {r}");
+    }
+    // `/metrics` leaks request and token counts, so it is guarded like any other.
+    assert!(get(addr, "/metrics", "").starts_with("HTTP/1.1 401"));
+    assert!(get(addr, "/metrics", "x-api-key: secret\r\n").starts_with("HTTP/1.1 200"));
+}
+
 #[test]
 fn oversized_body_is_rejected() {
     let addr = start_server(None);

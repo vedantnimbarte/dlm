@@ -9,8 +9,9 @@
 
 use crate::{DlmError, Result};
 use serde::Deserialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Files the engine actually reads from a model directory. Anything else in the
 /// repo (READMEs, `.gguf`, PyTorch `.bin`, images) is skipped.
@@ -40,9 +41,21 @@ pub fn normalize_repo(input: &str) -> Result<String> {
         .next()
         .unwrap_or("")
         .trim_matches('/');
-    if repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
+    let segments: Vec<&str> = repo.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() != 2 {
         return Err(DlmError::Hub(format!(
             "expected a repo id like `org/model`, got {input:?}"
+        )));
+    }
+    // Counting segments is not validating them. `a/..` has two, so it passed —
+    // and the model name is then `..`, which makes the destination `models/..`,
+    // i.e. the parent of the intended directory. `../x` likewise walked out of
+    // the API URL. `is_safe_relative_path` has always guarded the *filenames* the
+    // hub returns; this is the same rule for the *repo id the user types*, which
+    // reaches the same `Path::join`.
+    if !segments.iter().all(|s| is_safe_relative_path(s)) {
+        return Err(DlmError::Hub(format!(
+            "repo id {input:?} contains a path component that is not a plain name"
         )));
     }
     Ok(repo.to_string())
@@ -158,15 +171,53 @@ fn is_safe_relative_path(f: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_)))
 }
 
+/// Run `curl`, passing the auth header (if any) through a config file on **stdin**
+/// rather than on the command line.
+///
+/// A token in argv is world-readable on Linux: `/proc/<pid>/cmdline` is not
+/// privileged, so any local user can `ps` the token for as long as curl runs —
+/// and for a model pull that is minutes to hours. curl documents this and offers
+/// `--config <file>`; `-` reads the config from stdin, which never appears in the
+/// process table. The token therefore exists only in this process's memory and on
+/// the pipe.
+///
+/// `stdout` is returned; `stderr` is captured so the caller can report it.
+fn curl_with_token(
+    args: &[&str],
+    token: Option<&str>,
+    capture_stdout: bool,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new("curl");
+    cmd.args(args);
+    if token.is_some() {
+        // Read the header line from stdin instead of argv.
+        cmd.arg("--config").arg("-");
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    if !capture_stdout {
+        // Progress bar / body go straight to the terminal or the -o file.
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+    }
+
+    let mut child = cmd.spawn()?;
+    if let Some(t) = token {
+        // curl config syntax: one directive per line, value quoted.
+        let line = format!("header = \"Authorization: Bearer {t}\"\n");
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(line.as_bytes())?;
+            // Dropping closes the pipe, which curl needs to finish reading config.
+        }
+    }
+    child.wait_with_output()
+}
+
 /// GET a URL and return the body, failing clearly if curl is missing or the
 /// request errors.
 fn curl_json(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-sSfL", url]);
-    if let Some(t) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    let out = cmd.output().map_err(curl_missing)?;
+    let out = curl_with_token(&["-sSfL", url], token, true).map_err(curl_missing)?;
     if !out.status.success() {
         return Err(DlmError::Hub(format!(
             "request failed ({}): {}",
@@ -182,12 +233,7 @@ fn curl_json(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
 /// Used to skip files already fully present and to catch a transfer that ended
 /// early. A `HEAD` is cheap next to the multi-gigabyte bodies this module moves.
 fn remote_size(url: &str, token: Option<&str>) -> Option<u64> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-sIfL", url]);
-    if let Some(t) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    let out = cmd.output().ok()?;
+    let out = curl_with_token(&["-sIfL", url], token, true).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -226,24 +272,27 @@ fn curl_download(url: &str, out: &Path, token: Option<&str>) -> Result<()> {
         }
     }
 
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-fL",
-        "--progress-bar",
-        "--retry",
-        "10",
-        "--retry-delay",
-        "3",
-        "--retry-all-errors",
-        "--continue-at",
-        "-",
-        "-o",
-    ]);
-    cmd.arg(out).arg(url);
-    if let Some(t) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    let status = cmd.status().map_err(curl_missing)?;
+    let out_str = out.to_string_lossy();
+    let status = curl_with_token(
+        &[
+            "-fL",
+            "--progress-bar",
+            "--retry",
+            "10",
+            "--retry-delay",
+            "3",
+            "--retry-all-errors",
+            "--continue-at",
+            "-",
+            "-o",
+            &out_str,
+            url,
+        ],
+        token,
+        false,
+    )
+    .map_err(curl_missing)?
+    .status;
     if !status.success() {
         return Err(DlmError::Hub(format!(
             "download failed for {} — re-run `dlm pull` to resume from what was fetched",
@@ -310,6 +359,38 @@ mod tests {
         }
         assert!(normalize_repo("just-a-name").is_err());
         assert!(normalize_repo("a/b/c").is_err());
+    }
+
+    #[test]
+    fn rejects_repo_ids_that_escape_the_destination() {
+        // Each of these has exactly two non-empty segments, so the old
+        // segment-count check accepted every one. `a/..` is the sharp case: the
+        // model name becomes `..` and the destination `models/..` -- the parent of
+        // where the user asked for it.
+        for evil in [
+            "a/..",
+            "../x",
+            "../..",
+            "a/../b",
+            r"a\..",
+            "org/model\0",
+            "./x",
+            "a/.",
+        ] {
+            assert!(
+                normalize_repo(evil).is_err(),
+                "should have rejected repo id {evil:?}"
+            );
+        }
+        // Ordinary ids, including the URL forms, still normalize.
+        assert_eq!(
+            normalize_repo("Qwen/Qwen3-0.6B").unwrap(),
+            "Qwen/Qwen3-0.6B"
+        );
+        assert_eq!(
+            normalize_repo("meta-llama/Llama-3.2-1B-Instruct").unwrap(),
+            "meta-llama/Llama-3.2-1B-Instruct"
+        );
     }
 
     #[test]

@@ -723,7 +723,12 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
     Arc::new(move |req: &Request| -> Response {
         let started = std::time::Instant::now();
         let resp = match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/") | ("GET", "/health") => Response::text(200, "dlm: ok"),
+            // `/healthz` is routed as well as exempted: `is_public_path` has always
+            // listed it, but nothing served it, so a probe pointed there got a 404
+            // and restarted a healthy process.
+            ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") => {
+                Response::text(200, "dlm: ok")
+            }
             ("GET", "/metrics") => Response::text(200, metrics_text(&engine)),
             ("GET", "/v1/models") => {
                 let body = ModelsResponse {

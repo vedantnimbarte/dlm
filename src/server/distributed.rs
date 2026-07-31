@@ -93,7 +93,11 @@ pub fn secured_router(engine: Arc<DistributedEngine>, api_key: Option<String>) -
 pub fn router(engine: Arc<DistributedEngine>) -> Handler {
     Arc::new(move |req: &Request| -> Response {
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/") | ("GET", "/health") => Response::text(200, "dlm: ok (distributed)"),
+            // `/healthz` too — `is_public_path` exempts it on both routers, so both
+            // must actually serve it or a probe gets an unauthenticated 404.
+            ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") => {
+                Response::text(200, "dlm: ok (distributed)")
+            }
             ("GET", "/v1/models") => {
                 let body = serde_json::json!({
                     "object": "list",
