@@ -43,12 +43,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `--retry-all-errors` because a plain `--retry` ignores the ones that
+      # actually happen here: a bare `curl -fsSL` failed this required job with
+      # "Recv failure: Connection reset by peer", turning a transient reset into
+      # a red gate on an unrelated PR. The fixture script has always retried;
+      # these two jobs were the ones that did not.
       - name: Fetch a small real checkpoint (Qwen2.5-0.5B-Instruct)
         run: |
           mkdir -p models
           base="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main"
           for f in config.json generation_config.json tokenizer.json model.safetensors; do
-            curl -fsSL "$base/$f" -o "models/$f"
+            curl -fsSL --retry 5 --retry-all-errors "$base/$f" -o "models/$f"
           done
       - name: Assert the model actually answers correctly
         run: cargo test --release --test real_model -- --nocapture
@@ -70,7 +75,7 @@ jobs:
           mkdir -p "$dir"
           base="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4/resolve/main"
           for f in config.json generation_config.json tokenizer.json model.safetensors; do
-            curl -fsSL "$base/$f" -o "$dir/$f"
+            curl -fsSL --retry 5 --retry-all-errors "$base/$f" -o "$dir/$f"
           done
       # The test skips (rather than fails) when the fixture is missing, so that a
       # fresh clone still runs the suite. In CI that would turn a broken download
@@ -94,7 +99,7 @@ jobs:
   # about a family whose checkpoint nobody had loaded.
   #
   # No weights: these are parsing defects, and a tokenizer that picks the wrong
-  # pieces yields the wrong ids whatever the weights are. ~35 MB, and every
+  # pieces yields the wrong ids whatever the weights are. ~85 MB, and every
   # source is ungated, so this runs on fork PRs too.
   family-fixtures:
     runs-on: ubuntu-latest
