@@ -534,6 +534,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         moe: config.moe,
         sliding_window: config.sliding_window.map(|w| w as usize),
         activation: config.activation,
+        ffn_kind: config.ffn_kind,
         norm_kind: config.norm_kind,
         parallel_residual: config.parallel_residual,
         learned_positions: config.learned_positions,
@@ -646,6 +647,8 @@ pub(crate) fn load_layer_tensors_opt(
                 quant,
                 packed,
             )?,
+            up_bias: None,
+            down_bias: None,
         }),
         None => Ffn::Dense(ExpertFfn {
             gate: load_linear(
@@ -672,6 +675,8 @@ pub(crate) fn load_layer_tensors_opt(
                 quant,
                 packed,
             )?,
+            up_bias: None,
+            down_bias: None,
         }),
         Some(_) => load_moe_ffn(store, cfg, layer, quant, packed, include_experts)?,
     };
@@ -774,6 +779,7 @@ pub(crate) fn load_layer_tensors_opt(
             post_attention_layernorm,
             // LayerNorm biases: present on GPT-2 and Falcon, absent on every
             // RMSNorm family, which has no bias to carry.
+            o_bias: load_optional(store, &name("self_attn.o_proj.bias"), hidden)?,
             input_layernorm_bias: load_optional(store, &name("input_layernorm.bias"), hidden)?,
             post_attention_layernorm_bias: load_optional(
                 store,
@@ -969,6 +975,9 @@ fn load_expert(
             quant,
             packed,
         )?,
+        // Experts are MoE-only, and no MoE family dlm supports has FFN biases.
+        up_bias: None,
+        down_bias: None,
     })
 }
 

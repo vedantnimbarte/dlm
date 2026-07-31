@@ -60,6 +60,8 @@ fn coordinator() -> Coordinator {
                 gate: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)),
                 up: Weights::from_f32(r.vec(cfg.intermediate_size * hidden)),
                 down: Weights::from_f32(r.vec(hidden * cfg.intermediate_size)),
+                up_bias: None,
+                down_bias: None,
             }),
             input_layernorm: vec![1.0; hidden],
             post_attention_layernorm: vec![1.0; hidden],

@@ -734,6 +734,8 @@ mod tests {
                 gate: Weights::from_f32(vec![0.1; 8]),
                 up: Weights::from_f32(vec![0.1; 8]),
                 down: Weights::from_f32(vec![0.1; 8]),
+                up_bias: None,
+                down_bias: None,
             }))
         }
     }
@@ -829,6 +831,8 @@ mod tests {
                         gate: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
                         up: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
                         down: Weights::from_f32(vec![s; c.hidden_size * c.intermediate_size]),
+                        up_bias: None,
+                        down_bias: None,
                     }),
                     input_layernorm: vec![1.0; c.hidden_size],
                     post_attention_layernorm: vec![1.0; c.hidden_size],

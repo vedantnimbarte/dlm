@@ -905,6 +905,8 @@ mod tests {
                 gate: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
                 up: Weights::from_f32(vec(cfg.intermediate_size * hidden)),
                 down: Weights::from_f32(vec(hidden * cfg.intermediate_size)),
+                up_bias: None,
+                down_bias: None,
             }),
             input_layernorm: std::vec::from_elem(1.0, hidden),
             post_attention_layernorm: std::vec::from_elem(1.0, hidden),

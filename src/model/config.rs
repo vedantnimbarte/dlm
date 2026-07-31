@@ -589,6 +589,8 @@ pub struct ModelConfig {
     pub parallel_residual: bool,
     /// GPT-2: absolute learned position embeddings instead of RoPE.
     pub learned_positions: bool,
+    /// Whether the MLP is gated (SwiGLU/GeGLU). `Plain` only for GPT-2.
+    pub ffn_kind: crate::forward::cpu::FfnKind,
     /// Scalar applied to token embeddings after lookup (Gemma multiplies by
     /// `sqrt(hidden_size)`); `None` leaves embeddings unscaled.
     pub embed_scale: Option<f32>,
@@ -764,6 +766,11 @@ impl ModelConfig {
             norm_kind,
             parallel_residual: is_falcon,
             learned_positions: is_gpt2,
+            ffn_kind: if is_gpt2 {
+                crate::forward::cpu::FfnKind::Plain
+            } else {
+                crate::forward::cpu::FfnKind::Gated
+            },
             embed_scale: is_gemma.then(|| (raw.hidden_size as f32).sqrt()),
             activation,
             // HF hard-codes the alternation in the Gemma2 model class rather than

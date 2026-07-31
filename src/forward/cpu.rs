@@ -117,6 +117,14 @@ pub struct BlockConfig {
     /// GPT-2: absolute learned position embeddings replace RoPE entirely. When
     /// true the block applies no rotary at all.
     pub learned_positions: bool,
+    /// Whether the MLP is gated.
+    ///
+    /// An enum rather than a `bool` on purpose: `BlockConfig` derives `Default`,
+    /// and a `gated_ffn: bool` defaults to *false* -- silently turning every
+    /// `..Default::default()` construction into a GPT-2-shaped FFN. That is the
+    /// kind of default that produces wrong numbers instead of a compile error,
+    /// and it broke a Gemma2 test the moment it was introduced.
+    pub ffn_kind: FfnKind,
 }
 
 impl BlockConfig {
@@ -488,9 +496,16 @@ pub(crate) fn bytemuck_cast<T>(v: &[T]) -> &[u8] {
 /// shared expert) built from the same shape.
 #[derive(Debug, Clone, Default)]
 pub struct ExpertFfn {
+    /// The gate branch of a gated MLP. Unused when [`BlockConfig::gated_ffn`] is
+    /// false (GPT-2), where the FFN is a plain `down(act(up(x)))` with no gate at
+    /// all -- `up` carries the single projection.
     pub gate: Weights, // [inter, hidden]
     pub up: Weights,   // [inter, hidden]
     pub down: Weights, // [hidden, inter]
+    /// Projection biases. Present on GPT-2, whose every matmul has one; `None`
+    /// on every gated-MLP family dlm supported before it.
+    pub up_bias: Option<Vec<f32>>, // [inter]
+    pub down_bias: Option<Vec<f32>>, // [hidden]
 }
 
 impl ExpertFfn {
@@ -521,6 +536,8 @@ impl ExpertFfn {
             gate: Weights::zeros(inter * hidden),
             up: Weights::zeros(inter * hidden),
             down: Weights::zeros(hidden * inter),
+            up_bias: None,
+            down_bias: None,
         }
     }
 }
@@ -561,6 +578,9 @@ pub struct LayerTensors {
     pub ffn: Ffn,
     pub input_layernorm: Vec<f32>,          // [hidden]
     pub post_attention_layernorm: Vec<f32>, // [hidden]
+    /// Output-projection bias. GPT-2 has one on every matmul; dlm's other
+    /// families have biases on Q/K/V only.
+    pub o_bias: Option<Vec<f32>>, // [hidden]
     /// LayerNorm biases (GPT-2, Falcon). `None` for every RMSNorm family, which
     /// has no bias to carry.
     pub input_layernorm_bias: Option<Vec<f32>>, // [hidden]
@@ -1542,6 +1562,16 @@ pub(crate) fn layernorm(x: &[f32], weight: &[f32], bias: Option<&[f32]>, eps: f3
         .collect()
 }
 
+/// Whether a block's MLP has a gate branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfnKind {
+    /// `down(act(gate(x)) * up(x))` -- Llama, Mistral, Qwen, Gemma, Phi-3.
+    #[default]
+    Gated,
+    /// `down(act(up(x)))` -- GPT-2. No gate matrix at all.
+    Plain,
+}
+
 /// Which normalization a checkpoint's block uses.
 ///
 /// Selected from the architecture at load, never guessed: a model trained with
@@ -1641,14 +1671,37 @@ fn activate(act: Activation, x: f32) -> f32 {
 /// the `hidden`-wide contribution to the residual (the caller scales and adds it).
 /// `act` selects SwiGLU (SiLU) or Gemma's GeGLU (GELU).
 fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize, act: Activation) -> Vec<f32> {
-    let gate = matvec_native(&f.gate, x, inter, hidden);
-    let up = matvec_native(&f.up, x, inter, hidden);
-    let combined: Vec<f32> = gate
-        .iter()
-        .zip(&up)
-        .map(|(&g, &u)| activate(act, g) * u)
-        .collect();
-    matvec_native(&f.down, &combined, hidden, inter)
+    ffn_eval(f, x, hidden, inter, act, FfnKind::Gated)
+}
+
+/// Evaluate an MLP, gated (Llama/Qwen/Gemma) or plain (GPT-2).
+///
+/// A gated MLP computes `down(act(gate(x)) * up(x))`; a plain one computes
+/// `down(act(up(x)))` and has no gate matrix. Running one as the other is not a
+/// shape error when the tensors happen to line up -- it silently drops or invents
+/// a multiplicative term -- so the choice comes from the architecture.
+fn ffn_eval(
+    f: &ExpertFfn,
+    x: &[f32],
+    hidden: usize,
+    inter: usize,
+    act: Activation,
+    kind: FfnKind,
+) -> Vec<f32> {
+    let mut up = matvec_native(&f.up, x, inter, hidden);
+    add_bias(&mut up, f.up_bias.as_ref());
+    let combined: Vec<f32> = if kind == FfnKind::Gated {
+        let gate = matvec_native(&f.gate, x, inter, hidden);
+        gate.iter()
+            .zip(&up)
+            .map(|(&g, &u)| activate(act, g) * u)
+            .collect()
+    } else {
+        up.iter().map(|&u| activate(act, u)).collect()
+    };
+    let mut out = matvec_native(&f.down, &combined, hidden, inter);
+    add_bias(&mut out, f.down_bias.as_ref());
+    out
 }
 
 /// Select the top-`k` experts by routing probability and return
@@ -2112,12 +2165,13 @@ pub fn decode_block(
         cfg.norm_kind,
     );
     let mut ffn_out = match &w.ffn {
-        Ffn::Dense(f) => swiglu_ffn(
+        Ffn::Dense(f) => ffn_eval(
             f,
             &normed2,
             cfg.hidden_size,
             cfg.intermediate_size,
             cfg.activation,
+            cfg.ffn_kind,
         ),
         Ffn::Moe {
             router,
@@ -2212,6 +2266,7 @@ fn attention_sublayer(
     kv.append(&k, &v)?;
     let ctx = attention(cfg, &q, kv);
     let mut attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
+    add_bias(&mut attn_out, w.o_bias.as_ref());
 
     // Gemma2 normalizes the attention *output* before folding it into the
     // residual; elsewhere `post_attention_layernorm` is the pre-FFN norm and the
@@ -2667,6 +2722,8 @@ mod tests {
                 gate: lin(inter * h, 0.23),
                 up: lin(inter * h, 0.29),
                 down: lin(h * inter, 0.31),
+                up_bias: None,
+                down_bias: None,
             }),
             input_layernorm: (0..h).map(|i| 1.0 + i as f32 * 0.01).collect(),
             // Deliberately not all-ones: a norm applied in the wrong place must
@@ -3285,6 +3342,8 @@ mod tests {
             gate: Weights::from_f32(vec![1.0, 0.5, -0.5, 1.0]),
             up: Weights::from_f32(vec![0.5, 0.5, 0.5, 0.5]),
             down: Weights::from_f32(vec![1.0, 0.0, 0.0, 1.0]),
+            up_bias: None,
+            down_bias: None,
         };
         if let Ffn::Moe {
             router, experts, ..
@@ -3315,6 +3374,8 @@ mod tests {
                 gate: Weights::from_f32(vec![9.0, 9.0, 9.0, 9.0]),
                 up: Weights::from_f32(vec![9.0, 9.0, 9.0, 9.0]),
                 down: Weights::from_f32(vec![9.0, 9.0, 9.0, 9.0]),
+                up_bias: None,
+                down_bias: None,
             };
         }
         let mut kv2 = KvLayerCache::new(cfg.kv_dim());
@@ -3341,11 +3402,15 @@ mod tests {
             gate: Weights::from_f32(vec![0.3, -0.2, 0.1, 0.4]),
             up: Weights::from_f32(vec![0.5, 0.1, -0.3, 0.2]),
             down: Weights::from_f32(vec![1.0, 0.2, 0.1, -0.5]),
+            up_bias: None,
+            down_bias: None,
         };
         let e1 = ExpertFfn {
             gate: Weights::from_f32(vec![-0.4, 0.6, 0.2, -0.1]),
             up: Weights::from_f32(vec![0.2, -0.5, 0.3, 0.4]),
             down: Weights::from_f32(vec![-0.2, 0.7, 0.5, 0.1]),
+            up_bias: None,
+            down_bias: None,
         };
         if let Ffn::Moe {
             router, experts, ..
@@ -3388,6 +3453,8 @@ mod tests {
             gate: Weights::from_f32(vec![0.6, -0.2, 0.3, 0.5]),
             up: Weights::from_f32(vec![0.4, 0.1, -0.2, 0.3]),
             down: Weights::from_f32(vec![0.9, 0.2, -0.1, 0.4]),
+            up_bias: None,
+            down_bias: None,
         };
         // Routed experts stay zero, so only the shared expert contributes.
         if let Ffn::Moe {
