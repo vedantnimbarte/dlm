@@ -35,6 +35,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`dlm pull` verifies downloaded weights against the hub's published SHA-256.**
+  Previously only the byte count was checked, which catches truncation and
+  nothing else. A file that fails is deleted, so the next `pull` refetches it
+  rather than treating it as already complete.
 - **Phi-3 / Phi-3.5 support.** Their fused `self_attn.qkv_proj`
   (`[q_dim + 2*kv_dim, hidden]`) and `mlp.gate_up_proj` (`[2*intermediate, hidden]`)
   are split at load; the block is otherwise Llama-shaped. Detected by tensor

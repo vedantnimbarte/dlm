@@ -81,6 +81,18 @@ struct ModelInfo {
 #[derive(Debug, Deserialize)]
 struct Sibling {
     rfilename: String,
+    /// LFS metadata, present for the large files (the weights) and absent for
+    /// small ones like `config.json`, which the hub stores inline.
+    #[serde(default)]
+    lfs: Option<Lfs>,
+}
+
+/// The LFS pointer the hub publishes for a large file. `oid` is the content's
+/// SHA-256 in lowercase hex -- the digest we can check a download against.
+#[derive(Debug, Deserialize)]
+struct Lfs {
+    #[serde(default)]
+    oid: Option<String>,
 }
 
 /// Search the hub for models carrying safetensors weights, most-downloaded first.
@@ -101,7 +113,9 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ModelHit>> {
 /// `./models/<model>`). Returns the directory the model landed in.
 pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<PathBuf> {
     let repo = normalize_repo(repo)?;
-    let info_url = format!("{}/api/models/{}", base(), repo);
+    // `?blobs=true` is what makes the hub include each sibling's LFS block; the
+    // bare endpoint returns filenames only, with no digest to verify against.
+    let info_url = format!("{}/api/models/{}?blobs=true", base(), repo);
     let body = curl_json(&info_url, token)?;
     let info: ModelInfo = serde_json::from_slice(&body).map_err(|e| {
         DlmError::Hub(format!(
@@ -109,14 +123,14 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         ))
     })?;
 
-    let wanted: Vec<&String> = info
+    let wanted: Vec<(&String, Option<&str>)> = info
         .siblings
         .iter()
-        .map(|s| &s.rfilename)
-        .filter(|f| is_wanted(f))
+        .filter(|s| is_wanted(&s.rfilename))
+        .map(|s| (&s.rfilename, s.lfs.as_ref().and_then(|l| l.oid.as_deref())))
         .collect();
 
-    if !wanted.iter().any(|f| f.ends_with(".safetensors")) {
+    if !wanted.iter().any(|(f, _)| f.ends_with(".safetensors")) {
         return Err(DlmError::Hub(format!(
             "{repo} has no .safetensors weights — dlm cannot load GGUF/PyTorch-only repos"
         )));
@@ -132,7 +146,7 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         dir.display(),
         wanted.len()
     );
-    for file in &wanted {
+    for (file, oid) in &wanted {
         let url = format!("{}/{}/resolve/main/{}", base(), repo, file);
         let out = dir.join(file);
         if let Some(parent) = out.parent() {
@@ -140,6 +154,7 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         }
         println!("  {file}");
         curl_download(&url, &out, token)?;
+        verify_sha256(&out, *oid)?;
     }
     println!("done. run: dlm serve --model-path {}", dir.display());
     Ok(dir)
@@ -316,6 +331,37 @@ fn curl_download(url: &str, out: &Path, token: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Check a downloaded file against the digest the hub published for it.
+///
+/// A length match -- all `curl_download` could offer -- catches truncation and
+/// nothing else. It does not catch a corrupted transfer that happens to be the
+/// right size, a mirror serving different content, or a proxy rewriting the
+/// body. The weights are the one input to a dlm run that nothing verified: the
+/// binary is checksummed and minisigned by the installer and `Cargo.lock` pins
+/// the build, while a multi-gigabyte shard arrived on trust.
+///
+/// Skipped, with a note, when the hub publishes no `oid` -- true for the small
+/// non-LFS files. Silence there would be indistinguishable from a check that
+/// passed.
+fn verify_sha256(path: &Path, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let got = crate::storage::sha256::file_hex(path)
+        .map_err(|e| DlmError::Hub(format!("cannot read {} to verify: {e}", path.display())))?;
+    if !got.eq_ignore_ascii_case(expected) {
+        // Remove it: leaving a file that failed verification invites the next
+        // `pull` to treat it as already complete and skip re-fetching it.
+        let _ = std::fs::remove_file(path);
+        return Err(DlmError::Hub(format!(
+            "{} failed its checksum -- the hub published sha256 {expected}, the              download hashes to {got}. The file has been removed; re-run `dlm pull`.",
+            path.display()
+        )));
+    }
+    println!("    sha256 ok");
+    Ok(())
+}
+
 fn curl_missing(e: std::io::Error) -> DlmError {
     if e.kind() == std::io::ErrorKind::NotFound {
         DlmError::Hub(
@@ -423,6 +469,40 @@ mod tests {
         assert!(is_wanted("model.safetensors"));
         assert!(is_safe_relative_path("subdir/model.safetensors"));
         assert!(!is_wanted("README.md"));
+    }
+
+    /// `A10`: a download that hashes wrong is rejected AND removed, so the next
+    /// `pull` re-fetches it rather than treating it as already complete.
+    #[test]
+    fn sha256_mismatch_is_rejected_and_the_file_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard.safetensors");
+        std::fs::write(&path, b"abc").unwrap();
+
+        // Correct digest for "abc" passes and leaves the file alone.
+        let ok = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_sha256(&path, Some(ok)).is_ok());
+        assert!(path.exists());
+        // Case-insensitive: the hub publishes lowercase, but do not depend on it.
+        assert!(verify_sha256(&path, Some(&ok.to_uppercase())).is_ok());
+
+        // A wrong digest fails and takes the file with it.
+        let err = verify_sha256(&path, Some(&"0".repeat(64))).unwrap_err();
+        assert!(format!("{err}").contains("failed its checksum"), "{err}");
+        assert!(
+            !path.exists(),
+            "a file that failed verification must not survive"
+        );
+    }
+
+    /// No published `oid` (the small non-LFS files) is not an error.
+    #[test]
+    fn absent_digest_skips_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(verify_sha256(&path, None).is_ok());
+        assert!(path.exists());
     }
 
     #[test]
