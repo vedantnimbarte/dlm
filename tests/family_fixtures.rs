@@ -349,6 +349,37 @@ fn qwen3_family_fixture_has_explicit_head_dim() {
     assert_round_trip(&tok, "qwen3");
 }
 
+/// Phi-3: a real config for the fused-projection family.
+///
+/// The weight *mapping* — splitting `qkv_proj` and `gate_up_proj` — is checked in
+/// `tests/phi3_fused.rs`, where it can be verified by mutation. This fixture
+/// covers the half that lives in `config.json`: that a Phi-3 checkpoint parses at
+/// all, and that its declared sliding window survives.
+#[test]
+fn phi3_family_fixture() {
+    let Some(dir) = fixture("phi-3") else {
+        eprintln!("skipping phi-3: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("phi-3 config.json");
+    // Phi-3-mini-4k declares an odd 2047 rather than a round number; dlm must
+    // carry whatever the checkpoint says rather than rounding to a nicer one.
+    assert_eq!(cfg.sliding_window, Some(2047));
+    assert_eq!(cfg.vocab_size, 32064);
+    assert!(cfg.moe.is_none(), "Phi-3-mini is dense");
+    // Phi-3-mini is MHA, not GQA — kv heads equal attention heads. The fused QKV
+    // split must not assume a narrower K/V.
+    assert_eq!(cfg.num_kv_heads, cfg.num_attention_heads);
+    assert!(
+        cfg.rope_scaling.is_none(),
+        "the 4k variant declares no scaling; the 128k one uses longrope, which \
+         dlm refuses rather than approximates"
+    );
+
+    let tok = BpeTokenizer::from_dir(&dir).expect("phi-3 tokenizer");
+    assert_round_trip(&tok, "phi-3");
+}
+
 /// Qwen is the control: genuinely byte-level BPE with `add_bos_token: false`.
 /// If SentencePiece detection ever over-fires, this is what catches it — the
 /// regression that would silently break every model that was working.

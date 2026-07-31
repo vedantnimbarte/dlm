@@ -56,4 +56,8 @@ fetch qwen2-moe   Qwen/Qwen1.5-MoE-A2.7B-Chat                 # gated shared exp
 # Mixtral's own repos are gated; this is a Mixtral-layout checkpoint, which is
 # what the naming branch under test actually keys on.
 fetch mixtral     NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO # block_sparse_moe
+# Fused projections: qkv_proj and gate_up_proj. The weight-splitting itself is
+# covered by tests/phi3_fused.rs, which needs no checkpoint; this is the config
+# half.
+fetch phi-3       microsoft/Phi-3-mini-4k-instruct            # fused qkv/gate_up
 echo "done: $(du -sh "$dest" | cut -f1) total"

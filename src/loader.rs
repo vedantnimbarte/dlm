@@ -182,6 +182,85 @@ fn load_native(
     Ok(w)
 }
 
+/// Load a contiguous row range out of a **fused** projection.
+///
+/// Phi-3 (and Phi-3.5) ship one tensor where Llama ships several:
+/// `self_attn.qkv_proj.weight` is `[q_dim + kv_dim + kv_dim, hidden]` and
+/// `mlp.gate_up_proj.weight` is `[2 * intermediate, hidden]`. Everything else
+/// about the block is Llama-shaped, so the whole of Phi-3 support is being able
+/// to take a slice of these two.
+///
+/// The weight is row-major `[out, in]`, so a run of output rows is a **contiguous
+/// byte range** — this slices the mapped bytes rather than materializing the
+/// fused tensor and copying out of it, which would otherwise cost three full
+/// reads of QKV per layer.
+///
+/// Refuses a packed/GPTQ fused tensor rather than guessing: the group layout of a
+/// sliced `qweight` is not something to infer, and this project's rule is that a
+/// wrong decode yields plausible output rather than an error.
+fn load_linear_rows(
+    store: &MmapStore,
+    base: &str,
+    in_features: usize,
+    fused_out_features: usize,
+    row_offset: usize,
+    row_count: usize,
+    quant: QuantScheme,
+) -> Result<Weights> {
+    let name = format!("{base}.weight");
+    if store.locate(&name).is_none() && store.locate(&format!("{base}.qweight")).is_some() {
+        return Err(DlmError::UnsupportedQuant(format!(
+            "{base} is a fused packed 4-bit tensor; dlm splits fused projections \
+             only for float checkpoints, because slicing a packed tensor's groups \
+             wrongly yields plausible-looking but incorrect weights"
+        )));
+    }
+    let (shard, info) = store
+        .locate(&name)
+        .ok_or_else(|| DlmError::UnknownTensor(name.clone()))?;
+
+    let elem = match info.dtype {
+        Dtype::F32 => 4usize,
+        Dtype::BF16 | Dtype::F16 => 2usize,
+        other => {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "fused tensor {name:?} has dtype {other:?}; dlm's compute path \
+                 handles F32/F16/BF16 weights"
+            )))
+        }
+    };
+
+    let bytes = shard.tensor_bytes(&name)?;
+    let expected = fused_out_features * in_features * elem;
+    if bytes.len() != expected {
+        return Err(DlmError::InvalidConfig(format!(
+            "fused tensor {name:?}: expected {fused_out_features}x{in_features} \
+             ({expected} bytes), got {} — the checkpoint's fusion layout is not \
+             what this architecture declares",
+            bytes.len()
+        )));
+    }
+    let start = row_offset * in_features * elem;
+    let end = start + row_count * in_features * elem;
+    let slice = &bytes[start..end];
+
+    if matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
+        let floats = bytes_to_f32(slice, info.dtype)?;
+        let group = crate::forward::QUANT_GROUP_SIZE;
+        return match quant {
+            QuantScheme::Int4 => Weights::quantize_int4(&floats, group),
+            _ => Weights::quantize_int8(&floats, group),
+        };
+    }
+    let w = match info.dtype {
+        Dtype::F32 => Weights::F32(bytes_to_f32(slice, info.dtype)?),
+        Dtype::BF16 => Weights::Bf16(bytes_to_u16(slice, &name)?),
+        Dtype::F16 => Weights::F16(bytes_to_u16(slice, &name)?),
+        _ => unreachable!("dtype checked above"),
+    };
+    Ok(w)
+}
+
 /// Load a linear layer's weight as dense row-major `[out, in]`, transparently
 /// handling both float (`{base}.weight`) and GPTQ-style quantized
 /// (`{base}.qweight` + `.qzeros` + `.scales`) checkpoints.
@@ -527,7 +606,44 @@ pub(crate) fn load_layer_tensors_opt(
     let intermediate = cfg.intermediate_size;
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     // load_linear takes (in_features, out_features) of the underlying Linear.
+    // Phi-3 fuses gate and up into one `[2*intermediate, hidden]` tensor. Detect
+    // by presence rather than by architecture string: a checkpoint that ships the
+    // fused tensor needs splitting whatever its config calls itself, and one that
+    // ships both separately does not.
+    let gate_up = name("mlp.gate_up_proj");
+    let fused_ffn = store.locate(&format!("{gate_up}.weight")).is_some();
+
     let ffn = match cfg.moe {
+        None if fused_ffn => Ffn::Dense(ExpertFfn {
+            // Row order is gate first, then up — the order the reference
+            // implementation splits them in.
+            gate: load_linear_rows(
+                store,
+                &gate_up,
+                hidden,
+                2 * intermediate,
+                0,
+                intermediate,
+                quant,
+            )?,
+            up: load_linear_rows(
+                store,
+                &gate_up,
+                hidden,
+                2 * intermediate,
+                intermediate,
+                intermediate,
+                quant,
+            )?,
+            down: load_linear(
+                store,
+                &name("mlp.down_proj"),
+                intermediate,
+                hidden,
+                quant,
+                packed,
+            )?,
+        }),
         None => Ffn::Dense(ExpertFfn {
             gate: load_linear(
                 store,
@@ -580,6 +696,40 @@ pub(crate) fn load_layer_tensors_opt(
             input_layernorm,
             post_attention_layernorm,
             mla: Some(load_mla(store, cfg, m, layer, quant, packed, norm_add_one)?),
+            ..Default::default()
+        }
+    } else if store
+        .locate(&format!("{}.weight", name("self_attn.qkv_proj")))
+        .is_some()
+    {
+        // Phi-3: Q, K and V fused into `[q_dim + 2*kv_dim, hidden]`, in that
+        // order. Everything below this is identical to the Llama path, which is
+        // the whole reason Phi-3 costs a loader change and not a new block.
+        let qkv = name("self_attn.qkv_proj");
+        let fused_out = q_dim + 2 * kv_dim;
+        LayerTensors {
+            q_proj: load_linear_rows(store, &qkv, hidden, fused_out, 0, q_dim, quant)?,
+            k_proj: load_linear_rows(store, &qkv, hidden, fused_out, q_dim, kv_dim, quant)?,
+            v_proj: load_linear_rows(
+                store,
+                &qkv,
+                hidden,
+                fused_out,
+                q_dim + kv_dim,
+                kv_dim,
+                quant,
+            )?,
+            o_proj: load_linear(
+                store,
+                &name("self_attn.o_proj"),
+                q_dim,
+                hidden,
+                quant,
+                packed,
+            )?,
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
             ..Default::default()
         }
     } else {

@@ -35,6 +35,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Phi-3 / Phi-3.5 support.** Their fused `self_attn.qkv_proj`
+  (`[q_dim + 2*kv_dim, hidden]`) and `mlp.gate_up_proj` (`[2*intermediate, hidden]`)
+  are split at load; the block is otherwise Llama-shaped. Detected by tensor
+  presence rather than by architecture string, so any checkpoint shipping fused
+  projections is handled. The 128k `longrope` variant is still refused, since dlm
+  does not implement that scaling and running without it yields fluent nonsense.
 - **Graceful shutdown.** `SIGTERM`/`SIGINT` (Unix) stop the accept loop and drain
   in-flight requests for up to 8 seconds, under the 10s grace period Docker and
   Kubernetes allow before `SIGKILL`. Previously every deploy cut live requests
