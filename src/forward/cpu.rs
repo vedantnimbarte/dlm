@@ -106,6 +106,17 @@ pub struct BlockConfig {
     /// Multi-head Latent Attention geometry (DeepSeek); `None` for standard
     /// attention. When set, the attention sublayer takes the MLA path.
     pub mla: Option<MlaConfig>,
+    /// Which normalization the block uses. RMSNorm for every Llama-descended
+    /// family; LayerNorm for GPT-2 and Falcon, which centre as well as scale.
+    pub norm_kind: NormKind,
+    /// Falcon: attention and the FFN both read the **same** normalized input and
+    /// their outputs are summed into one residual, rather than the FFN reading
+    /// the post-attention residual. Same tensors, different dataflow — and
+    /// getting it backwards degrades output without erroring.
+    pub parallel_residual: bool,
+    /// GPT-2: absolute learned position embeddings replace RoPE entirely. When
+    /// true the block applies no rotary at all.
+    pub learned_positions: bool,
 }
 
 impl BlockConfig {
@@ -550,6 +561,10 @@ pub struct LayerTensors {
     pub ffn: Ffn,
     pub input_layernorm: Vec<f32>,          // [hidden]
     pub post_attention_layernorm: Vec<f32>, // [hidden]
+    /// LayerNorm biases (GPT-2, Falcon). `None` for every RMSNorm family, which
+    /// has no bias to carry.
+    pub input_layernorm_bias: Option<Vec<f32>>, // [hidden]
+    pub post_attention_layernorm_bias: Option<Vec<f32>>, // [hidden]
     /// Attention projection biases (Qwen2 et al.); `None` for Llama/Mistral.
     pub q_bias: Option<Vec<f32>>, // [q_dim]
     pub k_bias: Option<Vec<f32>>,           // [kv_dim]
@@ -1499,6 +1514,62 @@ pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     x.iter().zip(weight).map(|(&v, &w)| v * inv * w).collect()
 }
 
+/// Classic layer norm: centre, scale by standard deviation, then affine.
+///
+/// The difference from [`rmsnorm`] is the **mean subtraction** — RMSNorm divides
+/// by the root mean square and never re-centres. Substituting one for the other
+/// does not error and does not obviously break: it shifts every activation by the
+/// layer's mean, which for a model trained with LayerNorm degrades output into
+/// fluent nonsense rather than noise. GPT-2 and Falcon are trained with this one.
+///
+/// `bias` is separate and optional because it is genuinely absent in some
+/// LayerNorm variants, while the RMSNorm families never have one at all.
+pub(crate) fn layernorm(x: &[f32], weight: &[f32], bias: Option<&[f32]>, eps: f32) -> Vec<f32> {
+    let n = x.len() as f32;
+    let mean = x.iter().sum::<f32>() / n;
+    let var = x.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let inv = 1.0 / (var + eps).sqrt();
+    x.iter()
+        .enumerate()
+        .zip(weight)
+        .map(|((i, &v), &w)| {
+            let normed = (v - mean) * inv * w;
+            match bias {
+                Some(b) => normed + b[i],
+                None => normed,
+            }
+        })
+        .collect()
+}
+
+/// Which normalization a checkpoint's block uses.
+///
+/// Selected from the architecture at load, never guessed: a model trained with
+/// one and run with the other produces plausible output, which is the failure
+/// mode with no symptom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NormKind {
+    /// Llama, Mistral, Qwen, Gemma, DeepSeek, Phi-3.
+    #[default]
+    Rms,
+    /// GPT-2, Falcon — centres as well as scales, and carries a bias.
+    Layer,
+}
+
+/// Normalize by whichever rule the block declares.
+pub(crate) fn norm(
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+    kind: NormKind,
+) -> Vec<f32> {
+    match kind {
+        NormKind::Rms => rmsnorm(x, weight, eps),
+        NormKind::Layer => layernorm(x, weight, bias, eps),
+    }
+}
+
 /// Apply RMSNorm independently to each `head_dim`-wide head of `v` (Qwen3 Q/K
 /// norm). `weight` is `[head_dim]`, shared across the `num_heads` heads.
 fn head_rmsnorm(v: &mut [f32], num_heads: usize, head_dim: usize, weight: &[f32], eps: f32) {
@@ -2007,12 +2078,39 @@ pub fn decode_block(
         None => attention_sublayer(cfg, w, hidden, kv, position)?,
     };
 
+    // Falcon runs attention and the FFN **in parallel** off the same normalized
+    // input, summing both into one residual:
+    //
+    //     n   = LN(hidden)
+    //     out = hidden + Attn(n) + MLP(n)
+    //
+    // rather than the sequential Llama form, where the FFN reads the
+    // post-attention residual through a second norm. Same tensors, different
+    // dataflow — run one as the other and the model still produces fluent text,
+    // just wrong, so this is selected from the architecture and never inferred.
+    //
+    // `h1` is already `hidden + Attn(n)`, so feeding the FFN `LN(hidden)` instead
+    // of `LN(h1)` is the whole difference. The norm is recomputed rather than
+    // threaded out of the sublayer: one extra pass over `hidden_size` floats,
+    // against a materially simpler call graph.
+    let ffn_source = if cfg.parallel_residual {
+        std::borrow::Cow::Owned(hidden.to_vec())
+    } else {
+        std::borrow::Cow::Borrowed(&h1[..])
+    };
+
     // ── MLP sublayer: dense SwiGLU, or routed Mixture-of-Experts ──
     // The FFN's input norm is `pre_feedforward_layernorm` on Gemma2 (whose
     // `post_attention_layernorm` was already spent on the attention output) and
     // `post_attention_layernorm` everywhere else.
     let ffn_norm = w.ffn_input_norm();
-    let normed2 = rmsnorm(&h1, ffn_norm, cfg.rms_eps);
+    let normed2 = norm(
+        &ffn_source,
+        ffn_norm,
+        w.post_attention_layernorm_bias.as_deref(),
+        cfg.rms_eps,
+        cfg.norm_kind,
+    );
     let mut ffn_out = match &w.ffn {
         Ffn::Dense(f) => swiglu_ffn(
             f,
@@ -2063,7 +2161,13 @@ fn attention_sublayer(
             got: hidden.len(),
         });
     }
-    let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
+    let normed = norm(
+        hidden,
+        &w.input_layernorm,
+        w.input_layernorm_bias.as_deref(),
+        cfg.rms_eps,
+        cfg.norm_kind,
+    );
     let mut q = matvec_native(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
     let mut k = matvec_native(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
     let mut v = matvec_native(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
@@ -2080,24 +2184,30 @@ fn attention_sublayer(
         head_rmsnorm(&mut k, cfg.num_kv_heads, cfg.head_dim, kn, cfg.rms_eps);
     }
 
-    let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
-    let mscale = rope_mscale(cfg.rope_scaling);
-    rope_inplace(
-        &mut q,
-        cfg.num_heads,
-        cfg.head_dim,
-        position,
-        &inv_freq,
-        mscale,
-    );
-    rope_inplace(
-        &mut k,
-        cfg.num_kv_heads,
-        cfg.head_dim,
-        position,
-        &inv_freq,
-        mscale,
-    );
+    // GPT-2 encodes position by *adding* a learned embedding to the token
+    // embedding before the first block, so there is no rotation to apply here.
+    // Rotating anyway would apply position twice — which does not error, it
+    // just makes every long-range dependency wrong.
+    if !cfg.learned_positions {
+        let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
+        let mscale = rope_mscale(cfg.rope_scaling);
+        rope_inplace(
+            &mut q,
+            cfg.num_heads,
+            cfg.head_dim,
+            position,
+            &inv_freq,
+            mscale,
+        );
+        rope_inplace(
+            &mut k,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            position,
+            &inv_freq,
+            mscale,
+        );
+    }
 
     kv.append(&k, &v)?;
     let ctx = attention(cfg, &q, kv);
@@ -2213,6 +2323,68 @@ impl ComputeKernel for CpuKernel {
 mod tests {
     use super::*;
     use crate::model::MoeNaming;
+
+    /// LayerNorm against hand-computed values.
+    ///
+    /// The distinguishing property is **mean subtraction**: RMSNorm divides by
+    /// the root mean square and leaves the mean where it is. For an input whose
+    /// mean is non-zero the two therefore disagree, and this pins which one is
+    /// which — substituting the other does not error, it shifts every activation
+    /// and degrades output into fluent nonsense.
+    #[test]
+    fn layernorm_centres_and_scales() {
+        // mean = 2.5, var = 1.25, std = 1.1180340
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let w = [1.0f32; 4];
+        let got = layernorm(&x, &w, None, 0.0);
+        let expected = [-1.341_641, -0.447_213_6, 0.447_213_6, 1.341_641];
+        for (g, e) in got.iter().zip(&expected) {
+            assert!((g - e).abs() < 1e-5, "got {got:?}, want {expected:?}");
+        }
+        // Centred output sums to ~0; RMSNorm of this input would not.
+        assert!(got.iter().sum::<f32>().abs() < 1e-5);
+        let rms = rmsnorm(&x, &w, 0.0);
+        assert!(
+            rms.iter().sum::<f32>() > 1.0,
+            "RMSNorm must NOT centre, else this test proves nothing: {rms:?}"
+        );
+    }
+
+    #[test]
+    fn layernorm_applies_weight_and_bias() {
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let w = [2.0f32, 2.0, 2.0, 2.0];
+        let b = [0.5f32, 0.5, 0.5, 0.5];
+        let no_bias = layernorm(&x, &w, None, 0.0);
+        let with_bias = layernorm(&x, &w, Some(&b), 0.0);
+        for (n, wb) in no_bias.iter().zip(&with_bias) {
+            assert!(
+                (wb - n - 0.5).abs() < 1e-6,
+                "bias must be added after scale"
+            );
+        }
+        // Weight of 2 doubles the centred value.
+        assert!((no_bias[0] - 2.0 * -1.341_641).abs() < 1e-5);
+    }
+
+    #[test]
+    fn norm_dispatches_on_kind() {
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let w = [1.0f32; 4];
+        assert_eq!(
+            norm(&x, &w, None, 1e-5, NormKind::Rms),
+            rmsnorm(&x, &w, 1e-5)
+        );
+        assert_eq!(
+            norm(&x, &w, None, 1e-5, NormKind::Layer),
+            layernorm(&x, &w, None, 1e-5)
+        );
+        assert_ne!(
+            norm(&x, &w, None, 1e-5, NormKind::Rms),
+            norm(&x, &w, None, 1e-5, NormKind::Layer),
+            "the two kinds must be distinguishable on this input"
+        );
+    }
 
     #[test]
     fn kv_truncate_rolls_back_positions() {

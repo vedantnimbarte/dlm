@@ -582,6 +582,13 @@ pub struct ModelConfig {
     /// Gemma applies RMSNorm as `(1 + weight)` rather than `weight`. When true the
     /// loader bakes the `+1` into the norm weights so the kernels stay unchanged.
     pub norm_add_one: bool,
+    /// RMSNorm (Llama-descended) or LayerNorm (GPT-2, Falcon).
+    pub norm_kind: crate::forward::cpu::NormKind,
+    /// Falcon: attention and FFN read the same normalized input, summed into one
+    /// residual.
+    pub parallel_residual: bool,
+    /// GPT-2: absolute learned position embeddings instead of RoPE.
+    pub learned_positions: bool,
     /// Scalar applied to token embeddings after lookup (Gemma multiplies by
     /// `sqrt(hidden_size)`); `None` leaves embeddings unscaled.
     pub embed_scale: Option<f32>,
@@ -694,6 +701,23 @@ impl ModelConfig {
         let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
         let is_gemma2 = model_type == "gemma2";
         let is_gemma = model_type == "gemma" || is_gemma2;
+        // GPT-2 and Falcon are the two families that are not Llama-descended:
+        // both normalize with LayerNorm rather than RMSNorm, and each changes the
+        // block in one further way. Keyed on `model_type` rather than
+        // `architectures`, since the latter varies between exports of the same
+        // model while `model_type` does not.
+        let is_gpt2 = model_type == "gpt2";
+        // `refinedweb`/`RWForCausalLM` is Falcon's original name; both are live in
+        // the wild, so both must map to the same block.
+        let is_falcon = matches!(
+            model_type.as_str(),
+            "falcon" | "refinedweb" | "refinedwebmodel"
+        );
+        let norm_kind = if is_gpt2 || is_falcon {
+            crate::forward::cpu::NormKind::Layer
+        } else {
+            crate::forward::cpu::NormKind::Rms
+        };
         let activation = match raw
             .hidden_activation
             .as_deref()
@@ -737,6 +761,9 @@ impl ModelConfig {
             // attention; keep it as declared and let the kernel no-op it.
             sliding_window: raw.sliding_window.filter(|&w| w > 0),
             norm_add_one: is_gemma,
+            norm_kind,
+            parallel_residual: is_falcon,
+            learned_positions: is_gpt2,
             embed_scale: is_gemma.then(|| (raw.hidden_size as f32).sqrt()),
             activation,
             // HF hard-codes the alternation in the Gemma2 model class rather than

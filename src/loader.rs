@@ -534,6 +534,9 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         moe: config.moe,
         sliding_window: config.sliding_window.map(|w| w as usize),
         activation: config.activation,
+        norm_kind: config.norm_kind,
+        parallel_residual: config.parallel_residual,
+        learned_positions: config.learned_positions,
         mla: config.mla,
         sliding_window_pattern: config.sliding_window_pattern,
         attn_logit_softcap: config.attn_logit_softcap,
@@ -769,6 +772,14 @@ pub(crate) fn load_layer_tensors_opt(
             ffn,
             input_layernorm,
             post_attention_layernorm,
+            // LayerNorm biases: present on GPT-2 and Falcon, absent on every
+            // RMSNorm family, which has no bias to carry.
+            input_layernorm_bias: load_optional(store, &name("input_layernorm.bias"), hidden)?,
+            post_attention_layernorm_bias: load_optional(
+                store,
+                &name("post_attention_layernorm.bias"),
+                hidden,
+            )?,
             // Present on Qwen2 and friends, absent on Llama/Mistral.
             q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
             k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,

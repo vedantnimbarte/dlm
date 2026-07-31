@@ -127,6 +127,9 @@ fn tiny_cfg() -> BlockConfig {
         attn_logit_softcap: None,
         query_pre_attn_scalar: None,
         gemma2_norms: false,
+        norm_kind: Default::default(),
+        parallel_residual: false,
+        learned_positions: false,
     }
 }
 
