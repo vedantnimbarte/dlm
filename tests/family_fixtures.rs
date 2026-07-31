@@ -18,12 +18,19 @@
 //!
 //! **No weights are downloaded.** These defects were in parsing, and a tokenizer
 //! that picks the wrong pieces produces the wrong ids whatever the weights are,
-//! so config + tokenizer alone catch the whole class for ~35 MB and no secrets
+//! so config + tokenizer alone catch the whole class for ~85 MB and no secrets
 //! (every source here is ungated, so this runs on fork PRs too).
+//!
+//! **One fixture per row of the README's support table.** Five rows had none —
+//! Llama 3, Mixtral, Qwen2-MoE, Gemma v1 and dense Qwen3 — so those claims rested
+//! on nothing. The `llama-2` fixture in particular does not cover Llama 3: they
+//! share a table row and almost nothing else, since Llama 3 dropped SentencePiece
+//! for a 128k byte-level vocabulary and added `llama3` RoPE scaling.
 //!
 //! Populate with `.github/fetch-family-fixtures.sh`; each family skips when its
 //! directory is absent, so a fresh clone still runs the rest of the suite.
 
+use dlm::forward::cpu::RopeScaling;
 use dlm::model::{ModelConfig, MoeNaming, QuantScheme};
 use dlm::tokenizer::BpeTokenizer;
 use std::path::PathBuf;
@@ -181,6 +188,165 @@ fn deepseek_family_fixture() {
 
     let tok = BpeTokenizer::from_dir(&dir).expect("deepseek tokenizer");
     assert_round_trip(&tok, "deepseek-v2");
+}
+
+/// Llama 3: the `llama3` RoPE scaling the README advertises, which nothing
+/// asserted until now — the `llama-2` fixture is SentencePiece and covers a
+/// different tokenizer shape entirely, so "Llama 2 / 3 / 3.1 / 3.2" was one
+/// table row backed by half a test.
+///
+/// This is the highest-consequence gap of the five: a `rope_scaling` block that
+/// parses wrong does not error, it produces fluent nonsense, because the model
+/// was *trained* with that correction and running without it silently changes
+/// every position. dlm refuses scaling types it does not implement precisely
+/// because of that — so the refusal path needs a real config proving the type it
+/// *does* implement still parses.
+#[test]
+fn llama3_family_fixture_parses_rope_scaling() {
+    let Some(dir) = fixture("llama-3") else {
+        eprintln!("skipping llama-3: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("llama-3 config.json");
+
+    match cfg.rope_scaling {
+        Some(RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position,
+        }) => {
+            assert_eq!(factor, 32.0);
+            assert_eq!(low_freq_factor, 1.0);
+            assert_eq!(high_freq_factor, 4.0);
+            assert_eq!(original_max_position, 8192.0);
+        }
+        other => panic!("llama-3 must parse as RopeScaling::Llama3, got {other:?}"),
+    }
+
+    // Llama 3 dropped SentencePiece for a 128k byte-level vocabulary — the same
+    // family row as llama-2, a completely different tokenizer.
+    assert_eq!(cfg.vocab_size, 128256);
+
+    let tok = BpeTokenizer::from_dir(&dir).expect("llama-3 tokenizer");
+    assert_pieces(
+        &tok,
+        &["The", "Ġcapital", "Ġof", "ĠFrance", "Ġis"],
+        "llama-3",
+    );
+    assert_round_trip(&tok, "llama-3");
+}
+
+/// Mixtral layout: `block_sparse_moe.experts.*` with no shared expert — the
+/// naming branch that had no real config behind it. DeepSeek covers the
+/// `n_routed_experts` spelling and Qwen covers the gated shared expert; this is
+/// the third, and the one the README names first.
+#[test]
+fn mixtral_family_fixture() {
+    let Some(dir) = fixture("mixtral") else {
+        eprintln!("skipping mixtral: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("mixtral config.json");
+    let moe = cfg.moe.expect("num_local_experts must register as MoE");
+    assert_eq!(moe.naming, MoeNaming::Mixtral);
+    assert_eq!(moe.num_experts, 8);
+    assert_eq!(moe.experts_per_tok, 2);
+    assert_eq!(
+        moe.shared_intermediate_size, None,
+        "Mixtral has no shared expert; inventing one would add weights the \
+         checkpoint does not contain"
+    );
+    assert_eq!(moe.first_k_dense, 0, "every layer is routed");
+}
+
+/// Qwen2-MoE: routed experts *plus* a sigmoid-gated shared expert, which is the
+/// half of the MoE surface neither Mixtral (no shared expert) nor DeepSeek
+/// (ungated shared expert) reaches.
+#[test]
+fn qwen2_moe_family_fixture() {
+    let Some(dir) = fixture("qwen2-moe") else {
+        eprintln!("skipping qwen2-moe: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("qwen2-moe config.json");
+    let moe = cfg.moe.expect("num_experts must register as MoE");
+    assert_eq!(moe.naming, MoeNaming::Qwen);
+    assert_eq!(moe.num_experts, 60);
+    assert_eq!(moe.experts_per_tok, 4);
+    // The routed width is `moe_intermediate_size`, NOT the dense
+    // `intermediate_size` (5632) sitting next to it in the same file.
+    assert_eq!(moe.moe_intermediate_size, 1408);
+    assert_eq!(
+        moe.shared_intermediate_size,
+        Some(5632),
+        "Qwen states the shared expert as a width, unlike DeepSeek's count×width"
+    );
+    assert!(
+        !moe.norm_topk_prob,
+        "Qwen1.5-MoE sets norm_topk_prob: false; renormalising anyway would \
+         change every routing weight"
+    );
+}
+
+/// Gemma v1: the same family as gemma-2 and a different block — `(1+w)` RMSNorm,
+/// GeGLU, `sqrt(hidden)` embedding scaling, and crucially **no softcapping**.
+/// Applying gemma-2's caps here would silently squash every logit.
+#[test]
+fn gemma1_family_fixture_is_not_gemma2() {
+    let Some(dir) = fixture("gemma-1") else {
+        eprintln!("skipping gemma-1: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("gemma-1 config.json");
+    assert!(cfg.norm_add_one, "Gemma stores RMSNorm weights as (1+w)");
+    assert_eq!(
+        cfg.attn_logit_softcap, None,
+        "softcapping arrived in Gemma2; v1 must not inherit it"
+    );
+    assert_eq!(cfg.final_logit_softcap, None);
+    assert_eq!(
+        cfg.sliding_window_pattern, None,
+        "v1 has no alternating windows"
+    );
+    // Embeddings are scaled by sqrt(hidden_size); dropping it changes every logit.
+    let scale = cfg
+        .embed_scale
+        .expect("Gemma scales embeddings by sqrt(hidden)");
+    assert!(
+        (scale - (cfg.hidden_size as f32).sqrt()).abs() < 1e-3,
+        "embed_scale {scale} should be sqrt({})",
+        cfg.hidden_size
+    );
+
+    let tok = BpeTokenizer::from_dir(&dir).expect("gemma-1 tokenizer");
+    assert_round_trip(&tok, "gemma-1");
+}
+
+/// Qwen3 dense: `head_dim` is declared explicitly and does **not** equal
+/// `hidden_size / num_attention_heads` (128 vs 1024/16 = 64).
+///
+/// A loader that derives head_dim instead of reading it gets every projection
+/// shape wrong here. That is a config-level trap with no tokenizer component,
+/// and the reason a dense Qwen3 fixture earns its place next to qwen2.5.
+#[test]
+fn qwen3_family_fixture_has_explicit_head_dim() {
+    let Some(dir) = fixture("qwen3") else {
+        eprintln!("skipping qwen3: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("qwen3 config.json");
+    assert_eq!(cfg.explicit_head_dim, Some(128));
+    assert_ne!(
+        cfg.hidden_size / cfg.num_attention_heads,
+        128,
+        "this fixture is only interesting while derived != declared"
+    );
+    assert!(cfg.moe.is_none(), "Qwen3-0.6B is dense");
+
+    let tok = BpeTokenizer::from_dir(&dir).expect("qwen3 tokenizer");
+    assert_pieces(&tok, &["The", "Ġcapital", "Ġof", "ĠFrance", "Ġis"], "qwen3");
+    assert_round_trip(&tok, "qwen3");
 }
 
 /// Qwen is the control: genuinely byte-level BPE with `add_bos_token: false`.
