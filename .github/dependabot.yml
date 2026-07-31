@@ -1,0 +1,29 @@
+# Dependency updates.
+#
+# Only useful now that `Cargo.lock` is committed (1f69554). While the lockfile
+# was ignored, every build resolved fresh and a bump was invisible — there was
+# nothing to open a PR against. With the graph pinned, a bump is a reviewable
+# diff, which is the point.
+#
+# Weekly rather than daily: 8 direct dependencies do not move fast enough to
+# justify the noise, and every PR here costs a full CI run.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # One PR per dependency. Grouping would hide which bump broke the MSRV job,
+    # and an MSRV break is the specific failure this repo has already had:
+    # clap's unpinned `"4"` drifted to a clap_lex requiring 1.85 while the
+    # manifest still claimed 1.75, and nothing noticed.
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"

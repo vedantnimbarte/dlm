@@ -72,8 +72,11 @@ On **x86-64 Linux or Windows with an NVIDIA GPU**, the installer picks the
 (no NVIDIA GPU, arm64, macOS) it installs the portable **CPU build**.
 
 The GPU build **statically embeds the CUDA runtime**, so it needs only the
-**NVIDIA driver** — no CUDA toolkit install. An **AMD GPU** gets the CPU build for
-now (AMD GPU support is planned; see [Building for GPU](#building-for-gpu-nvidia--amd)).
+**NVIDIA driver** — no CUDA toolkit install. An **AMD GPU** gets the CPU build,
+because there is no prebuilt ROCm asset: the AMD compute path (`rocm-kernels`)
+**is implemented** and builds from source, but it has not yet been parity-verified
+on real AMD hardware, so it is not shipped prebuilt. See
+[Building for GPU](#building-for-gpu-nvidia--amd).
 
 - Force the CPU build: `DLM_CPU=1 curl … | sh` (or set `DLM_CPU=1` before the
   Windows one-liner).
@@ -227,9 +230,9 @@ any machine.
   - macOS: Xcode Command Line Tools (`xcode-select --install`)
   - Windows: the Visual Studio C++ Build Tools (MSVC)
 - **(Optional, for the GPU path)** NVIDIA CUDA Toolkit 12.x with `cudart` on the
-  library path. (AMD ROCm is memory-only for now — see
-  [Building for GPU](#building-for-gpu-nvidia--amd) — so it needs no toolkit to
-  build.)
+  library path. (For AMD, ROCm with `hipcc` — needed only for the `rocm-kernels`
+  compute build; the memory-only `rocm` feature needs no toolkit. See
+  [Building for GPU](#building-for-gpu-nvidia--amd).)
 
   Not required for building, testing, or the demo — the host fallback needs no GPU.
 
@@ -428,7 +431,10 @@ names. That covers:
 | Gemma (v1) | supported — `(1+w)` RMSNorm, GeGLU, `sqrt(hidden)` embedding scaling |
 | Mixtral (and Mixtral-layout MoE) | supported — top-k routing over `block_sparse_moe.experts.*` |
 | Qwen2-MoE / Qwen3-MoE | supported — routed experts + optional sigmoid-gated shared expert |
-| GPT-2 / Falcon / other layouts | **not supported** — errors on unknown tensor names |
+| Phi-3 / Phi-3.5 | supported — fused `qkv_proj` and `gate_up_proj` are split at load; the block is otherwise Llama-shaped. The 128k `longrope` variant is **refused** (dlm does not implement that scaling, and running without it yields fluent nonsense) |
+| GPT-2 | supported — LayerNorm (not RMSNorm), learned position embeddings instead of RoPE, an ungated MLP, biases on every projection, and `Conv1D` weights transposed at load. CPU only: the GPU kernels implement RMSNorm and a gated FFN, so `--device gpu` is refused |
+| Falcon | supported — parallel attention/FFN, multi-query (`multi_query` is a flag, not a count), LayerNorm, ungated MLP, fused `query_key_value`. **Config-verified, not run**: the smallest RoPE Falcon is 14 GB. `alibi: true` (falcon-rw-*) and `new_decoder_architecture` (Falcon-40B) are **refused** rather than mis-decoded. CPU only |
+| GPT-2 / Falcon / other layouts | other layouts **not supported** — errors on unknown tensor names |
 | DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU. MLA + MoE runs on the streaming GPU path (the resident kernel holds no routed experts, so `--no-stream` refuses it) |
 | Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
 
@@ -524,7 +530,8 @@ across vendors.
 | `cuda` | NVIDIA | `cudart` (dynamic) | `CUDA_PATH` |
 | `cuda-kernels` | NVIDIA | dynamic `cudart` + compiled `kernels.cu` (nvcc) | `CUDA_PATH` |
 | `cuda-static` | NVIDIA | **static** `cudart` baked in — runs on driver alone | `CUDA_PATH` |
-| `rocm` | AMD | `amdhip64` — memory only, no compute yet (planned) | `ROCM_PATH` |
+| `rocm` | AMD | `amdhip64` — memory only (no compute kernels) | `ROCM_PATH` |
+| `rocm-kernels` | AMD | `amdhip64` + compiled `kernels.cu` (hipcc) — compute, unverified on hardware | `ROCM_PATH` |
 | _(none)_ | — | host fallback | — |
 
 `cuda-kernels` additionally compiles [`src/gpu/kernels.cu`](src/gpu/kernels.cu)
@@ -565,9 +572,11 @@ changes between builds.
 
 ### Running on unofficially-supported AMD cards
 
-> **Not functional yet.** This applies only once AMD GPU compute lands (see the
-> status note above). It is kept here as reference for that work — today the
-> `rocm` build has no compute kernels and runs inference on the CPU.
+> **Applies to a `rocm-kernels` build**, which compiles the compute kernels with
+> `hipcc`. A plain `rocm` build is memory-only and runs inference on the CPU, where
+> the gfx override below changes nothing. The compute path has not yet been
+> parity-verified on real AMD hardware — run `dlm doctor` and
+> `cargo test --features rocm-kernels` before trusting its output.
 
 ROCm ships kernels only for a short list of "officially supported" GPUs, but many
 Radeon cards that aren't on that list share an ISA with one that is. The

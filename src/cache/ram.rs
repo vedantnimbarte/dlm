@@ -1,4 +1,4 @@
-//! Tiered CPU-RAM layer cache (`PRD.md` §3.2).
+//! Tiered CPU-RAM layer cache.
 //!
 //! System RAM is far larger than VRAM but far smaller than the model on NVMe, so
 //! `dlm` uses it as a middle tier: a bounded, byte-budgeted LRU cache of layer

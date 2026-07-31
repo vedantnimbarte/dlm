@@ -1,0 +1,36 @@
+# cargo-deny configuration.
+#
+# Checks the dependency graph for known vulnerabilities, license compatibility,
+# and duplicate versions. Meaningful only because `Cargo.lock` is committed
+# (1f69554) — an unlocked graph has no fixed set of versions to audit.
+
+[advisories]
+# Fail on any advisory affecting a locked dependency.
+yanked = "deny"
+
+[licenses]
+# dlm is Apache-2.0. These are the permissive licenses its dependency tree
+# actually uses; anything outside the list is a deliberate decision, not a
+# default, so it should fail and be reviewed.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate major versions of the same crate are a warning, not an error: they
+# usually mean a transitive dependency lags, which is not dlm's to fix.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

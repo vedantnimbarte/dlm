@@ -1,4 +1,4 @@
-//! Pipeline layer partitioning (`specs.md` §3.3 Pipeline Parallelism).
+//! Pipeline layer partitioning (Pipeline Parallelism).
 
 /// A contiguous half-open range of transformer layers `[start, end)` assigned to
 /// one node.

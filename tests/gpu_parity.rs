@@ -64,6 +64,8 @@ fn random_layers(cfg: &BlockConfig, num_layers: u32, seed: u64) -> Vec<LayerTens
                 gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
                 up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
                 down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+                up_bias: None,
+                down_bias: None,
             }),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size],
@@ -405,6 +407,8 @@ fn gpu_mla_matches_cpu() {
                 gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
                 up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
                 down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+                up_bias: None,
+                down_bias: None,
             }),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size],
@@ -810,6 +814,8 @@ fn random_moe_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> 
         gate: Weights::from_f32(rng.vec(inter * h, s)),
         up: Weights::from_f32(rng.vec(inter * h, s)),
         down: Weights::from_f32(rng.vec(h * inter, s)),
+        up_bias: None,
+        down_bias: None,
     };
     (0..n)
         .map(|_| {
@@ -821,6 +827,8 @@ fn random_moe_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> 
                     gate: Weights::from_f32(rng.vec(si * h, s)),
                     up: Weights::from_f32(rng.vec(si * h, s)),
                     down: Weights::from_f32(rng.vec(h * si, s)),
+                    up_bias: None,
+                    down_bias: None,
                 }),
                 shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
             };
@@ -1025,6 +1033,8 @@ fn gemma2_fixture() -> (BlockConfig, Vec<LayerTensors>) {
                 gate: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
                 up: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
                 down: Weights::from_f32(rng.vec(h * cfg.intermediate_size, s)),
+                up_bias: None,
+                down_bias: None,
             }),
             // Non-uniform norms: a norm applied in the wrong place must show up.
             input_layernorm: (0..h).map(|i| 1.0 + i as f32 * 0.002).collect(),
@@ -1113,6 +1123,8 @@ fn random_mla_layers(
                     gate: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
                     up: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
                     down: Weights::from_f32(rng.vec(h * cfg.intermediate_size, s)),
+                    up_bias: None,
+                    down_bias: None,
                 }),
                 Some(m) => {
                     let inter = m.moe_intermediate_size as usize;
@@ -1124,12 +1136,16 @@ fn random_mla_layers(
                                 gate: Weights::from_f32(rng.vec(inter * h, s)),
                                 up: Weights::from_f32(rng.vec(inter * h, s)),
                                 down: Weights::from_f32(rng.vec(h * inter, s)),
+                                up_bias: None,
+                                down_bias: None,
                             })
                             .collect(),
                         shared: shared_inter.map(|si| ExpertFfn {
                             gate: Weights::from_f32(rng.vec(si * h, s)),
                             up: Weights::from_f32(rng.vec(si * h, s)),
                             down: Weights::from_f32(rng.vec(h * si, s)),
+                            up_bias: None,
+                            down_bias: None,
                         }),
                         shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
                     }

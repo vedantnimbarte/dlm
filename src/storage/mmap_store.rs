@@ -1,6 +1,6 @@
 //! Memory-mapped weight storage engine.
 //!
-//! Per `specs.md` §3.2(1), `dlm` maps model shards from the NVMe SSD directly
+//! Per(1), `dlm` maps model shards from the NVMe SSD directly
 //! into the process address space, skipping the OS read-buffer copy. The kernel
 //! then demand-pages 4 KiB regions straight from disk as the streaming pipeline
 //! touches them. Tensor bytes are handed out as borrowed slices (`&[u8]`) that

@@ -71,7 +71,8 @@ fn start_server() -> SocketAddr {
 fn request(addr: SocketAddr, body: &str) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
     let raw = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        // Explicitly single-shot: this helper reads to EOF.
+        "POST /v1/chat/completions HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(raw.as_bytes()).unwrap();

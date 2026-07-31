@@ -1,4 +1,4 @@
-//! Layer-streaming compute kernel (`specs.md` §2.2 / §3.2).
+//! Layer-streaming compute kernel.
 //!
 //! This is what makes `dlm` run a model bigger than the resident budget: rather
 //! than holding every layer's weights in memory ([`CpuKernel`]), a
@@ -8,7 +8,7 @@
 //! caches them in an LRU sized to the window, and evicts the least-recently-used
 //! layer when the window is full — so peak memory is `window × per-layer`, not
 //! the whole model. Hot layers survive across token steps (the tiered CPU-RAM
-//! cache of `specs.md` §2.3).
+//! cache of).
 //!
 //! Because the kernel is stateless given (weights, KV, position), the output is
 //! **identical for any window size** — the window is purely a memory/throughput
@@ -734,6 +734,8 @@ mod tests {
                 gate: Weights::from_f32(vec![0.1; 8]),
                 up: Weights::from_f32(vec![0.1; 8]),
                 down: Weights::from_f32(vec![0.1; 8]),
+                up_bias: None,
+                down_bias: None,
             }))
         }
     }
@@ -829,6 +831,8 @@ mod tests {
                         gate: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
                         up: Weights::from_f32(vec![s; c.intermediate_size * c.hidden_size]),
                         down: Weights::from_f32(vec![s; c.hidden_size * c.intermediate_size]),
+                        up_bias: None,
+                        down_bias: None,
                     }),
                     input_layernorm: vec![1.0; c.hidden_size],
                     post_attention_layernorm: vec![1.0; c.hidden_size],

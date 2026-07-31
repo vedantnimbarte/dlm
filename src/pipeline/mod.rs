@@ -1,4 +1,4 @@
-//! Asynchronous double-buffered streaming pipeline (`specs.md` §3.2).
+//! Asynchronous double-buffered streaming pipeline.
 //!
 //! Phase 2 core. The [`schedule`] module builds the overlapped A/B timeline; the
 //! [`HostPipeline`] here *executes* it on the CPU fallback so the buffer-swap

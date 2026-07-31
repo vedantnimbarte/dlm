@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod mmap_store;
 pub mod safetensors;
+pub mod sha256;
 
 pub use catalog::LayerCatalog;
 pub use mmap_store::{MmapShard, MmapStore};

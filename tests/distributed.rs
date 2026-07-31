@@ -66,6 +66,8 @@ fn build_model() -> Model {
                 gate: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
                 up: Weights::from_f32(rng.vec(cfg.intermediate_size * hidden, s)),
                 down: Weights::from_f32(rng.vec(hidden * cfg.intermediate_size, s)),
+                up_bias: None,
+                down_bias: None,
             }),
             input_layernorm: vec![1.0; hidden],
             post_attention_layernorm: vec![1.0; hidden],

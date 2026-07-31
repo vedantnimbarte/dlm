@@ -1,0 +1,76 @@
+name: Bug report
+description: Something dlm did that it should not have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things make a dlm bug report actionable, and both are easy to miss.
+
+        **`dlm doctor` output.** It reports the GPU backend, free VRAM, and runs a
+        self-check — on a `cuda-kernels` build with a GPU present it also runs a
+        live CPU-vs-GPU parity probe. Most reports are resolved by it alone.
+
+        **The exact model.** Nearly every defect found before 0.3.0 lived in a
+        checkpoint's `config.json` or `tokenizer.json`, not in the engine. The
+        repo id tells us more than the symptom does.
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`dlm doctor` output"
+      description: Run `dlm doctor` (add `--model-path <dir>` if the problem involves a specific model).
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Hugging Face repo id, or the local path plus the family it came from.
+      placeholder: Qwen/Qwen3-0.6B
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The full command, including every flag.
+      placeholder: dlm serve --model-path models/qwen3 --device gpu --quant int4
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+      description: |
+        If the output was wrong rather than absent, paste it. "Fluent but wrong"
+        is a distinct and important failure mode here — it usually means a
+        checkpoint was decoded with the wrong convention, and it looks nothing
+        like a crash.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build
+    attributes:
+      label: Which build
+      options:
+        - Prebuilt CPU (install.sh / install.ps1)
+        - Prebuilt GPU (-cuda-static)
+        - Built from source, default features
+        - Built from source, --features cuda-kernels
+        - Built from source, --features rocm-kernels
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `dlm --version`.
+    validations:
+      required: true

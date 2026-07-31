@@ -9,8 +9,9 @@
 
 use crate::{DlmError, Result};
 use serde::Deserialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Files the engine actually reads from a model directory. Anything else in the
 /// repo (READMEs, `.gguf`, PyTorch `.bin`, images) is skipped.
@@ -40,9 +41,21 @@ pub fn normalize_repo(input: &str) -> Result<String> {
         .next()
         .unwrap_or("")
         .trim_matches('/');
-    if repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
+    let segments: Vec<&str> = repo.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() != 2 {
         return Err(DlmError::Hub(format!(
             "expected a repo id like `org/model`, got {input:?}"
+        )));
+    }
+    // Counting segments is not validating them. `a/..` has two, so it passed —
+    // and the model name is then `..`, which makes the destination `models/..`,
+    // i.e. the parent of the intended directory. `../x` likewise walked out of
+    // the API URL. `is_safe_relative_path` has always guarded the *filenames* the
+    // hub returns; this is the same rule for the *repo id the user types*, which
+    // reaches the same `Path::join`.
+    if !segments.iter().all(|s| is_safe_relative_path(s)) {
+        return Err(DlmError::Hub(format!(
+            "repo id {input:?} contains a path component that is not a plain name"
         )));
     }
     Ok(repo.to_string())
@@ -68,6 +81,18 @@ struct ModelInfo {
 #[derive(Debug, Deserialize)]
 struct Sibling {
     rfilename: String,
+    /// LFS metadata, present for the large files (the weights) and absent for
+    /// small ones like `config.json`, which the hub stores inline.
+    #[serde(default)]
+    lfs: Option<Lfs>,
+}
+
+/// The LFS pointer the hub publishes for a large file. `oid` is the content's
+/// SHA-256 in lowercase hex -- the digest we can check a download against.
+#[derive(Debug, Deserialize)]
+struct Lfs {
+    #[serde(default)]
+    oid: Option<String>,
 }
 
 /// Search the hub for models carrying safetensors weights, most-downloaded first.
@@ -88,7 +113,9 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ModelHit>> {
 /// `./models/<model>`). Returns the directory the model landed in.
 pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<PathBuf> {
     let repo = normalize_repo(repo)?;
-    let info_url = format!("{}/api/models/{}", base(), repo);
+    // `?blobs=true` is what makes the hub include each sibling's LFS block; the
+    // bare endpoint returns filenames only, with no digest to verify against.
+    let info_url = format!("{}/api/models/{}?blobs=true", base(), repo);
     let body = curl_json(&info_url, token)?;
     let info: ModelInfo = serde_json::from_slice(&body).map_err(|e| {
         DlmError::Hub(format!(
@@ -96,14 +123,14 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         ))
     })?;
 
-    let wanted: Vec<&String> = info
+    let wanted: Vec<(&String, Option<&str>)> = info
         .siblings
         .iter()
-        .map(|s| &s.rfilename)
-        .filter(|f| is_wanted(f))
+        .filter(|s| is_wanted(&s.rfilename))
+        .map(|s| (&s.rfilename, s.lfs.as_ref().and_then(|l| l.oid.as_deref())))
         .collect();
 
-    if !wanted.iter().any(|f| f.ends_with(".safetensors")) {
+    if !wanted.iter().any(|(f, _)| f.ends_with(".safetensors")) {
         return Err(DlmError::Hub(format!(
             "{repo} has no .safetensors weights — dlm cannot load GGUF/PyTorch-only repos"
         )));
@@ -119,7 +146,7 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         dir.display(),
         wanted.len()
     );
-    for file in &wanted {
+    for (file, oid) in &wanted {
         let url = format!("{}/{}/resolve/main/{}", base(), repo, file);
         let out = dir.join(file);
         if let Some(parent) = out.parent() {
@@ -127,6 +154,7 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         }
         println!("  {file}");
         curl_download(&url, &out, token)?;
+        verify_sha256(&out, *oid)?;
     }
     println!("done. run: dlm serve --model-path {}", dir.display());
     Ok(dir)
@@ -158,15 +186,53 @@ fn is_safe_relative_path(f: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_)))
 }
 
+/// Run `curl`, passing the auth header (if any) through a config file on **stdin**
+/// rather than on the command line.
+///
+/// A token in argv is world-readable on Linux: `/proc/<pid>/cmdline` is not
+/// privileged, so any local user can `ps` the token for as long as curl runs —
+/// and for a model pull that is minutes to hours. curl documents this and offers
+/// `--config <file>`; `-` reads the config from stdin, which never appears in the
+/// process table. The token therefore exists only in this process's memory and on
+/// the pipe.
+///
+/// `stdout` is returned; `stderr` is captured so the caller can report it.
+fn curl_with_token(
+    args: &[&str],
+    token: Option<&str>,
+    capture_stdout: bool,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new("curl");
+    cmd.args(args);
+    if token.is_some() {
+        // Read the header line from stdin instead of argv.
+        cmd.arg("--config").arg("-");
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    if !capture_stdout {
+        // Progress bar / body go straight to the terminal or the -o file.
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+    }
+
+    let mut child = cmd.spawn()?;
+    if let Some(t) = token {
+        // curl config syntax: one directive per line, value quoted.
+        let line = format!("header = \"Authorization: Bearer {t}\"\n");
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(line.as_bytes())?;
+            // Dropping closes the pipe, which curl needs to finish reading config.
+        }
+    }
+    child.wait_with_output()
+}
+
 /// GET a URL and return the body, failing clearly if curl is missing or the
 /// request errors.
 fn curl_json(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-sSfL", url]);
-    if let Some(t) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    let out = cmd.output().map_err(curl_missing)?;
+    let out = curl_with_token(&["-sSfL", url], token, true).map_err(curl_missing)?;
     if !out.status.success() {
         return Err(DlmError::Hub(format!(
             "request failed ({}): {}",
@@ -182,12 +248,7 @@ fn curl_json(url: &str, token: Option<&str>) -> Result<Vec<u8>> {
 /// Used to skip files already fully present and to catch a transfer that ended
 /// early. A `HEAD` is cheap next to the multi-gigabyte bodies this module moves.
 fn remote_size(url: &str, token: Option<&str>) -> Option<u64> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-sIfL", url]);
-    if let Some(t) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    let out = cmd.output().ok()?;
+    let out = curl_with_token(&["-sIfL", url], token, true).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -226,24 +287,27 @@ fn curl_download(url: &str, out: &Path, token: Option<&str>) -> Result<()> {
         }
     }
 
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-fL",
-        "--progress-bar",
-        "--retry",
-        "10",
-        "--retry-delay",
-        "3",
-        "--retry-all-errors",
-        "--continue-at",
-        "-",
-        "-o",
-    ]);
-    cmd.arg(out).arg(url);
-    if let Some(t) = token {
-        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
-    }
-    let status = cmd.status().map_err(curl_missing)?;
+    let out_str = out.to_string_lossy();
+    let status = curl_with_token(
+        &[
+            "-fL",
+            "--progress-bar",
+            "--retry",
+            "10",
+            "--retry-delay",
+            "3",
+            "--retry-all-errors",
+            "--continue-at",
+            "-",
+            "-o",
+            &out_str,
+            url,
+        ],
+        token,
+        false,
+    )
+    .map_err(curl_missing)?
+    .status;
     if !status.success() {
         return Err(DlmError::Hub(format!(
             "download failed for {} — re-run `dlm pull` to resume from what was fetched",
@@ -264,6 +328,37 @@ fn curl_download(url: &str, out: &Path, token: Option<&str>) -> Result<()> {
             )));
         }
     }
+    Ok(())
+}
+
+/// Check a downloaded file against the digest the hub published for it.
+///
+/// A length match -- all `curl_download` could offer -- catches truncation and
+/// nothing else. It does not catch a corrupted transfer that happens to be the
+/// right size, a mirror serving different content, or a proxy rewriting the
+/// body. The weights are the one input to a dlm run that nothing verified: the
+/// binary is checksummed and minisigned by the installer and `Cargo.lock` pins
+/// the build, while a multi-gigabyte shard arrived on trust.
+///
+/// Skipped, with a note, when the hub publishes no `oid` -- true for the small
+/// non-LFS files. Silence there would be indistinguishable from a check that
+/// passed.
+fn verify_sha256(path: &Path, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let got = crate::storage::sha256::file_hex(path)
+        .map_err(|e| DlmError::Hub(format!("cannot read {} to verify: {e}", path.display())))?;
+    if !got.eq_ignore_ascii_case(expected) {
+        // Remove it: leaving a file that failed verification invites the next
+        // `pull` to treat it as already complete and skip re-fetching it.
+        let _ = std::fs::remove_file(path);
+        return Err(DlmError::Hub(format!(
+            "{} failed its checksum -- the hub published sha256 {expected}, the              download hashes to {got}. The file has been removed; re-run `dlm pull`.",
+            path.display()
+        )));
+    }
+    println!("    sha256 ok");
     Ok(())
 }
 
@@ -313,6 +408,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_repo_ids_that_escape_the_destination() {
+        // Each of these has exactly two non-empty segments, so the old
+        // segment-count check accepted every one. `a/..` is the sharp case: the
+        // model name becomes `..` and the destination `models/..` -- the parent of
+        // where the user asked for it.
+        for evil in [
+            "a/..",
+            "../x",
+            "../..",
+            "a/../b",
+            r"a\..",
+            "org/model\0",
+            "./x",
+            "a/.",
+        ] {
+            assert!(
+                normalize_repo(evil).is_err(),
+                "should have rejected repo id {evil:?}"
+            );
+        }
+        // Ordinary ids, including the URL forms, still normalize.
+        assert_eq!(
+            normalize_repo("Qwen/Qwen3-0.6B").unwrap(),
+            "Qwen/Qwen3-0.6B"
+        );
+        assert_eq!(
+            normalize_repo("meta-llama/Llama-3.2-1B-Instruct").unwrap(),
+            "meta-llama/Llama-3.2-1B-Instruct"
+        );
+    }
+
+    #[test]
     fn keeps_only_loadable_files() {
         assert!(is_wanted("model.safetensors"));
         assert!(is_wanted("model-00001-of-00002.safetensors"));
@@ -342,6 +469,40 @@ mod tests {
         assert!(is_wanted("model.safetensors"));
         assert!(is_safe_relative_path("subdir/model.safetensors"));
         assert!(!is_wanted("README.md"));
+    }
+
+    /// `A10`: a download that hashes wrong is rejected AND removed, so the next
+    /// `pull` re-fetches it rather than treating it as already complete.
+    #[test]
+    fn sha256_mismatch_is_rejected_and_the_file_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard.safetensors");
+        std::fs::write(&path, b"abc").unwrap();
+
+        // Correct digest for "abc" passes and leaves the file alone.
+        let ok = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_sha256(&path, Some(ok)).is_ok());
+        assert!(path.exists());
+        // Case-insensitive: the hub publishes lowercase, but do not depend on it.
+        assert!(verify_sha256(&path, Some(&ok.to_uppercase())).is_ok());
+
+        // A wrong digest fails and takes the file with it.
+        let err = verify_sha256(&path, Some(&"0".repeat(64))).unwrap_err();
+        assert!(format!("{err}").contains("failed its checksum"), "{err}");
+        assert!(
+            !path.exists(),
+            "a file that failed verification must not survive"
+        );
+    }
+
+    /// No published `oid` (the small non-LFS files) is not an error.
+    #[test]
+    fn absent_digest_skips_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(verify_sha256(&path, None).is_ok());
+        assert!(path.exists());
     }
 
     #[test]

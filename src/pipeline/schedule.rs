@@ -1,4 +1,4 @@
-//! Double-buffer scheduling (`specs.md` §3.2).
+//! Double-buffer scheduling.
 //!
 //! Turns a linear [`LayerSwapPlan`] into the overlapped A/B execution timeline:
 //!

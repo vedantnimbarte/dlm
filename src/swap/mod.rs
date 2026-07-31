@@ -1,4 +1,4 @@
-//! The simple linear layer-swapping execution cycle (`PRD.md` Phase 1).
+//! The simple linear layer-swapping execution cycle ( Phase 1).
 //!
 //! Given a [`VramPlan`] (how many blocks fit) and a model's layer count, this
 //! module lays out the deterministic sequence of *streaming passes* a single

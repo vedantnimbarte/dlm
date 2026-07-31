@@ -1,4 +1,4 @@
-//! `dlm` binary — command-line entry point (`specs.md` §4).
+//! `dlm` binary — command-line entry point.
 //!
 //! Two subcommands:
 //! * `dlm profile` — map/estimate a model and print the VRAM plan, KV-cache
@@ -127,6 +127,10 @@ fn tiny_cfg() -> BlockConfig {
         attn_logit_softcap: None,
         query_pre_attn_scalar: None,
         gemma2_norms: false,
+        ffn_kind: Default::default(),
+        norm_kind: Default::default(),
+        parallel_residual: false,
+        learned_positions: false,
     }
 }
 
@@ -194,6 +198,8 @@ fn gpu_parity_probe() -> Result<f32> {
             gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
             up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, s)),
             down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, s)),
+            up_bias: None,
+            down_bias: None,
         }),
         input_layernorm: vec![1.0; cfg.hidden_size],
         post_attention_layernorm: vec![1.0; cfg.hidden_size],
@@ -496,6 +502,8 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
                 gate: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
                 up: Weights::from_f32(rng.vec(cfg.intermediate_size * cfg.hidden_size, scale)),
                 down: Weights::from_f32(rng.vec(cfg.hidden_size * cfg.intermediate_size, scale)),
+                up_bias: None,
+                down_bias: None,
             }),
             input_layernorm: vec![1.0; cfg.hidden_size],
             post_attention_layernorm: vec![1.0; cfg.hidden_size],
@@ -516,6 +524,8 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
     Ok(ModelParts {
+        position_embedding: None,
+        final_norm_bias: None,
         cfg,
         layers,
         embedding,
@@ -791,13 +801,13 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             };
 
             if !args.multi_gpu_ids.is_empty() {
-                // Split the target across local GPUs (specs §3.3); the small,
+                // Split the target across local GPUs; the small,
                 // pinned draft stays on the first GPU.
                 let ids = args.multi_gpu_ids.clone();
                 let split =
                     dlm::distributed::partition_layers(config.num_layers as usize, ids.len());
                 println!();
-                println!("multi-gpu    : pipeline-parallel layer split (specs §3.3)");
+                println!("multi-gpu    : pipeline-parallel layer split");
                 for (stage, shard) in split.iter().enumerate() {
                     println!(
                         "  gpu {:<6}: layers {}..{} ({} layer(s))",
@@ -1344,7 +1354,70 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         println!("  auth       : bearer token required on /v1/*");
     }
     let router = dlm::server::engine::secured_router(engine, args.api_key.clone());
-    server.serve(router) // blocks
+    let shutdown = install_signal_handler();
+    server.serve_with_shutdown(router, shutdown) // blocks until signalled
+}
+
+/// Return a [`Shutdown`] wired to `SIGTERM`/`SIGINT` where the platform allows.
+///
+/// `SIGTERM` is how supervisors stop a process — `docker stop`, systemd, a
+/// Kubernetes eviction — each followed by `SIGKILL` after a grace period. Without
+/// a handler the server died mid-generation and cut SSE streams without their
+/// terminating chunk, so every deploy dropped live requests.
+///
+/// **Unix only.** `libc` is already a Unix-only dependency and the standard
+/// library exposes no portable signal API. On Windows the handle is returned
+/// untriggered, so `serve_with_shutdown` behaves exactly like `serve` did — no
+/// regression, just no graceful path. Wiring `SetConsoleCtrlHandler` would mean a
+/// new dependency for the one platform least likely to run this under a
+/// supervisor.
+fn install_signal_handler() -> dlm::server::Shutdown {
+    let shutdown = dlm::server::Shutdown::new();
+
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        // The handler runs in a signal context, where almost nothing is legal to
+        // call. It may only touch an atomic — so it sets a flag, and a watcher
+        // thread does the real work (dialing the listener to wake `accept`).
+        static FLAG: OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+        let flag = FLAG
+            .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone();
+
+        extern "C" fn on_signal(_sig: libc::c_int) {
+            if let Some(f) = FLAG.get() {
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        // Cast through `*const ()` rather than straight to the integer
+        // `sighandler_t`: a direct function-item-to-integer cast is
+        // `clippy::fn_to_numeric_cast_any`, and it is a lint worth heeding —
+        // the item type is zero-sized, so which address you get is not
+        // something the cast makes obvious.
+        let handler_addr = on_signal as *const () as libc::sighandler_t;
+
+        // SAFETY: `signal` with a valid signal number and an `extern "C"` handler
+        // is defined behaviour. `on_signal` touches only an `AtomicBool`, which is
+        // async-signal-safe; everything else is deferred to the watcher below.
+        unsafe {
+            libc::signal(libc::SIGTERM, handler_addr);
+            libc::signal(libc::SIGINT, handler_addr);
+        }
+
+        let watcher = shutdown.clone();
+        std::thread::spawn(move || loop {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("dlm: shutdown signal received; draining in-flight requests");
+                watcher.trigger();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+    }
+
+    shutdown
 }
 
 /// Shared planner/reporter: map the model (if a dir is given), profile it, size
@@ -1429,7 +1502,7 @@ fn report_plan(
         swap.staging_bytes(plan.per_layer_weight_bytes) as f64 / (1024.0 * 1024.0),
     );
 
-    // Build the double-buffered A/B schedule (specs §3.2).
+    // Build the double-buffered A/B schedule.
     let sched = DoubleBufferSchedule::from_swap_plan(&swap);
     println!(
         "pipeline     : {} steps, {} overlapped (DMA hidden under compute)",

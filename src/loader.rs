@@ -50,6 +50,9 @@ pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
     let probe = [
         "model.layers.0.self_attn.q_proj.weight",
         "model.embed_tokens.weight",
+        // GPT-2's tree: no `model.` prefix, embedding is `wte`.
+        "h.0.attn.c_attn.weight",
+        "wte.weight",
     ];
     let dtype = probe
         .iter()
@@ -180,6 +183,145 @@ fn load_native(
         )));
     }
     Ok(w)
+}
+
+/// Load a contiguous row range out of a **fused** projection.
+///
+/// Phi-3 (and Phi-3.5) ship one tensor where Llama ships several:
+/// `self_attn.qkv_proj.weight` is `[q_dim + kv_dim + kv_dim, hidden]` and
+/// `mlp.gate_up_proj.weight` is `[2 * intermediate, hidden]`. Everything else
+/// about the block is Llama-shaped, so the whole of Phi-3 support is being able
+/// to take a slice of these two.
+///
+/// The weight is row-major `[out, in]`, so a run of output rows is a **contiguous
+/// byte range** — this slices the mapped bytes rather than materializing the
+/// fused tensor and copying out of it, which would otherwise cost three full
+/// reads of QKV per layer.
+///
+/// Refuses a packed/GPTQ fused tensor rather than guessing: the group layout of a
+/// sliced `qweight` is not something to infer, and this project's rule is that a
+/// wrong decode yields plausible output rather than an error.
+fn load_linear_rows(
+    store: &MmapStore,
+    base: &str,
+    in_features: usize,
+    fused_out_features: usize,
+    row_offset: usize,
+    row_count: usize,
+    quant: QuantScheme,
+) -> Result<Weights> {
+    let name = format!("{base}.weight");
+    if store.locate(&name).is_none() && store.locate(&format!("{base}.qweight")).is_some() {
+        return Err(DlmError::UnsupportedQuant(format!(
+            "{base} is a fused packed 4-bit tensor; dlm splits fused projections \
+             only for float checkpoints, because slicing a packed tensor's groups \
+             wrongly yields plausible-looking but incorrect weights"
+        )));
+    }
+    let (shard, info) = store
+        .locate(&name)
+        .ok_or_else(|| DlmError::UnknownTensor(name.clone()))?;
+
+    let elem = match info.dtype {
+        Dtype::F32 => 4usize,
+        Dtype::BF16 | Dtype::F16 => 2usize,
+        other => {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "fused tensor {name:?} has dtype {other:?}; dlm's compute path \
+                 handles F32/F16/BF16 weights"
+            )))
+        }
+    };
+
+    let bytes = shard.tensor_bytes(&name)?;
+    let expected = fused_out_features * in_features * elem;
+    if bytes.len() != expected {
+        return Err(DlmError::InvalidConfig(format!(
+            "fused tensor {name:?}: expected {fused_out_features}x{in_features} \
+             ({expected} bytes), got {} — the checkpoint's fusion layout is not \
+             what this architecture declares",
+            bytes.len()
+        )));
+    }
+    let start = row_offset * in_features * elem;
+    let end = start + row_count * in_features * elem;
+    let slice = &bytes[start..end];
+
+    if matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
+        let floats = bytes_to_f32(slice, info.dtype)?;
+        let group = crate::forward::QUANT_GROUP_SIZE;
+        return match quant {
+            QuantScheme::Int4 => Weights::quantize_int4(&floats, group),
+            _ => Weights::quantize_int8(&floats, group),
+        };
+    }
+    let w = match info.dtype {
+        Dtype::F32 => Weights::F32(bytes_to_f32(slice, info.dtype)?),
+        Dtype::BF16 => Weights::Bf16(bytes_to_u16(slice, &name)?),
+        Dtype::F16 => Weights::F16(bytes_to_u16(slice, &name)?),
+        _ => unreachable!("dtype checked above"),
+    };
+    Ok(w)
+}
+
+/// True if this checkpoint uses Falcon's `transformer.h.{i}` tree.
+fn is_falcon_tree(store: &MmapStore) -> bool {
+    store
+        .locate("transformer.h.0.self_attention.query_key_value.weight")
+        .is_some()
+}
+
+/// True if this checkpoint uses GPT-2's `h.{i}` / `wte` / `ln_f` tensor tree.
+fn is_gpt2_tree(store: &MmapStore) -> bool {
+    store.locate("wte.weight").is_some() && store.locate("h.0.attn.c_attn.weight").is_some()
+}
+
+/// Load a GPT-2 `Conv1D` weight, transposed into the `[out, in]` layout dlm's
+/// GEMV expects, optionally taking a run of the output dimension.
+///
+/// GPT-2 stores these `[in, out]` -- `c_attn.weight` is `[768, 2304]`, not
+/// `[2304, 768]`. That is the trap in this family: the element count matches, so
+/// loading it unchanged yields a correctly-sized and completely wrong matrix and
+/// the model emits fluent nonsense rather than erroring. `load_linear_rows`
+/// (which slices Phi-3's fused tensors) is precisely the wrong tool, because its
+/// rows are not this file's rows.
+fn load_conv1d_transposed(
+    store: &MmapStore,
+    base: &str,
+    in_features: usize,
+    fused_out: usize,
+    out_offset: usize,
+    out_len: usize,
+    quant: QuantScheme,
+) -> Result<Weights> {
+    let src = load_tensor(store, &format!("{base}.weight"), in_features * fused_out)?;
+    let mut dst = vec![0f32; out_len * in_features];
+    for (o, row) in dst.chunks_exact_mut(in_features).enumerate() {
+        let col = out_offset + o;
+        for (i, slot) in row.iter_mut().enumerate() {
+            *slot = src[i * fused_out + col];
+        }
+    }
+    Ok(match quant {
+        QuantScheme::Int4 => Weights::quantize_int4(&dst, crate::forward::QUANT_GROUP_SIZE)?,
+        QuantScheme::Int8 => Weights::quantize_int8(&dst, crate::forward::QUANT_GROUP_SIZE)?,
+        _ => Weights::F32(dst),
+    })
+}
+
+/// Slice a contiguous run out of a 1-D bias, e.g. `c_attn.bias` into q/k/v.
+fn bias_slice(
+    store: &MmapStore,
+    name: &str,
+    total: usize,
+    offset: usize,
+    len: usize,
+) -> Result<Option<Vec<f32>>> {
+    if store.locate(name).is_none() {
+        return Ok(None);
+    }
+    let all = load_tensor(store, name, total)?;
+    Ok(Some(all[offset..offset + len].to_vec()))
 }
 
 /// Load a linear layer's weight as dense row-major `[out, in]`, transparently
@@ -329,6 +471,10 @@ pub struct ModelParts {
     pub kv_blocks: u32,
     /// Embedding scale (Gemma: `sqrt(hidden)`); `None` leaves embeddings unscaled.
     pub embed_scale: Option<f32>,
+    /// GPT-2's learned position embeddings (`wpe`), and the bias for its
+    /// LayerNorm final norm. Both `None` on every RoPE/RMSNorm family.
+    pub position_embedding: Option<Vec<f32>>,
+    pub final_norm_bias: Option<Vec<f32>>,
     /// Gemma2 final-logit softcap; `None` elsewhere.
     pub final_logit_softcap: Option<f32>,
 }
@@ -338,6 +484,8 @@ impl ModelParts {
     pub fn into_cpu_generator(self) -> Result<Generator<CpuKernel>> {
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
+        let head_norm = self.cfg.norm_kind;
         let kernel = CpuKernel::new(self.cfg, self.layers)?;
         Ok(Generator::new(
             kernel,
@@ -350,6 +498,7 @@ impl ModelParts {
             self.kv_blocks,
         )?
         .with_embed_scale(embed_scale)
+        .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap))
     }
 
@@ -403,7 +552,7 @@ impl ModelParts {
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
-    /// parallelism, `specs.md` §3.3) and build a generator over the resulting
+    /// parallelism,) and build a generator over the resulting
     /// [`PipelineParallelKernel`]. Off-GPU it runs on the CPU kernel with the
     /// same layer partition, so output equals [`into_cpu_generator`].
     ///
@@ -455,6 +604,10 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         moe: config.moe,
         sliding_window: config.sliding_window.map(|w| w as usize),
         activation: config.activation,
+        ffn_kind: config.ffn_kind,
+        norm_kind: config.norm_kind,
+        parallel_residual: config.parallel_residual,
+        learned_positions: config.learned_positions,
         mla: config.mla,
         sliding_window_pattern: config.sliding_window_pattern,
         attn_logit_softcap: config.attn_logit_softcap,
@@ -527,7 +680,172 @@ pub(crate) fn load_layer_tensors_opt(
     let intermediate = cfg.intermediate_size;
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
     // load_linear takes (in_features, out_features) of the underlying Linear.
+    // Falcon: `transformer.h.{i}`, a fused `query_key_value`, an ungated MLP, and
+    // -- with `parallel_attn` -- a single `input_layernorm` feeding both
+    // sublayers. Weights are plain `nn.Linear` `[out, in]`, so they slice rather
+    // than transpose; the Conv1D transposition is GPT-2's problem, not Falcon's.
+    if is_falcon_tree(store) {
+        let p = format!("transformer.h.{layer}");
+        let qkv = format!("{p}.self_attention.query_key_value");
+        let fused = q_dim + 2 * kv_dim;
+        // `parallel_attn` reuses the one norm for the FFN too. Copying it into
+        // both slots keeps `ffn_input_norm` working without a special case, and
+        // the parallel-residual flag is what actually changes the dataflow.
+        let ln = load_tensor(store, &format!("{p}.input_layernorm.weight"), hidden)?;
+        let ln_bias = load_optional(store, &format!("{p}.input_layernorm.bias"), hidden)?;
+        return Ok(LayerTensors {
+            q_proj: load_linear_rows(store, &qkv, hidden, fused, 0, q_dim, quant)?,
+            k_proj: load_linear_rows(store, &qkv, hidden, fused, q_dim, kv_dim, quant)?,
+            v_proj: load_linear_rows(store, &qkv, hidden, fused, q_dim + kv_dim, kv_dim, quant)?,
+            o_proj: load_linear(
+                store,
+                &format!("{p}.self_attention.dense"),
+                q_dim,
+                hidden,
+                quant,
+                packed,
+            )?,
+            o_bias: load_optional(store, &format!("{p}.self_attention.dense.bias"), hidden)?,
+            ffn: Ffn::Dense(ExpertFfn {
+                // Ungated, so `gate` is never read.
+                gate: Weights::F32(Vec::new()),
+                up: load_linear(
+                    store,
+                    &format!("{p}.mlp.dense_h_to_4h"),
+                    hidden,
+                    intermediate,
+                    quant,
+                    packed,
+                )?,
+                down: load_linear(
+                    store,
+                    &format!("{p}.mlp.dense_4h_to_h"),
+                    intermediate,
+                    hidden,
+                    quant,
+                    packed,
+                )?,
+                up_bias: load_optional(
+                    store,
+                    &format!("{p}.mlp.dense_h_to_4h.bias"),
+                    intermediate,
+                )?,
+                down_bias: load_optional(store, &format!("{p}.mlp.dense_4h_to_h.bias"), hidden)?,
+            }),
+            input_layernorm: ln.clone(),
+            post_attention_layernorm: ln,
+            input_layernorm_bias: ln_bias.clone(),
+            post_attention_layernorm_bias: ln_bias,
+            ..Default::default()
+        });
+    }
+
+    // GPT-2 uses a different tensor tree entirely (`h.{i}`, `attn.c_attn`,
+    // `mlp.c_fc`), so it returns before anything reads a `model.layers.{i}.*`
+    // name -- the FFN and both norms are loaded generically below and would fail
+    // on a checkpoint that has no such tensors.
+    if is_gpt2_tree(store) {
+        let p = format!("h.{layer}");
+        let qkv = format!("{p}.attn.c_attn");
+        let fused = q_dim + 2 * kv_dim;
+        return Ok(LayerTensors {
+            q_proj: load_conv1d_transposed(store, &qkv, hidden, fused, 0, q_dim, quant)?,
+            k_proj: load_conv1d_transposed(store, &qkv, hidden, fused, q_dim, kv_dim, quant)?,
+            v_proj: load_conv1d_transposed(
+                store,
+                &qkv,
+                hidden,
+                fused,
+                q_dim + kv_dim,
+                kv_dim,
+                quant,
+            )?,
+            o_proj: load_conv1d_transposed(
+                store,
+                &format!("{p}.attn.c_proj"),
+                q_dim,
+                hidden,
+                0,
+                hidden,
+                quant,
+            )?,
+            q_bias: bias_slice(store, &format!("{qkv}.bias"), fused, 0, q_dim)?,
+            k_bias: bias_slice(store, &format!("{qkv}.bias"), fused, q_dim, kv_dim)?,
+            v_bias: bias_slice(store, &format!("{qkv}.bias"), fused, q_dim + kv_dim, kv_dim)?,
+            o_bias: load_optional(store, &format!("{p}.attn.c_proj.bias"), hidden)?,
+            ffn: Ffn::Dense(ExpertFfn {
+                // Ungated: `gate` is never read (ffn_kind is Plain), so it stays
+                // empty rather than becoming a second copy of `up`.
+                gate: Weights::F32(Vec::new()),
+                up: load_conv1d_transposed(
+                    store,
+                    &format!("{p}.mlp.c_fc"),
+                    hidden,
+                    intermediate,
+                    0,
+                    intermediate,
+                    quant,
+                )?,
+                down: load_conv1d_transposed(
+                    store,
+                    &format!("{p}.mlp.c_proj"),
+                    intermediate,
+                    hidden,
+                    0,
+                    hidden,
+                    quant,
+                )?,
+                up_bias: load_optional(store, &format!("{p}.mlp.c_fc.bias"), intermediate)?,
+                down_bias: load_optional(store, &format!("{p}.mlp.c_proj.bias"), hidden)?,
+            }),
+            input_layernorm: load_tensor(store, &format!("{p}.ln_1.weight"), hidden)?,
+            post_attention_layernorm: load_tensor(store, &format!("{p}.ln_2.weight"), hidden)?,
+            input_layernorm_bias: load_optional(store, &format!("{p}.ln_1.bias"), hidden)?,
+            post_attention_layernorm_bias: load_optional(store, &format!("{p}.ln_2.bias"), hidden)?,
+            ..Default::default()
+        });
+    }
+
+    // Phi-3 fuses gate and up into one `[2*intermediate, hidden]` tensor. Detect
+    // by presence rather than by architecture string: a checkpoint that ships the
+    // fused tensor needs splitting whatever its config calls itself, and one that
+    // ships both separately does not.
+    let gate_up = name("mlp.gate_up_proj");
+    let fused_ffn = store.locate(&format!("{gate_up}.weight")).is_some();
+
     let ffn = match cfg.moe {
+        None if fused_ffn => Ffn::Dense(ExpertFfn {
+            // Row order is gate first, then up — the order the reference
+            // implementation splits them in.
+            gate: load_linear_rows(
+                store,
+                &gate_up,
+                hidden,
+                2 * intermediate,
+                0,
+                intermediate,
+                quant,
+            )?,
+            up: load_linear_rows(
+                store,
+                &gate_up,
+                hidden,
+                2 * intermediate,
+                intermediate,
+                intermediate,
+                quant,
+            )?,
+            down: load_linear(
+                store,
+                &name("mlp.down_proj"),
+                intermediate,
+                hidden,
+                quant,
+                packed,
+            )?,
+            up_bias: None,
+            down_bias: None,
+        }),
         None => Ffn::Dense(ExpertFfn {
             gate: load_linear(
                 store,
@@ -553,6 +871,8 @@ pub(crate) fn load_layer_tensors_opt(
                 quant,
                 packed,
             )?,
+            up_bias: None,
+            down_bias: None,
         }),
         Some(_) => load_moe_ffn(store, cfg, layer, quant, packed, include_experts)?,
     };
@@ -580,6 +900,40 @@ pub(crate) fn load_layer_tensors_opt(
             input_layernorm,
             post_attention_layernorm,
             mla: Some(load_mla(store, cfg, m, layer, quant, packed, norm_add_one)?),
+            ..Default::default()
+        }
+    } else if store
+        .locate(&format!("{}.weight", name("self_attn.qkv_proj")))
+        .is_some()
+    {
+        // Phi-3: Q, K and V fused into `[q_dim + 2*kv_dim, hidden]`, in that
+        // order. Everything below this is identical to the Llama path, which is
+        // the whole reason Phi-3 costs a loader change and not a new block.
+        let qkv = name("self_attn.qkv_proj");
+        let fused_out = q_dim + 2 * kv_dim;
+        LayerTensors {
+            q_proj: load_linear_rows(store, &qkv, hidden, fused_out, 0, q_dim, quant)?,
+            k_proj: load_linear_rows(store, &qkv, hidden, fused_out, q_dim, kv_dim, quant)?,
+            v_proj: load_linear_rows(
+                store,
+                &qkv,
+                hidden,
+                fused_out,
+                q_dim + kv_dim,
+                kv_dim,
+                quant,
+            )?,
+            o_proj: load_linear(
+                store,
+                &name("self_attn.o_proj"),
+                q_dim,
+                hidden,
+                quant,
+                packed,
+            )?,
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
             ..Default::default()
         }
     } else {
@@ -619,6 +973,15 @@ pub(crate) fn load_layer_tensors_opt(
             ffn,
             input_layernorm,
             post_attention_layernorm,
+            // LayerNorm biases: present on GPT-2 and Falcon, absent on every
+            // RMSNorm family, which has no bias to carry.
+            o_bias: load_optional(store, &name("self_attn.o_proj.bias"), hidden)?,
+            input_layernorm_bias: load_optional(store, &name("input_layernorm.bias"), hidden)?,
+            post_attention_layernorm_bias: load_optional(
+                store,
+                &name("post_attention_layernorm.bias"),
+                hidden,
+            )?,
             // Present on Qwen2 and friends, absent on Llama/Mistral.
             q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
             k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
@@ -808,6 +1171,9 @@ fn load_expert(
             quant,
             packed,
         )?,
+        // Experts are MoE-only, and no MoE family dlm supports has FFN biases.
+        up_bias: None,
+        down_bias: None,
     })
 }
 
@@ -974,8 +1340,22 @@ fn load_streaming_pieces(
     let hidden = cfg.hidden_size;
     let vocab = config.vocab_size as usize;
 
-    let embedding = load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?;
-    let final_norm = load_norm(&store, "model.norm.weight", hidden, config.norm_add_one)?;
+    let gpt2 = is_gpt2_tree(&store);
+    let falcon = is_falcon_tree(&store);
+    let embedding = if falcon {
+        load_tensor(&store, "transformer.word_embeddings.weight", vocab * hidden)?
+    } else if gpt2 {
+        load_tensor(&store, "wte.weight", vocab * hidden)?
+    } else {
+        load_tensor(&store, "model.embed_tokens.weight", vocab * hidden)?
+    };
+    let final_norm = if falcon {
+        load_tensor(&store, "transformer.ln_f.weight", hidden)?
+    } else if gpt2 {
+        load_tensor(&store, "ln_f.weight", hidden)?
+    } else {
+        load_norm(&store, "model.norm.weight", hidden, config.norm_add_one)?
+    };
     let lm_head = if store.locate("lm_head.weight").is_some() {
         load_tensor(&store, "lm_head.weight", vocab * hidden)?
     } else {
@@ -1119,8 +1499,22 @@ pub fn load_model_parts(
         )?);
     }
 
-    let embedding = load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?;
-    let final_norm = load_norm(store, "model.norm.weight", hidden, config.norm_add_one)?;
+    let gpt2 = is_gpt2_tree(store);
+    let falcon = is_falcon_tree(store);
+    let embedding = if falcon {
+        load_tensor(store, "transformer.word_embeddings.weight", vocab * hidden)?
+    } else if gpt2 {
+        load_tensor(store, "wte.weight", vocab * hidden)?
+    } else {
+        load_tensor(store, "model.embed_tokens.weight", vocab * hidden)?
+    };
+    let final_norm = if falcon {
+        load_tensor(store, "transformer.ln_f.weight", hidden)?
+    } else if gpt2 {
+        load_tensor(store, "ln_f.weight", hidden)?
+    } else {
+        load_norm(store, "model.norm.weight", hidden, config.norm_add_one)?
+    };
     // Weight tying: reuse the embedding when there is no separate LM head.
     let lm_head = if store.locate("lm_head.weight").is_some() {
         load_tensor(store, "lm_head.weight", vocab * hidden)?
@@ -1136,7 +1530,23 @@ pub fn load_model_parts(
     };
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
+    // GPT-2 only: `wpe` replaces RoPE entirely, and `ln_f` carries a bias.
+    let position_embedding = if gpt2 {
+        Some(load_floats(store, "wpe.weight")?)
+    } else {
+        None
+    };
+    let final_norm_bias = if falcon {
+        load_optional(store, "transformer.ln_f.bias", hidden)?
+    } else if gpt2 {
+        load_optional(store, "ln_f.bias", hidden)?
+    } else {
+        None
+    };
+
     Ok(ModelParts {
+        position_embedding,
+        final_norm_bias,
         cfg,
         layers,
         embedding,

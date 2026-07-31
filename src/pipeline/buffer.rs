@@ -1,4 +1,4 @@
-//! Streaming-zone buffers for the double-buffered pipeline (`specs.md` §2.2).
+//! Streaming-zone buffers for the double-buffered pipeline.
 //!
 //! The Streaming Zone is split into two physical buffers, `A` and `B`. While
 //! one is locked and executing on the compute stream, the other is being filled

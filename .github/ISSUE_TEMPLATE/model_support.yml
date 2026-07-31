@@ -1,0 +1,59 @@
+name: Model / architecture support
+description: A checkpoint dlm refuses, or a family you want supported
+labels: [model-support]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        dlm implements the Llama-style decoder block and reads
+        `model.layers.{i}.*` tensor names. An unsupported architecture fails with
+        a clear `UnknownTensor` error at load rather than producing garbage — so
+        a refusal is working as designed, not a crash.
+
+        **What decides the effort is not the model's size but its shape:**
+
+        - a config-only variant of a supported block — days
+        - a new attention or FFN detail on a supported block — weeks
+        - a genuinely new block structure — a release
+
+        The two files below tell us which of those it is. They are also where
+        nearly every pre-0.3.0 defect actually lived.
+
+  - type: input
+    id: repo
+    attributes:
+      label: Hugging Face repo id
+      placeholder: microsoft/Phi-3-mini-4k-instruct
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: "`config.json`"
+      description: Paste it whole — `architectures`, the norm/activation fields, and any `rope_scaling` are what we read first.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: What dlm said
+      description: The full error, if you have a checkpoint to try. Leave blank for a family you have not downloaded.
+      render: shell
+
+  - type: dropdown
+    id: sizes
+    attributes:
+      label: Smallest size the family ships
+      description: |
+        dlm exists for people the VRAM wall told "no", so a family with a 1B–4B
+        member is worth more here than one that starts at 70B.
+      options:
+        - Under 2B
+        - 2B to 8B
+        - 8B to 30B
+        - Over 30B
+    validations:
+      required: true

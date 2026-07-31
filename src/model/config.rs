@@ -54,21 +54,31 @@ struct RawConfig {
     /// both are present, matching transformers' Gemma2Config.
     #[serde(default)]
     hidden_activation: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "activation_function")]
     hidden_act: Option<String>,
+    /// GPT-2 spells the core dimensions `n_embd`/`n_head`/`n_layer`/`n_positions`.
+    /// They mean the same things, so they are aliases rather than a second config
+    /// path -- a second path is a second place for every later field to be
+    /// forgotten.
+    #[serde(alias = "n_embd")]
     hidden_size: u32,
+    #[serde(alias = "n_head")]
     num_attention_heads: u32,
     #[serde(default)]
     num_key_value_heads: Option<u32>,
+    #[serde(alias = "n_layer")]
     num_hidden_layers: u32,
     vocab_size: u32,
     #[serde(default)]
     intermediate_size: Option<u32>,
-    #[serde(default)]
+    /// Aliased to `n_positions` only, **not** `n_ctx`: GPT-2 ships both with the
+    /// same value, and serde rejects a doubly-matched field -- the exact shape of
+    /// the bug that made every Gemma2 config unparseable.
+    #[serde(default, alias = "n_positions")]
     max_position_embeddings: Option<u32>,
     #[serde(default)]
     rope_theta: Option<f32>,
-    #[serde(default)]
+    #[serde(default, alias = "layer_norm_epsilon")]
     rms_norm_eps: Option<f32>,
     /// Explicit per-head dimension. Most models omit it (it is then
     /// `hidden_size / num_attention_heads`), but some declare a `head_dim` that
@@ -157,6 +167,23 @@ struct RawConfig {
     /// Gemma2 decouples the attention scale from `head_dim` (144 on the 27B).
     #[serde(default)]
     query_pre_attn_scalar: Option<f32>,
+    /// Falcon: one KV head shared by every query head.
+    #[serde(default)]
+    multi_query: Option<bool>,
+    /// Falcon: attention and the FFN read the same norm and sum into one
+    /// residual. False on `falcon-rw-*`, which is sequential.
+    #[serde(default)]
+    parallel_attn: Option<bool>,
+    /// Falcon: ALiBi positional bias instead of RoPE. dlm does not implement it,
+    /// so a checkpoint declaring it is refused rather than run without it --
+    /// dropping a positional scheme yields fluent nonsense, not an error.
+    #[serde(default)]
+    alibi: Option<bool>,
+    /// Falcon-40B's grouped-KV layout, which interleaves query_key_value by head
+    /// group rather than concatenating Q|K|V. Refused: slicing it as a concat
+    /// loads plausible, wrong weights.
+    #[serde(default)]
+    new_decoder_architecture: Option<bool>,
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -582,6 +609,15 @@ pub struct ModelConfig {
     /// Gemma applies RMSNorm as `(1 + weight)` rather than `weight`. When true the
     /// loader bakes the `+1` into the norm weights so the kernels stay unchanged.
     pub norm_add_one: bool,
+    /// RMSNorm (Llama-descended) or LayerNorm (GPT-2, Falcon).
+    pub norm_kind: crate::forward::cpu::NormKind,
+    /// Falcon: attention and FFN read the same normalized input, summed into one
+    /// residual.
+    pub parallel_residual: bool,
+    /// GPT-2: absolute learned position embeddings instead of RoPE.
+    pub learned_positions: bool,
+    /// Whether the MLP is gated (SwiGLU/GeGLU). `Plain` only for GPT-2.
+    pub ffn_kind: crate::forward::cpu::FfnKind,
     /// Scalar applied to token embeddings after lookup (Gemma multiplies by
     /// `sqrt(hidden_size)`); `None` leaves embeddings unscaled.
     pub embed_scale: Option<f32>,
@@ -694,6 +730,47 @@ impl ModelConfig {
         let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
         let is_gemma2 = model_type == "gemma2";
         let is_gemma = model_type == "gemma" || is_gemma2;
+        // GPT-2 and Falcon are the two families that are not Llama-descended:
+        // both normalize with LayerNorm rather than RMSNorm, and each changes the
+        // block in one further way. Keyed on `model_type` rather than
+        // `architectures`, since the latter varies between exports of the same
+        // model while `model_type` does not.
+        let is_gpt2 = model_type == "gpt2";
+        // `refinedweb`/`RWForCausalLM` is Falcon's original name; both are live in
+        // the wild, so both must map to the same block.
+        let is_falcon = matches!(
+            model_type.as_str(),
+            "falcon" | "refinedweb" | "refinedwebmodel"
+        );
+        // Two Falcon variants dlm cannot decode correctly, refused up front. Both
+        // would otherwise load and run: a dropped positional scheme and a
+        // mis-sliced fused tensor each produce fluent, wrong output rather than
+        // an error, which is the failure this project refuses to ship.
+        if is_falcon {
+            if raw.alibi.unwrap_or(false) {
+                return Err(DlmError::InvalidConfig(
+                    "this Falcon checkpoint uses ALiBi positional bias (`alibi: true`, e.g. \
+                     falcon-rw-*), which dlm does not implement. Running it without ALiBi \
+                     would not error -- it would silently mis-place every token. Use a \
+                     variant with `alibi: false`."
+                        .into(),
+                ));
+            }
+            if raw.new_decoder_architecture.unwrap_or(false) {
+                return Err(DlmError::InvalidConfig(
+                    "this Falcon checkpoint sets `new_decoder_architecture` (Falcon-40B), whose \
+                     query_key_value is interleaved by head group rather than concatenated \
+                     Q|K|V. dlm splits the concatenated layout; slicing the interleaved one \
+                     loads plausible but incorrect weights."
+                        .into(),
+                ));
+            }
+        }
+        let norm_kind = if is_gpt2 || is_falcon {
+            crate::forward::cpu::NormKind::Layer
+        } else {
+            crate::forward::cpu::NormKind::Rms
+        };
         let activation = match raw
             .hidden_activation
             .as_deref()
@@ -710,7 +787,15 @@ impl ModelConfig {
             hidden_size: raw.hidden_size,
             num_attention_heads: raw.num_attention_heads,
             // Default to full multi-head attention when kv-heads is unspecified.
-            num_kv_heads: raw.num_key_value_heads.unwrap_or(raw.num_attention_heads),
+            num_kv_heads: raw.num_key_value_heads.unwrap_or_else(|| {
+                // Falcon states this as a flag, not a count: `multi_query` means
+                // one KV head shared by every query head.
+                if is_falcon && raw.multi_query.unwrap_or(false) {
+                    1
+                } else {
+                    raw.num_attention_heads
+                }
+            }),
             num_layers: raw.num_hidden_layers,
             vocab_size: raw.vocab_size,
             intermediate_size: raw
@@ -737,6 +822,16 @@ impl ModelConfig {
             // attention; keep it as declared and let the kernel no-op it.
             sliding_window: raw.sliding_window.filter(|&w| w > 0),
             norm_add_one: is_gemma,
+            norm_kind,
+            parallel_residual: is_falcon && raw.parallel_attn.unwrap_or(true),
+            learned_positions: is_gpt2,
+            // Falcon's MLP is `dense_4h_to_h(gelu(dense_h_to_4h(x)))` -- ungated,
+            // like GPT-2 and unlike every Llama-descended family.
+            ffn_kind: if is_gpt2 || is_falcon {
+                crate::forward::cpu::FfnKind::Plain
+            } else {
+                crate::forward::cpu::FfnKind::Gated
+            },
             embed_scale: is_gemma.then(|| (raw.hidden_size as f32).sqrt()),
             activation,
             // HF hard-codes the alternation in the Gemma2 model class rather than

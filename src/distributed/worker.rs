@@ -1,5 +1,5 @@
 //! Worker node: owns a layer shard and serves forward-pass requests
-//! (`specs.md` §3.4 Master-Worker topology).
+//! (Master-Worker topology).
 //!
 //! A worker holds its shard's weights and per-layer KV history and answers
 //! [`Message::RunShard`] over TCP: it runs its transformer blocks for one token

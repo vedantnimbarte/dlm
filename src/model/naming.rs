@@ -1,21 +1,21 @@
 //! Tensor-name classification.
 //!
-//! Maps a checkpoint tensor name onto its role in the memory topography of
-//! `specs.md` §2. The Pinned Zone (§2.1) holds the embedding, LM head, and
-//! final norm permanently; the Streaming Zone (§2.2) cycles the per-layer
+//! Maps a checkpoint tensor name onto its role in dlm's memory topography.
+//! The Pinned Zone holds the embedding, LM head, and
+//! final norm permanently; the Streaming Zone cycles the per-layer
 //! transformer blocks. To size either, we first have to know which tensor is
 //! which — done here by structural name inspection, no model download required.
 
 /// The role a tensor plays in the VRAM layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorRole {
-    /// Token embedding matrix — pinned in VRAM (§2.1).
+    /// Token embedding matrix — pinned in VRAM.
     Embedding,
-    /// Output projection / LM head — pinned (§2.1).
+    /// Output projection / LM head — pinned.
     LmHead,
-    /// Final pre-head normalization — pinned (§2.1).
+    /// Final pre-head normalization — pinned.
     FinalNorm,
-    /// A weight belonging to transformer block `index` — streamed (§2.2).
+    /// A weight belonging to transformer block `index` — streamed.
     Layer(u32),
     /// Anything not recognized (rotary buffers, misc). Treated as pinned
     /// overhead so the budget never under-counts resident bytes.

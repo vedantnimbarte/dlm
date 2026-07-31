@@ -8,3 +8,11 @@
 # happened to serve that day, and it is how the MSRV broke unnoticed: clap's
 # `"4"` drifted to a clap_lex that requires 1.85 while the manifest still said
 # 1.75. Nothing observed the change because nothing recorded the old answer.
+
+# Private working notes: an audit of 0.3.0 and the release plans built from it.
+# Untracked ON PURPOSE -- AUDIT.md documents unfixed security findings (a token
+# disclosed through process argv, a connection-slot leak that wedges the server),
+# and committing it would publish them ahead of the fixes. Once those land, the
+# roadmaps are safe to publish under docs/ if that is useful; the audit is not.
+AUDIT.md
+ROADMAP-*.md

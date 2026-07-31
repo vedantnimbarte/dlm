@@ -1,6 +1,6 @@
 //! Page-locked (pinned) host memory buffers.
 //!
-//! Per `specs.md` §3.2(2), the streaming pipeline stages weights through
+//! Per(2), the streaming pipeline stages weights through
 //! **page-locked** host buffers so the PCIe controller can DMA them into VRAM
 //! with `cudaMemcpyAsync` while the compute stream runs — pageable memory would
 //! force a synchronous staging copy and stall the pipeline.

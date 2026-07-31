@@ -1,11 +1,11 @@
-//! Master/coordinator node (`specs.md` §3.4).
+//! Master/coordinator node.
 //!
 //! Holds the **full** model (so it can serve any shard from local CPU RAM) plus
 //! a routing table mapping each layer shard to a worker address (or local). A
 //! forward pass streams the hidden state through the shards in pipeline order;
 //! for each remote shard it sends [`Message::RunShard`] and awaits the result.
 //!
-//! **Fault tolerance** (`specs.md` §3.4 heartbeats): if a worker is unreachable,
+//! **Fault tolerance** (heartbeats): if a worker is unreachable,
 //! the coordinator transparently runs that shard from its local weights instead
 //! — the "CPU RAM fallback" — so a forward pass still completes. Because the
 //! coordinator keeps its own KV for every layer, a shard that falls back *from

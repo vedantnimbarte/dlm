@@ -1,4 +1,4 @@
-//! Speculative decoding (`PRD.md` §3.3).
+//! Speculative decoding.
 //!
 //! A small, cheap **draft** model proposes `gamma` tokens; the large **target**
 //! model verifies them. With greedy sampling the rule is exact: accept each draft
