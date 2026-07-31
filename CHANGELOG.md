@@ -10,7 +10,23 @@ between releases, which is the part a user upgrading actually needs.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-07-31
+
+### Verified
+
+Three model families landed and they are **not** equally proven; `RELEASING.md`
+carries the full ledger:
+
+- **Phi-3** — weight mapping proven by a same-weights-twice equivalence test,
+  confirmed by mutation.
+- **GPT-2** — answers correctly on the real `openai-community/gpt2`.
+- **Falcon** — **config-verified only.** No runnable checkpoint exists: the
+  smallest `alibi: false` variant is 14 GB, and the 1B `falcon-rw` uses ALiBi,
+  which dlm refuses. Not yet output-verified.
+
+GPU paths are unchanged and remain verified only on Turing (GTX 1650); CI has no
+GPU and never executes a device kernel.
+
 
 ### Fixed
 
@@ -84,5 +100,6 @@ Carried forward and tracked in `RELEASING.md`:
 - DeepSeek-V2/V3 (MLA + MoE) had run only on the CPU path.
 - Llama 2 was expected to work but had not been demonstrated.
 
-[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/vedantnimbarte/dlm/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vedantnimbarte/dlm/releases/tag/v0.3.0
