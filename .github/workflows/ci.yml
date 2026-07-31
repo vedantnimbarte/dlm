@@ -4,6 +4,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Weekly, for `deny`: a security advisory lands against a dependency without
+  # anyone touching this repo, so a push-only audit goes stale the moment the
+  # last commit does. The rest of the suite runs too, which is free signal —
+  # it catches a dependency bump breaking the build before someone opens a PR
+  # into it.
+  schedule:
+    - cron: "0 6 * * 1"
 
 jobs:
   # Unit + integration tests on both first-class platforms. dlm is pure std, so
@@ -156,6 +163,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check on the declared MSRV
         run: cargo check --locked --all-targets
+
+  # Audit the locked dependency graph: known advisories, license compatibility,
+  # unexpected sources.
+  #
+  # Only meaningful since `Cargo.lock` was committed — an unlocked graph has no
+  # fixed set of versions to audit, which is why this job did not exist before.
+  # Advisories appear without anyone touching the repo, so this must run on a
+  # schedule as well as on push; a clean audit last Tuesday says nothing today.
+  #
+  # Deliberately NOT in the `test` aggregate below, so it reports without
+  # gating. A new advisory in a transitive dependency is not something a PR
+  # author can fix, and wedging every unrelated PR until someone does is how a
+  # useful signal gets muted. It is loud, visible, and non-blocking.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Check advisories, licenses and sources
+        run: cargo deny --all-features check
 
   lint:
     runs-on: ubuntu-latest
