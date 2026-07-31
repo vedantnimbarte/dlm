@@ -153,6 +153,14 @@ const MAX_CONNECTIONS: usize = 256;
 /// How long a shed client is asked to wait before retrying, in seconds.
 const RETRY_AFTER_SECS: u32 = 1;
 
+/// Maximum requests served on one kept-alive connection before it is recycled.
+///
+/// Reuse is the point of keep-alive, but an unbounded connection lets one client
+/// hold a thread indefinitely while [`MAX_CONNECTIONS`] counts it once. Recycling
+/// bounds that, and costs a well-behaved client one extra handshake per hundred
+/// requests.
+const MAX_REQUESTS_PER_CONNECTION: usize = 100;
+
 /// How long in-flight requests are given to finish after shutdown is triggered.
 ///
 /// Shorter than the grace period supervisors allow before `SIGKILL` (Docker and
@@ -356,28 +364,53 @@ fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut String) -> std::io::Re
     Ok(Some(()))
 }
 
-/// Parse one request, run the handler, write one response, close.
+/// Serve requests on one connection until the client or the protocol ends it.
 fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()> {
     // A stalled peer must not pin this thread forever.
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let mut reader = BufReader::new(stream);
+    for _ in 0..MAX_REQUESTS_PER_CONNECTION {
+        match serve_one(&mut reader, &handler)? {
+            Disposition::KeepAlive => continue,
+            Disposition::Close => break,
+        }
+    }
+    Ok(())
+}
 
+/// What to do with the connection after one request/response exchange.
+enum Disposition {
+    /// Read another request on this socket.
+    KeepAlive,
+    /// Close it. Either the client asked, or the response cannot be delimited.
+    Close,
+}
+
+/// Parse one request, run the handler, write one response.
+///
+/// Returns whether the socket can carry another exchange. Reuse requires the
+/// client to know where the response ended, so it is offered only for
+/// [`Body::Full`], which sends a `Content-Length`. A streaming (SSE) body is
+/// framed by the close itself and always ends the connection.
+fn serve_one(reader: &mut BufReader<TcpStream>, handler: &Handler) -> std::io::Result<Disposition> {
     // Request line: METHOD PATH VERSION
     let mut request_line = String::new();
-    if read_line_capped(&mut reader, &mut request_line)?.is_none() {
-        return Ok(());
+    if read_line_capped(reader, &mut request_line)?.is_none() {
+        return Ok(Disposition::Close);
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let (path, query) = split_target(parts.next().unwrap_or("/"));
+    // HTTP/1.1 persists unless told otherwise; HTTP/1.0 is the reverse.
+    let http11 = parts.next().unwrap_or("HTTP/1.1").trim() != "HTTP/1.0";
 
     // Headers until a blank line.
     let mut headers = HashMap::new();
     let mut line = String::new();
     loop {
-        if read_line_capped(&mut reader, &mut line)?.is_none() {
+        if read_line_capped(reader, &mut line)?.is_none() {
             break;
         }
         let trimmed = line.trim_end();
@@ -400,10 +433,11 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
     // and fail JSON parsing with a misleading 400 — say what is actually wrong.
     if let Some(te) = headers.get("transfer-encoding") {
         if te.to_ascii_lowercase().contains("chunked") {
-            return write_response(
+            write_response(
                 reader.get_mut(),
                 Response::json(411, br#"{"error":{"message":"chunked transfer-encoding is not supported; send Content-Length","type":"invalid_request_error"}}"#.to_vec()),
-            );
+            )?;
+            return Ok(Disposition::Close);
         }
     }
 
@@ -413,14 +447,15 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
-        return write_response(
+        write_response(
             reader.get_mut(),
             Response::json(
                 413,
                 br#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#
                     .to_vec(),
             ),
-        );
+        )?;
+        return Ok(Disposition::Close);
     }
     // Read incrementally instead of pre-allocating the *declared* length: a
     // client could otherwise claim 16 MiB, send one byte, and hold that much
@@ -439,6 +474,19 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
         }
     }
 
+    // The client may ask to close; on HTTP/1.0 it must opt in to staying open.
+    let wants_keep_alive = match headers.get("connection") {
+        Some(v) => {
+            let v = v.to_ascii_lowercase();
+            if v.contains("close") {
+                false
+            } else {
+                http11 || v.contains("keep-alive")
+            }
+        }
+        None => http11,
+    };
+
     let request = Request {
         method,
         path,
@@ -447,7 +495,15 @@ fn handle_connection(stream: TcpStream, handler: Handler) -> std::io::Result<()>
         body,
     };
     let response = handler(&request);
-    write_response(reader.get_mut(), response)
+    // Only a length-delimited body can be followed by another response on the
+    // same socket; a stream is framed by the close.
+    let keep_alive = wants_keep_alive && !matches!(response.body, Body::Stream(_));
+    write_response_keep_alive(reader.get_mut(), response, keep_alive)?;
+    Ok(if keep_alive {
+        Disposition::KeepAlive
+    } else {
+        Disposition::Close
+    })
 }
 
 /// The response sent when [`MAX_CONNECTIONS`] is already reached.
@@ -468,16 +524,28 @@ fn extra_header_lines(extra: &[(&'static str, String)]) -> String {
     extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect()
 }
 
+/// Write a response and close the connection.
 fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
+    write_response_keep_alive(stream, response, false)
+}
+
+/// Write a response, advertising whether the connection stays open.
+fn write_response_keep_alive(
+    stream: &mut TcpStream,
+    response: Response,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     let extra = extra_header_lines(&response.extra_headers);
     match response.body {
         Body::Full(bytes) => {
             let head = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n{}\r\n",
                 response.status,
                 reason(response.status),
                 response.content_type,
                 bytes.len(),
+                conn,
                 extra,
             );
             stream.write_all(head.as_bytes())?;
@@ -502,13 +570,105 @@ fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result
 mod tests {
     use super::*;
 
-    /// Minimal HTTP client for tests: send a raw request, return the raw response.
+    /// Minimal HTTP client for tests: send a raw request, read to EOF.
+    ///
+    /// Valid only for exchanges that end the connection — see [`round_trip_once`].
     fn round_trip(addr: SocketAddr, raw: &str) -> String {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.write_all(raw.as_bytes()).unwrap();
         let mut resp = String::new();
         stream.read_to_string(&mut resp).unwrap();
         resp
+    }
+
+    /// One request, explicitly single-shot.
+    ///
+    /// Since keep-alive, a request that does not say `Connection: close` leaves
+    /// the socket open — so reading to EOF blocks until `IO_TIMEOUT`. That is the
+    /// server being right and the helper being wrong about it, and it is worth
+    /// naming: a test that hangs for 30s reads as a deadlock, not a protocol
+    /// change.
+    fn round_trip_once(addr: SocketAddr, raw: &str) -> String {
+        let raw = if raw.to_ascii_lowercase().contains("connection:") {
+            raw.to_string()
+        } else if let Some(i) = raw.find("\r\n\r\n") {
+            format!("{}\r\nConnection: close{}", &raw[..i], &raw[i..])
+        } else {
+            raw.to_string()
+        };
+        round_trip(addr, &raw)
+    }
+
+    /// Read exactly one complete response off a socket.
+    ///
+    /// A single `read` can return the head before the body, so this reads until
+    /// the declared `Content-Length` has arrived. Reading to EOF is not an option
+    /// here — the whole point is that EOF does not come.
+    fn read_one(s: &mut TcpStream) -> String {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed mid-response");
+            acc.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&acc).to_string();
+            if let Some(hdr_end) = text.find("\r\n\r\n") {
+                let len: usize = text
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length: ")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                if acc.len() >= hdr_end + 4 + len {
+                    return text;
+                }
+            }
+        }
+    }
+
+    /// `A8`: two requests on one socket. Before this the server closed after
+    /// each, so the pooling OpenAI and Anthropic SDKs paid a handshake per call.
+    #[test]
+    fn keep_alive_serves_two_requests_on_one_connection() {
+        let addr = serve_with(echo_target());
+        let mut s = TcpStream::connect(addr).unwrap();
+
+        s.write_all(b"GET /one HTTP/1.1\r\n\r\n").unwrap();
+        let first = read_one(&mut s);
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(
+            first
+                .to_ascii_lowercase()
+                .contains("connection: keep-alive"),
+            "{first}"
+        );
+        assert!(first.contains("/one"), "{first}");
+
+        // The socket must still be usable.
+        s.write_all(b"GET /two HTTP/1.1\r\n\r\n").unwrap();
+        let second = read_one(&mut s);
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+        assert!(
+            second.contains("/two"),
+            "second request not served: {second}"
+        );
+    }
+
+    /// `Connection: close` is honoured, and HTTP/1.0 defaults to closing.
+    #[test]
+    fn connection_close_and_http10_end_the_connection() {
+        let addr = serve_with(echo_target());
+        for raw in [
+            "GET /x HTTP/1.1\r\nConnection: close\r\n\r\n",
+            "GET /x HTTP/1.0\r\n\r\n",
+        ] {
+            let resp = round_trip_once(addr, raw);
+            assert!(
+                resp.to_ascii_lowercase().contains("connection: close"),
+                "{raw:?} -> {resp}"
+            );
+        }
     }
 
     #[test]
@@ -524,7 +684,7 @@ mod tests {
         std::thread::spawn(move || server.serve(handler).unwrap());
 
         let raw = "POST /v1/x HTTP/1.1\r\nContent-Length: 4\r\n\r\ntrue";
-        let resp = round_trip(addr, raw);
+        let resp = round_trip_once(addr, raw);
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
         assert!(resp.contains(r#""path":"/v1/x""#), "{resp}");
         assert!(resp.contains(r#""echo":true"#), "{resp}");
@@ -541,7 +701,7 @@ mod tests {
         std::thread::spawn(move || server.serve(handler).unwrap());
 
         let raw = "GET / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n";
-        let resp = round_trip(addr, raw);
+        let resp = round_trip_once(addr, raw);
         assert!(resp.contains("application/json"), "{resp}");
     }
 
@@ -585,10 +745,10 @@ mod tests {
     #[test]
     fn query_string_does_not_change_the_routed_path() {
         let addr = serve_with(echo_target());
-        let resp = round_trip(addr, "GET /health?probe=1 HTTP/1.1\r\n\r\n");
+        let resp = round_trip_once(addr, "GET /health?probe=1 HTTP/1.1\r\n\r\n");
         assert!(resp.contains("/health|probe=1"), "{resp}");
 
-        let resp = round_trip(addr, "GET /health HTTP/1.1\r\n\r\n");
+        let resp = round_trip_once(addr, "GET /health HTTP/1.1\r\n\r\n");
         assert!(resp.contains("/health|-"), "{resp}");
     }
 
@@ -628,7 +788,7 @@ mod tests {
         std::panic::set_hook(previous);
 
         // Every slot must have come back.
-        let resp = round_trip(addr, "GET /ok HTTP/1.1\r\n\r\n");
+        let resp = round_trip_once(addr, "GET /ok HTTP/1.1\r\n\r\n");
         assert!(
             resp.starts_with("HTTP/1.1 200 OK"),
             "server stopped serving after {} panics -- slots leaked: {resp}",
@@ -678,7 +838,7 @@ mod tests {
         let joined = std::thread::spawn(move || server.serve_with_shutdown(handler, s).unwrap());
 
         // Serve one request so we know it is up, then stop it.
-        assert!(round_trip(addr, "GET /x HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 200"));
+        assert!(round_trip_once(addr, "GET /x HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 200"));
         assert!(!shutdown.is_triggered());
         shutdown.trigger();
         assert!(shutdown.is_triggered());
@@ -714,7 +874,8 @@ mod tests {
         let s = shutdown.clone();
         std::thread::spawn(move || server.serve_with_shutdown(handler, s).unwrap());
 
-        let client = std::thread::spawn(move || round_trip(addr, "GET /slow HTTP/1.1\r\n\r\n"));
+        let client =
+            std::thread::spawn(move || round_trip_once(addr, "GET /slow HTTP/1.1\r\n\r\n"));
 
         // Trigger while the handler is mid-flight.
         std::thread::sleep(Duration::from_millis(60));
@@ -765,7 +926,7 @@ mod tests {
     fn chunked_transfer_encoding_is_refused_with_411() {
         let addr = serve_with(echo_target());
         let raw = "POST /v1/x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let resp = round_trip(addr, raw);
+        let resp = round_trip_once(addr, raw);
         assert!(resp.starts_with("HTTP/1.1 411 Length Required"), "{resp}");
         assert!(resp.contains("chunked"), "{resp}");
     }
@@ -778,7 +939,7 @@ mod tests {
             "POST /v1/x HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY_BYTES + 1
         );
-        let resp = round_trip(addr, &raw);
+        let resp = round_trip_once(addr, &raw);
         assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large"), "{resp}");
     }
 

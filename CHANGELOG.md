@@ -35,6 +35,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HTTP keep-alive.** Responses with a `Content-Length` now leave the connection
+  open, so the pooling OpenAI and Anthropic SDKs stop paying a TCP handshake per
+  request. `Connection: close` is honoured, HTTP/1.0 defaults to closing,
+  streaming (SSE) responses always close, and a connection is recycled after 100
+  requests so one client cannot hold a thread indefinitely.
 - **`dlm pull` verifies downloaded weights against the hub's published SHA-256.**
   Previously only the byte count was checked, which catches truncation and
   nothing else. A file that fails is deleted, so the next `pull` refetches it
