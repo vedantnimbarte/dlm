@@ -145,6 +145,59 @@ impl Drop for Stream {
     }
 }
 
+/// Times work on a stream using device events.
+///
+/// Wall-clock around an async copy measures the *enqueue*, not the transfer —
+/// the copy may not have started when the call returns, and may still be
+/// running long after. For telemetry that claims to report PCIe bandwidth, that
+/// distinction is the whole point: a bus-bound diagnosis built on enqueue
+/// timings would be fiction.
+///
+/// Both events are created up front and reused, so timing a copy costs two
+/// `EventRecord` calls on the stream rather than an allocation per layer.
+pub struct CopyTimer {
+    start: backend::EventRaw,
+    end: backend::EventRaw,
+}
+
+impl CopyTimer {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            start: backend::event_create()?,
+            end: backend::event_create()?,
+        })
+    }
+
+    /// Mark the beginning of the work to be timed.
+    pub fn begin(&self, stream: &Stream) -> Result<()> {
+        backend::event_record(self.start, stream.raw())
+    }
+
+    /// Mark the end, then block until the end event completes and report the
+    /// device-measured duration in microseconds.
+    ///
+    /// The caller is expected to be synchronizing the stream anyway (the
+    /// staging buffer cannot be reused until the copy lands), so this adds no
+    /// stall that was not already there.
+    pub fn end_us(&self, stream: &Stream) -> Result<u32> {
+        backend::event_record(self.end, stream.raw())?;
+        backend::event_synchronize(self.end)?;
+        backend::event_elapsed_us(self.start, self.end)
+    }
+}
+
+impl Drop for CopyTimer {
+    fn drop(&mut self) {
+        backend::event_destroy(self.start);
+        backend::event_destroy(self.end);
+    }
+}
+
+// SAFETY: event handles are opaque pointers into the thread-safe runtime, with
+// the same threading guarantees as `Stream`.
+unsafe impl Send for CopyTimer {}
+unsafe impl Sync for CopyTimer {}
+
 // SAFETY: a CUDA stream handle is an opaque pointer into the thread-safe CUDA
 // runtime; enqueuing/synchronizing from any thread is supported.
 unsafe impl Send for Stream {}

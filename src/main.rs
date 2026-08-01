@@ -587,8 +587,52 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
 }
 
 /// `dlm serve` — resolve the serving config, then run the planning pipeline.
+/// Publish the static context a telemetry subscriber needs before it can make
+/// sense of any event: how many layers there are, how big each one is, and
+/// whether weights are streaming at all.
+///
+/// Sent once at startup rather than per request — none of it changes for the
+/// life of the process, and a UI attaching mid-generation needs it immediately.
+fn publish_telemetry_snapshot(
+    config: &ModelConfig,
+    store: &MmapStore,
+    resident_layers: u32,
+    streaming: bool,
+    device: Device,
+) {
+    let catalog = LayerCatalog::build(store);
+    let num_layers = if catalog.num_layers() == 0 {
+        config.num_layers
+    } else {
+        catalog.num_layers()
+    };
+    let layer_bytes = (0..num_layers)
+        .map(|i| catalog.layer_bytes(i).unwrap_or(0))
+        .collect();
+    dlm::telemetry::set_snapshot(dlm::telemetry::Snapshot {
+        num_layers,
+        resident_layers,
+        layer_bytes,
+        pinned_bytes: catalog.pinned_bytes(),
+        streaming,
+        device: match device {
+            Device::Gpu => "gpu".into(),
+            _ => "cpu".into(),
+        },
+        // Device-measured H2D timing exists only on a GPU build with the copy
+        // stream. Anywhere else a duration would be wall-clock, and the
+        // consumer must render it as an estimate rather than a measurement.
+        estimated_h2d: !cfg!(any(feature = "cuda", feature = "rocm"))
+            || device != Device::Gpu,
+    });
+}
+
 fn run_serve(args: ServeArgs) -> Result<()> {
     banner();
+
+    // Decide up front whether `/v1/telemetry` exists. Collection still costs
+    // nothing until something actually subscribes.
+    dlm::telemetry::set_available(args.telemetry);
 
     // Map the checkpoint first: the weight precision (and every plan derived from
     // it) comes from the dtype the file actually holds.
@@ -687,6 +731,13 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // Streaming path: keep only a window of layers resident and stream the
             // rest from disk, so a model can exceed the resident budget. Streams to
             // host RAM (CPU) or into VRAM (--device gpu).
+            // Baseline snapshot for a fully-resident run: every layer is held,
+            // nothing streams. The streaming branch below replaces it with the
+            // real window once the plan is known.
+            if args.telemetry && !args.stream {
+                publish_telemetry_snapshot(&config, &store, config.num_layers, false, device);
+            }
+
             if args.stream {
                 if args.draft_model_path.is_some() {
                     return Err(DlmError::InvalidConfig(
@@ -697,6 +748,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
                 let ram_cache = resolve_ram_cache_bytes(&args, quant, &plan);
+                publish_telemetry_snapshot(&config, &store, window as u32, true, device);
                 println!();
                 let dest = if device == Device::Gpu {
                     "VRAM"
@@ -1328,6 +1380,9 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     println!("  openai     : POST /v1/chat/completions (stream), GET /v1/models");
     println!("  anthropic  : POST /v1/messages (stream), POST /v1/messages/count_tokens");
     println!("  ops        : GET /metrics (Prometheus), GET /health");
+    if args.telemetry {
+        println!("  telemetry  : GET /v1/telemetry (SSE, per-layer flow events)");
+    }
     if eos_tokens.is_empty() {
         println!("  stop       : max_tokens only (no eos_token_id in config; pass --eos-token)");
     } else {

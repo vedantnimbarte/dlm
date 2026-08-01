@@ -332,6 +332,20 @@ pub struct ServeArgs {
     /// No effect with a draft model (speculative sessions can't resume).
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub prefix_cache_size: usize,
+
+    /// Expose `GET /v1/telemetry`, a Server-Sent Events stream of per-layer flow
+    /// events: what each layer cost at each stage of
+    /// `mmap → RAM cache → pinned staging → VRAM → compute`, with measured bytes
+    /// and durations. Off by default.
+    ///
+    /// Collection only starts when something subscribes, and stops when it
+    /// disconnects — with no subscriber the instrumentation is a single atomic
+    /// load per site and never reads the clock.
+    ///
+    /// Events carry timings, byte counts and layer indices only; no prompt or
+    /// completion text. The route sits behind `--api-key` like `/metrics`.
+    #[arg(long, default_value_t = false)]
+    pub telemetry: bool,
 }
 
 /// Arguments for `dlm profile`.

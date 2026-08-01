@@ -80,10 +80,30 @@ impl LayerRamCache {
         if self.entries.contains_key(&layer) {
             self.hits += 1;
             self.touch(layer);
+            // A hit means this layer never touched the disk on this pass. The
+            // difference between hit and miss here is the difference between
+            // a storage-bound run and a cached one, which no aggregate counter
+            // can attribute to a specific layer.
+            let bytes = self.entries.get(&layer).map_or(0, |b| b.len() as u64);
+            crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                layer,
+                crate::telemetry::Stage::RamHit,
+                bytes,
+                0,
+            ));
         } else {
+            let t = crate::telemetry::Timer::start();
             let bytes = load()?;
+            let dur_us = t.elapsed_us();
+            let len = bytes.len() as u64;
             self.misses += 1;
             self.insert_new(layer, bytes);
+            crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                layer,
+                crate::telemetry::Stage::RamMiss,
+                len,
+                dur_us,
+            ));
         }
         // Borrow is taken after all mutation completes.
         Ok(self

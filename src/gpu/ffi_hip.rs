@@ -21,6 +21,8 @@ pub type hipStream_t = *mut c_void;
 /// Backend-neutral stream handle (the vendor-agnostic `device` module names it
 /// `StreamRaw` regardless of backend).
 pub type StreamRaw = hipStream_t;
+/// Backend-neutral alias for a timing event handle.
+pub type EventRaw = hipEvent_t;
 /// Opaque `hipEvent_t` handle.
 pub type hipEvent_t = *mut c_void;
 
@@ -57,6 +59,74 @@ extern "C" {
     fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
     fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
     fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: c_uint) -> hipError_t;
+    fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
+    /// HIP's mirror of `cudaEventElapsedTime`; see `ffi_cuda.rs` for why
+    /// device-measured time is used rather than wall-clock.
+    fn hipEventElapsedTime(
+        ms: *mut core::ffi::c_float,
+        start: hipEvent_t,
+        end: hipEvent_t,
+    ) -> hipError_t;
+}
+
+/// Create an event for timing.
+pub(super) fn event_create() -> Result<hipEvent_t> {
+    let mut e: hipEvent_t = std::ptr::null_mut();
+    // SAFETY: writes a single opaque handle into a stack slot.
+    let code = unsafe { hipEventCreate(&mut e) };
+    if code != HIP_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "hipEventCreate",
+            code,
+        });
+    }
+    Ok(e)
+}
+
+pub(super) fn event_destroy(event: hipEvent_t) {
+    // SAFETY: `event` came from `event_create`.
+    unsafe {
+        hipEventDestroy(event);
+    }
+}
+
+pub(super) fn event_record(event: hipEvent_t, stream: hipStream_t) -> Result<()> {
+    // SAFETY: both handles are opaque and owned by the caller.
+    let code = unsafe { hipEventRecord(event, stream) };
+    if code != HIP_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "hipEventRecord",
+            code,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn event_synchronize(event: hipEvent_t) -> Result<()> {
+    // SAFETY: blocks the caller until `event` completes; no memory is touched.
+    let code = unsafe { hipEventSynchronize(event) };
+    if code != HIP_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "hipEventSynchronize",
+            code,
+        });
+    }
+    Ok(())
+}
+
+/// Microseconds between two completed events, as the device measured them.
+pub(super) fn event_elapsed_us(start: hipEvent_t, end: hipEvent_t) -> Result<u32> {
+    let mut ms: core::ffi::c_float = 0.0;
+    // SAFETY: writes one float into a stack slot; both events must already be
+    // recorded and complete, which the caller guarantees by synchronizing.
+    let code = unsafe { hipEventElapsedTime(&mut ms, start, end) };
+    if code != HIP_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "hipEventElapsedTime",
+            code,
+        });
+    }
+    Ok((ms * 1000.0) as u32)
 }
 
 /// Make GPU `id` the current device for subsequent allocations and launches.

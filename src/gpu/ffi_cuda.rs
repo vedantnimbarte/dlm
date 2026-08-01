@@ -20,6 +20,8 @@ pub type cudaStream_t = *mut c_void;
 /// Backend-neutral stream handle (the vendor-agnostic `device` module names it
 /// `StreamRaw` regardless of backend).
 pub type StreamRaw = cudaStream_t;
+/// Backend-neutral alias for a timing event handle.
+pub type EventRaw = cudaEvent_t;
 /// Opaque `cudaEvent_t` handle.
 pub type cudaEvent_t = *mut c_void;
 
@@ -57,6 +59,76 @@ extern "C" {
     fn cudaEventDestroy(event: cudaEvent_t) -> cudaError_t;
     fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError_t;
     fn cudaStreamWaitEvent(stream: cudaStream_t, event: cudaEvent_t, flags: c_uint) -> cudaError_t;
+    fn cudaEventSynchronize(event: cudaEvent_t) -> cudaError_t;
+    /// Elapsed milliseconds between two recorded events, as measured **by the
+    /// device**. Wall-clock around an async copy measures the enqueue plus
+    /// whatever else the caller was doing; this measures the transfer.
+    fn cudaEventElapsedTime(
+        ms: *mut core::ffi::c_float,
+        start: cudaEvent_t,
+        end: cudaEvent_t,
+    ) -> cudaError_t;
+}
+
+/// Create an event for timing.
+pub(super) fn event_create() -> Result<cudaEvent_t> {
+    let mut e: cudaEvent_t = std::ptr::null_mut();
+    // SAFETY: writes a single opaque handle into a stack slot.
+    let code = unsafe { cudaEventCreate(&mut e) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "cudaEventCreate",
+            code,
+        });
+    }
+    Ok(e)
+}
+
+pub(super) fn event_destroy(event: cudaEvent_t) {
+    // SAFETY: `event` came from `event_create`; destroying is idempotent-safe
+    // here because the caller drops its handle immediately after.
+    unsafe {
+        cudaEventDestroy(event);
+    }
+}
+
+pub(super) fn event_record(event: cudaEvent_t, stream: cudaStream_t) -> Result<()> {
+    // SAFETY: both handles are opaque and owned by the caller.
+    let code = unsafe { cudaEventRecord(event, stream) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "cudaEventRecord",
+            code,
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn event_synchronize(event: cudaEvent_t) -> Result<()> {
+    // SAFETY: blocks the caller until `event` completes; no memory is touched.
+    let code = unsafe { cudaEventSynchronize(event) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "cudaEventSynchronize",
+            code,
+        });
+    }
+    Ok(())
+}
+
+/// Microseconds between two completed events, as the device measured them.
+pub(super) fn event_elapsed_us(start: cudaEvent_t, end: cudaEvent_t) -> Result<u32> {
+    let mut ms: core::ffi::c_float = 0.0;
+    // SAFETY: writes one float into a stack slot; both events must already be
+    // recorded and complete, which the caller guarantees by synchronizing.
+    let code = unsafe { cudaEventElapsedTime(&mut ms, start, end) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "cudaEventElapsedTime",
+            code,
+        });
+    }
+    Ok((ms * 1000.0) as u32)
 }
 
 /// Make GPU `id` the current device for subsequent allocations and launches.

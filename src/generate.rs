@@ -475,6 +475,11 @@ impl<K: ComputeKernel> Generator<K> {
         // first decode step samples from) and `position[s]` is the next position.
         for (s, prompt) in prompts.iter().enumerate() {
             for &tok in *prompt {
+                // Attribute layer events to a step, so a consumer can group a
+                // token's worth of transfers together. Prefill counts as step 0:
+                // it is one pass over the stack per prompt token, but it is the
+                // decode steps that show the steady-state streaming cost.
+                crate::telemetry::set_token(0);
                 let mut h = self.embed(tok, position[s])?;
                 for (l, kv) in kvs[s].iter_mut().enumerate() {
                     self.kernel.run_block(l as u32, &mut h, kv, position[s])?;
@@ -495,7 +500,8 @@ impl<K: ComputeKernel> Generator<K> {
         let mut out = vec![Vec::with_capacity(cfg.max_new_tokens); b];
         let mut done = vec![false; b];
 
-        for _ in 0..cfg.max_new_tokens {
+        for step in 0..cfg.max_new_tokens {
+            crate::telemetry::set_token(step as u64 + 1);
             // Sample the next token for each live sequence from its current hidden.
             for s in 0..b {
                 if done[s] {

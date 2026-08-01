@@ -163,14 +163,31 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
                 s.hits += 1;
                 s.order.retain(|&l| l != layer);
                 s.order.push_back(layer);
+                // A hit here means the layer never touched the disk on this
+                // pass. Hit-versus-miss at this seam is the difference between
+                // a storage-bound run and a cached one — the aggregate counters
+                // cannot attribute it to a specific layer.
+                crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                    layer,
+                    crate::telemetry::Stage::RamHit,
+                    t.byte_size() as u64,
+                    0,
+                ));
                 return Ok(t);
             }
             s.misses += 1;
         }
+        let miss_timer = crate::telemetry::Timer::start();
         // Load with the lock released so concurrent loads (and the prefetch
         // worker) overlap. A duplicate concurrent load of the same layer just
         // wastes one read; the second insert replaces an identical value.
         let t = self.inner.load_layer(layer)?;
+        crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+            layer,
+            crate::telemetry::Stage::RamMiss,
+            t.byte_size() as u64,
+            miss_timer.elapsed_us(),
+        ));
 
         let mut s = self.state.lock().unwrap();
         if s.budget == 0 {
@@ -300,6 +317,13 @@ impl LayerLru {
             if let Some(evict) = self.order.pop_front() {
                 self.map.remove(&evict);
                 self.stats.evictions += 1;
+                // Which layer had to leave to make room for this one. On a
+                // window smaller than the model this fires constantly, and the
+                // pattern is the clearest evidence of window thrashing.
+                crate::telemetry::emit(
+                    crate::telemetry::FlowEvent::new(layer, crate::telemetry::Stage::Evict, 0, 0)
+                        .with_victim(evict),
+                );
             } else {
                 break;
             }
@@ -420,7 +444,36 @@ impl<S: LayerSource> Shared<S> {
             } else {
                 self.source.load_layer(layer)
             };
-            ewma(&self.load_ns, t.elapsed().as_nanos() as u64);
+            let load_ns = t.elapsed().as_nanos() as u64;
+            ewma(&self.load_ns, load_ns);
+            // Materializing a layer: read from the mmap'd checkpoint (through
+            // the host RAM cache, which reports its own hit/miss) plus decode
+            // into the in-memory form. Reuses the timer auto-prefetch already
+            // needs, so nothing extra is measured on the hot path.
+            if crate::telemetry::is_enabled() {
+                let bytes = loaded
+                    .as_ref()
+                    .map(|t| t.byte_size() as u64)
+                    .unwrap_or(0);
+                crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                    layer,
+                    crate::telemetry::Stage::MmapRead,
+                    bytes,
+                    (load_ns / 1000) as u32,
+                ));
+                if by_worker {
+                    // Loaded ahead of demand. The depth in effect is the
+                    // kernel's, which is emitted separately at the point the
+                    // request is queued; this event records that the work
+                    // actually landed, which is the part that hides latency.
+                    crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                        layer,
+                        crate::telemetry::Stage::Prefetch,
+                        bytes,
+                        0,
+                    ));
+                }
+            }
             let mut cache = self.cache.lock().unwrap();
             cache.loading.remove(&layer);
             self.ready.notify_all();
@@ -660,6 +713,20 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
             for ahead in 1..=depth {
                 let _ = tx.send((layer + ahead) % self.num_layers);
             }
+            // The live depth, recorded where it is actually decided (it moves
+            // under --auto-prefetch). A depth that never turns into a landed
+            // Prefetch event is the signature of a starved prefetcher.
+            if depth > 0 {
+                crate::telemetry::emit(
+                    crate::telemetry::FlowEvent::new(
+                        layer,
+                        crate::telemetry::Stage::Prefetch,
+                        0,
+                        0,
+                    )
+                    .with_depth(depth),
+                );
+            }
         }
         // Compute without holding the cache lock — the worker loads in parallel.
         let t = std::time::Instant::now();
@@ -673,9 +740,19 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         } else {
             decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?
         };
+        let compute_ns = t.elapsed().as_nanos() as u64;
         if self.auto {
-            ewma(&self.shared.compute_ns, t.elapsed().as_nanos() as u64);
+            ewma(&self.shared.compute_ns, compute_ns);
         }
+        // The other half of the ratio the whole flow view is about: compute
+        // time against transfer time. Without this, a bus-bound run and a
+        // compute-bound one look identical.
+        crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+            layer,
+            crate::telemetry::Stage::Compute,
+            0,
+            (compute_ns / 1000) as u32,
+        ));
         hidden.copy_from_slice(&out);
         Ok(())
     }

@@ -23,6 +23,7 @@ pub mod server;
 pub mod speculative;
 pub mod storage;
 pub mod swap;
+pub mod telemetry;
 pub mod tokenizer;
 
 pub use activation::{ActivationBuffer, ActivationPool};

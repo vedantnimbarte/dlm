@@ -109,9 +109,52 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ModelHit>> {
         .map_err(|e| DlmError::Hub(format!("could not parse search results: {e}")))
 }
 
+/// Where a [`pull`] has got to.
+///
+/// Emitted per file rather than per byte: `curl_download` writes the file in
+/// one call, so byte-level progress is not observable from here without taking
+/// over the transfer. File granularity is still the difference between a UI
+/// that shows "3 of 7 — model-00003-of-00007.safetensors" and one that shows a
+/// frozen spinner for ten minutes.
+#[derive(Debug, Clone)]
+pub struct PullProgress<'a> {
+    pub file: &'a str,
+    /// 1-based index of the file being fetched.
+    pub index: usize,
+    pub total: usize,
+    pub phase: PullPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullPhase {
+    Downloading,
+    /// Checking the downloaded bytes against the hub's SHA-256. On a
+    /// multi-gigabyte shard this is slow enough to look like a hang if the UI
+    /// does not say what it is doing.
+    Verifying,
+    Done,
+}
+
 /// Download the files dlm needs from `repo` into `dest` (default
 /// `./models/<model>`). Returns the directory the model landed in.
+///
+/// Progress goes to stdout. Callers that need to render it themselves (a GUI)
+/// should use [`pull_with_progress`].
 pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<PathBuf> {
+    pull_with_progress(repo, dest, token, &mut |p: PullProgress| {
+        if p.phase == PullPhase::Downloading {
+            println!("  {}", p.file);
+        }
+    })
+}
+
+/// [`pull`], reporting progress through `on_progress`.
+pub fn pull_with_progress(
+    repo: &str,
+    dest: Option<PathBuf>,
+    token: Option<&str>,
+    on_progress: &mut dyn FnMut(PullProgress),
+) -> Result<PathBuf> {
     let repo = normalize_repo(repo)?;
     // `?blobs=true` is what makes the hub include each sibling's LFS block; the
     // bare endpoint returns filenames only, with no digest to verify against.
@@ -146,15 +189,24 @@ pub fn pull(repo: &str, dest: Option<PathBuf>, token: Option<&str>) -> Result<Pa
         dir.display(),
         wanted.len()
     );
-    for (file, oid) in &wanted {
+    let total = wanted.len();
+    for (index, (file, oid)) in wanted.iter().enumerate() {
         let url = format!("{}/{}/resolve/main/{}", base(), repo, file);
         let out = dir.join(file);
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        println!("  {file}");
+        let report = |phase| PullProgress {
+            file,
+            index: index + 1,
+            total,
+            phase,
+        };
+        on_progress(report(PullPhase::Downloading));
         curl_download(&url, &out, token)?;
+        on_progress(report(PullPhase::Verifying));
         verify_sha256(&out, *oid)?;
+        on_progress(report(PullPhase::Done));
     }
     println!("done. run: dlm serve --model-path {}", dir.display());
     Ok(dir)

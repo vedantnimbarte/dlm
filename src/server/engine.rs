@@ -627,9 +627,78 @@ pub(crate) fn authorized(req: &Request, key: &str) -> bool {
 
 /// Paths that stay open when an API key is configured: a liveness probe and the
 /// root banner. Everything else — including `/metrics`, which leaks request and
-/// token counts — requires the key.
+/// token counts, and `/v1/telemetry`, which exposes the engine's internal
+/// timings — requires the key.
 pub(crate) fn is_public_path(path: &str) -> bool {
     matches!(path, "/" | "/health" | "/healthz")
+}
+
+/// How often the telemetry stream flushes a batch. 20 Hz is well under what a
+/// UI can render and coalesces a streamed layer's events into one frame instead
+/// of one write per event.
+const TELEMETRY_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Re-send the static snapshot on this cadence, so a consumer that reconnects
+/// or drops a frame recovers without a separate request.
+const TELEMETRY_SNAPSHOT_EVERY: u32 = 100; // ticks → every 5s
+
+/// Turns telemetry off when the subscriber goes away.
+///
+/// Collection is global and gated on an atomic; leaving it enabled after a
+/// disconnect would keep taxing the streaming path for nobody. Drop runs on the
+/// early return from a write error (i.e. the client hanging up), which is the
+/// only way this stream normally ends.
+struct TelemetryGuard;
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        crate::telemetry::disable();
+    }
+}
+
+/// `GET /v1/telemetry` — per-layer flow events as Server-Sent Events.
+///
+/// Two frame types: `snapshot` carries the static shape of the run (layer
+/// count, layer sizes, whether weights are streaming at all), and `flow`
+/// carries batches of measured stage events. The snapshot goes first so a UI
+/// attaching mid-generation can render immediately rather than waiting a full
+/// pass to infer the model's shape.
+///
+/// Enabling collection is a side effect of subscribing: there is no point
+/// paying for events nobody reads.
+fn telemetry_stream() -> Response {
+    if !crate::telemetry::is_available() {
+        return Response::json(404, error_json("telemetry is not enabled (pass --telemetry)"));
+    }
+    Response::stream(200, "text/event-stream", move |w| {
+        crate::telemetry::enable();
+        let _guard = TelemetryGuard;
+
+        let mut ticks: u32 = 0;
+        loop {
+            if ticks % TELEMETRY_SNAPSHOT_EVERY == 0 {
+                if let Some(snapshot) = crate::telemetry::snapshot() {
+                    let json = serde_json::to_string(&snapshot).unwrap_or_default();
+                    write!(w, "event: snapshot\ndata: {json}\n\n")?;
+                    w.flush()?;
+                }
+            }
+            ticks = ticks.wrapping_add(1);
+
+            let batch = crate::telemetry::drain(1024);
+            if batch.events.is_empty() {
+                // A comment frame is a valid SSE keep-alive and is how a
+                // disconnected peer is detected: the write fails, `?` unwinds,
+                // and the guard turns collection back off.
+                write!(w, ": keep-alive\n\n")?;
+            } else {
+                let json = serde_json::to_string(&batch).unwrap_or_default();
+                write!(w, "event: flow\ndata: {json}\n\n")?;
+            }
+            w.flush()?;
+            std::thread::sleep(TELEMETRY_TICK);
+        }
+    })
 }
 
 /// Wrap [`router`] with bearer-token auth: when `api_key` is set, every request
@@ -730,6 +799,7 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
                 Response::text(200, "dlm: ok")
             }
             ("GET", "/metrics") => Response::text(200, metrics_text(&engine)),
+            ("GET", "/v1/telemetry") => telemetry_stream(),
             ("GET", "/v1/models") => {
                 let body = ModelsResponse {
                     object: "list",

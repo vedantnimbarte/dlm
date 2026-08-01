@@ -29,7 +29,7 @@ use crate::error::{DlmError, Result};
 use crate::forward::cpu::{route_topk, BlockConfig, ExpertFfn, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
 use crate::forward::streaming::{LayerSource, StreamStats};
-use crate::gpu::device::{synchronize_default, DeviceBuffer, Stream};
+use crate::gpu::device::{synchronize_default, CopyTimer, DeviceBuffer, Stream};
 use crate::memory::PinnedBuffer;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,9 +156,28 @@ impl GpuWeights {
     /// wait doesn't stop the GPU. On return the uploads are complete and `staging`
     /// is free to reuse.
     fn upload_async(t: &LayerTensors, stream: &Stream, staging: &mut PinnedBuffer) -> Result<Self> {
+        Self::upload_async_traced(t, stream, staging, None)
+    }
+
+    /// [`upload_async`](Self::upload_async), reporting per-stage cost for
+    /// `layer` when telemetry is on.
+    ///
+    /// The two phases below are already separate in this function, which is why
+    /// they can be reported separately: staging is a host memcpy into pinned
+    /// memory, the copy is the PCIe transfer. Conflating them would hide which
+    /// of the two is actually the bottleneck.
+    fn upload_async_traced(
+        t: &LayerTensors,
+        stream: &Stream,
+        staging: &mut PinnedBuffer,
+        layer: Option<u32>,
+    ) -> Result<Self> {
         let tensors = Self::tensors(t)?;
+        let trace = layer.filter(|_| crate::telemetry::is_enabled());
+
         // Phase 1: stage all tensors into pinned memory, recording layout.
         // (byte offset, byte length, element count)
+        let stage_timer = crate::telemetry::Timer::start();
         let mut layout: Vec<(usize, usize, usize)> = Vec::with_capacity(9);
         {
             let dst = staging.as_mut_slice();
@@ -170,7 +189,26 @@ impl GpuWeights {
                 byte_off += bytes;
             }
         }
+        let staged_bytes: u64 = layout.iter().map(|&(_, bytes, _)| bytes as u64).sum();
+        if let Some(layer) = trace {
+            crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                layer,
+                crate::telemetry::Stage::PinStage,
+                staged_bytes,
+                stage_timer.elapsed_us(),
+            ));
+        }
+
         // Phase 2: allocate device buffers and enqueue async copies from staging.
+        // Timed with device events rather than wall-clock: an async copy has
+        // barely started when the enqueue returns.
+        let copy_timer = match trace {
+            Some(_) => CopyTimer::new().ok(),
+            None => None,
+        };
+        if let Some(timer) = &copy_timer {
+            timer.begin(stream)?;
+        }
         let base = staging.as_ptr();
         let mut bufs: Vec<DeviceBuffer> = Vec::with_capacity(9);
         for &(off, bytes, len) in &layout {
@@ -180,6 +218,29 @@ impl GpuWeights {
             bufs.push(buf);
         }
         // Wait for the copies (staging becomes reusable; weights are ready).
+        if let (Some(layer), Some(timer)) = (trace, &copy_timer) {
+            // `end_us` synchronizes the end event, which is the same wait the
+            // `stream.synchronize()` below performs.
+            match timer.end_us(stream) {
+                Ok(dur_us) => crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                    layer,
+                    crate::telemetry::Stage::H2d,
+                    staged_bytes,
+                    dur_us,
+                )),
+                // Event timing failed; report the transfer without claiming a
+                // duration we did not measure.
+                Err(_) => crate::telemetry::emit(
+                    crate::telemetry::FlowEvent::new(
+                        layer,
+                        crate::telemetry::Stage::H2d,
+                        staged_bytes,
+                        0,
+                    )
+                    .estimated(),
+                ),
+            }
+        }
         stream.synchronize()?;
         let mut it = bufs.into_iter();
         let q_proj = it.next().unwrap();
@@ -515,7 +576,13 @@ impl<S: LayerSource> GpuShared<S> {
             } else {
                 self.source.load_layer(layer).and_then(|t| {
                     let mut staging = self.staging.lock().unwrap();
-                    GpuWeights::upload_async(&t, &self.copy_stream, &mut staging).map(Arc::new)
+                    GpuWeights::upload_async_traced(
+                        &t,
+                        &self.copy_stream,
+                        &mut staging,
+                        Some(layer),
+                    )
+                    .map(Arc::new)
                 })
             };
             let mut cache = self.weights.lock().unwrap();
