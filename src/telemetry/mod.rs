@@ -17,8 +17,8 @@
 //!
 //! # Cost when disabled
 //!
-//! Everything is gated on one relaxed [`AtomicBool`]. With no subscriber,
-//! [`is_enabled`] is a single atomic load and [`Timer::start`] does not call
+//! Everything is gated on one relaxed atomic subscriber count. With no
+//! subscriber, [`is_enabled`] is a single atomic load and [`Timer::start`] does not call
 //! `Instant::now()` at all — which matters, because this crate's entire premise
 //! is that bandwidth and per-layer time are scarce. A telemetry system that
 //! taxed the streaming path would be self-defeating.
@@ -31,7 +31,7 @@
 
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -41,8 +41,15 @@ use std::time::Instant;
 /// stalls cannot grow memory without limit.
 const RING_CAPACITY: usize = 8192;
 
-/// Master gate. Every emit site checks this before doing any work.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Number of attached subscribers. Collection runs while this is non-zero.
+///
+/// A plain on/off flag looked sufficient and was not: a subscriber that
+/// disconnects notices only on its next write, which can happen *after* a new
+/// subscriber has attached. With a boolean, the departing connection's cleanup
+/// then switched collection off underneath the arriving one, and the new
+/// subscriber silently received nothing. Counting makes the last one out turn
+/// off the lights.
+static SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Monotonic sequence, so a consumer can detect a gap even across drains.
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -196,8 +203,8 @@ impl FlowEvent {
     }
 }
 
-/// Whether `--telemetry` was passed. Distinct from [`ENABLED`], which tracks
-/// whether a subscriber is currently attached.
+/// Whether `--telemetry` was passed. Distinct from the subscriber count, which
+/// tracks whether anything is currently attached.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// Allow subscriptions (set from `--telemetry`).
@@ -217,18 +224,34 @@ pub fn is_available() -> bool {
 /// Is anything listening? A single relaxed atomic load.
 #[inline(always)]
 pub fn is_enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    SUBSCRIBERS.load(Ordering::Relaxed) > 0
 }
 
-/// Start collecting. Called when a subscriber attaches.
+/// Attach a subscriber and start collecting if this is the first.
 pub fn enable() {
     epoch(); // fix the time origin before the first event
-    ENABLED.store(true, Ordering::Relaxed);
+    SUBSCRIBERS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Stop collecting and discard anything buffered.
+/// Detach a subscriber. Collection stops, and the buffer is discarded, only
+/// when the last one leaves.
 pub fn disable() {
-    ENABLED.store(false, Ordering::Relaxed);
+    let prev = SUBSCRIBERS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
+    // Only the transition to zero clears the ring; clearing on every detach
+    // would throw away a live subscriber's unread events.
+    if matches!(prev, Ok(1)) {
+        if let Ok(mut ring) = ring().lock() {
+            ring.clear();
+        }
+    }
+}
+
+/// Force collection off regardless of subscriber count. Tests only.
+#[cfg(test)]
+fn reset_for_test() {
+    SUBSCRIBERS.store(0, Ordering::Relaxed);
     if let Ok(mut ring) = ring().lock() {
         ring.clear();
     }
@@ -369,7 +392,7 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        disable();
+        reset_for_test();
         g
     }
 
@@ -451,7 +474,7 @@ mod tests {
         enable();
         let t = Timer::start();
         assert!(t.0.is_some());
-        disable();
+        reset_for_test();
     }
 
     #[test]
@@ -468,7 +491,7 @@ mod tests {
         assert_eq!(e.bytes, 58_720_256);
         assert_eq!(e.dur_us, 5140);
         assert_eq!(e.token, 7, "events carry the decode step");
-        disable();
+        reset_for_test();
     }
 
     #[test]
@@ -482,7 +505,7 @@ mod tests {
             0,
             "a drained event must not repeat"
         );
-        disable();
+        reset_for_test();
     }
 
     #[test]
@@ -497,7 +520,7 @@ mod tests {
         for pair in events.windows(2) {
             assert!(pair[1].seq > pair[0].seq, "seq must strictly increase");
         }
-        disable();
+        reset_for_test();
     }
 
     #[test]
@@ -505,7 +528,7 @@ mod tests {
         let _g = guard();
         enable();
         emit(FlowEvent::new(MARKER, Stage::Compute, 0, 1));
-        disable();
+        reset_for_test();
         assert!(mine(&drain(usize::MAX)).is_empty());
     }
 
@@ -520,7 +543,7 @@ mod tests {
         enable();
         assert!(is_enabled(), "a subscriber can be attached...");
         assert!(!is_available(), "...without the route being advertised");
-        disable();
+        reset_for_test();
     }
 
     /// The JSON a subscriber receives. `estimated` and the detail fields are

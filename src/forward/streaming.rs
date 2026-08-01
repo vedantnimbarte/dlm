@@ -446,33 +446,24 @@ impl<S: LayerSource> Shared<S> {
             };
             let load_ns = t.elapsed().as_nanos() as u64;
             ewma(&self.load_ns, load_ns);
-            // Materializing a layer: read from the mmap'd checkpoint (through
-            // the host RAM cache, which reports its own hit/miss) plus decode
-            // into the in-memory form. Reuses the timer auto-prefetch already
-            // needs, so nothing extra is measured on the hot path.
-            if crate::telemetry::is_enabled() {
-                let bytes = loaded
-                    .as_ref()
-                    .map(|t| t.byte_size() as u64)
-                    .unwrap_or(0);
+            // No stage event for the materialization itself. The source below
+            // is always a `CachedLayerSource`, which reports RamHit when it
+            // serves from host RAM and RamMiss (timing the real read) when it
+            // goes to the checkpoint. Emitting a read event here as well would
+            // double-count, and — worse — would report a full layer's bytes
+            // against a near-zero duration on every cache hit, producing
+            // bandwidth figures in the terabytes per second.
+            if crate::telemetry::is_enabled() && by_worker {
+                // Loaded ahead of demand. The depth in effect is emitted where
+                // the request is queued; this records that the work actually
+                // landed, which is the part that hides latency.
+                let bytes = loaded.as_ref().map(|t| t.byte_size() as u64).unwrap_or(0);
                 crate::telemetry::emit(crate::telemetry::FlowEvent::new(
                     layer,
-                    crate::telemetry::Stage::MmapRead,
+                    crate::telemetry::Stage::Prefetch,
                     bytes,
                     (load_ns / 1000) as u32,
                 ));
-                if by_worker {
-                    // Loaded ahead of demand. The depth in effect is the
-                    // kernel's, which is emitted separately at the point the
-                    // request is queued; this event records that the work
-                    // actually landed, which is the part that hides latency.
-                    crate::telemetry::emit(crate::telemetry::FlowEvent::new(
-                        layer,
-                        crate::telemetry::Stage::Prefetch,
-                        bytes,
-                        0,
-                    ));
-                }
             }
             let mut cache = self.cache.lock().unwrap();
             cache.loading.remove(&layer);
