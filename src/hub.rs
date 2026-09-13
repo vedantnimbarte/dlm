@@ -23,6 +23,9 @@ const KEEP_EXACT: &[&str] = &[
     "vocab.json",
     "merges.txt",
     "special_tokens_map.json",
+    // Newer exports keep the chat template here instead of in
+    // tokenizer_config.json, and `--chat-template auto` reads it first.
+    "chat_template.jinja",
 ];
 
 fn base() -> String {
@@ -527,6 +530,7 @@ mod tests {
         assert!(is_wanted("model.safetensors.index.json"));
         assert!(is_wanted("config.json"));
         assert!(is_wanted("tokenizer.json"));
+        assert!(is_wanted("chat_template.jinja"));
         assert!(!is_wanted("model.gguf"));
         assert!(!is_wanted("pytorch_model.bin"));
     }
