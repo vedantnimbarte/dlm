@@ -668,7 +668,10 @@ impl Drop for TelemetryGuard {
 /// paying for events nobody reads.
 fn telemetry_stream() -> Response {
     if !crate::telemetry::is_available() {
-        return Response::json(404, error_json("telemetry is not enabled (pass --telemetry)"));
+        return Response::json(
+            404,
+            error_json("telemetry is not enabled (pass --telemetry)"),
+        );
     }
     Response::stream(200, "text/event-stream", move |w| {
         crate::telemetry::enable();

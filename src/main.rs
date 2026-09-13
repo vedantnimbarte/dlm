@@ -622,8 +622,7 @@ fn publish_telemetry_snapshot(
         // Device-measured H2D timing exists only on a GPU build with the copy
         // stream. Anywhere else a duration would be wall-clock, and the
         // consumer must render it as an estimate rather than a measurement.
-        estimated_h2d: !cfg!(any(feature = "cuda", feature = "rocm"))
-            || device != Device::Gpu,
+        estimated_h2d: !cfg!(any(feature = "cuda", feature = "rocm")) || device != Device::Gpu,
     });
 }
 

@@ -557,7 +557,9 @@ mod tests {
         assert!(!json.contains("estimated"), "{json}");
         assert!(!json.contains("victim"), "{json}");
 
-        let e = FlowEvent::new(4, Stage::Evict, 0, 0).with_victim(9).estimated();
+        let e = FlowEvent::new(4, Stage::Evict, 0, 0)
+            .with_victim(9)
+            .estimated();
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains(r#""victim":9"#), "{json}");
         assert!(json.contains(r#""estimated":true"#), "{json}");
