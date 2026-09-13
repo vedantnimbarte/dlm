@@ -1,34 +1,45 @@
 //! Speculative decoding.
 //!
 //! A small, cheap **draft** model proposes `gamma` tokens; the large **target**
-//! model verifies them. With greedy sampling the rule is exact: accept each draft
-//! token while it equals the target's greedy choice; at the first mismatch take
-//! the target's token instead; if all `gamma` are accepted, append the target's
-//! next ("bonus") token. This yields between 1 and `gamma + 1` tokens per round
-//! and — crucially — produces **exactly** the same sequence as plain target-greedy
-//! decoding, just faster when the draft guesses well.
+//! model scores all of them in **one** forward pass (a [`prefill`] over the
+//! proposals) and keeps the longest prefix it agrees with. A round yields between
+//! 1 and `gamma + 1` tokens for a single target pass, so it is faster than plain
+//! decoding whenever the draft guesses well and the target pass over `gamma + 1`
+//! tokens costs less than `gamma + 1` single-token passes — which the batched
+//! prefill kernels make true.
 //!
-//! The speed win comes from verifying all `gamma` positions in a single *batched*
-//! target forward pass. `dlm`'s CPU forward is single-token, so this
-//! implementation verifies sequentially (one target step per position) — the
-//! accept/reject logic and its exactness are identical; only the wall-clock
-//! saving awaits a batched kernel. Acceptance statistics are reported so the
-//! benefit is measurable.
+//! Acceptance is the standard rejection rule (Leviathan et al., Chen et al.):
+//! draft token `x`, drawn from the draft distribution `q`, is kept with
+//! probability `min(1, p(x)/q(x))` under the target distribution `p`; on the
+//! first rejection the round ends with a token drawn from `max(0, p − q)`,
+//! renormalized; if every proposal is kept, a bonus token is drawn from the
+//! target's next distribution. Each emitted token is then distributed exactly as
+//! the target's own sampler would have drawn it. Both distributions are the
+//! request's [`Sampler`] applied to each model's logits (temperature, top-k/p,
+//! min-p, repetition penalty), and with [`Sampler::Greedy`] both are one-hot, so
+//! the rule reduces to "keep while the draft matches the target's argmax" and the
+//! output is **identical** to plain target-greedy decoding. A sampled run follows
+//! the target's distribution, but not the same draws as a plain seeded run.
+//!
+//! Both models keep their KV cache across rounds. After a round each is
+//! [`truncate`]d back to the tokens now committed, so a rejection costs a
+//! rollback, not a re-prefill.
 //!
 //! Two entry points share the same round logic:
 //!
-//! * [`SpeculativeDecoder`] — a one-shot `prompt → tokens` decoder.
+//! * [`SpeculativeDecoder`] — a one-shot greedy `prompt → tokens` decoder.
 //! * [`SpeculativeSession`] — a *resumable* decoder that runs a single round per
 //!   [`step`](SpeculativeSession::step) call, emitting the 1..=`gamma`+1 tokens
 //!   that round produced. This is the surface the continuous-batching engine
-//!   drives ([`BatchScheduler::with_speculative`](crate::batching::BatchScheduler::with_speculative)):
-//!   a scheduler tick advances every request by one round, and the accepted
-//!   tokens for each request flow out through the same streaming path as plain
-//!   decoding.
+//!   drives ([`BatchScheduler::with_speculative`](crate::batching::BatchScheduler::with_speculative)).
+//!
+//! [`prefill`]: crate::forward::ForwardOrchestrator::prefill
+//! [`truncate`]: crate::forward::ForwardOrchestrator::truncate
 
-use crate::error::Result;
-use crate::forward::ComputeKernel;
-use crate::generate::{GenerationConfig, Generator, Sampler};
+use crate::error::{DlmError, Result};
+use crate::forward::{ComputeKernel, ForwardOrchestrator};
+use crate::generate::{sample_from, Generator, Sampler, SplitMix64};
+use std::collections::HashSet;
 
 /// Outcome of a speculative generation.
 #[derive(Debug, Clone)]
@@ -37,7 +48,7 @@ pub struct SpeculativeResult {
     pub tokens: Vec<u32>,
     /// Draft tokens proposed across all rounds.
     pub proposed: usize,
-    /// Draft tokens accepted (matched the target).
+    /// Draft tokens accepted by the target.
     pub accepted: usize,
 }
 
@@ -69,16 +80,22 @@ impl<T: ComputeKernel, D: ComputeKernel> SpeculativeDecoder<T, D> {
         }
     }
 
-    /// Generate up to `max_new_tokens` tokens for `prompt`.
+    /// Greedily generate up to `max_new_tokens` tokens for `prompt`.
     pub fn generate(&self, prompt: &[u32], max_new_tokens: usize) -> Result<SpeculativeResult> {
-        let mut session = SpeculativeSession::new(&self.target, &self.draft, self.gamma, prompt);
+        let mut session = SpeculativeSession::new(
+            &self.target,
+            &self.draft,
+            self.gamma,
+            prompt,
+            Sampler::Greedy,
+        )?;
         let mut out: Vec<u32> = Vec::with_capacity(max_new_tokens);
         while out.len() < max_new_tokens {
             // Cap each round to the tokens still wanted so the length limit can't
             // masquerade as a draft rejection.
             let emitted = session.step(max_new_tokens - out.len())?;
             if emitted.is_empty() {
-                break; // unreachable for gamma >= 1; a defensive progress guard
+                break; // unreachable for a non-zero budget; a defensive progress guard
             }
             out.extend(emitted);
         }
@@ -94,93 +111,149 @@ impl<T: ComputeKernel, D: ComputeKernel> SpeculativeDecoder<T, D> {
 /// A resumable speculative decoder: one [`step`](Self::step) runs a single
 /// draft-propose / target-verify round and returns the tokens it produced.
 ///
-/// State is just the running sequence plus acceptance counters; each round
-/// re-derives the target's greedy choices from that sequence (the same
-/// sequential verification [`SpeculativeDecoder`] uses), so no KV rewind is
-/// needed on a rejection. Borrows both generators, so many sessions can be
-/// driven concurrently by a scheduler.
+/// Invariant between rounds: `seq` holds the prompt and every emitted token, and
+/// both models' KV caches hold all of `seq` **except its last token**, which is
+/// fed to them at the start of the next round. Borrows both generators, so many
+/// sessions can be driven concurrently by a scheduler.
 pub struct SpeculativeSession<'a, T: ComputeKernel, D: ComputeKernel> {
     target: &'a Generator<T>,
     draft: &'a Generator<D>,
+    target_kv: ForwardOrchestrator<&'a T>,
+    draft_kv: ForwardOrchestrator<&'a D>,
     gamma: usize,
+    sampler: Sampler,
+    rng: SplitMix64,
     seq: Vec<u32>,
+    /// Tokens in `seq`, for the repetition penalty.
+    seen: HashSet<u32>,
     proposed: usize,
     accepted: usize,
 }
 
 impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
-    /// Begin a session that proposes `gamma` tokens per round, seeded with
-    /// `prompt`. Emitted tokens are appended to the internal sequence.
+    /// Begin a session that proposes `gamma` tokens per round, prefilling
+    /// `prompt` (all but its last token) into both models.
     pub fn new(
         target: &'a Generator<T>,
         draft: &'a Generator<D>,
         gamma: usize,
         prompt: &[u32],
-    ) -> Self {
-        Self {
+        sampler: Sampler,
+    ) -> Result<Self> {
+        let Some((_, head)) = prompt.split_last() else {
+            return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
+        };
+        let mut target_kv = target.orchestrator();
+        let mut draft_kv = draft.orchestrator();
+        if !head.is_empty() {
+            target.prefill(&mut target_kv, head)?;
+            draft.prefill(&mut draft_kv, head)?;
+        }
+        Ok(Self {
             target,
             draft,
+            target_kv,
+            draft_kv,
             gamma: gamma.max(1),
+            rng: SplitMix64::new(sampler.seed()),
+            sampler,
             seq: prompt.to_vec(),
+            seen: prompt.iter().copied().collect(),
             proposed: 0,
             accepted: 0,
-        }
-    }
-
-    /// The target's greedy next token given the current sequence.
-    fn target_next(&self) -> Result<u32> {
-        let cfg = GenerationConfig {
-            max_new_tokens: 1,
-            eos_token: None,
-            sampler: Sampler::Greedy,
-        };
-        Ok(self.target.generate(&self.seq, &cfg)?[0])
+        })
     }
 
     /// Run one speculative round, emitting at most `budget` tokens (normally
-    /// 1..=`gamma`+1). The tokens are exactly the target-greedy continuation of
-    /// the current sequence and are appended to it. Returns them for the caller
-    /// to forward; the caller decides when to stop (length or EOS). For
-    /// `budget >= 1` the result is always non-empty, so a driver makes progress.
+    /// 1..=`gamma`+1) and appending them to the sequence. The caller decides when
+    /// to stop (length or EOS). For `budget >= 1` the result is never empty.
     pub fn step(&mut self, budget: usize) -> Result<Vec<u32>> {
         if budget == 0 {
             return Ok(Vec::new());
         }
-        // Never propose more than the caller still wants this round.
         let gamma = self.gamma.min(budget);
-        let draft_cfg = GenerationConfig {
-            max_new_tokens: gamma,
-            eos_token: None,
-            sampler: Sampler::Greedy,
-        };
-        let draft_tokens = self.draft.generate(&self.seq, &draft_cfg)?;
-        self.proposed += draft_tokens.len();
 
+        // 1. The draft catches up on the tokens it has not seen (at least the
+        //    pending one), then proposes `gamma` tokens from its own distribution.
+        let unseen = self.draft_kv.position();
+        let mut hidden = self
+            .draft
+            .prefill(&mut self.draft_kv, &self.seq[unseen..])?;
+        let mut seen = self.seen.clone();
+        let mut proposals = Vec::with_capacity(gamma);
+        let mut draft_dists = Vec::with_capacity(gamma);
+        for j in 0..gamma {
+            if j > 0 {
+                hidden = self
+                    .draft
+                    .embed(proposals[j - 1], self.draft_kv.position())?;
+                self.draft_kv.decode_token(&mut hidden)?;
+            }
+            let q = self.draft.distribution(&hidden, &seen, &self.sampler)?;
+            let x = sample_from(&q, &mut self.rng);
+            seen.insert(x);
+            proposals.push(x);
+            draft_dists.push(q);
+        }
+        self.proposed += gamma;
+
+        // 2. The target scores the pending token and every proposal in one pass.
+        //    The last `gamma + 1` hidden states give its distribution before each
+        //    proposal and after the last.
+        let start = self.target_kv.position();
+        let fed: Vec<u32> = self.seq[start..]
+            .iter()
+            .chain(&proposals)
+            .copied()
+            .collect();
+        let mut hiddens = Vec::new();
+        for (i, &token) in fed.iter().enumerate() {
+            hiddens.extend(self.target.embed(token, start + i)?);
+        }
+        let h = hiddens.len() / fed.len();
+        self.target_kv.prefill(&mut hiddens)?;
+        let target_hidden = |j: usize| {
+            let at = (fed.len() - gamma - 1 + j) * h;
+            &hiddens[at..at + h]
+        };
+
+        // 3. Accept each proposal with probability min(1, p/q); on the first
+        //    rejection, draw the replacement from the residual and stop.
+        let mut seen = self.seen.clone();
         let mut emitted = Vec::with_capacity(gamma + 1);
-        let mut all_accepted = true;
-        for &dt in &draft_tokens {
-            let target_tok = self.target_next()?;
-            if target_tok == dt {
-                self.seq.push(dt);
-                emitted.push(dt);
+        let accepted_before = self.accepted;
+        for (j, (&x, q)) in proposals.iter().zip(&draft_dists).enumerate() {
+            let p = self
+                .target
+                .distribution(target_hidden(j), &seen, &self.sampler)?;
+            let (px, qx) = (prob_of(&p, x), prob_of(q, x));
+            if qx > 0.0 && self.rng.next_f32() < px / qx {
+                emitted.push(x);
+                seen.insert(x);
                 self.accepted += 1;
             } else {
-                // Mismatch: take the target's correction and end the round.
-                self.seq.push(target_tok);
-                emitted.push(target_tok);
-                all_accepted = false;
+                emitted.push(sample_from(&residual(&p, q), &mut self.rng));
                 break;
             }
         }
-
-        // All draft tokens accepted → append the target's bonus token, unless
-        // that would exceed the caller's budget for this round.
+        // Only when every proposal was accepted: a rejection at the last one
+        // also leaves `gamma` tokens emitted, and must not draw a bonus.
+        let all_accepted = self.accepted - accepted_before == gamma;
         if all_accepted && emitted.len() < budget {
-            let bonus = self.target_next()?;
-            self.seq.push(bonus);
-            emitted.push(bonus);
+            let p = self
+                .target
+                .distribution(target_hidden(gamma), &seen, &self.sampler)?;
+            emitted.push(sample_from(&p, &mut self.rng));
         }
 
+        // 4. Commit, and roll both caches back to everything but the new pending
+        //    token. What stays is valid: every emitted token but the last is an
+        //    accepted proposal, i.e. exactly what both models were fed.
+        self.seq.extend(&emitted);
+        self.seen.extend(&emitted);
+        let keep = self.seq.len() - 1;
+        self.target_kv.truncate(keep);
+        self.draft_kv.truncate(keep);
         Ok(emitted)
     }
 
@@ -192,5 +265,49 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
     /// Draft tokens accepted so far.
     pub fn accepted(&self) -> usize {
         self.accepted
+    }
+}
+
+/// The probability `dist` assigns to `token` (0 outside its support).
+fn prob_of(dist: &[(u32, f32)], token: u32) -> f32 {
+    dist.iter()
+        .find(|&&(t, _)| t == token)
+        .map_or(0.0, |&(_, p)| p)
+}
+
+/// `max(0, p − q)`, renormalized: the distribution a rejected position resamples
+/// from. When rounding leaves no mass (p and q agree everywhere), `p` itself.
+fn residual(p: &[(u32, f32)], q: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let qmap: std::collections::HashMap<u32, f32> = q.iter().copied().collect();
+    let mut r: Vec<(u32, f32)> = p
+        .iter()
+        .map(|&(t, pt)| (t, (pt - qmap.get(&t).copied().unwrap_or(0.0)).max(0.0)))
+        .filter(|&(_, m)| m > 0.0)
+        .collect();
+    let total: f32 = r.iter().map(|&(_, m)| m).sum();
+    if total <= 0.0 {
+        return p.to_vec();
+    }
+    for (_, m) in &mut r {
+        *m /= total;
+    }
+    r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One-hot distributions make the residual exactly the target's argmax, which
+    /// is what keeps greedy speculation identical to greedy decoding.
+    #[test]
+    fn residual_of_one_hots_is_the_target_token() {
+        assert_eq!(residual(&[(7, 1.0)], &[(3, 1.0)]), vec![(7, 1.0)]);
+        // Agreeing distributions leave no residual mass; fall back to p.
+        assert_eq!(residual(&[(7, 1.0)], &[(7, 1.0)]), vec![(7, 1.0)]);
+        let r = residual(&[(1, 0.5), (2, 0.5)], &[(1, 0.8), (2, 0.2)]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 2);
+        assert!((r[0].1 - 1.0).abs() < 1e-6);
     }
 }

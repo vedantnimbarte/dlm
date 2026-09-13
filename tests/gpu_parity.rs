@@ -1439,3 +1439,479 @@ fn gpu_grouped_experts_match_cpu() {
         "grouped-top4",
     );
 }
+
+/// Prefill on `gpu` (two prompts back to back, then two decoded tokens) must
+/// match the CPU oracle decoding the same tokens one at a time. The second
+/// prompt is 37 tokens: it starts on non-empty history and spans three 16-slot
+/// device calls, the last one partial — the three places a chunking or aliasing
+/// error in the batched prefill would show.
+fn assert_prefill_matches_cpu<K: ComputeKernel>(
+    cfg: BlockConfig,
+    layers: Vec<LayerTensors>,
+    gpu: K,
+    what: &str,
+) {
+    let num_layers = layers.len() as u32;
+    let cpu = CpuKernel::new(cfg, layers).unwrap();
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+
+    let h = cfg.hidden_size;
+    let mut rng = Rng::new(0x9E1F11);
+    for (round, tokens) in [5usize, 37, 1, 1].into_iter().enumerate() {
+        let mut want = rng.vec(tokens * h, 0.5);
+        let mut got = want.clone();
+        for hidden in want.chunks_mut(h) {
+            orch_cpu.decode_token(hidden).unwrap();
+        }
+        if tokens == 1 {
+            orch_gpu.decode_token(&mut got).unwrap();
+        } else {
+            orch_gpu.prefill(&mut got).unwrap();
+        }
+        let max_diff = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "{what}: round {round} ({tokens} tokens) diverged by {max_diff}"
+        );
+        assert_eq!(orch_cpu.position(), orch_gpu.position(), "{what}");
+    }
+}
+
+#[test]
+fn gpu_prefill_matches_cpu_decode() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 3, 0xBA7C4);
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "dense");
+}
+
+/// Gemma2's windowed layers must clip inside a prefill chunk too: the window (2)
+/// is far shorter than the 16-token chunks.
+#[test]
+fn gpu_prefill_matches_cpu_decode_gemma2() {
+    let (cfg, layers) = gemma2_fixture();
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "gemma2");
+}
+
+/// The streaming kernel's dense prefill, under a window of 2 of 3 layers.
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 3, 0xBA7C5);
+    let gpu = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming dense");
+}
+
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode_gemma2() {
+    let (cfg, layers) = gemma2_fixture();
+    let gpu = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming gemma2");
+}
+
+/// MoE layers take the per-token branch of the streaming prefill.
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode_moe() {
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 64,
+        shared_intermediate_size: Some(64),
+        norm_topk_prob: true,
+        naming: MoeNaming::Qwen,
+        first_k_dense: 0,
+    };
+    let cfg = BlockConfig {
+        moe: Some(m),
+        ..small_cfg()
+    };
+    let layers = random_moe_layers(&cfg, 4, 0x50FB);
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming moe");
+}
+
+/// DeepSeek's shape — MLA attention with MoE — also takes the per-token branch.
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode_mla_moe() {
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 16,
+        shared_intermediate_size: None,
+        norm_topk_prob: true,
+        naming: MoeNaming::Mixtral,
+        first_k_dense: 0,
+    };
+    let (cfg, sh) = mla_test_config(Some(m));
+    let layers = random_mla_layers(&cfg, sh, 4, 0xD5F1, Some(m));
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming mla+moe");
+}
+
+/// Attention over a long history: 1,100 prefilled tokens, then decoding past the
+/// 1,024-position step the device grows its score buffer by. Every other parity
+/// case stays under 50 positions, where a scoring or mixing error confined to a
+/// large (head × position) grid would never show.
+#[test]
+fn gpu_long_context_attention_matches_cpu() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 2, 0x10C7);
+    let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+    let gpu = GpuKernel::new(cfg, layers, 1200).unwrap();
+    let kv_cfg = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 80),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 80),
+        dlm::forward::KvQuant::None,
+    );
+
+    let h = cfg.hidden_size;
+    let mut rng = Rng::new(0x10C8);
+    let mut want = rng.vec(1100 * h, 0.5);
+    let mut got = want.clone();
+    for hidden in want.chunks_mut(h) {
+        orch_cpu.decode_token(hidden).unwrap();
+    }
+    orch_gpu.prefill(&mut got).unwrap();
+    let diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let tail = 16 * h;
+    let d = diff(&want[want.len() - tail..], &got[got.len() - tail..]);
+    assert!(d < 2e-3, "long prefill diverged by {d}");
+
+    for step in 0..3 {
+        let mut a = rng.vec(h, 0.5);
+        let mut b = a.clone();
+        orch_cpu.decode_token(&mut a).unwrap();
+        orch_gpu.decode_token(&mut b).unwrap();
+        let d = diff(&a, &b);
+        assert!(
+            d < 2e-3,
+            "decode step {step} at 1100+ positions diverged by {d}"
+        );
+    }
+}
+
+/// The LM head on the device must pick the same tokens as the host head, in
+/// each precision it uploads: bf16 (a head whose values are exactly
+/// bf16-representable, as a bf16 checkpoint's are), f32 (anything else), and
+/// int8 (a quantized model). The model is random, so the logits have no
+/// comfortable margins -- a head that scored the wrong rows would diverge within
+/// a few tokens.
+#[test]
+fn gpu_lm_head_matches_host_head() {
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    let cfg = small_cfg();
+    let vocab = 300;
+    let layers = random_layers(&cfg, 2, 0x4EAD);
+    let mut rng = Rng::new(0x4EAE);
+    let embedding = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let f32_head = rng.vec(vocab * cfg.hidden_size, 0.5);
+    // Keep only the bits bf16 stores, so the bf16 branch is taken and lossless.
+    let bf16_head: Vec<f32> = f32_head
+        .iter()
+        .map(|v| f32::from_bits(v.to_bits() & !0xFFFF))
+        .collect();
+    let kv = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let build = |head: &[f32]| {
+        Generator::new(
+            GpuKernel::new(cfg, layers.clone(), 64).unwrap(),
+            embedding.clone(),
+            vec![1.0; cfg.hidden_size],
+            head.to_vec(),
+            vocab,
+            1e-5,
+            kv,
+            4,
+        )
+        .unwrap()
+    };
+    let greedy = GenerationConfig {
+        max_new_tokens: 24,
+        eos_token: None,
+        sampler: Sampler::Greedy,
+    };
+    let prompt = [5u32, 77, 140, 3];
+    for (what, head, int8) in [
+        ("bf16", &bf16_head, false),
+        ("f32", &f32_head, false),
+        ("int8", &f32_head, true),
+    ] {
+        let host = build(head).generate(&prompt, &greedy).unwrap();
+        let mut dev = build(head);
+        dev.place_lm_head_on_gpu(int8, None).unwrap();
+        let got = dev.generate(&prompt, &greedy).unwrap();
+        if int8 {
+            // Quantization may move a near-tie; most tokens must still agree.
+            let same = host.iter().zip(&got).filter(|(a, b)| a == b).count();
+            assert!(
+                same >= 20,
+                "{what}: only {same}/24 tokens match the host head"
+            );
+        } else {
+            assert_eq!(got, host, "{what}: device head chose different tokens");
+        }
+    }
+}
+
+// ── Non-Llama blocks: GPT-2 and Falcon ───────────────────────────────────────
+//
+// Both differ from the Llama block in ways that produce fluent garbage rather
+// than an error when missed: LayerNorm with biases, no gate, biases on the
+// output projection and the MLP; GPT-2 without rotary; Falcon with the FFN
+// reading the block input's norm. Norms and biases are non-uniform, so a norm
+// applied as RMSNorm or a bias left off moves the hidden state.
+
+/// A GPT-2- or Falcon-shaped layer stack for `cfg` (ungated, LayerNorm, biased).
+fn biased_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> {
+    let mut rng = Rng::new(seed);
+    let (h, s) = (cfg.hidden_size, 0.05);
+    (0..n)
+        .map(|_| LayerTensors {
+            q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * h, s)),
+            k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+            v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+            o_proj: Weights::from_f32(rng.vec(h * cfg.q_dim(), s)),
+            o_bias: Some(rng.vec(h, 0.1)),
+            q_bias: Some(rng.vec(cfg.q_dim(), 0.1)),
+            k_bias: Some(rng.vec(cfg.kv_dim(), 0.1)),
+            v_bias: Some(rng.vec(cfg.kv_dim(), 0.1)),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::F32(Vec::new()),
+                up: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
+                down: Weights::from_f32(rng.vec(h * cfg.intermediate_size, s)),
+                up_bias: Some(rng.vec(cfg.intermediate_size, 0.1)),
+                down_bias: Some(rng.vec(h, 0.1)),
+            }),
+            input_layernorm: (0..h).map(|i| 1.0 + i as f32 * 0.01).collect(),
+            input_layernorm_bias: Some(rng.vec(h, 0.2)),
+            post_attention_layernorm: (0..h).map(|i| 0.9 - i as f32 * 0.005).collect(),
+            post_attention_layernorm_bias: Some(rng.vec(h, 0.2)),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn gpt2_cfg() -> BlockConfig {
+    BlockConfig {
+        norm_kind: dlm::forward::cpu::NormKind::Layer,
+        ffn_kind: dlm::forward::cpu::FfnKind::Plain,
+        learned_positions: true,
+        activation: dlm::forward::Activation::GeluTanh,
+        num_kv_heads: 4,
+        ..small_cfg()
+    }
+}
+
+fn falcon_cfg() -> BlockConfig {
+    BlockConfig {
+        norm_kind: dlm::forward::cpu::NormKind::Layer,
+        ffn_kind: dlm::forward::cpu::FfnKind::Plain,
+        parallel_residual: true,
+        activation: dlm::forward::Activation::GeluTanh,
+        num_kv_heads: 1, // multi-query
+        ..small_cfg()
+    }
+}
+
+#[test]
+fn gpu_gpt2_block_matches_cpu() {
+    let cfg = gpt2_cfg();
+    assert_gpu_matches_cpu(cfg, biased_layers(&cfg, 3, 0x6E72), 1e-3, "gpt2");
+}
+
+#[test]
+fn gpu_falcon_block_matches_cpu() {
+    let cfg = falcon_cfg();
+    assert_gpu_matches_cpu(cfg, biased_layers(&cfg, 3, 0xFA1C), 1e-3, "falcon");
+}
+
+/// Both shapes through the batched block (resident and streamed prefill).
+#[test]
+fn gpu_gpt2_and_falcon_prefill_matches_cpu() {
+    for (what, cfg, seed) in [
+        ("gpt2", gpt2_cfg(), 0x6E73),
+        ("falcon", falcon_cfg(), 0xFA1D),
+    ] {
+        let layers = biased_layers(&cfg, 3, seed);
+        let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+        assert_prefill_matches_cpu(cfg, layers.clone(), gpu, what);
+        let streamed =
+            StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+        assert_prefill_matches_cpu(cfg, layers, streamed, &format!("{what} streamed"));
+    }
+}
+
+/// Gemma 3's per-layer attention on the device: windowed layers rotate with the
+/// local base and no scaling, global layers with `rope_theta` and `rope_scaling`.
+/// The GPU kernels precompute one frequency buffer per kind, so a buffer built
+/// with the wrong scaling would pass every check that runs on the CPU. With a
+/// window of 2, a pattern of 3 and 44 prefilled positions, every layer kind is
+/// exercised well past its window, on the resident and streamed kernels.
+#[test]
+fn gpu_gemma3_layers_match_cpu() {
+    let (base, layers) = gemma2_fixture();
+    let cfg = BlockConfig {
+        sliding_window: Some(2),
+        sliding_window_pattern: Some(3),
+        rope_theta: 10_000.0,
+        rope_scaling: Some(dlm::forward::cpu::RopeScaling::Linear { factor: 8.0 }),
+        rope_local_theta: Some(100.0),
+        attn_logit_softcap: None,
+        ..base
+    };
+    let mut rng = Rng::new(0x6E33);
+    let layers: Vec<LayerTensors> = layers
+        .into_iter()
+        .chain(gemma2_fixture().1.into_iter().take(2))
+        .map(|l| LayerTensors {
+            q_norm: Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect()),
+            k_norm: Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect()),
+            ..l
+        })
+        .collect();
+    assert_eq!(layers.len(), 6);
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu(cfg, layers.clone(), gpu, "gemma3");
+    let streamed = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, streamed, "gemma3 streamed");
+}
+
+/// MLA attention over a long history, in f32 and with `kv_b` quantized to int8.
+/// The device factors attention through latent space (the latent query and the
+/// weighted latent mix) instead of reconstructing K and V per position, so it has
+/// to agree with the CPU oracle's explicit reconstruction on 1,100 positions,
+/// and through each weight decoder the factored kernels read `kv_b` with.
+#[test]
+fn gpu_mla_long_context_matches_cpu() {
+    let (cfg, sh) = mla_test_config(None);
+    for quantize in [false, true] {
+        let mut layers = random_mla_layers(&cfg, sh, 2, 0x31A7, None);
+        if quantize {
+            for l in &mut layers {
+                let mla = l.mla.as_mut().unwrap();
+                let floats: Vec<f32> = (0..mla.kv_b_proj.len())
+                    .map(|i| mla.kv_b_proj.get(i))
+                    .collect();
+                mla.kv_b_proj = Weights::quantize_int8(&floats, 64).unwrap();
+            }
+        }
+        let what = if quantize { "mla int8 kv_b" } else { "mla f32" };
+        let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+        let gpu = GpuKernel::new(cfg, layers, 1200).unwrap();
+        let kv_cfg = KvCacheConfig {
+            num_layers: 2,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            head_dim: cfg.head_dim as u32,
+            block_size: 16,
+        };
+        let mut orch_cpu = ForwardOrchestrator::new(
+            cpu,
+            PagedKvCache::new(kv_cfg, 80),
+            dlm::forward::KvQuant::None,
+        );
+        let mut orch_gpu = ForwardOrchestrator::new(
+            gpu,
+            PagedKvCache::new(kv_cfg, 80),
+            dlm::forward::KvQuant::None,
+        );
+        let h = cfg.hidden_size;
+        let mut rng = Rng::new(0x31A8);
+        let mut want = rng.vec(1100 * h, 0.5);
+        let mut got = want.clone();
+        orch_cpu.prefill(&mut want).unwrap();
+        orch_gpu.prefill(&mut got).unwrap();
+        let tail = 16 * h;
+        let d = want[want.len() - tail..]
+            .iter()
+            .zip(&got[got.len() - tail..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d < 2e-3, "{what}: 1,100-token prefill diverged by {d}");
+    }
+}
+
+/// A multi-GPU pipeline's LM head lives on the last stage's GPU and must select
+/// that device itself: whichever stage ran last is current when logits run.
+/// With one GPU this can only check the wiring -- a pipeline over `[0, 0]` with
+/// the head placed on device 0 must choose the host head's tokens -- not a real
+/// cross-device run, which needs a second card.
+#[test]
+fn multi_gpu_lm_head_matches_host_head() {
+    use dlm::forward::MultiGpuKernel;
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    let cfg = small_cfg();
+    let vocab = 300;
+    let layers = random_layers(&cfg, 4, 0x4EAF);
+    let mut rng = Rng::new(0x4EB0);
+    let embedding = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let head = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let kv = KvCacheConfig {
+        num_layers: 4,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let build = || {
+        Generator::new(
+            MultiGpuKernel::new(cfg, layers.clone(), &[0, 0], 64).unwrap(),
+            embedding.clone(),
+            vec![1.0; cfg.hidden_size],
+            head.clone(),
+            vocab,
+            1e-5,
+            kv,
+            4,
+        )
+        .unwrap()
+    };
+    let greedy = GenerationConfig {
+        max_new_tokens: 24,
+        eos_token: None,
+        sampler: Sampler::Greedy,
+    };
+    let prompt = [9u32, 200, 41];
+    let want = build().generate(&prompt, &greedy).unwrap();
+    let mut dev = build();
+    dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    assert_eq!(dev.generate(&prompt, &greedy).unwrap(), want);
+}

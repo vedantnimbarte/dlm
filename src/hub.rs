@@ -23,6 +23,9 @@ const KEEP_EXACT: &[&str] = &[
     "vocab.json",
     "merges.txt",
     "special_tokens_map.json",
+    // Newer exports keep the chat template here instead of in
+    // tokenizer_config.json, and `--chat-template auto` reads it first.
+    "chat_template.jinja",
 ];
 
 fn base() -> String {
@@ -263,7 +266,12 @@ fn curl_with_token(
     } else {
         cmd.stdin(Stdio::null());
     }
-    if !capture_stdout {
+    if capture_stdout {
+        // `spawn` inherits both by default (unlike `output`), so capturing has to
+        // be asked for, or `wait_with_output` returns empty buffers.
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+    } else {
         // Progress bar / body go straight to the terminal or the -o file.
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
@@ -445,6 +453,30 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// `curl_json` must return the body, with and without a token. It once
+    /// returned nothing — `spawn` inherits stdout, so the body went to the
+    /// terminal — which broke every `dlm pull` at the first metadata request.
+    /// A `file://` URL keeps this offline; skipped where curl is absent.
+    #[test]
+    fn curl_json_captures_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("info.json");
+        std::fs::write(&path, br#"{"ok":true}"#).unwrap();
+        let url = format!(
+            "file:///{}",
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+        );
+        for token in [None, Some("secret")] {
+            match curl_json(&url, token) {
+                Ok(body) => assert_eq!(body, br#"{"ok":true}"#, "token {token:?}"),
+                Err(DlmError::Hub(m)) if m.contains("curl") && m.contains("not found") => return,
+                Err(e) => panic!("token {token:?}: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn normalizes_repo_forms() {
         for input in [
@@ -498,6 +530,7 @@ mod tests {
         assert!(is_wanted("model.safetensors.index.json"));
         assert!(is_wanted("config.json"));
         assert!(is_wanted("tokenizer.json"));
+        assert!(is_wanted("chat_template.jinja"));
         assert!(!is_wanted("model.gguf"));
         assert!(!is_wanted("pytorch_model.bin"));
     }

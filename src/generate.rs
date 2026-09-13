@@ -18,6 +18,10 @@ use crate::error::{DlmError, Result};
 use crate::forward::cpu::{matvec, KvLayerCache};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
 
+/// Prompt tokens staged per prefill call. Bounds the `tokens × hidden` buffer on
+/// a long prompt; a streaming kernel loads each layer once per chunk.
+const PREFILL_CHUNK: usize = 512;
+
 /// Index of the largest logit (greedy pick; first max wins on ties).
 pub fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -102,6 +106,27 @@ impl Sampler {
         }
     }
 
+    /// The distribution [`sample`](Self::sample) draws from, as `(token, prob)`
+    /// pairs over the tokens that survive truncation, most likely first. Greedy
+    /// (or `temperature <= 0`) is the one-hot distribution on the argmax.
+    /// Speculative decoding needs the distributions themselves, not a draw.
+    pub fn distribution(&self, logits: &[f32]) -> Vec<(u32, f32)> {
+        match *self {
+            Sampler::TopPK {
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                ..
+            } if temperature > 0.0 && !logits.is_empty() => {
+                let (idx, probs) =
+                    topk_topp_distribution(logits, temperature, top_p, top_k as usize, min_p);
+                idx.into_iter().map(|i| i as u32).zip(probs).collect()
+            }
+            _ => vec![(argmax(logits), 1.0)],
+        }
+    }
+
     /// Pick the next token id from `logits`, advancing `rng` for stochastic
     /// samplers (unused by [`Greedy`](Sampler::Greedy)).
     pub fn sample(&self, logits: &[f32], rng: &mut SplitMix64) -> u32 {
@@ -160,6 +185,35 @@ fn sample_topk_topp(
     if logits.is_empty() {
         return 0;
     }
+    let (idx, probs) = topk_topp_distribution(logits, temperature, top_p, top_k, min_p);
+    let pairs: Vec<(u32, f32)> = idx.into_iter().map(|i| i as u32).zip(probs).collect();
+    sample_from(&pairs, rng)
+}
+
+/// Inverse-CDF draw from `(token, prob)` pairs, in the order given. Falls back
+/// to the last token when rounding leaves the cumulative mass just short of 1.
+pub(crate) fn sample_from(dist: &[(u32, f32)], rng: &mut SplitMix64) -> u32 {
+    let r = rng.next_f32();
+    let mut cum = 0.0f32;
+    for &(token, p) in dist {
+        cum += p;
+        if r < cum {
+            return token;
+        }
+    }
+    dist.last().map_or(0, |&(token, _)| token)
+}
+
+/// The filtered, renormalized distribution behind [`sample_topk_topp`]: token
+/// indices sorted by logit (descending) and their probabilities. `logits` must
+/// be non-empty.
+fn topk_topp_distribution(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    min_p: f32,
+) -> (Vec<usize>, Vec<f32>) {
     // Candidate indices sorted by logit, descending.
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_unstable_by(|&a, &b| {
@@ -219,16 +273,7 @@ fn sample_topk_topp(
         }
     }
 
-    // Inverse-CDF sample.
-    let r = rng.next_f32();
-    let mut cum = 0.0f32;
-    for (j, &p) in probs.iter().enumerate() {
-        cum += p;
-        if r < cum {
-            return idx[j] as u32;
-        }
-    }
-    idx[idx.len() - 1] as u32
+    (idx, probs)
 }
 
 /// Generation parameters.
@@ -287,6 +332,10 @@ pub struct Generator<K: ComputeKernel> {
     /// changes the distribution (it compresses the tail toward the cap), so it is
     /// part of correctness rather than a stylistic knob. `None` elsewhere.
     final_logit_softcap: Option<f32>,
+    /// The LM head on the device, when [`with_gpu_lm_head`](Self::with_gpu_lm_head)
+    /// placed it there; `lm_head` is then left empty.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    gpu_head: Option<crate::forward::GpuLmHead>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -331,6 +380,8 @@ impl<K: ComputeKernel> Generator<K> {
             final_norm_bias: None,
             final_norm_kind: crate::forward::cpu::NormKind::Rms,
             final_logit_softcap: None,
+            #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+            gpu_head: None,
         })
     }
 
@@ -387,7 +438,82 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// Embed a token id into a fresh hidden vector.
-    fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
+    /// Move the LM head into VRAM, so each step's vocabulary-wide GEMV runs on the
+    /// device instead of the host.
+    ///
+    /// Precision follows the weights: a head that is exactly bf16-representable
+    /// (a bf16 checkpoint) uploads as bf16, losslessly and at half the size;
+    /// anything else uploads as f32. `quantize_int8` is for a model whose layers
+    /// were quantized at load (`--quant int4`/`int8`) -- the user already chose
+    /// lossy weights, and int8 keeps the head's error small (int4 is too coarse
+    /// for the one matrix every token's choice goes through).
+    ///
+    /// `device` names the GPU to hold it; `None` uses the current device, which
+    /// is right for a single-GPU kernel. A multi-GPU pipeline passes its last
+    /// stage's device, since no one device is current when logits are computed.
+    ///
+    /// The host copy is released once the upload succeeds; on failure (VRAM
+    /// exhausted, say) the generator is untouched and keeps the host head.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn place_lm_head_on_gpu(&mut self, quantize_int8: bool, device: Option<u32>) -> Result<()> {
+        use crate::forward::Weights;
+        let head = if quantize_int8 {
+            Weights::quantize_int8(&self.lm_head, crate::forward::QUANT_GROUP_SIZE)?
+        } else if self.lm_head.iter().all(|v| v.to_bits() & 0xFFFF == 0) {
+            Weights::Bf16(
+                self.lm_head
+                    .iter()
+                    .map(|v| (v.to_bits() >> 16) as u16)
+                    .collect(),
+            )
+        } else {
+            Weights::from_f32(self.lm_head.clone())
+        };
+        self.gpu_head = Some(crate::forward::GpuLmHead::new(
+            &head,
+            self.vocab_size,
+            self.hidden_size,
+            device,
+        )?);
+        self.lm_head = Vec::new();
+        Ok(())
+    }
+
+    /// [`place_lm_head_on_gpu`](Self::place_lm_head_on_gpu), falling back to the
+    /// host head with a warning rather than failing: a host head is slower, not
+    /// wrong.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn with_lm_head_on_gpu(mut self, quantize_int8: bool, device: Option<u32>) -> Self {
+        if let Err(e) = self.place_lm_head_on_gpu(quantize_int8, device) {
+            eprintln!("warning: the LM head stays on the CPU ({e}); decoding will be slower");
+        }
+        self
+    }
+
+    /// A fresh single-sequence orchestrator over this generator's kernel and KV
+    /// budget.
+    pub(crate) fn orchestrator(&self) -> ForwardOrchestrator<&K> {
+        ForwardOrchestrator::new(
+            &self.kernel,
+            PagedKvCache::new(self.kv_config, self.kv_total_blocks),
+            self.kv_quant,
+        )
+    }
+
+    /// The sampler's next-token distribution after `hidden`, with the repetition
+    /// penalty applied over `seen` -- exactly what a session samples from.
+    pub(crate) fn distribution(
+        &self,
+        hidden: &[f32],
+        seen: &std::collections::HashSet<u32>,
+        sampler: &Sampler,
+    ) -> Result<Vec<(u32, f32)>> {
+        let mut logits = self.logits(hidden)?;
+        apply_repetition_penalty(&mut logits, seen, sampler.repetition_penalty());
+        Ok(sampler.distribution(&logits))
+    }
+
+    pub(crate) fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
         let idx = token as usize;
         if idx >= self.vocab_size {
             return Err(DlmError::InvalidConfig(format!(
@@ -416,8 +542,60 @@ impl<K: ComputeKernel> Generator<K> {
         Ok(v)
     }
 
+    /// Run `tokens` (non-empty) through the model as one prefill, in chunks of
+    /// [`PREFILL_CHUNK`] so a long prompt's staged hidden states stay bounded.
+    /// Returns the last token's hidden state.
+    pub(crate) fn prefill(
+        &self,
+        orch: &mut ForwardOrchestrator<&K>,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        let mut hiddens = Vec::new();
+        for chunk in tokens.chunks(PREFILL_CHUNK) {
+            hiddens.clear();
+            for (i, &token) in chunk.iter().enumerate() {
+                hiddens.extend(self.embed(token, orch.position() + i)?);
+            }
+            orch.prefill(&mut hiddens)?;
+        }
+        Ok(hiddens.split_off(hiddens.len() - self.hidden_size))
+    }
+
+    /// The log-probability the model assigns each token given the ones before it
+    /// (teacher forcing): `out[i]` is `log p(tokens[i + 1] | tokens[..=i])`, so
+    /// the result is one shorter than `tokens`. The mean of its negation is the
+    /// text's cross-entropy -- the number that tells a subtly wrong forward pass
+    /// (a misplaced norm, a wrong RoPE base) from a right one when greedy output
+    /// still looks fine.
+    pub fn score(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut orch = self.orchestrator();
+        let mut out = Vec::with_capacity(tokens.len().saturating_sub(1));
+        for (c, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+            let mut hiddens = Vec::with_capacity(chunk.len() * self.hidden_size);
+            for (i, &token) in chunk.iter().enumerate() {
+                hiddens.extend(self.embed(token, orch.position() + i)?);
+            }
+            orch.prefill(&mut hiddens)?;
+            for (i, hidden) in hiddens.chunks(self.hidden_size).enumerate() {
+                let Some(&next) = tokens.get(c * PREFILL_CHUNK + i + 1) else {
+                    break;
+                };
+                let logits = self.logits(hidden)?;
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let lse = max
+                    + logits
+                        .iter()
+                        .map(|&l| ((l - max) as f64).exp())
+                        .sum::<f64>()
+                        .ln() as f32;
+                out.push(logits[next as usize] - lse);
+            }
+        }
+        Ok(out)
+    }
+
     /// Project a hidden state to vocabulary logits via final norm + LM head.
-    fn logits(&self, hidden: &[f32]) -> Vec<f32> {
+    fn logits(&self, hidden: &[f32]) -> Result<Vec<f32>> {
         let normed = crate::forward::cpu::norm(
             hidden,
             &self.final_norm,
@@ -425,13 +603,19 @@ impl<K: ComputeKernel> Generator<K> {
             self.rms_eps,
             self.final_norm_kind,
         );
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        let mut out = match &self.gpu_head {
+            Some(head) => head.logits(&normed)?,
+            None => matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size),
+        };
+        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         let mut out = matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
         if let Some(cap) = self.final_logit_softcap {
             for l in out.iter_mut() {
                 *l = (*l / cap).tanh() * cap;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Greedy-decode a **batch** of prompts together, advancing all sequences
@@ -507,7 +691,7 @@ impl<K: ComputeKernel> Generator<K> {
                 if done[s] {
                     continue;
                 }
-                let mut logits = self.logits(&hidden[s]);
+                let mut logits = self.logits(&hidden[s])?;
                 apply_repetition_penalty(&mut logits, &seen[s], penalty);
                 let next = cfg.sampler.sample(&logits, &mut rngs[s]);
                 out[s].push(next);
@@ -551,11 +735,7 @@ impl<K: ComputeKernel> Generator<K> {
         let mut orch = ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
 
         // Prefill: run every prompt token, carrying the last hidden state.
-        let mut hidden = vec![0.0f32; self.hidden_size];
-        for &token in prompt {
-            hidden = self.embed(token, orch.position())?;
-            orch.decode_token(&mut hidden)?;
-        }
+        let mut hidden = self.prefill(&mut orch, prompt)?;
 
         // Decode loop. `seen` tracks the full context (prompt + generated) for
         // the repetition penalty.
@@ -564,7 +744,7 @@ impl<K: ComputeKernel> Generator<K> {
         let mut seen: std::collections::HashSet<u32> = prompt.iter().copied().collect();
         let mut generated = Vec::with_capacity(cfg.max_new_tokens);
         for _ in 0..cfg.max_new_tokens {
-            let mut logits = self.logits(&hidden);
+            let mut logits = self.logits(&hidden)?;
             apply_repetition_penalty(&mut logits, &seen, penalty);
             let next = cfg.sampler.sample(&logits, &mut rng);
             generated.push(next);
@@ -607,11 +787,7 @@ impl<K: ComputeKernel> Generator<K> {
         let budget = crate::cache::PagedKvCache::new(self.kv_config, self.kv_total_blocks);
         let mut orchestrator =
             crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
-        let mut hidden = vec![0.0f32; self.hidden_size];
-        for &token in prompt {
-            hidden = self.embed(token, orchestrator.position())?;
-            orchestrator.decode_token(&mut hidden)?;
-        }
+        let hidden = self.prefill(&mut orchestrator, prompt)?;
         Ok(GenerationSession {
             generator: self,
             orchestrator,
@@ -654,11 +830,7 @@ impl<K: ComputeKernel> Generator<K> {
         }
         let budget = PagedKvCache::new(self.kv_config, self.kv_total_blocks);
         let mut orchestrator = ForwardOrchestrator::resume(&self.kernel, budget, snapshot)?;
-        let mut hidden = vec![0.0f32; self.hidden_size];
-        for &token in suffix {
-            hidden = self.embed(token, orchestrator.position())?;
-            orchestrator.decode_token(&mut hidden)?;
-        }
+        let hidden = self.prefill(&mut orchestrator, suffix)?;
         Ok(GenerationSession {
             generator: self,
             orchestrator,
@@ -691,7 +863,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
 
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
-        let mut logits = self.generator.logits(&self.last_hidden);
+        let mut logits = self.generator.logits(&self.last_hidden)?;
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
         let next = self.sampler.sample(&logits, &mut self.rng);
         self.seen.insert(next);
@@ -756,6 +928,29 @@ mod tests {
         .unwrap()
     }
 
+    /// `score` must be the log-softmax of the next token, computed the slow way:
+    /// one decode step at a time, full logits, explicit normalization.
+    #[test]
+    fn score_is_the_next_tokens_log_softmax() {
+        let g = counting_generator();
+        let tokens = [0u32, 1, 3, 2, 2];
+        let got = g.score(&tokens).unwrap();
+        assert_eq!(got.len(), tokens.len() - 1);
+        let mut orch = g.orchestrator();
+        for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+            let mut h = g.embed(t, i).unwrap();
+            orch.decode_token(&mut h).unwrap();
+            let logits = g.logits(&h).unwrap();
+            let z: f32 = logits.iter().map(|l| l.exp()).sum();
+            let want = logits[tokens[i + 1] as usize] - z.ln();
+            assert!(
+                (got[i] - want).abs() < 1e-5,
+                "token {i}: {} vs {want}",
+                got[i]
+            );
+        }
+    }
+
     /// Gemma2's final-logit softcap squashes logits through `tanh(l/cap)*cap`
     /// before sampling. It must compress the spread (that is the whole point —
     /// it changes the sampled distribution) while leaving the ranking intact,
@@ -764,10 +959,10 @@ mod tests {
     fn final_logit_softcap_compresses_without_reordering() {
         let hidden = vec![0.4f32, -0.7, 0.15, 0.9];
         let plain = counting_generator();
-        let raw = plain.logits(&hidden);
+        let raw = plain.logits(&hidden).unwrap();
 
         let capped_gen = counting_generator().with_final_logit_softcap(Some(0.5));
-        let capped = capped_gen.logits(&hidden);
+        let capped = capped_gen.logits(&hidden).unwrap();
 
         assert_eq!(raw.len(), capped.len());
         // Every capped logit is inside ±cap, and strictly smaller in magnitude
@@ -783,11 +978,12 @@ mod tests {
 
         // A non-positive cap is treated as "off", not as a divide-by-zero.
         let off = counting_generator().with_final_logit_softcap(Some(0.0));
-        assert_eq!(off.logits(&hidden), raw);
+        assert_eq!(off.logits(&hidden).unwrap(), raw);
         assert_eq!(
             counting_generator()
                 .with_final_logit_softcap(None)
-                .logits(&hidden),
+                .logits(&hidden)
+                .unwrap(),
             raw
         );
     }

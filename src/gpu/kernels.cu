@@ -30,6 +30,9 @@
 #define cudaGetLastError hipGetLastError
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaGetDevice hipGetDevice
+#define cudaErrorInvalidDevice hipErrorInvalidDevice
 #else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -64,6 +67,48 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* out, int n
     __syncthreads();
 
     for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = x[i] * inv_rms * w[i];
+}
+
+// out[i] = (x[i] - mean(x)) * rsqrt(var(x) + eps) * w[i] + b[i]  (b may be NULL)
+//
+// LayerNorm (GPT-2, Falcon): RMSNorm's tree reduction twice over -- the mean
+// first, then the sum of squared deviations from it -- which is `layernorm()` in
+// src/forward/cpu.rs. Computing var as mean(x^2) - mean^2 in one pass would save
+// a reduction but cancels catastrophically on GPT-2's residual stream, whose
+// outlier dimensions dwarf the rest. `out` may alias `x`.
+__global__ void layernorm_kernel(const float* x, const float* w, const float* b, float* out,
+                                 int n, float eps) {
+    __shared__ float partial[RMS_THREADS];
+    __shared__ float mean;
+    __shared__ float inv_std;
+
+    float s = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) s += x[k];
+    partial[threadIdx.x] = s;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) mean = partial[0] / (float)n;
+    __syncthreads();
+
+    float ss = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        float d = x[k] - mean;
+        ss += d * d;
+    }
+    partial[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_std = rsqrtf(partial[0] / (float)n + eps);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        out[i] = (x[i] - mean) * inv_std * w[i] + (b ? b[i] : 0.0f);
 }
 
 // Row-major [out_dim, in_dim] matrix times vector, plus an optional bias.
@@ -237,52 +282,71 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
     for (int i = 0; i < head_dim; ++i) head[i] = head[i] * inv * w[i];
 }
 
-// Grouped-query attention over `positions` cached tokens. One thread per query
-// head; online softmax so no per-position scratch is needed.
+// Grouped-query attention over `positions` cached tokens, in three launches so
+// the work spreads over (head, position) rather than one thread per head. The
+// one-thread-per-head version walked the whole history in a scalar loop, which
+// made every token's cost grow with context: at a few hundred tokens it was the
+// dominant cost of a 0.5B model on a GTX 1650.
+//
+//   1. attn_scores_kernel  — one thread per (head, position): the scaled (and
+//                            softcapped) logit.
+//   2. attn_softmax_kernel — one thread per head: max-subtracted softmax of its
+//                            row, in place.
+//   3. attn_mix_kernel     — one thread per (head, dim): the weighted sum of the
+//                            values.
+//
+// This is `attention()` in src/forward/cpu.rs step for step: logits, softcap,
+// softmax, then accumulate weight × value in position order.
 // `sliding_window > 0` bounds attention to the last `sliding_window` positions
-// (Mistral); `0` is full causal attention. Mirrors `attention()` in
-// src/forward/cpu.rs (start = positions - window).
+// (Mistral); `0` is full causal attention (start = positions - window).
 // `scale` is passed in rather than derived from head_dim: Gemma2 decouples it
 // (`query_pre_attn_scalar`). `softcap > 0` squashes each logit through
-// `tanh(s/cap)*cap` before the softmax (Gemma2); 0 disables it. Both mirror
-// `attention()` in src/forward/cpu.rs.
-__global__ void attention_kernel(const float* q, const float* keys, const float* values,
-                                 float* ctx, int num_heads, int num_kv_heads, int head_dim,
-                                 int positions, int sliding_window, float scale, float softcap) {
+// `tanh(s/cap)*cap` before the softmax (Gemma2); 0 disables it.
+__global__ void attn_scores_kernel(const float* q, const float* keys, float* scores,
+                                   int num_heads, int num_kv_heads, int head_dim,
+                                   int start, int span, float scale, float softcap) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)num_heads * span) return;
+    int h = (int)(idx / span);
+    int p = start + (int)(idx % span);
+    int kvh = h / (num_heads / num_kv_heads);
+    const float* qh = q + h * head_dim;
+    const float* kh = keys + (long)p * (num_kv_heads * head_dim) + kvh * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
+    dot *= scale;
+    if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
+    scores[idx] = dot;
+}
+
+__global__ void attn_softmax_kernel(float* scores, int num_heads, int span) {
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= num_heads) return;
-    int group = num_heads / num_kv_heads;
-    int kvh = h / group;
-    int kv_dim = num_kv_heads * head_dim;
-    const float* qh = q + h * head_dim;
-    float* out = ctx + h * head_dim;
-    int start = (sliding_window > 0 && positions > sliding_window)
-                    ? positions - sliding_window
-                    : 0;
-
+    float* row = scores + (long)h * span;
     float maxv = -1e30f;
-    for (int p = start; p < positions; ++p) {
-        const float* kh = keys + (long)p * kv_dim + kvh * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
-        dot *= scale;
-        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
-        if (dot > maxv) maxv = dot;
-    }
-    for (int d = 0; d < head_dim; ++d) out[d] = 0.0f;
+    for (int i = 0; i < span; ++i) if (row[i] > maxv) maxv = row[i];
     float denom = 0.0f;
-    for (int p = start; p < positions; ++p) {
-        const float* kh = keys + (long)p * kv_dim + kvh * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
-        dot *= scale;
-        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
-        float e = expf(dot - maxv);
-        denom += e;
-        const float* vh = values + (long)p * kv_dim + kvh * head_dim;
-        for (int d = 0; d < head_dim; ++d) out[d] += e * vh[d];
+    for (int i = 0; i < span; ++i) {
+        row[i] = expf(row[i] - maxv);
+        denom += row[i];
     }
-    for (int d = 0; d < head_dim; ++d) out[d] /= denom;
+    for (int i = 0; i < span; ++i) row[i] /= denom;
+}
+
+__global__ void attn_mix_kernel(const float* weights, const float* values, float* ctx,
+                                int num_heads, int num_kv_heads, int head_dim,
+                                int start, int span) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * head_dim) return;
+    int h = idx / head_dim;
+    int d = idx % head_dim;
+    int kvh = h / (num_heads / num_kv_heads);
+    const float* row = weights + (long)h * span;
+    long off = (long)kvh * head_dim + d;
+    long kv_dim = (long)num_kv_heads * head_dim;
+    float acc = 0.0f;
+    for (int i = 0; i < span; ++i) acc += row[i] * values[(long)(start + i) * kv_dim + off];
+    ctx[idx] = acc;
 }
 
 // x[i] += y[i]  (residual add).
@@ -319,6 +383,13 @@ __global__ void swiglu_kernel(const float* gate, const float* up, float* out, in
     }
 }
 
+// out[i] = act(x[i]): the ungated MLP's activation (GPT-2, Falcon), where
+// SwiGLU would multiply by the up branch.
+__global__ void activate_kernel(const float* x, float* out, long n, int act) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = dlm_activate(x[i], act);
+}
+
 // Copy `n` floats device→device.
 __global__ void copy_kernel(const float* src, float* dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -336,25 +407,50 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // CPU. The scratch sizes are fixed by model geometry, so allocate once and reuse
 // across every layer and token; realloc only if a later call needs a bigger
 // buffer.
-// thread_local so each inference thread owns its scratch: the multi-GPU path runs
-// one thread per device (each with its own CUDA context), and the test harness
-// runs cases in parallel threads — a single global would race and corrupt
-// buffers across them. Per-thread scratch is allocated on that thread's current
-// device and reclaimed by the driver at process exit.
+// Keyed by thread *and* device. thread_local because the test harness (and any
+// embedder) runs inference on several threads at once, and a single global would
+// race. Per device because one thread can drive several GPUs: the multi-GPU
+// pipeline runs every stage on the inference thread, calling cudaSetDevice
+// before each layer. Scratch keyed by thread alone was allocated on the first
+// stage's device and then handed to every later stage's kernels -- device memory
+// from another GPU, which a launch cannot address. Each (thread, device) pair
+// now allocates its own on that device; the driver reclaims them at exit.
 // Slots 0-10 are the dense decode block's scratch. Slots 11-12 are MoE-only:
 // 11 holds `normed2` (the FFN input) so it survives from `dlm_moe_attn` across
 // the router matvec and every per-expert apply on the same stream; 12 is the
 // router/shared-gate matvec output staged for the D2H copy.
 // Slots 13-18 are MLA-only: normed, q (nh*qk), c_q (q_lora), kv_a (latent+rope),
 // c_kv (latent), and the attention context (nh*v_head_dim).
-enum { SCRATCH_N = 19 };
+// Slot 19 holds the attention logits/weights, [num_heads, attended positions].
+// Slots 20-21 are the LM head's input hidden and output logits.
+// Slots 22-23 are MLA's per-head latent query and latent value mix.
+enum { SCRATCH_N = 24 };
+enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
-static thread_local float* g_scratch[SCRATCH_N] = {0};
-static thread_local int g_scratch_cap[SCRATCH_N] = {0}; // capacity in floats
+enum { DLM_MAX_DEVICES = 16 };
+static thread_local float* g_scratch_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}};
+static thread_local int g_scratch_cap_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}}; // floats
 
-// Ensure scratch slot `i` holds at least `n` floats; (re)allocates only on growth.
+// The current device's index into the scratch tables. A device id past the table
+// is refused by scratch_ensure, which every entry point calls before it reads a
+// slot, so the clamp here only keeps an unreachable index in bounds.
+static inline int scratch_device() {
+    int d = 0;
+    if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= DLM_MAX_DEVICES) return 0;
+    return d;
+}
+// Every existing `g_scratch[i]` / `g_scratch_cap[i]` reads the current device's row.
+#define g_scratch (g_scratch_by_device[scratch_device()])
+#define g_scratch_cap (g_scratch_cap_by_device[scratch_device()])
+
+// Ensure scratch slot `i` holds at least `n` floats on the current device;
+// (re)allocates only on growth.
 static cudaError_t scratch_ensure(int i, int n) {
+    int device = 0;
+    cudaError_t de = cudaGetDevice(&device);
+    if (de != cudaSuccess) return de;
+    if (device < 0 || device >= DLM_MAX_DEVICES) return cudaErrorInvalidDevice;
     if (g_scratch_cap[i] >= n) return cudaSuccess;
     if (g_scratch[i]) cudaFree(g_scratch[i]);
     g_scratch[i] = 0;
@@ -364,7 +460,46 @@ static cudaError_t scratch_ensure(int i, int n) {
     return e;
 }
 
-// `kv_keys` / `kv_values` are **persistent** device buffers (capacity
+// Block shape beyond the Llama default, for the families that are not
+// Llama-descended. Passing NULL means the default: RMSNorm, gated MLP, RoPE,
+// sequential residual, no output/MLP/norm biases. Must match `DlmBlockExt` in
+// src/forward/gpu.rs.
+typedef struct {
+    int layer_norm;               // 1: LayerNorm (+ bias) instead of RMSNorm (GPT-2, Falcon)
+    int gated;                    // 0: ungated MLP, down(act(up(x))) (GPT-2, Falcon)
+    int rope;                     // 0: no rotary (GPT-2's positions are in the embedding)
+    int parallel;                 // 1: the FFN reads the block input's norm (Falcon)
+    const float* in_norm_bias;    // LayerNorm biases; NULL when absent
+    const float* post_norm_bias;
+    const float* o_bias;          // output-projection bias
+    const float* up_bias;         // MLP biases
+    const float* down_bias;
+} DlmBlockExt;
+static const DlmBlockExt DLM_BLOCK_DEFAULT = {0, 1, 1, 0, 0, 0, 0, 0, 0};
+
+// Launch the three attention kernels for one query over `positions` cached
+// tokens. Scores live in scratch slot ATTN_SCORES.
+static cudaError_t launch_attention(const float* q, const float* keys, const float* values,
+                                    float* ctx, int num_heads, int num_kv_heads, int head_dim,
+                                    int positions, int sliding_window, float scale,
+                                    float softcap) {
+    const int B = 256;
+    int start = (sliding_window > 0 && positions > sliding_window) ? positions - sliding_window : 0;
+    int span = positions - start;
+    // The span grows by one every token; sizing to it exactly would free and
+    // re-malloc (two synchronizing driver calls) on every call. Grow in steps.
+    cudaError_t e = scratch_ensure(ATTN_SCORES, num_heads * ((span + 1023) & ~1023));
+    if (e != cudaSuccess) return e;
+    float* scores = g_scratch[ATTN_SCORES];
+    attn_scores_kernel<<<grid_for(num_heads * span, B), B>>>(q, keys, scores, num_heads, num_kv_heads,
+                                                            head_dim, start, span, scale, softcap);
+    attn_softmax_kernel<<<grid_for(num_heads, B), B>>>(scores, num_heads, span);
+    attn_mix_kernel<<<grid_for(num_heads * head_dim, B), B>>>(scores, values, ctx, num_heads,
+                                                             num_kv_heads, head_dim, start, span);
+    return cudaSuccess;
+}
+
+// `kv_keys` / `kv_values` are **persistent** device buffers// `kv_keys` / `kv_values` are **persistent** device buffers (capacity
 // max_positions * kv_dim) owned by the caller across the whole sequence. This
 // call writes the new token's K/V into slot `num_positions` in place and attends
 // over the first `num_positions + 1` slots — so the KV history never leaves VRAM
@@ -391,10 +526,15 @@ extern "C" int dlm_decode_block(
     // Gemma2's extra norm pair; both NULL on every other architecture. When set,
     // `post_norm` normalizes the *attention output* and `pre_ffn_norm` the FFN
     // input, matching `decode_block` in src/forward/cpu.rs.
-    const float* pre_ffn_norm, const float* post_ffn_norm)
+    const float* pre_ffn_norm, const float* post_ffn_norm,
+    const DlmBlockExt* ext)                // NULL: the Llama block shape
 {
     const int B = 256;
     int total_pos = num_positions + 1;
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    #define DLM_NORM(src, w, bias, dst) { \
+        if (o->layer_norm) layernorm_kernel<<<1, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
+        else rmsnorm_kernel<<<1, RMS_THREADS>>>((src), (w), (dst), hidden_size, rms_eps); }
     if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
     const int gemma2 = (pre_ffn_norm != 0);
 
@@ -422,35 +562,48 @@ extern "C" int dlm_decode_block(
 
     if (e == cudaSuccess) {
         // Attention sublayer.
-        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+        DLM_NORM(x, in_norm, o->in_norm_bias, normed)
         launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
         // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
-        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, rope_mscale);
-        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
+        if (o->rope) {
+            rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, rope_mscale);
+            rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
+        }
 
         // Append this token's K/V into the persistent history at slot num_positions.
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
 
         // Attend over history + this token, reading the persistent buffers directly.
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
-        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
+        e = launch_attention(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        if (e != cudaSuccess) return (int)e;
+        launch_matvec(w_dtype, o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, w_group_size);
         // Gemma2 norms the attention output before the residual add (in place, so
         // the add below is unchanged); elsewhere it goes in raw.
         if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
+        // Falcon's parallel block: the FFN reads the norm of the block *input*,
+        // so take it before the attention output lands in `x`.
+        if (o->parallel) DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
-        // MLP sublayer (SwiGLU). Gemma2 uses its dedicated pre-FFN norm here,
-        // since `post_norm` was already spent on the attention output.
-        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, gemma2 ? pre_ffn_norm : post_norm, normed2, hidden_size, rms_eps);
-        launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
-        launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size);
-        swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
-        launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size);
+        // MLP sublayer. Gemma2 uses its dedicated pre-FFN norm here, since
+        // `post_norm` was already spent on the attention output.
+        if (!o->parallel) {
+            if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
+            else DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
+        }
+        launch_matvec(w_dtype, up_proj, normed2, o->up_bias, up, inter, hidden_size, w_group_size);
+        if (o->gated) {
+            launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
+            swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
+        } else {
+            activate_kernel<<<grid_for(inter, B), B>>>(up, inter_buf, (long)inter, activation);
+        }
+        launch_matvec(w_dtype, down_proj, inter_buf, o->down_bias, down, hidden_size, inter, w_group_size);
         if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
@@ -465,6 +618,7 @@ extern "C" int dlm_decode_block(
         e = cudaGetLastError();
     }
 
+    #undef DLM_NORM
     // Scratch is persistent — not freed here. It is reused across every layer and
     // token and reclaimed by the driver at process exit.
     return (int)e;
@@ -558,6 +712,43 @@ __global__ void rmsnorm_batched_kernel(const float* x, const float* w, float* ou
     for (int i = threadIdx.x; i < n; i += blockDim.x) ob[i] = xb[i] * inv_rms * w[i];
 }
 
+// LayerNorm over B rows: one block per row, as rmsnorm_batched_kernel.
+__global__ void layernorm_batched_kernel(const float* x, const float* w, const float* b,
+                                         float* out, int n, float eps) {
+    __shared__ float partial[RMS_THREADS];
+    __shared__ float mean;
+    __shared__ float inv_std;
+    const float* xb = x + (long)blockIdx.x * n;
+    float* ob = out + (long)blockIdx.x * n;
+
+    float s = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) s += xb[k];
+    partial[threadIdx.x] = s;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) mean = partial[0] / (float)n;
+    __syncthreads();
+
+    float ss = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        float d = xb[k] - mean;
+        ss += d * d;
+    }
+    partial[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_std = rsqrtf(partial[0] / (float)n + eps);
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        ob[i] = (xb[i] - mean) * inv_std * w[i] + (b ? b[i] : 0.0f);
+}
+
 // SwiGLU/GeGLU over the whole [batch, inter] plane.
 __global__ void swiglu_batched_kernel(const float* gate, const float* up, float* out, long n,
                                       int act) {
@@ -590,10 +781,15 @@ extern "C" int dlm_decode_block_batched(
     int batch,
     int sliding_window, int activation, float rope_mscale,
     float attn_scale, float attn_softcap,
-    const float* pre_ffn_norm, const float* post_ffn_norm)
+    const float* pre_ffn_norm, const float* post_ffn_norm,
+    const DlmBlockExt* ext)
 {
     const int B = 256;
     if (batch <= 0) return 0;
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    #define DLM_NORM_B(src, w, bias, dst) { \
+        if (o->layer_norm) layernorm_batched_kernel<<<batch, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
+        else rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>((src), (w), (dst), hidden_size, rms_eps); }
     if (batch > DLM_MAX_BATCH) return (int)cudaErrorInvalidValue;
     if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
     const int gemma2 = (pre_ffn_norm != 0);
@@ -620,7 +816,7 @@ extern "C" int dlm_decode_block_batched(
 
     // Attention sublayer. Projections are batched (one weight read for all
     // slots); everything downstream of them is per-slot state.
-    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    DLM_NORM_B(x, in_norm, o->in_norm_bias, normed)
     launch_matvec_batched(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size, batch);
     launch_matvec_batched(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size, batch);
     launch_matvec_batched(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size, batch);
@@ -636,32 +832,42 @@ extern "C" int dlm_decode_block_batched(
 
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(qb, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(kb, k_norm, num_kv_heads, head_dim, rms_eps);
-        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(qb, num_heads, head_dim, pos, inv_freq, rope_mscale);
-        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(kb, num_kv_heads, head_dim, pos, inv_freq, rope_mscale);
+        if (o->rope) {
+            rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(qb, num_heads, head_dim, pos, inv_freq, rope_mscale);
+            rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(kb, num_kv_heads, head_dim, pos, inv_freq, rope_mscale);
+        }
         copy_kernel<<<grid_for(kv_dim, B), B>>>(kb, kv_keys->p[b] + (long)np * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(vb, kv_values->p[b] + (long)np * kv_dim, kv_dim);
-        attention_kernel<<<grid_for(num_heads, B), B>>>(qb, kv_keys->p[b], kv_values->p[b], ctxb,
-                                                        num_heads, num_kv_heads, head_dim,
-                                                        total_pos, sliding_window, attn_scale,
-                                                        attn_softcap);
+        e = launch_attention(qb, kv_keys->p[b], kv_values->p[b], ctxb, num_heads, num_kv_heads,
+                             head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        if (e != cudaSuccess) return (int)e;
     }
 
-    launch_matvec_batched(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size, batch);
+    launch_matvec_batched(w_dtype, o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, w_group_size, batch);
     if (gemma2) {
         rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
     }
+    if (o->parallel) DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
     add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, attn_out, (long)batch * hidden_size);
 
     // MLP sublayer — all batched.
-    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, gemma2 ? pre_ffn_norm : post_norm, normed2, hidden_size, rms_eps);
-    launch_matvec_batched(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size, batch);
-    launch_matvec_batched(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size, batch);
-    swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
-    launch_matvec_batched(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size, batch);
+    if (!o->parallel) {
+        if (gemma2) rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
+        else DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
+    }
+    launch_matvec_batched(w_dtype, up_proj, normed2, o->up_bias, up, inter, hidden_size, w_group_size, batch);
+    if (o->gated) {
+        launch_matvec_batched(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size, batch);
+        swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
+    } else {
+        activate_kernel<<<grid_for(batch * inter, B), B>>>(up, inter_buf, (long)batch * inter, activation);
+    }
+    launch_matvec_batched(w_dtype, down_proj, inter_buf, o->down_bias, down, hidden_size, inter, w_group_size, batch);
     if (gemma2) {
         rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
     }
     add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, down, (long)batch * hidden_size);
+    #undef DLM_NORM_B
     return (int)cudaGetLastError();
 }
 
@@ -732,7 +938,8 @@ extern "C" int dlm_moe_attn(
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        e = launch_attention(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        if (e != cudaSuccess) return (int)e;
         launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
         // FFN input, reused by the router matvec and every expert.
@@ -774,6 +981,29 @@ extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_g
     // is negligible against the expert GEMVs that follow.
     if (e == cudaSuccess)
         e = cudaMemcpy(y_host, g_scratch[MOE_MATVEC], (size_t)out_dim * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+    return (int)e;
+}
+
+// The LM head: `logits_host[0..vocab] = W · x_host`. The host applies the final
+// norm (one hidden-wide vector) and uploads the result; the vocabulary-wide GEMV
+// -- by far the largest single matvec in a decode step -- runs here, and the
+// logits come back in one blocking copy.
+extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                           const void* w, const float* x_host, float* logits_host)
+{
+    cudaError_t e = scratch_ensure(LM_X, hidden_size);
+    if (e == cudaSuccess) e = scratch_ensure(LM_LOGITS, vocab);
+    if (e == cudaSuccess)
+        e = cudaMemcpy(g_scratch[LM_X], x_host, (size_t)hidden_size * sizeof(float),
+                       cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) {
+        launch_matvec(w_dtype, w, g_scratch[LM_X], (const float*)0, g_scratch[LM_LOGITS],
+                      vocab, hidden_size, w_group_size);
+        e = cudaGetLastError();
+    }
+    if (e == cudaSuccess)
+        e = cudaMemcpy(logits_host, g_scratch[LM_LOGITS], (size_t)vocab * sizeof(float),
                        cudaMemcpyDeviceToHost);
     return (int)e;
 }
@@ -1006,83 +1236,120 @@ __global__ void mla_rope_q_kernel(float* q, int num_heads, int qk, int nope, int
     q[base + i + half] = a * s + b * c;
 }
 
-// Reconstruct kv_b row `row` (of the `[., latent]` up-projection) dotted with the
-// cached latent `c_kv` — i.e. one element of the on-the-fly K or V reconstruction.
+// MLA attention over `positions` cached latents, without reconstructing K or V.
+//
+// Each position caches `[c_p ; k_pe_p]`, and head h's key/value are linear in
+// the latent: k_nope = K_h c_p, v = V_h c_p, where K_h and V_h are head h's rows
+// of `kv_b`. So both sides of attention factor through latent space:
+//
+//   score(h, p) = q_nope_h . (K_h c_p) + q_rope_h . k_pe_p
+//               = (K_h^T q_nope_h) . c_p + q_rope_h . k_pe_p
+//   ctx_h       = sum_p w(h, p) V_h c_p  =  V_h (sum_p w(h, p) c_p)
+//
+// Five launches, each parallel over a grid:
+//
+//   1. mla_query_latent_kernel  (head, latent)   u_h = K_h^T q_nope_h
+//   2. mla_scores_kernel        (head, position) the scaled logit
+//   3. attn_softmax_kernel      (head)           softmax of each row, shared
+//                                                with standard attention
+//   4. mla_mix_kernel           (head, latent)   m_h = sum_p w(h, p) c_p
+//   5. mla_values_kernel        (head, v dim)    ctx_h = V_h m_h
+//
+// The previous kernel ran one thread per head and rebuilt every K and V element
+// of every position with a latent-wide dot product through `kv_b`: heads x
+// positions x (2 nope + v) x latent weight reads per token, per layer, serially
+// per head. This is heads x (nope + v) x latent once, plus heads x positions x
+// (latent + rope). `mla_attention_sublayer` in src/forward/cpu.rs reconstructs
+// explicitly; the two agree up to the order of floating-point sums.
 template <int DT>
-__device__ __forceinline__ float mla_row_dot(const void* kv_b, long row, int latent,
-                                             const float* c_kv, long n, int group) {
-    long base = row * (long)latent;
-    float s = 0.0f;
-    for (int l = 0; l < latent; ++l) s += load_w<DT>(kv_b, base + l, n, group) * c_kv[l];
-    return s;
-}
-
-// One thread per query head. Reconstructs k_nope/v for each cached position from
-// the latent via `kv_b` (dtype DT), scores with the split nope/rope query, and
-// accumulates the value context. Slow but a faithful oracle mirror.
-template <int DT>
-__global__ void mla_attention_kernel(const float* q, const float* kv_keys, const void* kv_b,
-                                     int kv_b_group, float* ctx, int num_heads, int nope, int rope,
-                                     int vdim, int latent, int positions, float scale) {
-    int h = blockIdx.x * blockDim.x + threadIdx.x;
-    if (h >= num_heads) return;
+__global__ void mla_query_latent_kernel(const float* q, const void* kv_b, int kv_b_group,
+                                        float* u, int num_heads, int nope, int rope, int vdim,
+                                        int latent) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * latent) return;
+    int h = idx / latent, l = idx % latent;
     int qk = nope + rope;
-    int kv_dim = latent + rope;
-    int per_head = nope + vdim;
-    long kv_b_n = (long)num_heads * per_head * latent;
+    long per_head = nope + vdim;
+    long n = (long)num_heads * per_head * latent;
     const float* q_nope = q + (long)h * qk;
-    const float* q_rope = q + (long)h * qk + nope;
-    float* out = ctx + (long)h * vdim;
-
-    float maxv = -1e30f;
-    for (int p = 0; p < positions; ++p) {
-        const float* ck = kv_keys + (long)p * kv_dim;
-        const float* kpe = ck + latent;
-        float sc = 0.0f;
-        for (int d = 0; d < nope; ++d)
-            sc += q_nope[d] * mla_row_dot<DT>(kv_b, (long)h * per_head + d, latent, ck, kv_b_n, kv_b_group);
-        for (int d = 0; d < rope; ++d) sc += q_rope[d] * kpe[d];
-        sc *= scale;
-        if (sc > maxv) maxv = sc;
-    }
-    for (int d = 0; d < vdim; ++d) out[d] = 0.0f;
-    float denom = 0.0f;
-    for (int p = 0; p < positions; ++p) {
-        const float* ck = kv_keys + (long)p * kv_dim;
-        const float* kpe = ck + latent;
-        float sc = 0.0f;
-        for (int d = 0; d < nope; ++d)
-            sc += q_nope[d] * mla_row_dot<DT>(kv_b, (long)h * per_head + d, latent, ck, kv_b_n, kv_b_group);
-        for (int d = 0; d < rope; ++d) sc += q_rope[d] * kpe[d];
-        float ex = expf(sc * scale - maxv);
-        denom += ex;
-        for (int d = 0; d < vdim; ++d)
-            out[d] += ex * mla_row_dot<DT>(kv_b, (long)h * per_head + nope + d, latent, ck, kv_b_n, kv_b_group);
-    }
-    for (int d = 0; d < vdim; ++d) out[d] /= denom;
+    float acc = 0.0f;
+    for (int d = 0; d < nope; ++d)
+        acc += q_nope[d] * load_w<DT>(kv_b, ((long)h * per_head + d) * latent + l, n, kv_b_group);
+    u[idx] = acc;
 }
 
-static void launch_mla_attention(int dt, const float* q, const float* kv_keys, const void* kv_b,
-                                 int kv_b_group, float* ctx, int num_heads, int nope, int rope,
-                                 int vdim, int latent, int positions, float scale) {
-    int grid = grid_for(num_heads, 64);
+__global__ void mla_scores_kernel(const float* q, const float* u, const float* kv_keys,
+                                  float* scores, int num_heads, int nope, int rope, int latent,
+                                  int positions, float scale) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)num_heads * positions) return;
+    int h = (int)(idx / positions), p = (int)(idx % positions);
+    const float* ck = kv_keys + (long)p * (latent + rope);
+    const float* uh = u + (long)h * latent;
+    const float* q_rope = q + (long)h * (nope + rope) + nope;
+    float sc = 0.0f;
+    for (int l = 0; l < latent; ++l) sc += uh[l] * ck[l];
+    for (int d = 0; d < rope; ++d) sc += q_rope[d] * ck[latent + d];
+    scores[idx] = sc * scale;
+}
+
+__global__ void mla_mix_kernel(const float* weights, const float* kv_keys, float* m,
+                               int num_heads, int rope, int latent, int positions) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * latent) return;
+    int h = idx / latent, l = idx % latent;
+    const float* row = weights + (long)h * positions;
+    long kv_dim = latent + rope;
+    float acc = 0.0f;
+    for (int p = 0; p < positions; ++p) acc += row[p] * kv_keys[(long)p * kv_dim + l];
+    m[idx] = acc;
+}
+
+template <int DT>
+__global__ void mla_values_kernel(const float* m, const void* kv_b, int kv_b_group, float* ctx,
+                                  int num_heads, int nope, int vdim, int latent) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * vdim) return;
+    int h = idx / vdim, d = idx % vdim;
+    long per_head = nope + vdim;
+    long n = (long)num_heads * per_head * latent;
+    long base = ((long)h * per_head + nope + d) * latent;
+    const float* mh = m + (long)h * latent;
+    float acc = 0.0f;
+    for (int l = 0; l < latent; ++l) acc += load_w<DT>(kv_b, base + l, n, kv_b_group) * mh[l];
+    ctx[idx] = acc;
+}
+
+// Launch the MLA attention kernels for weights in dtype `dt`.
+static cudaError_t launch_mla_attention(int dt, const float* q, const float* kv_keys,
+                                        const void* kv_b, int kv_b_group, float* ctx,
+                                        int num_heads, int nope, int rope, int vdim, int latent,
+                                        int positions, float scale) {
+    const int B = 256;
+    cudaError_t e = scratch_ensure(MLA_U, num_heads * latent);
+    if (e == cudaSuccess) e = scratch_ensure(MLA_M, num_heads * latent);
+    // Grown in steps, as in launch_attention: the span grows by one every token.
+    if (e == cudaSuccess) e = scratch_ensure(ATTN_SCORES, num_heads * ((positions + 1023) & ~1023));
+    if (e != cudaSuccess) return e;
+    float* u = g_scratch[MLA_U];
+    float* m = g_scratch[MLA_M];
+    float* scores = g_scratch[ATTN_SCORES];
+    int hl = grid_for(num_heads * latent, B);
+    #define DLM_MLA_DT(DT) \
+        mla_query_latent_kernel<DT><<<hl, B>>>(q, kv_b, kv_b_group, u, num_heads, nope, rope, vdim, latent); \
+        mla_scores_kernel<<<grid_for(num_heads * positions, B), B>>>(q, u, kv_keys, scores, num_heads, nope, rope, latent, positions, scale); \
+        attn_softmax_kernel<<<grid_for(num_heads, B), B>>>(scores, num_heads, positions); \
+        mla_mix_kernel<<<hl, B>>>(scores, kv_keys, m, num_heads, rope, latent, positions); \
+        mla_values_kernel<DT><<<grid_for(num_heads * vdim, B), B>>>(m, kv_b, kv_b_group, ctx, num_heads, nope, vdim, latent);
     switch (dt) {
-        case DLM_W_BF16:
-            mla_attention_kernel<DLM_W_BF16><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        case DLM_W_F16:
-            mla_attention_kernel<DLM_W_F16><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        case DLM_W_INT4:
-            mla_attention_kernel<DLM_W_INT4><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        case DLM_W_INT8:
-            mla_attention_kernel<DLM_W_INT8><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        default:
-            mla_attention_kernel<DLM_W_F32><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
+        case DLM_W_BF16: DLM_MLA_DT(DLM_W_BF16) break;
+        case DLM_W_F16: DLM_MLA_DT(DLM_W_F16) break;
+        case DLM_W_INT4: DLM_MLA_DT(DLM_W_INT4) break;
+        case DLM_W_INT8: DLM_MLA_DT(DLM_W_INT8) break;
+        default: DLM_MLA_DT(DLM_W_F32) break;
     }
+    #undef DLM_MLA_DT
+    return cudaSuccess;
 }
 
 // One MLA attention sublayer. All attention-projection weights share `w_dtype`.
@@ -1146,7 +1413,8 @@ extern "C" int dlm_mla_attn(
     copy_kernel<<<grid_for(qk_rope, B), B>>>(kva + latent, kv_keys + (long)num_positions * kv_dim + latent, qk_rope);
     // Attend (reconstructing K/V from each cached latent), then output-project.
     float scale = rope_mscale * rope_mscale / sqrtf((float)qk);
-    launch_mla_attention(w_dtype, q, kv_keys, kv_b_proj, w_group_size, ctx, num_heads, qk_nope, qk_rope, v_head_dim, latent, total_pos, scale);
+    e = launch_mla_attention(w_dtype, q, kv_keys, kv_b_proj, w_group_size, ctx, num_heads, qk_nope, qk_rope, v_head_dim, latent, total_pos, scale);
+    if (e != cudaSuccess) return (int)e;
     // o = o_proj · ctx, added into the residual (scratch slot 0 reused for `o`).
     if (e == cudaSuccess) e = scratch_ensure(0, hidden_size);
     if (e == cudaSuccess) {

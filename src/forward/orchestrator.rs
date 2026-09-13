@@ -142,6 +142,40 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         Ok(())
     }
 
+    /// Advance the sequence by `hiddens.len() / hidden_size` tokens at once — a
+    /// prompt prefill. Each token's hidden state is updated in place; the result
+    /// is identical to calling [`decode_token`](Self::decode_token) on each in
+    /// turn, but the kernel chooses the order ([`ComputeKernel::prefill`]).
+    pub fn prefill(&mut self, hiddens: &mut [f32]) -> Result<()> {
+        let hidden_size = self.kernel.hidden_size();
+        if hiddens.is_empty() || hiddens.len() % hidden_size != 0 {
+            return Err(DlmError::ShapeMismatch {
+                expected: hidden_size,
+                got: hiddens.len(),
+            });
+        }
+        let n = hiddens.len() / hidden_size;
+        self.budget.append_tokens(SEQ_ID, n as u64)?;
+        self.kernel
+            .prefill(hiddens, &mut self.kv_layers, self.position)?;
+        self.position += n;
+        Ok(())
+    }
+
+    /// Roll the sequence back to its first `len` tokens, discarding the K/V and
+    /// budget of everything after (a no-op if it holds `len` or fewer). How a
+    /// speculative round drops the draft tokens the target rejected.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.position {
+            return;
+        }
+        for kv in &mut self.kv_layers {
+            kv.truncate(len);
+        }
+        self.budget.truncate_sequence(SEQ_ID, len as u64);
+        self.position = len;
+    }
+
     /// Absolute position of the next token (tokens decoded so far).
     pub fn position(&self) -> usize {
         self.position

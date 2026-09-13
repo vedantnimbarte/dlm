@@ -479,3 +479,84 @@ fn qwen_family_fixture_stays_byte_level() {
     );
     assert_round_trip(&tok, "qwen2.5");
 }
+
+/// `--chat-template auto` against each family's real `tokenizer_config.json`:
+/// the fingerprint must pick the format the model was trained on, and that
+/// format's end-of-turn marker must be a real token, or generation would run
+/// past the turn. Families whose fixture ships no template (base models, and
+/// mirrors that predate chat templates) must detect as none, not as a guess.
+#[test]
+fn chat_template_auto_detection_per_family() {
+    use dlm::server::engine::ChatTemplate;
+    let cases = [
+        ("qwen2.5", Some(ChatTemplate::ChatMl)),
+        ("qwen3", Some(ChatTemplate::ChatMl)),
+        ("qwen2-moe", Some(ChatTemplate::ChatMl)),
+        ("mixtral", Some(ChatTemplate::ChatMl)), // Nous-Hermes fine-tune: ChatML
+        ("llama-3", Some(ChatTemplate::Llama3)),
+        ("gemma-1", Some(ChatTemplate::Gemma)),
+        ("gemma-2", Some(ChatTemplate::Gemma)),
+        ("phi-3", Some(ChatTemplate::Phi3)),
+        ("deepseek-v2", Some(ChatTemplate::DeepSeek)),
+        ("llama-2", None),
+        ("mistral", None),
+        ("gpt2", None),
+        ("falcon", None),
+    ];
+    for (family, want) in cases {
+        let Some(dir) = fixture(family) else {
+            eprintln!("skipping {family}: fixture absent");
+            continue;
+        };
+        let got = ChatTemplate::read_jinja(&dir).and_then(|j| ChatTemplate::detect(&j));
+        assert_eq!(got, want, "{family}: wrong chat template detected");
+        if let Some(eot) = got.and_then(|t| t.end_of_turn()) {
+            let tok = BpeTokenizer::from_dir(&dir).expect("tokenizer");
+            assert!(
+                tok.id_of(eot).is_some(),
+                "{family}: end-of-turn {eot:?} is not a token"
+            );
+        }
+    }
+}
+
+/// Gemma 3: Gemma 2's norm layout and (1+w) norms, plus a 5:1 local/global layer
+/// pattern whose local layers use their own RoPE base. The 1B states the pattern
+/// as `sliding_window_pattern: 6`; the 270M as a `layer_types` list; the 4B nests
+/// the whole text model in a multimodal config's `text_config`. All must resolve
+/// to the same rule, and to layers 5, 11, 17, ... being the global ones.
+#[test]
+fn gemma3_family_fixtures() {
+    use dlm::server::engine::ChatTemplate;
+    for (family, window) in [
+        ("gemma-3", 512),
+        ("gemma-3-270m", 512),
+        ("gemma-3-4b", 1024),
+    ] {
+        let Some(dir) = fixture(family) else {
+            eprintln!("skipping {family}: fixture absent");
+            return;
+        };
+        let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16)
+            .unwrap_or_else(|e| panic!("{family} config.json: {e}"));
+        assert_eq!(cfg.sliding_window_pattern, Some(6), "{family}");
+        assert_eq!(cfg.sliding_window, Some(window), "{family}");
+        assert_eq!(cfg.rope_local_theta, Some(10_000.0), "{family}");
+        assert_eq!(cfg.rope_theta, 1_000_000.0, "{family}");
+        assert!(cfg.gemma2_norms && cfg.norm_add_one, "{family}");
+        assert_eq!(
+            cfg.attn_logit_softcap, None,
+            "{family}: Gemma 3 dropped softcapping"
+        );
+        assert_eq!(cfg.final_logit_softcap, None, "{family}");
+        assert_eq!(cfg.explicit_head_dim, Some(256), "{family}");
+
+        let tok = BpeTokenizer::from_dir(&dir).expect("gemma-3 tokenizer");
+        assert!(tok.bos_id().is_some(), "{family}: trained with <bos>");
+        assert!(tok.id_of("<end_of_turn>").is_some(), "{family}");
+        assert_round_trip(&tok, family);
+
+        let template = ChatTemplate::read_jinja(&dir).and_then(|j| ChatTemplate::detect(&j));
+        assert_eq!(template, Some(ChatTemplate::Gemma), "{family}");
+    }
+}

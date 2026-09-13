@@ -82,12 +82,18 @@ pub struct BlockConfig {
     /// `window` positions. `None` is full causal attention. Bounds only the
     /// attention *read*, not KV storage.
     pub sliding_window: Option<usize>,
-    /// Gemma2 alternates windowed and global attention layers instead of applying
-    /// [`sliding_window`](Self::sliding_window) to all of them. `Some(n)` means a
-    /// layer is windowed only when `layer % n == 0` (Gemma2 ships `n = 2`, so
-    /// even layers are local and odd layers see full history). `None` applies the
+    /// Gemma2/3 interleave windowed and global attention layers instead of
+    /// applying [`sliding_window`](Self::sliding_window) to all of them. `Some(n)`
+    /// makes every `n`-th layer global -- the last of each group, where
+    /// `(layer + 1) % n == 0` -- and the rest windowed: Gemma2 ships `n = 2` (even
+    /// layers local), Gemma3 `n = 6` (five local, one global). `None` applies the
     /// window uniformly. Resolve per layer with [`Self::window_for_layer`].
     pub sliding_window_pattern: Option<u32>,
+    /// Gemma3 rotates its windowed layers with a different RoPE base
+    /// (`rope_local_base_freq`, 10k) than its global ones (`rope_theta`, 1M), and
+    /// applies `rope_scaling` to the global layers only. `None` everywhere else.
+    /// Resolved per layer by [`Self::for_layer`].
+    pub rope_local_theta: Option<f32>,
     /// Gemma2 caps attention logits at `tanh(score / cap) * cap` before the
     /// softmax, bounding the scores a long context can produce. `None` elsewhere.
     pub attn_logit_softcap: Option<f32>,
@@ -159,17 +165,29 @@ impl BlockConfig {
     /// attention path.
     pub fn window_for_layer(&self, layer: u32) -> Option<usize> {
         match self.sliding_window_pattern {
-            Some(n) if n > 0 && layer % n != 0 => None,
+            Some(n) if n > 0 && (layer + 1) % n == 0 => None,
             _ => self.sliding_window,
         }
+    }
+
+    /// Whether `layer` rotates with the local RoPE base (a Gemma3 windowed layer).
+    pub fn uses_local_rope(&self, layer: u32) -> bool {
+        self.rope_local_theta.is_some() && self.window_for_layer(layer).is_some()
     }
 
     /// This block's `BlockConfig` with the sliding window resolved for `layer`.
     /// Kernels call this once per `run_block` so everything downstream — CPU
     /// attention and the device kernels alike — reads one already-correct window.
     pub fn for_layer(&self, layer: u32) -> Self {
+        let (rope_theta, rope_scaling) = match self.rope_local_theta {
+            Some(local) if self.uses_local_rope(layer) => (local, None),
+            _ => (self.rope_theta, self.rope_scaling),
+        };
         Self {
             sliding_window: self.window_for_layer(layer),
+            rope_theta,
+            rope_scaling,
+            rope_local_theta: None,
             // A resolved config must not re-resolve: the window above is final.
             sliding_window_pattern: None,
             // DeepSeek's leading `first_k_dense_replace` layers carry a plain
@@ -1198,11 +1216,9 @@ impl KvLayerCache {
     }
 
     /// Drop cached positions beyond `n`, keeping the first `n` (a no-op if already
-    /// `<= n`). The rollback hook a **persistent-KV** speculative session would use
-    /// to discard rejected draft tokens — the current speculative path re-prefills
-    /// a fresh cache each verification, so this is not yet on the hot path. On the
-    /// GPU path the device slots are simply overwritten at the reduced length, so
-    /// only the host length (which drives `num_positions`) needs shrinking.
+    /// `<= n`). The speculative session's rollback for rejected draft tokens. On
+    /// the GPU path the device slots are simply overwritten at the reduced length,
+    /// so only the host length (which drives `num_positions`) needs shrinking.
     pub fn truncate(&mut self, n: usize) {
         let kv_dim = self.kv_dim;
         match &mut self.store {
@@ -2384,6 +2400,45 @@ impl ComputeKernel for CpuKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gemma 3 windows five layers in six and rotates those with their own base,
+    /// unscaled; the global layers keep `rope_theta` and `rope_scaling`. Gemma 2's
+    /// alternation is the same rule at `n = 2`.
+    #[test]
+    fn per_layer_window_and_rope_resolution() {
+        let scaling = Some(RopeScaling::Linear { factor: 8.0 });
+        let cfg = BlockConfig {
+            sliding_window: Some(512),
+            sliding_window_pattern: Some(6),
+            rope_theta: 1_000_000.0,
+            rope_scaling: scaling,
+            rope_local_theta: Some(10_000.0),
+            ..Default::default()
+        };
+        for layer in 0..18u32 {
+            let l = cfg.for_layer(layer);
+            if (layer + 1) % 6 == 0 {
+                assert_eq!(l.sliding_window, None, "layer {layer} is global");
+                assert_eq!((l.rope_theta, l.rope_scaling), (1_000_000.0, scaling));
+            } else {
+                assert_eq!(l.sliding_window, Some(512), "layer {layer} is local");
+                assert_eq!((l.rope_theta, l.rope_scaling), (10_000.0, None));
+            }
+        }
+        let gemma2 = BlockConfig {
+            sliding_window: Some(4096),
+            sliding_window_pattern: Some(2),
+            ..Default::default()
+        };
+        let windowed: Vec<bool> = (0..4)
+            .map(|l| gemma2.window_for_layer(l).is_some())
+            .collect();
+        assert_eq!(
+            windowed,
+            [true, false, true, false],
+            "Gemma 2: even layers local"
+        );
+    }
     use crate::model::MoeNaming;
 
     /// LayerNorm against hand-computed values.

@@ -77,6 +77,8 @@ extern "C" {
         // what `post_norm` means — see `decode_block` in cpu.rs.
         pre_ffn_norm: *const f32,
         post_ffn_norm: *const f32,
+        // Non-Llama block shape (GPT-2, Falcon); null for the Llama default.
+        ext: *const DlmBlockExt,
     ) -> i32;
 
     /// MoE layer, part 1: attention sublayer + post-attn norm. Leaves `normed2`
@@ -129,6 +131,17 @@ extern "C" {
         rms_eps: f32,
         post_norm: *const f32,
         x: *mut f32,
+    ) -> i32;
+
+    /// `logits_host[0..vocab] = W · x_host`: the LM head on the device.
+    pub(crate) fn dlm_lm_head(
+        vocab: i32,
+        hidden_size: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        w: *const c_void,
+        x_host: *const f32,
+        logits_host: *mut f32,
     ) -> i32;
 
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
@@ -237,6 +250,8 @@ extern "C" {
         attn_softcap: f32,
         pre_ffn_norm: *const f32,
         post_ffn_norm: *const f32,
+        // Non-Llama block shape (GPT-2, Falcon); null for the Llama default.
+        ext: *const DlmBlockExt,
     ) -> i32;
 
     /// MoE layer, part 3 (**grouped**): apply all `n_experts` selected experts in
@@ -307,6 +322,68 @@ pub(crate) struct DlmSlots {
     pub(crate) p: [*mut f32; DLM_MAX_BATCH],
 }
 
+/// Block shape beyond the Llama default. Matches `DlmBlockExt` in
+/// `src/gpu/kernels.cu`, field for field.
+#[repr(C)]
+pub(crate) struct DlmBlockExt {
+    layer_norm: i32,
+    gated: i32,
+    rope: i32,
+    parallel: i32,
+    in_norm_bias: *const f32,
+    post_norm_bias: *const f32,
+    o_bias: *const f32,
+    up_bias: *const f32,
+    down_bias: *const f32,
+}
+
+impl DlmBlockExt {
+    /// The device block options for `cfg`, pointing at the layer's biases. Every
+    /// field falls out of the config or a bias's presence, so a Llama-shaped
+    /// layer yields exactly the kernel's default.
+    pub(crate) fn new(cfg: &BlockConfig, b: &GpuBlockBiases) -> Self {
+        use crate::forward::cpu::{FfnKind, NormKind};
+        Self {
+            layer_norm: (cfg.norm_kind == NormKind::Layer) as i32,
+            gated: (cfg.ffn_kind == FfnKind::Gated) as i32,
+            rope: (!cfg.learned_positions) as i32,
+            parallel: cfg.parallel_residual as i32,
+            in_norm_bias: bias_ptr(&b.in_norm),
+            post_norm_bias: bias_ptr(&b.post_norm),
+            o_bias: bias_ptr(&b.o),
+            up_bias: bias_ptr(&b.up),
+            down_bias: bias_ptr(&b.down),
+        }
+    }
+}
+
+/// The biases a Llama block does not have: LayerNorm's (GPT-2, Falcon), the
+/// output projection's, and the MLP's. All `None` elsewhere.
+#[derive(Default)]
+pub(crate) struct GpuBlockBiases {
+    pub(crate) in_norm: Option<DeviceBuffer>,
+    pub(crate) post_norm: Option<DeviceBuffer>,
+    pub(crate) o: Option<DeviceBuffer>,
+    pub(crate) up: Option<DeviceBuffer>,
+    pub(crate) down: Option<DeviceBuffer>,
+}
+
+impl GpuBlockBiases {
+    pub(crate) fn upload(t: &LayerTensors) -> Result<Self> {
+        let (up, down) = match &t.ffn {
+            crate::forward::Ffn::Dense(f) => (f.up_bias.as_ref(), f.down_bias.as_ref()),
+            crate::forward::Ffn::Moe { .. } => (None, None),
+        };
+        Ok(Self {
+            in_norm: upload_bias(t.input_layernorm_bias.as_ref())?,
+            post_norm: upload_bias(t.post_attention_layernorm_bias.as_ref())?,
+            o: upload_bias(t.o_bias.as_ref())?,
+            up: upload_bias(up)?,
+            down: upload_bias(down)?,
+        })
+    }
+}
+
 /// Per-slot integers (history length, RoPE position). Matches `DlmInts`.
 #[repr(C)]
 pub(crate) struct DlmInts {
@@ -328,6 +405,85 @@ pub(crate) fn upload_bias(bias: Option<&Vec<f32>>) -> Result<Option<DeviceBuffer
 /// Device pointer for an optional buffer — NULL when absent.
 pub(crate) fn bias_ptr(b: &Option<DeviceBuffer>) -> *const f32 {
     b.as_ref().map_or(std::ptr::null(), |d| d.as_ptr())
+}
+
+/// The LM head resident in VRAM. Decoding ends every step with a
+/// `vocab × hidden` GEMV -- 233M multiply-adds for a 151,936-token vocabulary at
+/// hidden 1536 -- which on the host costs more than the whole GPU layer stack
+/// of a small model.
+pub struct GpuLmHead {
+    /// The GPU holding `w`, when that is not simply the current device. A
+    /// multi-GPU pipeline leaves whichever stage ran last current, so the head
+    /// must select its own device before launching on its own buffer.
+    device: Option<u32>,
+    w: DeviceBuffer,
+    w_dtype: i32,
+    w_group_size: i32,
+    vocab: usize,
+    hidden: usize,
+}
+
+impl GpuLmHead {
+    /// Upload `head` (row-major `[vocab, hidden]`, already in the precision the
+    /// caller chose) to `device`, or to the current device when `None`.
+    pub fn new(
+        head: &crate::forward::Weights,
+        vocab: usize,
+        hidden: usize,
+        device: Option<u32>,
+    ) -> Result<Self> {
+        if head.len() != vocab * hidden {
+            return Err(DlmError::ShapeMismatch {
+                expected: vocab * hidden,
+                got: head.len(),
+            });
+        }
+        if let Some(id) = device {
+            crate::gpu::set_device(id)?;
+        }
+        Ok(Self {
+            device,
+            w: upload_weight(head)?,
+            w_dtype: head.dtype_code(),
+            w_group_size: head.group_size() as i32,
+            vocab,
+            hidden,
+        })
+    }
+
+    /// Logits for the final-normed hidden state `x`.
+    pub fn logits(&self, x: &[f32]) -> Result<Vec<f32>> {
+        if x.len() != self.hidden {
+            return Err(DlmError::ShapeMismatch {
+                expected: self.hidden,
+                got: x.len(),
+            });
+        }
+        if let Some(id) = self.device {
+            crate::gpu::set_device(id)?;
+        }
+        let mut out = vec![0.0f32; self.vocab];
+        // SAFETY: `w` is a live device buffer of `vocab × hidden` weights in
+        // `w_dtype`; `x` and `out` are host slices of the lengths passed.
+        let code = unsafe {
+            dlm_lm_head(
+                self.vocab as i32,
+                self.hidden as i32,
+                self.w_dtype,
+                self.w_group_size,
+                self.w.as_ptr() as *const c_void,
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_lm_head",
+                code,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// One layer's weights plus its persistent K/V history, resident in VRAM.
@@ -354,6 +510,8 @@ struct GpuLayer {
     /// the device block to the Gemma2 norm placement.
     pre_ffn_norm: Option<DeviceBuffer>,
     post_ffn_norm: Option<DeviceBuffer>,
+    /// LayerNorm, output-projection and MLP biases (GPT-2, Falcon).
+    biases: GpuBlockBiases,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -421,6 +579,7 @@ impl GpuLayer {
             mla: t.mla.as_ref().map(GpuMla::upload).transpose()?,
             pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
             post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
+            biases: GpuBlockBiases::upload(t)?,
             w_dtype,
             w_group_size,
         })
@@ -435,6 +594,8 @@ pub struct GpuKernel {
     /// oracle uses ([`rope_inv_freqs`]) and kept resident so the kernel indexes
     /// it instead of recomputing (and possibly diverging from) the formula.
     inv_freq: DeviceBuffer,
+    /// Gemma3's local-layer frequencies; `None` when every layer shares `inv_freq`.
+    local_inv_freq: Option<DeviceBuffer>,
     /// Max tokens the per-layer KV buffers can hold.
     kv_capacity_tokens: usize,
     /// Persistent device buffer for the hidden vector, reused across every layer
@@ -477,6 +638,17 @@ impl GpuKernel {
             cfg.rope_theta,
             cfg.rope_scaling,
         ))?;
+        // Gemma3's windowed layers rotate with their own base, unscaled.
+        let local_inv_freq = cfg
+            .rope_local_theta
+            .map(|theta| {
+                DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
+                    cfg.head_dim,
+                    theta,
+                    None,
+                ))
+            })
+            .transpose()?;
         // MLA rotates only its qk_rope sub-dimension.
         let mla_inv_freq = match &cfg.mla {
             Some(m) => Some(DeviceBuffer::from_slice(
@@ -493,10 +665,93 @@ impl GpuKernel {
             cfg,
             layers: gpu_layers,
             inv_freq,
+            local_inv_freq,
             kv_capacity_tokens: cap,
             d_hidden,
             mla_inv_freq,
         })
+    }
+}
+
+impl GpuKernel {
+    /// The RoPE inverse frequencies `layer` rotates with.
+    fn inv_freq_for(&self, layer: u32) -> *const f32 {
+        match &self.local_inv_freq {
+            Some(local) if self.cfg.uses_local_rope(layer) => local.as_ptr(),
+            _ => self.inv_freq.as_ptr(),
+        }
+    }
+
+    /// One `dlm_decode_block_batched` call over the `[batch, hidden]` device block
+    /// at `x`, for dense standard-attention layer `layer`. The caller owns the
+    /// slot tables and the host KV length bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_block_batched(
+        &self,
+        layer: u32,
+        x: *mut f32,
+        slot_keys: &DlmSlots,
+        slot_values: &DlmSlots,
+        num_positions: &DlmInts,
+        slot_positions: &DlmInts,
+        batch: usize,
+    ) -> Result<()> {
+        let w = &self.layers[layer as usize];
+        let cfg = self.cfg.for_layer(layer);
+        let hidden_size = cfg.hidden_size;
+        let kv_dim = cfg.kv_dim();
+        // SAFETY: all pointers are live device allocations of the sizes the kernel
+        // expects; each slot's KV has room for its `num_positions + 1`-th row.
+        let code = unsafe {
+            dlm_decode_block_batched(
+                hidden_size as i32,
+                cfg.q_dim() as i32,
+                kv_dim as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.intermediate_size as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.gate_proj.as_ptr() as *const c_void,
+                w.up_proj.as_ptr() as *const c_void,
+                w.down_proj.as_ptr() as *const c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq_for(layer),
+                x,
+                slot_keys,
+                slot_values,
+                num_positions,
+                slot_positions,
+                batch as i32,
+                cfg.sliding_window.unwrap_or(0) as i32,
+                cfg.activation.code(),
+                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                cfg.attn_scale(),
+                cfg.attn_logit_softcap.unwrap_or(0.0),
+                bias_ptr(&w.pre_ffn_norm),
+                bias_ptr(&w.post_ffn_norm),
+                &DlmBlockExt::new(&cfg, &w.biases),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_decode_block_batched",
+                code,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -535,11 +790,8 @@ impl ComputeKernel for GpuKernel {
             }
             return Ok(());
         }
-        let w = &self.layers[layer as usize];
-        // Gemma2's alternating window is resolved per layer, as in `run_block`.
-        let cfg = self.cfg.for_layer(layer);
-        let hidden_size = cfg.hidden_size;
-        let kv_dim = cfg.kv_dim();
+        let hidden_size = self.cfg.hidden_size;
+        let kv_dim = self.cfg.kv_dim();
 
         let mut slot_keys = DlmSlots {
             p: [std::ptr::null_mut(); DLM_MAX_BATCH],
@@ -581,56 +833,15 @@ impl ComputeKernel for GpuKernel {
         }
 
         let d_batch = DeviceBuffer::from_slice(&staged)?;
-        // SAFETY: all pointers are live device allocations of the sizes the kernel
-        // expects; each slot's KV has room for its `num_positions + 1`-th row.
-        let code = unsafe {
-            dlm_decode_block_batched(
-                hidden_size as i32,
-                cfg.q_dim() as i32,
-                kv_dim as i32,
-                cfg.num_heads as i32,
-                cfg.num_kv_heads as i32,
-                cfg.head_dim as i32,
-                cfg.intermediate_size as i32,
-                cfg.rms_eps,
-                w.w_dtype,
-                w.w_group_size,
-                w.q_proj.as_ptr() as *const c_void,
-                w.k_proj.as_ptr() as *const c_void,
-                w.v_proj.as_ptr() as *const c_void,
-                w.o_proj.as_ptr() as *const c_void,
-                w.gate_proj.as_ptr() as *const c_void,
-                w.up_proj.as_ptr() as *const c_void,
-                w.down_proj.as_ptr() as *const c_void,
-                w.input_layernorm.as_ptr(),
-                w.post_attention_layernorm.as_ptr(),
-                bias_ptr(&w.q_bias),
-                bias_ptr(&w.k_bias),
-                bias_ptr(&w.v_bias),
-                bias_ptr(&w.q_norm),
-                bias_ptr(&w.k_norm),
-                self.inv_freq.as_ptr(),
-                d_batch.as_mut_ptr(),
-                &slot_keys,
-                &slot_values,
-                &num_positions,
-                &slot_positions,
-                batch as i32,
-                cfg.sliding_window.unwrap_or(0) as i32,
-                cfg.activation.code(),
-                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
-                cfg.attn_scale(),
-                cfg.attn_logit_softcap.unwrap_or(0.0),
-                bias_ptr(&w.pre_ffn_norm),
-                bias_ptr(&w.post_ffn_norm),
-            )
-        };
-        if code != 0 {
-            return Err(DlmError::Gpu {
-                api: "dlm_decode_block_batched",
-                code,
-            });
-        }
+        self.launch_block_batched(
+            layer,
+            d_batch.as_mut_ptr(),
+            &slot_keys,
+            &slot_values,
+            &num_positions,
+            &slot_positions,
+            batch,
+        )?;
         d_batch.download(&mut staged)?;
         for (b, hidden) in hiddens.iter_mut().enumerate() {
             hidden.copy_from_slice(&staged[b * hidden_size..(b + 1) * hidden_size]);
@@ -640,6 +851,74 @@ impl ComputeKernel for GpuKernel {
             kv.append(&vec![0.0; kv_dim], &vec![0.0; kv_dim])?;
         }
         Ok(())
+    }
+
+    /// Prefill a dense model layer by layer, up to [`DLM_MAX_BATCH`] tokens per
+    /// device call. Every slot of a call points at the **same** layer KV, with
+    /// `num_positions = history + b`: the batched block writes slot `b`'s K/V
+    /// and then attends over rows `[0, history + b]`, in slot order on one
+    /// stream, so each token sees exactly the tokens before it — causal prefill
+    /// out of the decode kernel, with each projection read once per chunk. The
+    /// hidden states stay on the device for the whole stack.
+    ///
+    /// MLA layers have no batched block and keep the per-token order.
+    fn prefill(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let hidden_size = self.cfg.hidden_size;
+        let n = hiddens.len() / hidden_size;
+        if n <= 1 || self.cfg.mla.is_some() {
+            return crate::forward::kernel::prefill_token_by_token(self, hiddens, kv_layers, start);
+        }
+        let kv_dim = self.cfg.kv_dim();
+        let zeros = vec![0.0f32; kv_dim];
+        let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
+        for layer in 0..self.num_layers() {
+            let kv = &mut kv_layers[layer as usize];
+            for chunk in (0..n).step_by(DLM_MAX_BATCH) {
+                let batch = (n - chunk).min(DLM_MAX_BATCH);
+                let history = kv.len();
+                if history + batch > self.kv_capacity_tokens {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "GPU KV capacity {} exceeded at position {}",
+                        self.kv_capacity_tokens,
+                        start + chunk + batch - 1
+                    )));
+                }
+                let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
+                let slot_keys = DlmSlots {
+                    p: [keys; DLM_MAX_BATCH],
+                };
+                let slot_values = DlmSlots {
+                    p: [values; DLM_MAX_BATCH],
+                };
+                let num_positions = DlmInts {
+                    v: std::array::from_fn(|b| (history + b) as i32),
+                };
+                let slot_positions = DlmInts {
+                    v: std::array::from_fn(|b| (start + chunk + b) as i32),
+                };
+                // SAFETY: `chunk + batch <= n`, so the offset block lies inside
+                // the `n × hidden` device buffer.
+                let x = unsafe { d_hiddens.as_mut_ptr().add(chunk * hidden_size) };
+                self.launch_block_batched(
+                    layer,
+                    x,
+                    &slot_keys,
+                    &slot_values,
+                    &num_positions,
+                    &slot_positions,
+                    batch,
+                )?;
+                for _ in 0..batch {
+                    kv.append(&zeros, &zeros)?;
+                }
+            }
+        }
+        d_hiddens.download(hiddens)
     }
 
     fn run_block(
@@ -773,7 +1052,7 @@ impl ComputeKernel for GpuKernel {
                         bias_ptr(&w.v_bias),
                         bias_ptr(&w.q_norm),
                         bias_ptr(&w.k_norm),
-                        self.inv_freq.as_ptr(),
+                        self.inv_freq_for(layer),
                         d_hidden.as_mut_ptr(),
                         kv_keys,
                         kv_values,
@@ -785,11 +1064,12 @@ impl ComputeKernel for GpuKernel {
                         // `sliding_window` would clip the global layers too.
                         self.cfg.window_for_layer(layer).unwrap_or(0) as i32,
                         self.cfg.activation.code(),
-                        crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
+                        crate::forward::cpu::rope_mscale(self.cfg.for_layer(layer).rope_scaling),
                         self.cfg.attn_scale(),
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
+                        &DlmBlockExt::new(&self.cfg, &w.biases),
                     )
                 };
                 if code != 0 {

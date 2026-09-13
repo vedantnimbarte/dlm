@@ -508,6 +508,12 @@ impl ModelParts {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
+        let head_norm = self.cfg.norm_kind;
+        let quantized = self
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
         let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
         Ok(Generator::new(
             kernel,
@@ -520,7 +526,9 @@ impl ModelParts {
             self.kv_blocks,
         )?
         .with_embed_scale(embed_scale)
-        .with_final_logit_softcap(logit_cap))
+        .with_head(wpe, ln_f_bias, head_norm)
+        .with_final_logit_softcap(logit_cap)
+        .with_lm_head_on_gpu(quantized, None))
     }
 
     /// Split the model's layers across `gpu_ids` and build a generator over a
@@ -535,8 +543,17 @@ impl ModelParts {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
+        let head_norm = self.cfg.norm_kind;
+        let quantized = self
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
         let kernel =
             crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
+        // The head goes on the last stage's GPU, which produces the final hidden
+        // state. It is not current when logits run, so the head selects it.
+        let head_device = gpu_ids.last().copied();
         Ok(Generator::new(
             kernel,
             self.embedding,
@@ -548,7 +565,9 @@ impl ModelParts {
             self.kv_blocks,
         )?
         .with_embed_scale(embed_scale)
-        .with_final_logit_softcap(logit_cap))
+        .with_head(wpe, ln_f_bias, head_norm)
+        .with_final_logit_softcap(logit_cap)
+        .with_lm_head_on_gpu(quantized, head_device))
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
@@ -563,6 +582,8 @@ impl ModelParts {
     ) -> Result<Generator<PipelineParallelKernel<CpuKernel>>> {
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
+        let head_norm = self.cfg.norm_kind;
         let kernel = PipelineParallelKernel::new(CpuKernel::new(self.cfg, self.layers)?, gpu_ids)?;
         Ok(Generator::new(
             kernel,
@@ -575,6 +596,7 @@ impl ModelParts {
             self.kv_blocks,
         )?
         .with_embed_scale(embed_scale)
+        .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap))
     }
 }
@@ -610,6 +632,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         learned_positions: config.learned_positions,
         mla: config.mla,
         sliding_window_pattern: config.sliding_window_pattern,
+        rope_local_theta: config.rope_local_theta,
         attn_logit_softcap: config.attn_logit_softcap,
         query_pre_attn_scalar: config.query_pre_attn_scalar,
         gemma2_norms: config.gemma2_norms,
@@ -986,9 +1009,20 @@ pub(crate) fn load_layer_tensors_opt(
             q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
             k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
             v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
-            // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3.
-            q_norm: load_optional(store, &name("self_attn.q_norm.weight"), cfg.head_dim)?,
-            k_norm: load_optional(store, &name("self_attn.k_norm.weight"), cfg.head_dim)?,
+            // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3 and Gemma3.
+            // Gemma3's are `(1 + w)` like its other norms.
+            q_norm: load_norm_optional(
+                store,
+                &name("self_attn.q_norm.weight"),
+                cfg.head_dim,
+                norm_add_one,
+            )?,
+            k_norm: load_norm_optional(
+                store,
+                &name("self_attn.k_norm.weight"),
+                cfg.head_dim,
+                norm_add_one,
+            )?,
             mla: None,
             // Gemma2's extra norm pair; absent on every other architecture.
             pre_feedforward_layernorm: load_norm_optional(
@@ -1327,6 +1361,8 @@ struct StreamingPieces {
     kv_blocks: u32,
     embed_scale: Option<f32>,
     final_logit_softcap: Option<f32>,
+    position_embedding: Option<Vec<f32>>,
+    final_norm_bias: Option<Vec<f32>>,
 }
 
 /// Load the pinned pieces (embedding, final norm, LM head, KV sizing) and bind a
@@ -1368,8 +1404,11 @@ fn load_streaming_pieces(
         block_size: 16,
     };
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
+    let (position_embedding, final_norm_bias) = load_head_extras(&store, hidden)?;
 
     Ok(StreamingPieces {
+        position_embedding,
+        final_norm_bias,
         source: MmapLayerSource {
             store,
             cfg,
@@ -1425,6 +1464,7 @@ pub fn build_streaming_generator(
         p.kv_blocks,
     )?
     .with_embed_scale(p.embed_scale)
+    .with_head(p.position_embedding, p.final_norm_bias, cfg.norm_kind)
     .with_final_logit_softcap(p.final_logit_softcap))
 }
 
@@ -1466,7 +1506,36 @@ pub fn build_streaming_gpu_generator(
         p.kv_blocks,
     )?
     .with_embed_scale(p.embed_scale)
-    .with_final_logit_softcap(p.final_logit_softcap))
+    .with_head(p.position_embedding, p.final_norm_bias, cfg.norm_kind)
+    .with_final_logit_softcap(p.final_logit_softcap)
+    // The VRAM plan already reserves the pinned zone (embedding, head, norms)
+    // before sizing the window, so the head fits in what was set aside for it.
+    .with_lm_head_on_gpu(
+        matches!(config.quant, QuantScheme::Int4 | QuantScheme::Int8),
+        None,
+    ))
+}
+
+/// `(position_embedding, final_norm_bias)`; see [`load_head_extras`].
+type HeadExtras = (Option<Vec<f32>>, Option<Vec<f32>>);
+
+/// GPT-2's learned position embeddings (`wpe`), and the final-norm bias GPT-2
+/// and Falcon's LayerNorm head carries. Both `None` on every other family.
+///
+/// Every generator builder needs these, not just the CPU one: a GPT-2 generator
+/// without `wpe` has no positional signal at all and repeats one token, and an
+/// RMSNorm head where a LayerNorm belongs is wrong without erroring.
+fn load_head_extras(store: &MmapStore, hidden: usize) -> Result<HeadExtras> {
+    if is_gpt2_tree(store) {
+        Ok((
+            Some(load_floats(store, "wpe.weight")?),
+            load_optional(store, "ln_f.bias", hidden)?,
+        ))
+    } else if is_falcon_tree(store) {
+        Ok((None, load_optional(store, "transformer.ln_f.bias", hidden)?))
+    } else {
+        Ok((None, None))
+    }
 }
 
 /// Materialize a checkpoint into [`ModelParts`] (host `f32` weights + shapes).
@@ -1530,19 +1599,7 @@ pub fn load_model_parts(
     };
     let kv_blocks = (max_context as u64).div_ceil(16) as u32 + 2;
 
-    // GPT-2 only: `wpe` replaces RoPE entirely, and `ln_f` carries a bias.
-    let position_embedding = if gpt2 {
-        Some(load_floats(store, "wpe.weight")?)
-    } else {
-        None
-    };
-    let final_norm_bias = if falcon {
-        load_optional(store, "transformer.ln_f.bias", hidden)?
-    } else if gpt2 {
-        load_optional(store, "ln_f.bias", hidden)?
-    } else {
-        None
-    };
+    let (position_embedding, final_norm_bias) = load_head_extras(store, hidden)?;
 
     Ok(ModelParts {
         position_embedding,
