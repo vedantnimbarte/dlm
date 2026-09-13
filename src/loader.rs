@@ -528,7 +528,7 @@ impl ModelParts {
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap)
-        .with_lm_head_on_gpu(quantized))
+        .with_lm_head_on_gpu(quantized, None))
     }
 
     /// Split the model's layers across `gpu_ids` and build a generator over a
@@ -545,8 +545,15 @@ impl ModelParts {
         let logit_cap = self.final_logit_softcap;
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
+        let quantized = self
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
         let kernel =
             crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
+        // The head goes on the last stage's GPU, which produces the final hidden
+        // state. It is not current when logits run, so the head selects it.
+        let head_device = gpu_ids.last().copied();
         Ok(Generator::new(
             kernel,
             self.embedding,
@@ -559,7 +566,8 @@ impl ModelParts {
         )?
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
-        .with_final_logit_softcap(logit_cap))
+        .with_final_logit_softcap(logit_cap)
+        .with_lm_head_on_gpu(quantized, head_device))
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
@@ -1502,10 +1510,10 @@ pub fn build_streaming_gpu_generator(
     .with_final_logit_softcap(p.final_logit_softcap)
     // The VRAM plan already reserves the pinned zone (embedding, head, norms)
     // before sizing the window, so the head fits in what was set aside for it.
-    .with_lm_head_on_gpu(matches!(
-        config.quant,
-        QuantScheme::Int4 | QuantScheme::Int8
-    )))
+    .with_lm_head_on_gpu(
+        matches!(config.quant, QuantScheme::Int4 | QuantScheme::Int8),
+        None,
+    ))
 }
 
 /// `(position_embedding, final_norm_bias)`; see [`load_head_extras`].

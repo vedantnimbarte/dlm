@@ -92,6 +92,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--quant`. If it does not fit, dlm warns and keeps the host head. On a GTX
   1650, Qwen2.5-1.5B `--quant int8` generates 128 tokens in 10.2 s instead of
   19.7 s; streamed with 8 of 28 layers resident, 50.5 s instead of 56.6 s.
+  Multi-GPU pipelines place it on the last stage's GPU, which it selects itself
+  before each launch.
 - **Speculative decoding samples, and keeps its KV cache.** With
   `--draft-model-path`, each verification used to rebuild the target's KV
   cache and re-run the whole sequence for every token it checked, and request

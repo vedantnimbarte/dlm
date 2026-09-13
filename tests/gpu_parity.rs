@@ -1678,7 +1678,7 @@ fn gpu_lm_head_matches_host_head() {
     ] {
         let host = build(head).generate(&prompt, &greedy).unwrap();
         let mut dev = build(head);
-        dev.place_lm_head_on_gpu(int8).unwrap();
+        dev.place_lm_head_on_gpu(int8, None).unwrap();
         let got = dev.generate(&prompt, &greedy).unwrap();
         if int8 {
             // Quantization may move a near-tie; most tokens must still agree.
@@ -1868,4 +1868,50 @@ fn gpu_mla_long_context_matches_cpu() {
             .fold(0.0f32, f32::max);
         assert!(d < 2e-3, "{what}: 1,100-token prefill diverged by {d}");
     }
+}
+
+/// A multi-GPU pipeline's LM head lives on the last stage's GPU and must select
+/// that device itself: whichever stage ran last is current when logits run.
+/// With one GPU this can only check the wiring -- a pipeline over `[0, 0]` with
+/// the head placed on device 0 must choose the host head's tokens -- not a real
+/// cross-device run, which needs a second card.
+#[test]
+fn multi_gpu_lm_head_matches_host_head() {
+    use dlm::forward::MultiGpuKernel;
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    let cfg = small_cfg();
+    let vocab = 300;
+    let layers = random_layers(&cfg, 4, 0x4EAF);
+    let mut rng = Rng::new(0x4EB0);
+    let embedding = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let head = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let kv = KvCacheConfig {
+        num_layers: 4,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let build = || {
+        Generator::new(
+            MultiGpuKernel::new(cfg, layers.clone(), &[0, 0], 64).unwrap(),
+            embedding.clone(),
+            vec![1.0; cfg.hidden_size],
+            head.clone(),
+            vocab,
+            1e-5,
+            kv,
+            4,
+        )
+        .unwrap()
+    };
+    let greedy = GenerationConfig {
+        max_new_tokens: 24,
+        eos_token: None,
+        sampler: Sampler::Greedy,
+    };
+    let prompt = [9u32, 200, 41];
+    let want = build().generate(&prompt, &greedy).unwrap();
+    let mut dev = build();
+    dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    assert_eq!(dev.generate(&prompt, &greedy).unwrap(), want);
 }

@@ -448,10 +448,14 @@ impl<K: ComputeKernel> Generator<K> {
     /// lossy weights, and int8 keeps the head's error small (int4 is too coarse
     /// for the one matrix every token's choice goes through).
     ///
+    /// `device` names the GPU to hold it; `None` uses the current device, which
+    /// is right for a single-GPU kernel. A multi-GPU pipeline passes its last
+    /// stage's device, since no one device is current when logits are computed.
+    ///
     /// The host copy is released once the upload succeeds; on failure (VRAM
     /// exhausted, say) the generator is untouched and keeps the host head.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-    pub fn place_lm_head_on_gpu(&mut self, quantize_int8: bool) -> Result<()> {
+    pub fn place_lm_head_on_gpu(&mut self, quantize_int8: bool, device: Option<u32>) -> Result<()> {
         use crate::forward::Weights;
         let head = if quantize_int8 {
             Weights::quantize_int8(&self.lm_head, crate::forward::QUANT_GROUP_SIZE)?
@@ -469,6 +473,7 @@ impl<K: ComputeKernel> Generator<K> {
             &head,
             self.vocab_size,
             self.hidden_size,
+            device,
         )?);
         self.lm_head = Vec::new();
         Ok(())
@@ -478,8 +483,8 @@ impl<K: ComputeKernel> Generator<K> {
     /// host head with a warning rather than failing: a host head is slower, not
     /// wrong.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-    pub fn with_lm_head_on_gpu(mut self, quantize_int8: bool) -> Self {
-        if let Err(e) = self.place_lm_head_on_gpu(quantize_int8) {
+    pub fn with_lm_head_on_gpu(mut self, quantize_int8: bool, device: Option<u32>) -> Self {
+        if let Err(e) = self.place_lm_head_on_gpu(quantize_int8, device) {
             eprintln!("warning: the LM head stays on the CPU ({e}); decoding will be slower");
         }
         self

@@ -412,6 +412,10 @@ pub(crate) fn bias_ptr(b: &Option<DeviceBuffer>) -> *const f32 {
 /// hidden 1536 -- which on the host costs more than the whole GPU layer stack
 /// of a small model.
 pub struct GpuLmHead {
+    /// The GPU holding `w`, when that is not simply the current device. A
+    /// multi-GPU pipeline leaves whichever stage ran last current, so the head
+    /// must select its own device before launching on its own buffer.
+    device: Option<u32>,
     w: DeviceBuffer,
     w_dtype: i32,
     w_group_size: i32,
@@ -421,15 +425,24 @@ pub struct GpuLmHead {
 
 impl GpuLmHead {
     /// Upload `head` (row-major `[vocab, hidden]`, already in the precision the
-    /// caller chose).
-    pub fn new(head: &crate::forward::Weights, vocab: usize, hidden: usize) -> Result<Self> {
+    /// caller chose) to `device`, or to the current device when `None`.
+    pub fn new(
+        head: &crate::forward::Weights,
+        vocab: usize,
+        hidden: usize,
+        device: Option<u32>,
+    ) -> Result<Self> {
         if head.len() != vocab * hidden {
             return Err(DlmError::ShapeMismatch {
                 expected: vocab * hidden,
                 got: head.len(),
             });
         }
+        if let Some(id) = device {
+            crate::gpu::set_device(id)?;
+        }
         Ok(Self {
+            device,
             w: upload_weight(head)?,
             w_dtype: head.dtype_code(),
             w_group_size: head.group_size() as i32,
@@ -445,6 +458,9 @@ impl GpuLmHead {
                 expected: self.hidden,
                 got: x.len(),
             });
+        }
+        if let Some(id) = self.device {
+            crate::gpu::set_device(id)?;
         }
         let mut out = vec![0.0f32; self.vocab];
         // SAFETY: `w` is a live device buffer of `vocab × hidden` weights in
