@@ -1815,3 +1815,57 @@ fn gpu_gemma3_layers_match_cpu() {
     let streamed = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
     assert_prefill_matches_cpu(cfg, layers, streamed, "gemma3 streamed");
 }
+
+/// MLA attention over a long history, in f32 and with `kv_b` quantized to int8.
+/// The device factors attention through latent space (the latent query and the
+/// weighted latent mix) instead of reconstructing K and V per position, so it has
+/// to agree with the CPU oracle's explicit reconstruction on 1,100 positions,
+/// and through each weight decoder the factored kernels read `kv_b` with.
+#[test]
+fn gpu_mla_long_context_matches_cpu() {
+    let (cfg, sh) = mla_test_config(None);
+    for quantize in [false, true] {
+        let mut layers = random_mla_layers(&cfg, sh, 2, 0x31A7, None);
+        if quantize {
+            for l in &mut layers {
+                let mla = l.mla.as_mut().unwrap();
+                let floats: Vec<f32> = (0..mla.kv_b_proj.len())
+                    .map(|i| mla.kv_b_proj.get(i))
+                    .collect();
+                mla.kv_b_proj = Weights::quantize_int8(&floats, 64).unwrap();
+            }
+        }
+        let what = if quantize { "mla int8 kv_b" } else { "mla f32" };
+        let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+        let gpu = GpuKernel::new(cfg, layers, 1200).unwrap();
+        let kv_cfg = KvCacheConfig {
+            num_layers: 2,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            head_dim: cfg.head_dim as u32,
+            block_size: 16,
+        };
+        let mut orch_cpu = ForwardOrchestrator::new(
+            cpu,
+            PagedKvCache::new(kv_cfg, 80),
+            dlm::forward::KvQuant::None,
+        );
+        let mut orch_gpu = ForwardOrchestrator::new(
+            gpu,
+            PagedKvCache::new(kv_cfg, 80),
+            dlm::forward::KvQuant::None,
+        );
+        let h = cfg.hidden_size;
+        let mut rng = Rng::new(0x31A8);
+        let mut want = rng.vec(1100 * h, 0.5);
+        let mut got = want.clone();
+        orch_cpu.prefill(&mut want).unwrap();
+        orch_gpu.prefill(&mut got).unwrap();
+        let tail = 16 * h;
+        let d = want[want.len() - tail..]
+            .iter()
+            .zip(&got[got.len() - tail..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d < 2e-3, "{what}: 1,100-token prefill diverged by {d}");
+    }
+}

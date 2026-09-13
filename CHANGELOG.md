@@ -109,8 +109,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kernel ran one thread per head, each walking the whole history in a scalar
   loop; it is now three launches parallel over (head, position) and (head,
   dim). On a GTX 1650 with Qwen2.5-0.5B at ~600 tokens of context, decode went
-  from 254 to 97 ms/token and a 604-token prefill from 40 s to 11 s. MLA
-  attention (DeepSeek) still uses the per-head kernel.
+  from 254 to 97 ms/token and a 604-token prefill from 40 s to 11 s.
+- **MLA attention (DeepSeek) factors through latent space on the GPU.** It ran
+  one thread per head and rebuilt every cached position's K and V from the
+  latent through `kv_b` for every token. Since K and V are linear in the latent,
+  scores now use the query projected into latent space once, and the context
+  applies `kv_b`'s value rows once to the weighted latent mix, each parallel
+  over (head, position) or (head, latent). At DeepSeek-V2-Lite's dimensions one
+  MLA layer decodes in 1.3–2.1 ms/token over 1–1,024 positions on a GTX 1650,
+  against 913 ms/token (1–256) and 2,812 ms/token (257–512) before.
 - **Chat template auto-detection.** `--chat-template` now defaults to `auto`,
   which fingerprints the checkpoint's Jinja template and picks the matching
   built-in format. Five formats are new — `llama2`, `mistral`, `gemma`,

@@ -418,8 +418,9 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // c_kv (latent), and the attention context (nh*v_head_dim).
 // Slot 19 holds the attention logits/weights, [num_heads, attended positions].
 // Slots 20-21 are the LM head's input hidden and output logits.
-enum { SCRATCH_N = 22 };
-enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21 };
+// Slots 22-23 are MLA's per-head latent query and latent value mix.
+enum { SCRATCH_N = 24 };
+enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
 static thread_local float* g_scratch[SCRATCH_N] = {0};
@@ -1212,83 +1213,120 @@ __global__ void mla_rope_q_kernel(float* q, int num_heads, int qk, int nope, int
     q[base + i + half] = a * s + b * c;
 }
 
-// Reconstruct kv_b row `row` (of the `[., latent]` up-projection) dotted with the
-// cached latent `c_kv` — i.e. one element of the on-the-fly K or V reconstruction.
+// MLA attention over `positions` cached latents, without reconstructing K or V.
+//
+// Each position caches `[c_p ; k_pe_p]`, and head h's key/value are linear in
+// the latent: k_nope = K_h c_p, v = V_h c_p, where K_h and V_h are head h's rows
+// of `kv_b`. So both sides of attention factor through latent space:
+//
+//   score(h, p) = q_nope_h . (K_h c_p) + q_rope_h . k_pe_p
+//               = (K_h^T q_nope_h) . c_p + q_rope_h . k_pe_p
+//   ctx_h       = sum_p w(h, p) V_h c_p  =  V_h (sum_p w(h, p) c_p)
+//
+// Five launches, each parallel over a grid:
+//
+//   1. mla_query_latent_kernel  (head, latent)   u_h = K_h^T q_nope_h
+//   2. mla_scores_kernel        (head, position) the scaled logit
+//   3. attn_softmax_kernel      (head)           softmax of each row, shared
+//                                                with standard attention
+//   4. mla_mix_kernel           (head, latent)   m_h = sum_p w(h, p) c_p
+//   5. mla_values_kernel        (head, v dim)    ctx_h = V_h m_h
+//
+// The previous kernel ran one thread per head and rebuilt every K and V element
+// of every position with a latent-wide dot product through `kv_b`: heads x
+// positions x (2 nope + v) x latent weight reads per token, per layer, serially
+// per head. This is heads x (nope + v) x latent once, plus heads x positions x
+// (latent + rope). `mla_attention_sublayer` in src/forward/cpu.rs reconstructs
+// explicitly; the two agree up to the order of floating-point sums.
 template <int DT>
-__device__ __forceinline__ float mla_row_dot(const void* kv_b, long row, int latent,
-                                             const float* c_kv, long n, int group) {
-    long base = row * (long)latent;
-    float s = 0.0f;
-    for (int l = 0; l < latent; ++l) s += load_w<DT>(kv_b, base + l, n, group) * c_kv[l];
-    return s;
-}
-
-// One thread per query head. Reconstructs k_nope/v for each cached position from
-// the latent via `kv_b` (dtype DT), scores with the split nope/rope query, and
-// accumulates the value context. Slow but a faithful oracle mirror.
-template <int DT>
-__global__ void mla_attention_kernel(const float* q, const float* kv_keys, const void* kv_b,
-                                     int kv_b_group, float* ctx, int num_heads, int nope, int rope,
-                                     int vdim, int latent, int positions, float scale) {
-    int h = blockIdx.x * blockDim.x + threadIdx.x;
-    if (h >= num_heads) return;
+__global__ void mla_query_latent_kernel(const float* q, const void* kv_b, int kv_b_group,
+                                        float* u, int num_heads, int nope, int rope, int vdim,
+                                        int latent) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * latent) return;
+    int h = idx / latent, l = idx % latent;
     int qk = nope + rope;
-    int kv_dim = latent + rope;
-    int per_head = nope + vdim;
-    long kv_b_n = (long)num_heads * per_head * latent;
+    long per_head = nope + vdim;
+    long n = (long)num_heads * per_head * latent;
     const float* q_nope = q + (long)h * qk;
-    const float* q_rope = q + (long)h * qk + nope;
-    float* out = ctx + (long)h * vdim;
-
-    float maxv = -1e30f;
-    for (int p = 0; p < positions; ++p) {
-        const float* ck = kv_keys + (long)p * kv_dim;
-        const float* kpe = ck + latent;
-        float sc = 0.0f;
-        for (int d = 0; d < nope; ++d)
-            sc += q_nope[d] * mla_row_dot<DT>(kv_b, (long)h * per_head + d, latent, ck, kv_b_n, kv_b_group);
-        for (int d = 0; d < rope; ++d) sc += q_rope[d] * kpe[d];
-        sc *= scale;
-        if (sc > maxv) maxv = sc;
-    }
-    for (int d = 0; d < vdim; ++d) out[d] = 0.0f;
-    float denom = 0.0f;
-    for (int p = 0; p < positions; ++p) {
-        const float* ck = kv_keys + (long)p * kv_dim;
-        const float* kpe = ck + latent;
-        float sc = 0.0f;
-        for (int d = 0; d < nope; ++d)
-            sc += q_nope[d] * mla_row_dot<DT>(kv_b, (long)h * per_head + d, latent, ck, kv_b_n, kv_b_group);
-        for (int d = 0; d < rope; ++d) sc += q_rope[d] * kpe[d];
-        float ex = expf(sc * scale - maxv);
-        denom += ex;
-        for (int d = 0; d < vdim; ++d)
-            out[d] += ex * mla_row_dot<DT>(kv_b, (long)h * per_head + nope + d, latent, ck, kv_b_n, kv_b_group);
-    }
-    for (int d = 0; d < vdim; ++d) out[d] /= denom;
+    float acc = 0.0f;
+    for (int d = 0; d < nope; ++d)
+        acc += q_nope[d] * load_w<DT>(kv_b, ((long)h * per_head + d) * latent + l, n, kv_b_group);
+    u[idx] = acc;
 }
 
-static void launch_mla_attention(int dt, const float* q, const float* kv_keys, const void* kv_b,
-                                 int kv_b_group, float* ctx, int num_heads, int nope, int rope,
-                                 int vdim, int latent, int positions, float scale) {
-    int grid = grid_for(num_heads, 64);
+__global__ void mla_scores_kernel(const float* q, const float* u, const float* kv_keys,
+                                  float* scores, int num_heads, int nope, int rope, int latent,
+                                  int positions, float scale) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)num_heads * positions) return;
+    int h = (int)(idx / positions), p = (int)(idx % positions);
+    const float* ck = kv_keys + (long)p * (latent + rope);
+    const float* uh = u + (long)h * latent;
+    const float* q_rope = q + (long)h * (nope + rope) + nope;
+    float sc = 0.0f;
+    for (int l = 0; l < latent; ++l) sc += uh[l] * ck[l];
+    for (int d = 0; d < rope; ++d) sc += q_rope[d] * ck[latent + d];
+    scores[idx] = sc * scale;
+}
+
+__global__ void mla_mix_kernel(const float* weights, const float* kv_keys, float* m,
+                               int num_heads, int rope, int latent, int positions) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * latent) return;
+    int h = idx / latent, l = idx % latent;
+    const float* row = weights + (long)h * positions;
+    long kv_dim = latent + rope;
+    float acc = 0.0f;
+    for (int p = 0; p < positions; ++p) acc += row[p] * kv_keys[(long)p * kv_dim + l];
+    m[idx] = acc;
+}
+
+template <int DT>
+__global__ void mla_values_kernel(const float* m, const void* kv_b, int kv_b_group, float* ctx,
+                                  int num_heads, int nope, int vdim, int latent) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * vdim) return;
+    int h = idx / vdim, d = idx % vdim;
+    long per_head = nope + vdim;
+    long n = (long)num_heads * per_head * latent;
+    long base = ((long)h * per_head + nope + d) * latent;
+    const float* mh = m + (long)h * latent;
+    float acc = 0.0f;
+    for (int l = 0; l < latent; ++l) acc += load_w<DT>(kv_b, base + l, n, kv_b_group) * mh[l];
+    ctx[idx] = acc;
+}
+
+// Launch the MLA attention kernels for weights in dtype `dt`.
+static cudaError_t launch_mla_attention(int dt, const float* q, const float* kv_keys,
+                                        const void* kv_b, int kv_b_group, float* ctx,
+                                        int num_heads, int nope, int rope, int vdim, int latent,
+                                        int positions, float scale) {
+    const int B = 256;
+    cudaError_t e = scratch_ensure(MLA_U, num_heads * latent);
+    if (e == cudaSuccess) e = scratch_ensure(MLA_M, num_heads * latent);
+    // Grown in steps, as in launch_attention: the span grows by one every token.
+    if (e == cudaSuccess) e = scratch_ensure(ATTN_SCORES, num_heads * ((positions + 1023) & ~1023));
+    if (e != cudaSuccess) return e;
+    float* u = g_scratch[MLA_U];
+    float* m = g_scratch[MLA_M];
+    float* scores = g_scratch[ATTN_SCORES];
+    int hl = grid_for(num_heads * latent, B);
+    #define DLM_MLA_DT(DT) \
+        mla_query_latent_kernel<DT><<<hl, B>>>(q, kv_b, kv_b_group, u, num_heads, nope, rope, vdim, latent); \
+        mla_scores_kernel<<<grid_for(num_heads * positions, B), B>>>(q, u, kv_keys, scores, num_heads, nope, rope, latent, positions, scale); \
+        attn_softmax_kernel<<<grid_for(num_heads, B), B>>>(scores, num_heads, positions); \
+        mla_mix_kernel<<<hl, B>>>(scores, kv_keys, m, num_heads, rope, latent, positions); \
+        mla_values_kernel<DT><<<grid_for(num_heads * vdim, B), B>>>(m, kv_b, kv_b_group, ctx, num_heads, nope, vdim, latent);
     switch (dt) {
-        case DLM_W_BF16:
-            mla_attention_kernel<DLM_W_BF16><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        case DLM_W_F16:
-            mla_attention_kernel<DLM_W_F16><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        case DLM_W_INT4:
-            mla_attention_kernel<DLM_W_INT4><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        case DLM_W_INT8:
-            mla_attention_kernel<DLM_W_INT8><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
-        default:
-            mla_attention_kernel<DLM_W_F32><<<grid, 64>>>(q, kv_keys, kv_b, kv_b_group, ctx, num_heads, nope, rope, vdim, latent, positions, scale);
-            break;
+        case DLM_W_BF16: DLM_MLA_DT(DLM_W_BF16) break;
+        case DLM_W_F16: DLM_MLA_DT(DLM_W_F16) break;
+        case DLM_W_INT4: DLM_MLA_DT(DLM_W_INT4) break;
+        case DLM_W_INT8: DLM_MLA_DT(DLM_W_INT8) break;
+        default: DLM_MLA_DT(DLM_W_F32) break;
     }
+    #undef DLM_MLA_DT
+    return cudaSuccess;
 }
 
 // One MLA attention sublayer. All attention-projection weights share `w_dtype`.
@@ -1352,7 +1390,8 @@ extern "C" int dlm_mla_attn(
     copy_kernel<<<grid_for(qk_rope, B), B>>>(kva + latent, kv_keys + (long)num_positions * kv_dim + latent, qk_rope);
     // Attend (reconstructing K/V from each cached latent), then output-project.
     float scale = rope_mscale * rope_mscale / sqrtf((float)qk);
-    launch_mla_attention(w_dtype, q, kv_keys, kv_b_proj, w_group_size, ctx, num_heads, qk_nope, qk_rope, v_head_dim, latent, total_pos, scale);
+    e = launch_mla_attention(w_dtype, q, kv_keys, kv_b_proj, w_group_size, ctx, num_heads, qk_nope, qk_rope, v_head_dim, latent, total_pos, scale);
+    if (e != cudaSuccess) return (int)e;
     // o = o_proj · ctx, added into the residual (scratch slot 0 reused for `o`).
     if (e == cudaSuccess) e = scratch_ensure(0, hidden_size);
     if (e == cudaSuccess) {
