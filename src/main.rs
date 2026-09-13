@@ -439,6 +439,43 @@ fn serve_tokenizer(model_path: &Path) -> Result<BpeTokenizer> {
     }
 }
 
+/// Resolve `--chat-template`. A named template is used as given; `auto` reads
+/// the checkpoint's Jinja template (`chat_template.jinja`, else the
+/// `chat_template` field of `tokenizer_config.json`) and fingerprints it. A
+/// checkpoint with no template (a base model) gets `plain`; one whose template
+/// is not recognized also gets `plain`, with a warning naming the flag to set.
+fn resolve_chat_template(args: &ServeArgs) -> Result<dlm::server::engine::ChatTemplate> {
+    use dlm::server::engine::ChatTemplate;
+    if !args.chat_template.eq_ignore_ascii_case("auto") {
+        return ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
+            DlmError::InvalidConfig(format!(
+                "unknown --chat-template {:?} (expected auto, {})",
+                args.chat_template,
+                ChatTemplate::NAMES
+            ))
+        });
+    }
+    let Some(jinja) = ChatTemplate::read_jinja(&args.model_path) else {
+        println!("chat template: plain (checkpoint declares none)");
+        return Ok(ChatTemplate::Plain);
+    };
+    match ChatTemplate::detect(&jinja) {
+        Some(t) => {
+            println!("chat template: {} (detected from checkpoint)", t.name());
+            Ok(t)
+        }
+        None => {
+            eprintln!(
+                "warning: the checkpoint's chat template is not one dlm recognizes; using \
+                 plain, which the model was not trained on. Pass --chat-template ({}) \
+                 if one matches.",
+                ChatTemplate::NAMES
+            );
+            Ok(ChatTemplate::Plain)
+        }
+    }
+}
+
 /// Pick a tokenizer for `generate`: explicit `--tokenizer`, else the model
 /// directory if it ships one, else a raw byte tokenizer.
 fn resolve_tokenizer(args: &GenerateArgs) -> Result<BpeTokenizer> {
@@ -1246,13 +1283,7 @@ fn serve_distributed(
     )?
     .with_auth(secret.clone());
 
-    let template =
-        dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
-            DlmError::InvalidConfig(format!(
-                "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
-                args.chat_template
-            ))
-        })?;
+    let template = resolve_chat_template(args)?;
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1318,19 +1349,22 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let template =
-        dlm::server::engine::ChatTemplate::parse(&args.chat_template).ok_or_else(|| {
-            DlmError::InvalidConfig(format!(
-                "unknown --chat-template {:?} (expected plain, chatml, or llama3)",
-                args.chat_template
-            ))
-        })?;
+    let template = resolve_chat_template(args)?;
     // EOS: an explicit --eos-token overrides; otherwise auto-detect from the
     // model's config.json (`eos_token_id`, which may list several ids).
-    let eos_tokens = match args.eos_token {
+    let mut eos_tokens = match args.eos_token {
         Some(id) => vec![id],
         None => config.eos_token_ids.clone(),
     };
+    // The template's end-of-turn marker stops generation too, when it is a real
+    // token in this vocabulary and --eos-token did not pin the stop set.
+    if args.eos_token.is_none() {
+        if let Some(id) = template.end_of_turn().and_then(|t| tokenizer.id_of(t)) {
+            if !eos_tokens.contains(&id) {
+                eos_tokens.push(id);
+            }
+        }
+    }
 
     // Optional KV-cache quantization (int8/int4) — shrinks the KV memory.
     let kv_quant = args.kv_quant.to_kv_quant();

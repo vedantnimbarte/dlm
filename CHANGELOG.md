@@ -12,7 +12,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`dlm pull` failed on every repo.** Since 0.4.0 moved the token out of
+  `argv`, curl was spawned with its output inherited rather than captured, so
+  the model-info request returned an empty body and the pull stopped with
+  "could not read model info … private/gated?".
+
 ### Added
+
+- **Chat template auto-detection.** `--chat-template` now defaults to `auto`,
+  which fingerprints the checkpoint's Jinja template and picks the matching
+  built-in format. Five formats are new — `llama2`, `mistral`, `gemma`,
+  `phi3`, `deepseek` join `plain`, `chatml`, `llama3` — and the format's
+  end-of-turn token (`<end_of_turn>`, `<|end|>`, …) is added to the stop set.
+  Previously every model defaulted to `plain`, a format no instruct model is
+  trained on, unless the user knew to pass the flag. Checked against the real
+  `tokenizer_config.json` of all thirteen fixture families.
 
 - **Per-layer flow telemetry.** `dlm serve --telemetry` exposes `GET
   /v1/telemetry`, a Server-Sent Events stream of timestamped per-layer events

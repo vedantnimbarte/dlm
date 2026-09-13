@@ -661,7 +661,7 @@ check your model's output rather than assuming. Three caveats worth knowing:
 
 ```sh
 dlm pull Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4 --local-dir models/qwen-gptq
-dlm serve --model-path models/qwen-gptq --chat-template chatml
+dlm serve --model-path models/qwen-gptq
 ```
 
 Its codes are *relabeled* into dlm's layout, not dequantized and re-quantized, so
@@ -710,9 +710,13 @@ inference engine):
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,
-  and `--chat-template {plain,chatml,llama3}` renders chat messages in the model's
-  trained format (control tokens become single ids via the special-token
-  vocabulary). Hardening: `--api-key` requires a key on **every** route except
+  and chat messages are rendered in the model's trained format (control tokens
+  become single ids via the special-token vocabulary). The format is
+  **auto-detected** from the checkpoint's Jinja `chat_template` by its control
+  markers — ChatML, Llama-3, Llama-2, Mistral, Gemma, Phi-3 and DeepSeek-V2 — and
+  the format's end-of-turn token is added to the stop set. dlm does not run
+  Jinja: an unrecognized template falls back to `plain` with a warning, and
+  `--chat-template <name>` overrides detection either way. Hardening: `--api-key` requires a key on **every** route except
   `/`, `/health` and `/healthz` — including `/metrics`, which leaks request and
   token counts. Send it as either `Authorization: Bearer <key>` (OpenAI) or
   `x-api-key: <key>` (Anthropic), so either SDK authenticates unchanged. The

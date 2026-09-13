@@ -315,9 +315,10 @@ pub struct ServeArgs {
     #[arg(long, value_name = "KEY")]
     pub api_key: Option<String>,
 
-    /// Chat prompt template applied to `/v1/chat/completions` messages:
-    /// `plain` (default), `chatml`, or `llama3`. Match the served model.
-    #[arg(long, value_name = "NAME", default_value = "plain")]
+    /// Chat prompt template applied to chat messages. `auto` (default) detects it
+    /// from the checkpoint's tokenizer_config.json; or name one: `plain`,
+    /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `phi3`, `deepseek`.
+    #[arg(long, value_name = "NAME", default_value = "auto")]
     pub chat_template: String,
 
     /// Stop generation when the model produces this token id (the model's EOS).

@@ -479,3 +479,43 @@ fn qwen_family_fixture_stays_byte_level() {
     );
     assert_round_trip(&tok, "qwen2.5");
 }
+
+/// `--chat-template auto` against each family's real `tokenizer_config.json`:
+/// the fingerprint must pick the format the model was trained on, and that
+/// format's end-of-turn marker must be a real token, or generation would run
+/// past the turn. Families whose fixture ships no template (base models, and
+/// mirrors that predate chat templates) must detect as none, not as a guess.
+#[test]
+fn chat_template_auto_detection_per_family() {
+    use dlm::server::engine::ChatTemplate;
+    let cases = [
+        ("qwen2.5", Some(ChatTemplate::ChatMl)),
+        ("qwen3", Some(ChatTemplate::ChatMl)),
+        ("qwen2-moe", Some(ChatTemplate::ChatMl)),
+        ("mixtral", Some(ChatTemplate::ChatMl)), // Nous-Hermes fine-tune: ChatML
+        ("llama-3", Some(ChatTemplate::Llama3)),
+        ("gemma-1", Some(ChatTemplate::Gemma)),
+        ("gemma-2", Some(ChatTemplate::Gemma)),
+        ("phi-3", Some(ChatTemplate::Phi3)),
+        ("deepseek-v2", Some(ChatTemplate::DeepSeek)),
+        ("llama-2", None),
+        ("mistral", None),
+        ("gpt2", None),
+        ("falcon", None),
+    ];
+    for (family, want) in cases {
+        let Some(dir) = fixture(family) else {
+            eprintln!("skipping {family}: fixture absent");
+            continue;
+        };
+        let got = ChatTemplate::read_jinja(&dir).and_then(|j| ChatTemplate::detect(&j));
+        assert_eq!(got, want, "{family}: wrong chat template detected");
+        if let Some(eot) = got.and_then(|t| t.end_of_turn()) {
+            let tok = BpeTokenizer::from_dir(&dir).expect("tokenizer");
+            assert!(
+                tok.id_of(eot).is_some(),
+                "{family}: end-of-turn {eot:?} is not a token"
+            );
+        }
+    }
+}

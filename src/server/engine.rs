@@ -549,20 +549,118 @@ pub enum ChatTemplate {
     ChatMl,
     /// Llama-3 (`<|start_header_id|>role<|end_header_id|> … <|eot_id|>`).
     Llama3,
+    /// Llama-2 chat (`[INST] <<SYS>>…<</SYS>> … [/INST]`).
+    Llama2,
+    /// Mistral (`[INST] … [/INST]`); a system prompt is folded into the first
+    /// user turn, since the format has no system role.
+    Mistral,
+    /// Gemma 1/2 (`<start_of_turn>user … <end_of_turn>`); the assistant role is
+    /// `model`, and a system prompt is folded into the first user turn.
+    Gemma,
+    /// Phi-3 (`<|user|>\n … <|end|>`).
+    Phi3,
+    /// DeepSeek-V2 chat (`User: …\n\nAssistant:`).
+    DeepSeek,
 }
 
 impl ChatTemplate {
-    /// Parse a `--chat-template` value.
+    /// Every name `--chat-template` accepts, besides `auto`.
+    pub const NAMES: &'static str = "plain, chatml, llama3, llama2, mistral, gemma, phi3, deepseek";
+
+    /// Parse a `--chat-template` value (`auto` is resolved by the caller).
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "plain" => Some(ChatTemplate::Plain),
             "chatml" => Some(ChatTemplate::ChatMl),
             "llama3" | "llama-3" => Some(ChatTemplate::Llama3),
+            "llama2" | "llama-2" => Some(ChatTemplate::Llama2),
+            "mistral" => Some(ChatTemplate::Mistral),
+            "gemma" => Some(ChatTemplate::Gemma),
+            "phi3" | "phi-3" => Some(ChatTemplate::Phi3),
+            "deepseek" => Some(ChatTemplate::DeepSeek),
             _ => None,
         }
     }
 
-    /// Render `messages` into the prompt string for this template.
+    /// The `--chat-template` name for this template.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ChatTemplate::Plain => "plain",
+            ChatTemplate::ChatMl => "chatml",
+            ChatTemplate::Llama3 => "llama3",
+            ChatTemplate::Llama2 => "llama2",
+            ChatTemplate::Mistral => "mistral",
+            ChatTemplate::Gemma => "gemma",
+            ChatTemplate::Phi3 => "phi3",
+            ChatTemplate::DeepSeek => "deepseek",
+        }
+    }
+
+    /// The checkpoint's Jinja chat template, if it ships one. `chat_template` may be
+    /// a string or a list of named templates, of which `default` is the chat one.
+    pub fn read_jinja(model_path: &std::path::Path) -> Option<String> {
+        if let Ok(s) = std::fs::read_to_string(model_path.join("chat_template.jinja")) {
+            return Some(s);
+        }
+        let bytes = std::fs::read(model_path.join("tokenizer_config.json")).ok()?;
+        let cfg: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        match cfg.get("chat_template")? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(list) => list
+                .iter()
+                .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("default"))
+                .and_then(|t| t.get("template")?.as_str())
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// Recognize a checkpoint's Jinja `chat_template` by the control markers it
+    /// emits. This is a fingerprint, not a Jinja renderer: it maps the formats
+    /// dlm's families are trained on onto the built-in renderers, and returns
+    /// `None` for anything else, so the caller can say so rather than render a
+    /// format the model never saw.
+    pub fn detect(jinja: &str) -> Option<Self> {
+        let has = |m: &str| jinja.contains(m);
+        // Phi-4 puts `<|im_sep|>` between ChatML's role and content; rendering it
+        // as plain ChatML would be quietly wrong.
+        if has("<|im_sep|>") {
+            None
+        } else if has("<|im_start|>") {
+            Some(ChatTemplate::ChatMl)
+        } else if has("<|start_header_id|>") {
+            Some(ChatTemplate::Llama3)
+        } else if has("<start_of_turn>") {
+            Some(ChatTemplate::Gemma)
+        } else if has("<<SYS>>") {
+            Some(ChatTemplate::Llama2)
+        } else if has("[INST]") {
+            Some(ChatTemplate::Mistral)
+        } else if has("<|user|>") && has("<|end|>") {
+            Some(ChatTemplate::Phi3)
+        } else if has("'User: '") && has("'Assistant:") {
+            Some(ChatTemplate::DeepSeek)
+        } else {
+            None
+        }
+    }
+
+    /// The control token that closes a turn, when the format has one distinct
+    /// from EOS. Generation must stop on it even when `config.json` lists only
+    /// `<eos>` (gemma-1.1 does), or the model runs on into a fabricated next turn.
+    pub fn end_of_turn(&self) -> Option<&'static str> {
+        match self {
+            ChatTemplate::ChatMl => Some("<|im_end|>"),
+            ChatTemplate::Llama3 => Some("<|eot_id|>"),
+            ChatTemplate::Gemma => Some("<end_of_turn>"),
+            ChatTemplate::Phi3 => Some("<|end|>"),
+            _ => None,
+        }
+    }
+
+    /// Render `messages` into the prompt string for this template. BOS is left
+    /// to the tokenizer (`add_bos_token`), which skips it when the text already
+    /// starts with it.
     pub fn apply(&self, messages: &[ChatMessage]) -> String {
         let mut p = String::new();
         match self {
@@ -593,6 +691,77 @@ impl ChatTemplate {
                     ));
                 }
                 p.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            }
+            ChatTemplate::Llama2 | ChatTemplate::Mistral => {
+                let llama2 = *self == ChatTemplate::Llama2;
+                let mut system = String::new();
+                let mut first_user = true;
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => system.push_str(&m.content),
+                        "assistant" if llama2 => p.push_str(&format!(" {} </s>", m.content)),
+                        "assistant" => p.push_str(&format!("{}</s>", m.content)),
+                        _ => {
+                            // Llama-2 reopens every later user turn with BOS.
+                            if llama2 && !first_user {
+                                p.push_str("<s>");
+                            }
+                            p.push_str("[INST] ");
+                            if first_user && !system.is_empty() {
+                                if llama2 {
+                                    p.push_str(&format!("<<SYS>>\n{system}\n<</SYS>>\n\n"));
+                                } else {
+                                    p.push_str(&format!("{system}\n\n"));
+                                }
+                            }
+                            p.push_str(&m.content);
+                            p.push_str(" [/INST]");
+                            first_user = false;
+                        }
+                    }
+                }
+            }
+            ChatTemplate::Gemma => {
+                let mut system = String::new();
+                for m in messages {
+                    let role = match m.role.as_str() {
+                        "system" => {
+                            system.push_str(&m.content);
+                            system.push_str("\n\n");
+                            continue;
+                        }
+                        "assistant" => "model",
+                        other => other,
+                    };
+                    let prefix = if role == "user" {
+                        std::mem::take(&mut system)
+                    } else {
+                        String::new()
+                    };
+                    p.push_str(&format!(
+                        "<start_of_turn>{role}\n{prefix}{}<end_of_turn>\n",
+                        m.content.trim()
+                    ));
+                }
+                p.push_str("<start_of_turn>model\n");
+            }
+            ChatTemplate::Phi3 => {
+                for m in messages {
+                    p.push_str(&format!("<|{}|>\n{}<|end|>\n", m.role, m.content));
+                }
+                p.push_str("<|assistant|>\n");
+            }
+            ChatTemplate::DeepSeek => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "system" => p.push_str(&format!("{}\n\n", m.content)),
+                        "assistant" => {
+                            p.push_str(&format!("Assistant: {}<｜end▁of▁sentence｜>", m.content))
+                        }
+                        _ => p.push_str(&format!("User: {}\n\n", m.content)),
+                    }
+                }
+                p.push_str("Assistant:");
             }
         }
         p
@@ -1738,6 +1907,72 @@ mod tests {
             l3.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"),
             "{l3}"
         );
+    }
+
+    /// Every name round-trips, and each template renders a system + two-turn
+    /// conversation the way its model's Jinja template does.
+    #[test]
+    fn chat_templates_render_system_and_multi_turn() {
+        for name in ChatTemplate::NAMES.split(", ") {
+            assert_eq!(ChatTemplate::parse(name).unwrap().name(), name);
+        }
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        };
+        let convo = vec![
+            msg("system", "Be brief."),
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "bye"),
+        ];
+        assert_eq!(
+            ChatTemplate::Gemma.apply(&convo),
+            "<start_of_turn>user\nBe brief.\n\nhi<end_of_turn>\n\
+             <start_of_turn>model\nhello<end_of_turn>\n\
+             <start_of_turn>user\nbye<end_of_turn>\n<start_of_turn>model\n"
+        );
+        assert_eq!(
+            ChatTemplate::Mistral.apply(&convo),
+            "[INST] Be brief.\n\nhi [/INST]hello</s>[INST] bye [/INST]"
+        );
+        assert_eq!(
+            ChatTemplate::Llama2.apply(&convo),
+            "[INST] <<SYS>>\nBe brief.\n<</SYS>>\n\nhi [/INST] hello </s><s>[INST] bye [/INST]"
+        );
+        assert_eq!(
+            ChatTemplate::Phi3.apply(&convo),
+            "<|system|>\nBe brief.<|end|>\n<|user|>\nhi<|end|>\n\
+             <|assistant|>\nhello<|end|>\n<|user|>\nbye<|end|>\n<|assistant|>\n"
+        );
+        assert_eq!(
+            ChatTemplate::DeepSeek.apply(&convo),
+            "Be brief.\n\nUser: hi\n\nAssistant: hello<｜end▁of▁sentence｜>User: bye\n\nAssistant:"
+        );
+    }
+
+    #[test]
+    fn chat_template_detection_by_marker() {
+        let cases = [
+            ("{{'<|im_start|>' + role}}", Some(ChatTemplate::ChatMl)),
+            ("{{'<|start_header_id|>'}}", Some(ChatTemplate::Llama3)),
+            ("{{'<start_of_turn>' + role}}", Some(ChatTemplate::Gemma)),
+            ("{{'[INST] <<SYS>>\\n'}}", Some(ChatTemplate::Llama2)),
+            ("{{'[INST] ' + content}}", Some(ChatTemplate::Mistral)),
+            (
+                "{{'<|user|>\\n' + c + '<|end|>'}}",
+                Some(ChatTemplate::Phi3),
+            ),
+            (
+                "{{ 'User: ' + c }}{{ 'Assistant:' }}",
+                Some(ChatTemplate::DeepSeek),
+            ),
+            ("{{'<|im_start|>user<|im_sep|>'}}", None),
+            ("{{ something_else }}", None),
+        ];
+        for (jinja, want) in cases {
+            assert_eq!(ChatTemplate::detect(jinja), want, "{jinja}");
+        }
     }
 
     #[test]
