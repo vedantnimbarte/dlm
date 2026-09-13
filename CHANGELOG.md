@@ -39,6 +39,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   140 s to 10.5 s; the fully-resident prefill went from 8.4 s to 6.5 s. Output is
   unchanged, and six new parity tests pin dense, Gemma2, MoE and MLA+MoE prefill
   against the CPU oracle.
+- **GPU attention no longer slows down linearly with context.** The attention
+  kernel ran one thread per head, each walking the whole history in a scalar
+  loop; it is now three launches parallel over (head, position) and (head,
+  dim). On a GTX 1650 with Qwen2.5-0.5B at ~600 tokens of context, decode went
+  from 254 to 97 ms/token and a 604-token prefill from 40 s to 11 s. MLA
+  attention (DeepSeek) still uses the per-head kernel.
 - **Chat template auto-detection.** `--chat-template` now defaults to `auto`,
   which fingerprints the checkpoint's Jinja template and picks the matching
   built-in format. Five formats are new — `llama2`, `mistral`, `gemma`,

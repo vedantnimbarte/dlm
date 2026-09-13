@@ -1567,3 +1567,61 @@ fn streaming_gpu_prefill_matches_cpu_decode_mla_moe() {
     let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
     assert_prefill_matches_cpu(cfg, layers, gpu, "streaming mla+moe");
 }
+
+/// Attention over a long history: 1,100 prefilled tokens, then decoding past the
+/// 1,024-position step the device grows its score buffer by. Every other parity
+/// case stays under 50 positions, where a scoring or mixing error confined to a
+/// large (head × position) grid would never show.
+#[test]
+fn gpu_long_context_attention_matches_cpu() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 2, 0x10C7);
+    let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+    let gpu = GpuKernel::new(cfg, layers, 1200).unwrap();
+    let kv_cfg = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 80),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 80),
+        dlm::forward::KvQuant::None,
+    );
+
+    let h = cfg.hidden_size;
+    let mut rng = Rng::new(0x10C8);
+    let mut want = rng.vec(1100 * h, 0.5);
+    let mut got = want.clone();
+    for hidden in want.chunks_mut(h) {
+        orch_cpu.decode_token(hidden).unwrap();
+    }
+    orch_gpu.prefill(&mut got).unwrap();
+    let diff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let tail = 16 * h;
+    let d = diff(&want[want.len() - tail..], &got[got.len() - tail..]);
+    assert!(d < 2e-3, "long prefill diverged by {d}");
+
+    for step in 0..3 {
+        let mut a = rng.vec(h, 0.5);
+        let mut b = a.clone();
+        orch_cpu.decode_token(&mut a).unwrap();
+        orch_gpu.decode_token(&mut b).unwrap();
+        let d = diff(&a, &b);
+        assert!(
+            d < 2e-3,
+            "decode step {step} at 1100+ positions diverged by {d}"
+        );
+    }
+}

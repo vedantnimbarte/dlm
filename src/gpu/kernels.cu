@@ -237,52 +237,71 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
     for (int i = 0; i < head_dim; ++i) head[i] = head[i] * inv * w[i];
 }
 
-// Grouped-query attention over `positions` cached tokens. One thread per query
-// head; online softmax so no per-position scratch is needed.
+// Grouped-query attention over `positions` cached tokens, in three launches so
+// the work spreads over (head, position) rather than one thread per head. The
+// one-thread-per-head version walked the whole history in a scalar loop, which
+// made every token's cost grow with context: at a few hundred tokens it was the
+// dominant cost of a 0.5B model on a GTX 1650.
+//
+//   1. attn_scores_kernel  — one thread per (head, position): the scaled (and
+//                            softcapped) logit.
+//   2. attn_softmax_kernel — one thread per head: max-subtracted softmax of its
+//                            row, in place.
+//   3. attn_mix_kernel     — one thread per (head, dim): the weighted sum of the
+//                            values.
+//
+// This is `attention()` in src/forward/cpu.rs step for step: logits, softcap,
+// softmax, then accumulate weight × value in position order.
 // `sliding_window > 0` bounds attention to the last `sliding_window` positions
-// (Mistral); `0` is full causal attention. Mirrors `attention()` in
-// src/forward/cpu.rs (start = positions - window).
+// (Mistral); `0` is full causal attention (start = positions - window).
 // `scale` is passed in rather than derived from head_dim: Gemma2 decouples it
 // (`query_pre_attn_scalar`). `softcap > 0` squashes each logit through
-// `tanh(s/cap)*cap` before the softmax (Gemma2); 0 disables it. Both mirror
-// `attention()` in src/forward/cpu.rs.
-__global__ void attention_kernel(const float* q, const float* keys, const float* values,
-                                 float* ctx, int num_heads, int num_kv_heads, int head_dim,
-                                 int positions, int sliding_window, float scale, float softcap) {
+// `tanh(s/cap)*cap` before the softmax (Gemma2); 0 disables it.
+__global__ void attn_scores_kernel(const float* q, const float* keys, float* scores,
+                                   int num_heads, int num_kv_heads, int head_dim,
+                                   int start, int span, float scale, float softcap) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)num_heads * span) return;
+    int h = (int)(idx / span);
+    int p = start + (int)(idx % span);
+    int kvh = h / (num_heads / num_kv_heads);
+    const float* qh = q + h * head_dim;
+    const float* kh = keys + (long)p * (num_kv_heads * head_dim) + kvh * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
+    dot *= scale;
+    if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
+    scores[idx] = dot;
+}
+
+__global__ void attn_softmax_kernel(float* scores, int num_heads, int span) {
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= num_heads) return;
-    int group = num_heads / num_kv_heads;
-    int kvh = h / group;
-    int kv_dim = num_kv_heads * head_dim;
-    const float* qh = q + h * head_dim;
-    float* out = ctx + h * head_dim;
-    int start = (sliding_window > 0 && positions > sliding_window)
-                    ? positions - sliding_window
-                    : 0;
-
+    float* row = scores + (long)h * span;
     float maxv = -1e30f;
-    for (int p = start; p < positions; ++p) {
-        const float* kh = keys + (long)p * kv_dim + kvh * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
-        dot *= scale;
-        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
-        if (dot > maxv) maxv = dot;
-    }
-    for (int d = 0; d < head_dim; ++d) out[d] = 0.0f;
+    for (int i = 0; i < span; ++i) if (row[i] > maxv) maxv = row[i];
     float denom = 0.0f;
-    for (int p = start; p < positions; ++p) {
-        const float* kh = keys + (long)p * kv_dim + kvh * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kh[d];
-        dot *= scale;
-        if (softcap > 0.0f) dot = tanhf(dot / softcap) * softcap;
-        float e = expf(dot - maxv);
-        denom += e;
-        const float* vh = values + (long)p * kv_dim + kvh * head_dim;
-        for (int d = 0; d < head_dim; ++d) out[d] += e * vh[d];
+    for (int i = 0; i < span; ++i) {
+        row[i] = expf(row[i] - maxv);
+        denom += row[i];
     }
-    for (int d = 0; d < head_dim; ++d) out[d] /= denom;
+    for (int i = 0; i < span; ++i) row[i] /= denom;
+}
+
+__global__ void attn_mix_kernel(const float* weights, const float* values, float* ctx,
+                                int num_heads, int num_kv_heads, int head_dim,
+                                int start, int span) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_heads * head_dim) return;
+    int h = idx / head_dim;
+    int d = idx % head_dim;
+    int kvh = h / (num_heads / num_kv_heads);
+    const float* row = weights + (long)h * span;
+    long off = (long)kvh * head_dim + d;
+    long kv_dim = (long)num_kv_heads * head_dim;
+    float acc = 0.0f;
+    for (int i = 0; i < span; ++i) acc += row[i] * values[(long)(start + i) * kv_dim + off];
+    ctx[idx] = acc;
 }
 
 // x[i] += y[i]  (residual add).
@@ -347,7 +366,9 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // router/shared-gate matvec output staged for the D2H copy.
 // Slots 13-18 are MLA-only: normed, q (nh*qk), c_q (q_lora), kv_a (latent+rope),
 // c_kv (latent), and the attention context (nh*v_head_dim).
-enum { SCRATCH_N = 19 };
+// Slot 19 holds the attention logits/weights, [num_heads, attended positions].
+enum { SCRATCH_N = 20 };
+enum { ATTN_SCORES = 19 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
 static thread_local float* g_scratch[SCRATCH_N] = {0};
@@ -364,7 +385,29 @@ static cudaError_t scratch_ensure(int i, int n) {
     return e;
 }
 
-// `kv_keys` / `kv_values` are **persistent** device buffers (capacity
+// Launch the three attention kernels for one query over `positions` cached
+// tokens. Scores live in scratch slot ATTN_SCORES.
+static cudaError_t launch_attention(const float* q, const float* keys, const float* values,
+                                    float* ctx, int num_heads, int num_kv_heads, int head_dim,
+                                    int positions, int sliding_window, float scale,
+                                    float softcap) {
+    const int B = 256;
+    int start = (sliding_window > 0 && positions > sliding_window) ? positions - sliding_window : 0;
+    int span = positions - start;
+    // The span grows by one every token; sizing to it exactly would free and
+    // re-malloc (two synchronizing driver calls) on every call. Grow in steps.
+    cudaError_t e = scratch_ensure(ATTN_SCORES, num_heads * ((span + 1023) & ~1023));
+    if (e != cudaSuccess) return e;
+    float* scores = g_scratch[ATTN_SCORES];
+    attn_scores_kernel<<<grid_for(num_heads * span, B), B>>>(q, keys, scores, num_heads, num_kv_heads,
+                                                            head_dim, start, span, scale, softcap);
+    attn_softmax_kernel<<<grid_for(num_heads, B), B>>>(scores, num_heads, span);
+    attn_mix_kernel<<<grid_for(num_heads * head_dim, B), B>>>(scores, values, ctx, num_heads,
+                                                             num_kv_heads, head_dim, start, span);
+    return cudaSuccess;
+}
+
+// `kv_keys` / `kv_values` are **persistent** device buffers// `kv_keys` / `kv_values` are **persistent** device buffers (capacity
 // max_positions * kv_dim) owned by the caller across the whole sequence. This
 // call writes the new token's K/V into slot `num_positions` in place and attends
 // over the first `num_positions + 1` slots — so the KV history never leaves VRAM
@@ -437,7 +480,8 @@ extern "C" int dlm_decode_block(
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
 
         // Attend over history + this token, reading the persistent buffers directly.
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        e = launch_attention(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        if (e != cudaSuccess) return (int)e;
         launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
         // Gemma2 norms the attention output before the residual add (in place, so
         // the add below is unchanged); elsewhere it goes in raw.
@@ -640,10 +684,9 @@ extern "C" int dlm_decode_block_batched(
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(kb, num_kv_heads, head_dim, pos, inv_freq, rope_mscale);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(kb, kv_keys->p[b] + (long)np * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(vb, kv_values->p[b] + (long)np * kv_dim, kv_dim);
-        attention_kernel<<<grid_for(num_heads, B), B>>>(qb, kv_keys->p[b], kv_values->p[b], ctxb,
-                                                        num_heads, num_kv_heads, head_dim,
-                                                        total_pos, sliding_window, attn_scale,
-                                                        attn_softcap);
+        e = launch_attention(qb, kv_keys->p[b], kv_values->p[b], ctxb, num_heads, num_kv_heads,
+                             head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        if (e != cudaSuccess) return (int)e;
     }
 
     launch_matvec_batched(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size, batch);
@@ -732,7 +775,8 @@ extern "C" int dlm_moe_attn(
         rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(v, kv_values + (long)num_positions * kv_dim, kv_dim);
-        attention_kernel<<<grid_for(num_heads, B), B>>>(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        e = launch_attention(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
+        if (e != cudaSuccess) return (int)e;
         launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
         // FFN input, reused by the router matvec and every expert.
