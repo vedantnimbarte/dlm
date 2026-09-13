@@ -41,9 +41,9 @@ use std::thread::JoinHandle;
 // Restating the `extern` block let this path keep calling the old ABI after the
 // kernel signature changed — a silent mismatch the compiler only warns about.
 use crate::forward::gpu::{
-    bias_ptr, dlm_apply_expert, dlm_apply_experts, dlm_decode_block, dlm_dense_ffn, dlm_mla_attn,
-    dlm_moe_attn, dlm_moe_matvec, dlm_moe_norm, upload_bias, upload_weight, DlmPtrs, DlmWeights,
-    GpuMla, DLM_MAX_TOPK,
+    bias_ptr, dlm_apply_expert, dlm_apply_experts, dlm_decode_block, dlm_decode_block_batched,
+    dlm_dense_ffn, dlm_mla_attn, dlm_moe_attn, dlm_moe_matvec, dlm_moe_norm, upload_bias,
+    upload_weight, DlmInts, DlmPtrs, DlmSlots, DlmWeights, GpuMla, DLM_MAX_BATCH, DLM_MAX_TOPK,
 };
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -850,6 +850,188 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     /// `dlm_moe_attn`) or MLA (via `dlm_mla_attn` + `dlm_moe_norm`). Both leave
     /// `normed2` in the same device scratch slot, which is the only state this
     /// consumes, so DeepSeek-V2/V3's MLA + MoE reuses this verbatim.
+    /// Run resident layer `layer` (weights `w`) for one token whose hidden state
+    /// is already in `d_hidden`, reading and writing `kv`'s device history. The
+    /// caller moves the hidden across the bus and keeps `kv`'s host length.
+    fn run_layer(
+        &self,
+        layer: u32,
+        w: &GpuWeights,
+        kv: &mut KvLayerCache,
+        position: usize,
+        d_hidden: &DeviceBuffer,
+    ) -> Result<()> {
+        let kv_dim = self.shared.cfg.kv_dim();
+        let cfg = &self.shared.cfg;
+        let num_positions = kv.len();
+        // Per-session K/V (owned by this sequence's KvLayerCache), so batched
+        // requests sharing this kernel keep independent history.
+        // MLA reconstructs K and V from one cached latent — no value cache.
+        let (kv_keys, kv_values) =
+            kv.gpu_kv(self.kv_capacity_tokens, self.shared.cfg.mla.is_none())?;
+
+        // MLA (DeepSeek) runs attention as its own device call, then the FFN half —
+        // dense or routed — exactly as the standard-attention paths do. This is the
+        // GPU mirror of `decode_block_streaming_moe`, which branches attention on
+        // `w.mla` and then runs the same MoE FFN.
+        if let (Some(mcfg), Some(mw)) = (&cfg.mla, &w.mla) {
+            // SAFETY: all pointers are live device allocations of the sizes the
+            // kernel expects; `kv_keys` has capacity for `num_positions + 1` rows
+            // of `kv_lora_rank + qk_rope_head_dim` (MLA's `kv_dim`).
+            let code = unsafe {
+                dlm_mla_attn(
+                    cfg.hidden_size as i32,
+                    cfg.num_heads as i32,
+                    mcfg.q_lora_rank.unwrap_or(0) as i32,
+                    mcfg.kv_lora_rank as i32,
+                    mcfg.qk_nope_head_dim as i32,
+                    mcfg.qk_rope_head_dim as i32,
+                    mcfg.v_head_dim as i32,
+                    cfg.rms_eps,
+                    w.w_dtype,
+                    w.w_group_size,
+                    mw.q_a_proj
+                        .as_ref()
+                        .map_or(std::ptr::null(), |b| b.as_ptr())
+                        as *const std::ffi::c_void,
+                    bias_ptr(&mw.q_a_layernorm),
+                    mw.q_b_proj.as_ptr() as *const std::ffi::c_void,
+                    mw.kv_a_proj.as_ptr() as *const std::ffi::c_void,
+                    mw.kv_a_layernorm.as_ptr(),
+                    mw.kv_b_proj.as_ptr() as *const std::ffi::c_void,
+                    w.o_proj.as_ptr() as *const std::ffi::c_void,
+                    w.input_layernorm.as_ptr(),
+                    self.mla_inv_freq
+                        .as_ref()
+                        .expect("mla_inv_freq present whenever cfg.mla is")
+                        .as_ptr(),
+                    crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                    d_hidden.as_mut_ptr(),
+                    kv_keys,
+                    num_positions as i32,
+                    position as i32,
+                )
+            };
+            if code != 0 {
+                return Err(DlmError::Gpu {
+                    api: "dlm_mla_attn",
+                    code,
+                });
+            }
+            match &w.ffn {
+                GpuFfn::Dense(f) => {
+                    let code = unsafe {
+                        dlm_dense_ffn(
+                            cfg.hidden_size as i32,
+                            cfg.intermediate_size as i32,
+                            cfg.rms_eps,
+                            f.w_dtype,
+                            f.w_group_size,
+                            f.gate.as_ptr() as *const std::ffi::c_void,
+                            f.up.as_ptr() as *const std::ffi::c_void,
+                            f.down.as_ptr() as *const std::ffi::c_void,
+                            w.post_attention_layernorm.as_ptr(),
+                            cfg.activation.code(),
+                            d_hidden.as_mut_ptr(),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu {
+                            api: "dlm_dense_ffn",
+                            code,
+                        });
+                    }
+                }
+                GpuFfn::Moe { .. } => {
+                    // `dlm_mla_attn` folds the residual but leaves no FFN input;
+                    // this produces the `normed2` the router/experts consume.
+                    let code = unsafe {
+                        dlm_moe_norm(
+                            cfg.hidden_size as i32,
+                            cfg.rms_eps,
+                            w.post_attention_layernorm.as_ptr(),
+                            d_hidden.as_mut_ptr(),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu {
+                            api: "dlm_moe_norm",
+                            code,
+                        });
+                    }
+                    self.run_moe_ffn(layer, w, d_hidden)?;
+                }
+            }
+        } else {
+            match &w.ffn {
+                GpuFfn::Dense(f) => {
+                    // SAFETY: all pointers are live device allocations sized as the
+                    // kernel expects; the KV buffers have capacity for `num_positions + 1`.
+                    let code = unsafe {
+                        dlm_decode_block(
+                            cfg.hidden_size as i32,
+                            cfg.q_dim() as i32,
+                            kv_dim as i32,
+                            cfg.num_heads as i32,
+                            cfg.num_kv_heads as i32,
+                            cfg.head_dim as i32,
+                            cfg.intermediate_size as i32,
+                            cfg.rms_eps,
+                            w.w_dtype,
+                            w.w_group_size,
+                            w.q_proj.as_ptr() as *const std::ffi::c_void,
+                            w.k_proj.as_ptr() as *const std::ffi::c_void,
+                            w.v_proj.as_ptr() as *const std::ffi::c_void,
+                            w.o_proj.as_ptr() as *const std::ffi::c_void,
+                            f.gate.as_ptr() as *const std::ffi::c_void,
+                            f.up.as_ptr() as *const std::ffi::c_void,
+                            f.down.as_ptr() as *const std::ffi::c_void,
+                            w.input_layernorm.as_ptr(),
+                            w.post_attention_layernorm.as_ptr(),
+                            bias_ptr(&w.q_bias),
+                            bias_ptr(&w.k_bias),
+                            bias_ptr(&w.v_bias),
+                            bias_ptr(&w.q_norm),
+                            bias_ptr(&w.k_norm),
+                            self.inv_freq.as_ptr(),
+                            d_hidden.as_mut_ptr(),
+                            kv_keys,
+                            kv_values,
+                            num_positions as i32,
+                            position as i32,
+                            // Per-layer window: Gemma2's global layers must not be clipped.
+                            cfg.window_for_layer(layer).unwrap_or(0) as i32,
+                            cfg.activation.code(),
+                            crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                            cfg.attn_scale(),
+                            cfg.attn_logit_softcap.unwrap_or(0.0),
+                            bias_ptr(&w.pre_ffn_norm),
+                            bias_ptr(&w.post_ffn_norm),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu {
+                            api: "dlm_decode_block",
+                            code,
+                        });
+                    }
+                }
+                GpuFfn::Moe { .. } => {
+                    self.run_moe_block(
+                        layer,
+                        w,
+                        kv_keys,
+                        kv_values,
+                        d_hidden,
+                        num_positions,
+                        position,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_moe_ffn(&self, layer: u32, w: &GpuWeights, d_hidden: &DeviceBuffer) -> Result<()> {
         use std::ffi::c_void;
         let cfg = &self.shared.cfg;
@@ -1051,6 +1233,134 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         Some(self.stats())
     }
 
+    /// Prefill layer by layer, so each layer streams into VRAM once per prompt
+    /// chunk instead of once per prompt token — on a model bigger than the card,
+    /// the difference between re-sending the model per token and sending it once.
+    ///
+    /// Dense standard-attention layers run up to [`DLM_MAX_BATCH`] tokens per
+    /// device call, every slot aliasing the one layer KV (see `GpuKernel::prefill`
+    /// for why that is exact causal attention). MLA and MoE layers have no batched
+    /// block, so their tokens go one at a time through the same per-token body
+    /// `run_block` uses — still one stream-in per layer.
+    ///
+    /// ponytail: the hidden states live on the host between layers and cross the
+    /// bus per chunk (dense) or per token (MLA/MoE). Small next to a streamed
+    /// layer; keep them on the device if a profile ever shows the round trips.
+    fn prefill(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let cfg = &self.shared.cfg;
+        let hidden_size = cfg.hidden_size;
+        let kv_dim = cfg.kv_dim();
+        let n = hiddens.len() / hidden_size;
+        let zeros = vec![0.0f32; kv_dim];
+        if kv_layers.first().map_or(0, |kv| kv.len()) + n > self.kv_capacity_tokens {
+            return Err(DlmError::InvalidConfig(format!(
+                "GPU KV capacity {} exceeded at position {}",
+                self.kv_capacity_tokens,
+                start + n - 1
+            )));
+        }
+        for layer in 0..self.num_layers {
+            let w = self.shared.fetch(layer)?;
+            if let Some(tx) = &self.prefetch_tx {
+                let _ = tx.send((layer + 1) % self.num_layers);
+            }
+            let kv = &mut kv_layers[layer as usize];
+            let batched = cfg.mla.is_none() && matches!(w.ffn, GpuFfn::Dense(_));
+            if !batched {
+                for (i, hidden) in hiddens.chunks_mut(hidden_size).enumerate() {
+                    self.d_hidden.upload(hidden)?;
+                    self.run_layer(layer, &w, kv, start + i, &self.d_hidden)?;
+                    synchronize_default()?;
+                    self.d_hidden.download(hidden)?;
+                    kv.append(&zeros, &zeros)?;
+                }
+                continue;
+            }
+            let GpuFfn::Dense(f) = &w.ffn else {
+                unreachable!("batched implies a dense FFN")
+            };
+            let lcfg = cfg.for_layer(layer);
+            for (c, chunk) in hiddens.chunks_mut(hidden_size * DLM_MAX_BATCH).enumerate() {
+                let batch = chunk.len() / hidden_size;
+                let history = kv.len();
+                let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
+                let slot_keys = DlmSlots {
+                    p: [keys; DLM_MAX_BATCH],
+                };
+                let slot_values = DlmSlots {
+                    p: [values; DLM_MAX_BATCH],
+                };
+                let num_positions = DlmInts {
+                    v: std::array::from_fn(|b| (history + b) as i32),
+                };
+                let positions = DlmInts {
+                    v: std::array::from_fn(|b| (start + c * DLM_MAX_BATCH + b) as i32),
+                };
+                let d_chunk = DeviceBuffer::from_slice(chunk)?;
+                // SAFETY: live device buffers of the sizes the kernel expects; the
+                // KV has room for `history + batch` rows (checked above).
+                let code = unsafe {
+                    dlm_decode_block_batched(
+                        hidden_size as i32,
+                        lcfg.q_dim() as i32,
+                        kv_dim as i32,
+                        lcfg.num_heads as i32,
+                        lcfg.num_kv_heads as i32,
+                        lcfg.head_dim as i32,
+                        lcfg.intermediate_size as i32,
+                        lcfg.rms_eps,
+                        w.w_dtype,
+                        w.w_group_size,
+                        w.q_proj.as_ptr() as *const std::ffi::c_void,
+                        w.k_proj.as_ptr() as *const std::ffi::c_void,
+                        w.v_proj.as_ptr() as *const std::ffi::c_void,
+                        w.o_proj.as_ptr() as *const std::ffi::c_void,
+                        f.gate.as_ptr() as *const std::ffi::c_void,
+                        f.up.as_ptr() as *const std::ffi::c_void,
+                        f.down.as_ptr() as *const std::ffi::c_void,
+                        w.input_layernorm.as_ptr(),
+                        w.post_attention_layernorm.as_ptr(),
+                        bias_ptr(&w.q_bias),
+                        bias_ptr(&w.k_bias),
+                        bias_ptr(&w.v_bias),
+                        bias_ptr(&w.q_norm),
+                        bias_ptr(&w.k_norm),
+                        self.inv_freq.as_ptr(),
+                        d_chunk.as_mut_ptr(),
+                        &slot_keys,
+                        &slot_values,
+                        &num_positions,
+                        &positions,
+                        batch as i32,
+                        lcfg.sliding_window.unwrap_or(0) as i32,
+                        lcfg.activation.code(),
+                        crate::forward::cpu::rope_mscale(lcfg.rope_scaling),
+                        lcfg.attn_scale(),
+                        lcfg.attn_logit_softcap.unwrap_or(0.0),
+                        bias_ptr(&w.pre_ffn_norm),
+                        bias_ptr(&w.post_ffn_norm),
+                    )
+                };
+                if code != 0 {
+                    return Err(DlmError::Gpu {
+                        api: "dlm_decode_block_batched",
+                        code,
+                    });
+                }
+                d_chunk.download(chunk)?;
+                for _ in 0..batch {
+                    kv.append(&zeros, &zeros)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_block(
         &self,
         layer: u32,
@@ -1059,7 +1369,6 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         position: usize,
     ) -> Result<()> {
         let kv_dim = self.shared.cfg.kv_dim();
-        let cfg = &self.shared.cfg;
         let num_positions = kv.len();
         if num_positions >= self.kv_capacity_tokens {
             return Err(DlmError::InvalidConfig(format!(
@@ -1075,12 +1384,6 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         if let Some(tx) = &self.prefetch_tx {
             let _ = tx.send((layer + 1) % self.num_layers);
         }
-        // Per-session K/V (owned by this sequence's KvLayerCache), so batched
-        // requests sharing this kernel keep independent history.
-        // MLA reconstructs K and V from one cached latent — no value cache.
-        let (kv_keys, kv_values) =
-            kv.gpu_kv(self.kv_capacity_tokens, self.shared.cfg.mla.is_none())?;
-
         // The hidden stays resident across the streamed stack: upload before the
         // first layer, chain through, download after the last — so only weights
         // cross the bus per layer, not a hidden round-trip each time.
@@ -1090,166 +1393,8 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         if is_first {
             d_hidden.upload(hidden)?;
         }
+        self.run_layer(layer, &w, kv, position, d_hidden)?;
 
-        // MLA (DeepSeek) runs attention as its own device call, then the FFN half —
-        // dense or routed — exactly as the standard-attention paths do. This is the
-        // GPU mirror of `decode_block_streaming_moe`, which branches attention on
-        // `w.mla` and then runs the same MoE FFN.
-        if let (Some(mcfg), Some(mw)) = (&cfg.mla, &w.mla) {
-            // SAFETY: all pointers are live device allocations of the sizes the
-            // kernel expects; `kv_keys` has capacity for `num_positions + 1` rows
-            // of `kv_lora_rank + qk_rope_head_dim` (MLA's `kv_dim`).
-            let code = unsafe {
-                dlm_mla_attn(
-                    cfg.hidden_size as i32,
-                    cfg.num_heads as i32,
-                    mcfg.q_lora_rank.unwrap_or(0) as i32,
-                    mcfg.kv_lora_rank as i32,
-                    mcfg.qk_nope_head_dim as i32,
-                    mcfg.qk_rope_head_dim as i32,
-                    mcfg.v_head_dim as i32,
-                    cfg.rms_eps,
-                    w.w_dtype,
-                    w.w_group_size,
-                    mw.q_a_proj
-                        .as_ref()
-                        .map_or(std::ptr::null(), |b| b.as_ptr())
-                        as *const std::ffi::c_void,
-                    bias_ptr(&mw.q_a_layernorm),
-                    mw.q_b_proj.as_ptr() as *const std::ffi::c_void,
-                    mw.kv_a_proj.as_ptr() as *const std::ffi::c_void,
-                    mw.kv_a_layernorm.as_ptr(),
-                    mw.kv_b_proj.as_ptr() as *const std::ffi::c_void,
-                    w.o_proj.as_ptr() as *const std::ffi::c_void,
-                    w.input_layernorm.as_ptr(),
-                    self.mla_inv_freq
-                        .as_ref()
-                        .expect("mla_inv_freq present whenever cfg.mla is")
-                        .as_ptr(),
-                    crate::forward::cpu::rope_mscale(cfg.rope_scaling),
-                    d_hidden.as_mut_ptr(),
-                    kv_keys,
-                    num_positions as i32,
-                    position as i32,
-                )
-            };
-            if code != 0 {
-                return Err(DlmError::Gpu {
-                    api: "dlm_mla_attn",
-                    code,
-                });
-            }
-            match &w.ffn {
-                GpuFfn::Dense(f) => {
-                    let code = unsafe {
-                        dlm_dense_ffn(
-                            cfg.hidden_size as i32,
-                            cfg.intermediate_size as i32,
-                            cfg.rms_eps,
-                            f.w_dtype,
-                            f.w_group_size,
-                            f.gate.as_ptr() as *const std::ffi::c_void,
-                            f.up.as_ptr() as *const std::ffi::c_void,
-                            f.down.as_ptr() as *const std::ffi::c_void,
-                            w.post_attention_layernorm.as_ptr(),
-                            cfg.activation.code(),
-                            d_hidden.as_mut_ptr(),
-                        )
-                    };
-                    if code != 0 {
-                        return Err(DlmError::Gpu {
-                            api: "dlm_dense_ffn",
-                            code,
-                        });
-                    }
-                }
-                GpuFfn::Moe { .. } => {
-                    // `dlm_mla_attn` folds the residual but leaves no FFN input;
-                    // this produces the `normed2` the router/experts consume.
-                    let code = unsafe {
-                        dlm_moe_norm(
-                            cfg.hidden_size as i32,
-                            cfg.rms_eps,
-                            w.post_attention_layernorm.as_ptr(),
-                            d_hidden.as_mut_ptr(),
-                        )
-                    };
-                    if code != 0 {
-                        return Err(DlmError::Gpu {
-                            api: "dlm_moe_norm",
-                            code,
-                        });
-                    }
-                    self.run_moe_ffn(layer, &w, d_hidden)?;
-                }
-            }
-        } else {
-            match &w.ffn {
-                GpuFfn::Dense(f) => {
-                    // SAFETY: all pointers are live device allocations sized as the
-                    // kernel expects; the KV buffers have capacity for `num_positions + 1`.
-                    let code = unsafe {
-                        dlm_decode_block(
-                            cfg.hidden_size as i32,
-                            cfg.q_dim() as i32,
-                            kv_dim as i32,
-                            cfg.num_heads as i32,
-                            cfg.num_kv_heads as i32,
-                            cfg.head_dim as i32,
-                            cfg.intermediate_size as i32,
-                            cfg.rms_eps,
-                            w.w_dtype,
-                            w.w_group_size,
-                            w.q_proj.as_ptr() as *const std::ffi::c_void,
-                            w.k_proj.as_ptr() as *const std::ffi::c_void,
-                            w.v_proj.as_ptr() as *const std::ffi::c_void,
-                            w.o_proj.as_ptr() as *const std::ffi::c_void,
-                            f.gate.as_ptr() as *const std::ffi::c_void,
-                            f.up.as_ptr() as *const std::ffi::c_void,
-                            f.down.as_ptr() as *const std::ffi::c_void,
-                            w.input_layernorm.as_ptr(),
-                            w.post_attention_layernorm.as_ptr(),
-                            bias_ptr(&w.q_bias),
-                            bias_ptr(&w.k_bias),
-                            bias_ptr(&w.v_bias),
-                            bias_ptr(&w.q_norm),
-                            bias_ptr(&w.k_norm),
-                            self.inv_freq.as_ptr(),
-                            d_hidden.as_mut_ptr(),
-                            kv_keys,
-                            kv_values,
-                            num_positions as i32,
-                            position as i32,
-                            // Per-layer window: Gemma2's global layers must not be clipped.
-                            cfg.window_for_layer(layer).unwrap_or(0) as i32,
-                            cfg.activation.code(),
-                            crate::forward::cpu::rope_mscale(cfg.rope_scaling),
-                            cfg.attn_scale(),
-                            cfg.attn_logit_softcap.unwrap_or(0.0),
-                            bias_ptr(&w.pre_ffn_norm),
-                            bias_ptr(&w.post_ffn_norm),
-                        )
-                    };
-                    if code != 0 {
-                        return Err(DlmError::Gpu {
-                            api: "dlm_decode_block",
-                            code,
-                        });
-                    }
-                }
-                GpuFfn::Moe { .. } => {
-                    self.run_moe_block(
-                        layer,
-                        &w,
-                        kv_keys,
-                        kv_values,
-                        d_hidden,
-                        num_positions,
-                        position,
-                    )?;
-                }
-            }
-        }
         // Bring the result back only after the last layer. `download` is a blocking
         // D2H that drains the default stream, so an in-flight weight upload on the
         // copy stream keeps overlapping until then.

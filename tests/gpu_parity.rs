@@ -1439,3 +1439,131 @@ fn gpu_grouped_experts_match_cpu() {
         "grouped-top4",
     );
 }
+
+/// Prefill on `gpu` (two prompts back to back, then two decoded tokens) must
+/// match the CPU oracle decoding the same tokens one at a time. The second
+/// prompt is 37 tokens: it starts on non-empty history and spans three 16-slot
+/// device calls, the last one partial — the three places a chunking or aliasing
+/// error in the batched prefill would show.
+fn assert_prefill_matches_cpu<K: ComputeKernel>(
+    cfg: BlockConfig,
+    layers: Vec<LayerTensors>,
+    gpu: K,
+    what: &str,
+) {
+    let num_layers = layers.len() as u32;
+    let cpu = CpuKernel::new(cfg, layers).unwrap();
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut orch_cpu = ForwardOrchestrator::new(
+        cpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+    let mut orch_gpu = ForwardOrchestrator::new(
+        gpu,
+        PagedKvCache::new(kv_cfg, 16),
+        dlm::forward::KvQuant::None,
+    );
+
+    let h = cfg.hidden_size;
+    let mut rng = Rng::new(0x9E1F11);
+    for (round, tokens) in [5usize, 37, 1, 1].into_iter().enumerate() {
+        let mut want = rng.vec(tokens * h, 0.5);
+        let mut got = want.clone();
+        for hidden in want.chunks_mut(h) {
+            orch_cpu.decode_token(hidden).unwrap();
+        }
+        if tokens == 1 {
+            orch_gpu.decode_token(&mut got).unwrap();
+        } else {
+            orch_gpu.prefill(&mut got).unwrap();
+        }
+        let max_diff = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "{what}: round {round} ({tokens} tokens) diverged by {max_diff}"
+        );
+        assert_eq!(orch_cpu.position(), orch_gpu.position(), "{what}");
+    }
+}
+
+#[test]
+fn gpu_prefill_matches_cpu_decode() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 3, 0xBA7C4);
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "dense");
+}
+
+/// Gemma2's windowed layers must clip inside a prefill chunk too: the window (2)
+/// is far shorter than the 16-token chunks.
+#[test]
+fn gpu_prefill_matches_cpu_decode_gemma2() {
+    let (cfg, layers) = gemma2_fixture();
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "gemma2");
+}
+
+/// The streaming kernel's dense prefill, under a window of 2 of 3 layers.
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 3, 0xBA7C5);
+    let gpu = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming dense");
+}
+
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode_gemma2() {
+    let (cfg, layers) = gemma2_fixture();
+    let gpu = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming gemma2");
+}
+
+/// MoE layers take the per-token branch of the streaming prefill.
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode_moe() {
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 64,
+        shared_intermediate_size: Some(64),
+        norm_topk_prob: true,
+        naming: MoeNaming::Qwen,
+        first_k_dense: 0,
+    };
+    let cfg = BlockConfig {
+        moe: Some(m),
+        ..small_cfg()
+    };
+    let layers = random_moe_layers(&cfg, 4, 0x50FB);
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming moe");
+}
+
+/// DeepSeek's shape — MLA attention with MoE — also takes the per-token branch.
+#[test]
+fn streaming_gpu_prefill_matches_cpu_decode_mla_moe() {
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 16,
+        shared_intermediate_size: None,
+        norm_topk_prob: true,
+        naming: MoeNaming::Mixtral,
+        first_k_dense: 0,
+    };
+    let (cfg, sh) = mla_test_config(Some(m));
+    let layers = random_mla_layers(&cfg, sh, 4, 0xD5F1, Some(m));
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming mla+moe");
+}

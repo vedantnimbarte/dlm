@@ -28,6 +28,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--stream --resident-layers 4` prefills in 26 s instead of 56 s — the same as
   the fully-resident run. Output is bit-identical. Kernels gain a stack-level
   `ComputeKernel::prefill`, whose default keeps the old order.
+- **Batched prefill on the GPU.** Dense layers now prefill up to 16 prompt
+  tokens per device call on both GPU kernels, reusing the batched decode block
+  with every slot pointed at the one sequence's KV — which is exact causal
+  attention, since each slot writes its row before attending over the rows
+  below it. The streaming GPU kernel also goes layer by layer (MLA and MoE
+  layers one token at a time), so a layer streams into VRAM once per prompt
+  chunk instead of once per token. On a GTX 1650 with Qwen2.5-0.5B, a 204-token
+  prompt plus 8 generated tokens with `--stream --resident-layers 4` fell from
+  140 s to 10.5 s; the fully-resident prefill went from 8.4 s to 6.5 s. Output is
+  unchanged, and six new parity tests pin dense, Gemma2, MoE and MLA+MoE prefill
+  against the CPU oracle.
 - **Chat template auto-detection.** `--chat-template` now defaults to `auto`,
   which fingerprints the checkpoint's Jinja template and picks the matching
   built-in format. Five formats are new — `llama2`, `mistral`, `gemma`,

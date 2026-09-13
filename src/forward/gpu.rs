@@ -500,6 +500,79 @@ impl GpuKernel {
     }
 }
 
+impl GpuKernel {
+    /// One `dlm_decode_block_batched` call over the `[batch, hidden]` device block
+    /// at `x`, for dense standard-attention layer `layer`. The caller owns the
+    /// slot tables and the host KV length bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_block_batched(
+        &self,
+        layer: u32,
+        x: *mut f32,
+        slot_keys: &DlmSlots,
+        slot_values: &DlmSlots,
+        num_positions: &DlmInts,
+        slot_positions: &DlmInts,
+        batch: usize,
+    ) -> Result<()> {
+        let w = &self.layers[layer as usize];
+        let cfg = self.cfg.for_layer(layer);
+        let hidden_size = cfg.hidden_size;
+        let kv_dim = cfg.kv_dim();
+        // SAFETY: all pointers are live device allocations of the sizes the kernel
+        // expects; each slot's KV has room for its `num_positions + 1`-th row.
+        let code = unsafe {
+            dlm_decode_block_batched(
+                hidden_size as i32,
+                cfg.q_dim() as i32,
+                kv_dim as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.intermediate_size as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.gate_proj.as_ptr() as *const c_void,
+                w.up_proj.as_ptr() as *const c_void,
+                w.down_proj.as_ptr() as *const c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq.as_ptr(),
+                x,
+                slot_keys,
+                slot_values,
+                num_positions,
+                slot_positions,
+                batch as i32,
+                cfg.sliding_window.unwrap_or(0) as i32,
+                cfg.activation.code(),
+                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                cfg.attn_scale(),
+                cfg.attn_logit_softcap.unwrap_or(0.0),
+                bias_ptr(&w.pre_ffn_norm),
+                bias_ptr(&w.post_ffn_norm),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_decode_block_batched",
+                code,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl ComputeKernel for GpuKernel {
     fn num_layers(&self) -> u32 {
         self.layers.len() as u32
@@ -535,11 +608,8 @@ impl ComputeKernel for GpuKernel {
             }
             return Ok(());
         }
-        let w = &self.layers[layer as usize];
-        // Gemma2's alternating window is resolved per layer, as in `run_block`.
-        let cfg = self.cfg.for_layer(layer);
-        let hidden_size = cfg.hidden_size;
-        let kv_dim = cfg.kv_dim();
+        let hidden_size = self.cfg.hidden_size;
+        let kv_dim = self.cfg.kv_dim();
 
         let mut slot_keys = DlmSlots {
             p: [std::ptr::null_mut(); DLM_MAX_BATCH],
@@ -581,56 +651,15 @@ impl ComputeKernel for GpuKernel {
         }
 
         let d_batch = DeviceBuffer::from_slice(&staged)?;
-        // SAFETY: all pointers are live device allocations of the sizes the kernel
-        // expects; each slot's KV has room for its `num_positions + 1`-th row.
-        let code = unsafe {
-            dlm_decode_block_batched(
-                hidden_size as i32,
-                cfg.q_dim() as i32,
-                kv_dim as i32,
-                cfg.num_heads as i32,
-                cfg.num_kv_heads as i32,
-                cfg.head_dim as i32,
-                cfg.intermediate_size as i32,
-                cfg.rms_eps,
-                w.w_dtype,
-                w.w_group_size,
-                w.q_proj.as_ptr() as *const c_void,
-                w.k_proj.as_ptr() as *const c_void,
-                w.v_proj.as_ptr() as *const c_void,
-                w.o_proj.as_ptr() as *const c_void,
-                w.gate_proj.as_ptr() as *const c_void,
-                w.up_proj.as_ptr() as *const c_void,
-                w.down_proj.as_ptr() as *const c_void,
-                w.input_layernorm.as_ptr(),
-                w.post_attention_layernorm.as_ptr(),
-                bias_ptr(&w.q_bias),
-                bias_ptr(&w.k_bias),
-                bias_ptr(&w.v_bias),
-                bias_ptr(&w.q_norm),
-                bias_ptr(&w.k_norm),
-                self.inv_freq.as_ptr(),
-                d_batch.as_mut_ptr(),
-                &slot_keys,
-                &slot_values,
-                &num_positions,
-                &slot_positions,
-                batch as i32,
-                cfg.sliding_window.unwrap_or(0) as i32,
-                cfg.activation.code(),
-                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
-                cfg.attn_scale(),
-                cfg.attn_logit_softcap.unwrap_or(0.0),
-                bias_ptr(&w.pre_ffn_norm),
-                bias_ptr(&w.post_ffn_norm),
-            )
-        };
-        if code != 0 {
-            return Err(DlmError::Gpu {
-                api: "dlm_decode_block_batched",
-                code,
-            });
-        }
+        self.launch_block_batched(
+            layer,
+            d_batch.as_mut_ptr(),
+            &slot_keys,
+            &slot_values,
+            &num_positions,
+            &slot_positions,
+            batch,
+        )?;
         d_batch.download(&mut staged)?;
         for (b, hidden) in hiddens.iter_mut().enumerate() {
             hidden.copy_from_slice(&staged[b * hidden_size..(b + 1) * hidden_size]);
@@ -640,6 +669,74 @@ impl ComputeKernel for GpuKernel {
             kv.append(&vec![0.0; kv_dim], &vec![0.0; kv_dim])?;
         }
         Ok(())
+    }
+
+    /// Prefill a dense model layer by layer, up to [`DLM_MAX_BATCH`] tokens per
+    /// device call. Every slot of a call points at the **same** layer KV, with
+    /// `num_positions = history + b`: the batched block writes slot `b`'s K/V
+    /// and then attends over rows `[0, history + b]`, in slot order on one
+    /// stream, so each token sees exactly the tokens before it — causal prefill
+    /// out of the decode kernel, with each projection read once per chunk. The
+    /// hidden states stay on the device for the whole stack.
+    ///
+    /// MLA layers have no batched block and keep the per-token order.
+    fn prefill(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let hidden_size = self.cfg.hidden_size;
+        let n = hiddens.len() / hidden_size;
+        if n <= 1 || self.cfg.mla.is_some() {
+            return crate::forward::kernel::prefill_token_by_token(self, hiddens, kv_layers, start);
+        }
+        let kv_dim = self.cfg.kv_dim();
+        let zeros = vec![0.0f32; kv_dim];
+        let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
+        for layer in 0..self.num_layers() {
+            let kv = &mut kv_layers[layer as usize];
+            for chunk in (0..n).step_by(DLM_MAX_BATCH) {
+                let batch = (n - chunk).min(DLM_MAX_BATCH);
+                let history = kv.len();
+                if history + batch > self.kv_capacity_tokens {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "GPU KV capacity {} exceeded at position {}",
+                        self.kv_capacity_tokens,
+                        start + chunk + batch - 1
+                    )));
+                }
+                let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
+                let slot_keys = DlmSlots {
+                    p: [keys; DLM_MAX_BATCH],
+                };
+                let slot_values = DlmSlots {
+                    p: [values; DLM_MAX_BATCH],
+                };
+                let num_positions = DlmInts {
+                    v: std::array::from_fn(|b| (history + b) as i32),
+                };
+                let slot_positions = DlmInts {
+                    v: std::array::from_fn(|b| (start + chunk + b) as i32),
+                };
+                // SAFETY: `chunk + batch <= n`, so the offset block lies inside
+                // the `n × hidden` device buffer.
+                let x = unsafe { d_hiddens.as_mut_ptr().add(chunk * hidden_size) };
+                self.launch_block_batched(
+                    layer,
+                    x,
+                    &slot_keys,
+                    &slot_values,
+                    &num_positions,
+                    &slot_positions,
+                    batch,
+                )?;
+                for _ in 0..batch {
+                    kv.append(&zeros, &zeros)?;
+                }
+            }
+        }
+        d_hiddens.download(hiddens)
     }
 
     fn run_block(

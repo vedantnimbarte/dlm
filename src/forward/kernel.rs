@@ -75,12 +75,7 @@ pub trait ComputeKernel {
         kv_layers: &mut [KvLayerCache],
         start: usize,
     ) -> Result<()> {
-        for (i, hidden) in hiddens.chunks_mut(self.hidden_size()).enumerate() {
-            for layer in 0..self.num_layers() {
-                self.run_block(layer, hidden, &mut kv_layers[layer as usize], start + i)?;
-            }
-        }
-        Ok(())
+        prefill_token_by_token(self, hiddens, kv_layers, start)
     }
 
     /// Layer-streaming cache stats, if this kernel streams weights. Resident
@@ -138,6 +133,23 @@ impl<K: ComputeKernel> ComputeKernel for &K {
     ) -> Result<()> {
         (**self).prefill(hiddens, kv_layers, start)
     }
+}
+
+/// [`ComputeKernel::prefill`] in decode order: each token through every layer
+/// before the next token starts. The default, and the fallback for a kernel that
+/// overrides prefill for only some layer shapes.
+pub fn prefill_token_by_token<K: ComputeKernel + ?Sized>(
+    kernel: &K,
+    hiddens: &mut [f32],
+    kv_layers: &mut [KvLayerCache],
+    start: usize,
+) -> Result<()> {
+    for (i, hidden) in hiddens.chunks_mut(kernel.hidden_size()).enumerate() {
+        for layer in 0..kernel.num_layers() {
+            kernel.run_block(layer, hidden, &mut kv_layers[layer as usize], start + i)?;
+        }
+    }
+    Ok(())
 }
 
 /// [`ComputeKernel::prefill`] in layer-major order: every token through layer 0,
