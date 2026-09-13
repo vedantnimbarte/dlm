@@ -20,7 +20,7 @@ pub use cpu::{
     KvQuant, LayerTensors, MlaWeights, QuantLayout, RopeScaling, Weights, QUANT_GROUP_SIZE,
 };
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-pub use gpu::{GpuKernel, MultiGpuKernel};
+pub use gpu::{GpuKernel, GpuLmHead, MultiGpuKernel};
 pub use kernel::{ComputeKernel, StubKernel};
 pub use multigpu::PipelineParallelKernel;
 pub use orchestrator::{ForwardOrchestrator, KvSnapshot};

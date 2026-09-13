@@ -131,6 +131,17 @@ extern "C" {
         x: *mut f32,
     ) -> i32;
 
+    /// `logits_host[0..vocab] = W · x_host`: the LM head on the device.
+    pub(crate) fn dlm_lm_head(
+        vocab: i32,
+        hidden_size: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        w: *const c_void,
+        x_host: *const f32,
+        logits_host: *mut f32,
+    ) -> i32;
+
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
     /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
     pub(crate) fn dlm_moe_matvec(
@@ -328,6 +339,69 @@ pub(crate) fn upload_bias(bias: Option<&Vec<f32>>) -> Result<Option<DeviceBuffer
 /// Device pointer for an optional buffer — NULL when absent.
 pub(crate) fn bias_ptr(b: &Option<DeviceBuffer>) -> *const f32 {
     b.as_ref().map_or(std::ptr::null(), |d| d.as_ptr())
+}
+
+/// The LM head resident in VRAM. Decoding ends every step with a
+/// `vocab × hidden` GEMV -- 233M multiply-adds for a 151,936-token vocabulary at
+/// hidden 1536 -- which on the host costs more than the whole GPU layer stack
+/// of a small model.
+pub struct GpuLmHead {
+    w: DeviceBuffer,
+    w_dtype: i32,
+    w_group_size: i32,
+    vocab: usize,
+    hidden: usize,
+}
+
+impl GpuLmHead {
+    /// Upload `head` (row-major `[vocab, hidden]`, already in the precision the
+    /// caller chose).
+    pub fn new(head: &crate::forward::Weights, vocab: usize, hidden: usize) -> Result<Self> {
+        if head.len() != vocab * hidden {
+            return Err(DlmError::ShapeMismatch {
+                expected: vocab * hidden,
+                got: head.len(),
+            });
+        }
+        Ok(Self {
+            w: upload_weight(head)?,
+            w_dtype: head.dtype_code(),
+            w_group_size: head.group_size() as i32,
+            vocab,
+            hidden,
+        })
+    }
+
+    /// Logits for the final-normed hidden state `x`.
+    pub fn logits(&self, x: &[f32]) -> Result<Vec<f32>> {
+        if x.len() != self.hidden {
+            return Err(DlmError::ShapeMismatch {
+                expected: self.hidden,
+                got: x.len(),
+            });
+        }
+        let mut out = vec![0.0f32; self.vocab];
+        // SAFETY: `w` is a live device buffer of `vocab × hidden` weights in
+        // `w_dtype`; `x` and `out` are host slices of the lengths passed.
+        let code = unsafe {
+            dlm_lm_head(
+                self.vocab as i32,
+                self.hidden as i32,
+                self.w_dtype,
+                self.w_group_size,
+                self.w.as_ptr() as *const c_void,
+                x.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_lm_head",
+                code,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// One layer's weights plus its persistent K/V history, resident in VRAM.

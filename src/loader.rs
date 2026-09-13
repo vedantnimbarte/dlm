@@ -508,6 +508,10 @@ impl ModelParts {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let quantized = self
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
         let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
         Ok(Generator::new(
             kernel,
@@ -520,7 +524,8 @@ impl ModelParts {
             self.kv_blocks,
         )?
         .with_embed_scale(embed_scale)
-        .with_final_logit_softcap(logit_cap))
+        .with_final_logit_softcap(logit_cap)
+        .with_lm_head_on_gpu(quantized))
     }
 
     /// Split the model's layers across `gpu_ids` and build a generator over a
@@ -1466,7 +1471,13 @@ pub fn build_streaming_gpu_generator(
         p.kv_blocks,
     )?
     .with_embed_scale(p.embed_scale)
-    .with_final_logit_softcap(p.final_logit_softcap))
+    .with_final_logit_softcap(p.final_logit_softcap)
+    // The VRAM plan already reserves the pinned zone (embedding, head, norms)
+    // before sizing the window, so the head fits in what was set aside for it.
+    .with_lm_head_on_gpu(matches!(
+        config.quant,
+        QuantScheme::Int4 | QuantScheme::Int8
+    )))
 }
 
 /// Materialize a checkpoint into [`ModelParts`] (host `f32` weights + shapes).

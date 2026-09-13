@@ -189,7 +189,7 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
                     .embed(proposals[j - 1], self.draft_kv.position())?;
                 self.draft_kv.decode_token(&mut hidden)?;
             }
-            let q = self.draft.distribution(&hidden, &seen, &self.sampler);
+            let q = self.draft.distribution(&hidden, &seen, &self.sampler)?;
             let x = sample_from(&q, &mut self.rng);
             seen.insert(x);
             proposals.push(x);
@@ -225,7 +225,7 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
         for (j, (&x, q)) in proposals.iter().zip(&draft_dists).enumerate() {
             let p = self
                 .target
-                .distribution(target_hidden(j), &seen, &self.sampler);
+                .distribution(target_hidden(j), &seen, &self.sampler)?;
             let (px, qx) = (prob_of(&p, x), prob_of(q, x));
             if qx > 0.0 && self.rng.next_f32() < px / qx {
                 emitted.push(x);
@@ -242,7 +242,7 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
         if all_accepted && emitted.len() < budget {
             let p = self
                 .target
-                .distribution(target_hidden(gamma), &seen, &self.sampler);
+                .distribution(target_hidden(gamma), &seen, &self.sampler)?;
             emitted.push(sample_from(&p, &mut self.rng));
         }
 

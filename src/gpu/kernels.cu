@@ -30,6 +30,7 @@
 #define cudaGetLastError hipGetLastError
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -367,8 +368,9 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 13-18 are MLA-only: normed, q (nh*qk), c_q (q_lora), kv_a (latent+rope),
 // c_kv (latent), and the attention context (nh*v_head_dim).
 // Slot 19 holds the attention logits/weights, [num_heads, attended positions].
-enum { SCRATCH_N = 20 };
-enum { ATTN_SCORES = 19 };
+// Slots 20-21 are the LM head's input hidden and output logits.
+enum { SCRATCH_N = 22 };
+enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
 static thread_local float* g_scratch[SCRATCH_N] = {0};
@@ -818,6 +820,29 @@ extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_g
     // is negligible against the expert GEMVs that follow.
     if (e == cudaSuccess)
         e = cudaMemcpy(y_host, g_scratch[MOE_MATVEC], (size_t)out_dim * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+    return (int)e;
+}
+
+// The LM head: `logits_host[0..vocab] = W · x_host`. The host applies the final
+// norm (one hidden-wide vector) and uploads the result; the vocabulary-wide GEMV
+// -- by far the largest single matvec in a decode step -- runs here, and the
+// logits come back in one blocking copy.
+extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                           const void* w, const float* x_host, float* logits_host)
+{
+    cudaError_t e = scratch_ensure(LM_X, hidden_size);
+    if (e == cudaSuccess) e = scratch_ensure(LM_LOGITS, vocab);
+    if (e == cudaSuccess)
+        e = cudaMemcpy(g_scratch[LM_X], x_host, (size_t)hidden_size * sizeof(float),
+                       cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) {
+        launch_matvec(w_dtype, w, g_scratch[LM_X], (const float*)0, g_scratch[LM_LOGITS],
+                      vocab, hidden_size, w_group_size);
+        e = cudaGetLastError();
+    }
+    if (e == cudaSuccess)
+        e = cudaMemcpy(logits_host, g_scratch[LM_LOGITS], (size_t)vocab * sizeof(float),
                        cudaMemcpyDeviceToHost);
     return (int)e;
 }

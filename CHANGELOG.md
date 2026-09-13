@@ -39,6 +39,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   140 s to 10.5 s; the fully-resident prefill went from 8.4 s to 6.5 s. Output is
   unchanged, and six new parity tests pin dense, Gemma2, MoE and MLA+MoE prefill
   against the CPU oracle.
+- **The LM head runs on the GPU.** Every GPU decode step used to finish with
+  the vocabulary-wide GEMV on the host — 233M multiply-adds per token for
+  Qwen2.5-1.5B — which cost more than the model's entire layer stack on the
+  device. The head now uploads with the layers: bf16 when its values are exactly
+  bf16 (lossless), f32 otherwise, int8 when the layers were quantized with
+  `--quant`. If it does not fit, dlm warns and keeps the host head. On a GTX
+  1650, Qwen2.5-1.5B `--quant int8` generates 128 tokens in 10.2 s instead of
+  19.7 s; streamed with 8 of 28 layers resident, 50.5 s instead of 56.6 s.
 - **Speculative decoding samples, and keeps its KV cache.** With
   `--draft-model-path`, each verification used to rebuild the target's KV
   cache and re-run the whole sequence for every token it checked, and request
@@ -48,7 +56,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `temperature`, `top_p`, `top_k`, `min_p` and `repetition_penalty` are honored
   and the output follows the target's distribution (greedy stays identical to
   plain decoding). Qwen2.5-1.5B with a 0.5B draft reproduces plain greedy output
-  token for token at 80% acceptance.
+  token for token at 80% acceptance, in 13.7 s for 128 tokens where the old
+  implementation took 691 s. On the GTX 1650 that is still slower than plain
+  decoding (10.2 s): per-layer launch overhead, not weight size, dominates there,
+  so a 24-layer draft costs nearly as much per token as a 28-layer target.
 - **GPU attention no longer slows down linearly with context.** The attention
   kernel ran one thread per head, each walking the whole history in a scalar
   loop; it is now three launches parallel over (head, position) and (head,

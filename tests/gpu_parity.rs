@@ -1625,3 +1625,70 @@ fn gpu_long_context_attention_matches_cpu() {
         );
     }
 }
+
+/// The LM head on the device must pick the same tokens as the host head, in
+/// each precision it uploads: bf16 (a head whose values are exactly
+/// bf16-representable, as a bf16 checkpoint's are), f32 (anything else), and
+/// int8 (a quantized model). The model is random, so the logits have no
+/// comfortable margins -- a head that scored the wrong rows would diverge within
+/// a few tokens.
+#[test]
+fn gpu_lm_head_matches_host_head() {
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    let cfg = small_cfg();
+    let vocab = 300;
+    let layers = random_layers(&cfg, 2, 0x4EAD);
+    let mut rng = Rng::new(0x4EAE);
+    let embedding = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let f32_head = rng.vec(vocab * cfg.hidden_size, 0.5);
+    // Keep only the bits bf16 stores, so the bf16 branch is taken and lossless.
+    let bf16_head: Vec<f32> = f32_head
+        .iter()
+        .map(|v| f32::from_bits(v.to_bits() & !0xFFFF))
+        .collect();
+    let kv = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let build = |head: &[f32]| {
+        Generator::new(
+            GpuKernel::new(cfg, layers.clone(), 64).unwrap(),
+            embedding.clone(),
+            vec![1.0; cfg.hidden_size],
+            head.to_vec(),
+            vocab,
+            1e-5,
+            kv,
+            4,
+        )
+        .unwrap()
+    };
+    let greedy = GenerationConfig {
+        max_new_tokens: 24,
+        eos_token: None,
+        sampler: Sampler::Greedy,
+    };
+    let prompt = [5u32, 77, 140, 3];
+    for (what, head, int8) in [
+        ("bf16", &bf16_head, false),
+        ("f32", &f32_head, false),
+        ("int8", &f32_head, true),
+    ] {
+        let host = build(head).generate(&prompt, &greedy).unwrap();
+        let mut dev = build(head);
+        dev.place_lm_head_on_gpu(int8).unwrap();
+        let got = dev.generate(&prompt, &greedy).unwrap();
+        if int8 {
+            // Quantization may move a near-tie; most tokens must still agree.
+            let same = host.iter().zip(&got).filter(|(a, b)| a == b).count();
+            assert!(
+                same >= 20,
+                "{what}: only {same}/24 tokens match the host head"
+            );
+        } else {
+            assert_eq!(got, host, "{what}: device head chose different tokens");
+        }
+    }
+}

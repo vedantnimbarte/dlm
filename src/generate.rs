@@ -332,6 +332,10 @@ pub struct Generator<K: ComputeKernel> {
     /// changes the distribution (it compresses the tail toward the cap), so it is
     /// part of correctness rather than a stylistic knob. `None` elsewhere.
     final_logit_softcap: Option<f32>,
+    /// The LM head on the device, when [`with_gpu_lm_head`](Self::with_gpu_lm_head)
+    /// placed it there; `lm_head` is then left empty.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    gpu_head: Option<crate::forward::GpuLmHead>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -376,6 +380,8 @@ impl<K: ComputeKernel> Generator<K> {
             final_norm_bias: None,
             final_norm_kind: crate::forward::cpu::NormKind::Rms,
             final_logit_softcap: None,
+            #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+            gpu_head: None,
         })
     }
 
@@ -432,6 +438,53 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// Embed a token id into a fresh hidden vector.
+    /// Move the LM head into VRAM, so each step's vocabulary-wide GEMV runs on the
+    /// device instead of the host.
+    ///
+    /// Precision follows the weights: a head that is exactly bf16-representable
+    /// (a bf16 checkpoint) uploads as bf16, losslessly and at half the size;
+    /// anything else uploads as f32. `quantize_int8` is for a model whose layers
+    /// were quantized at load (`--quant int4`/`int8`) -- the user already chose
+    /// lossy weights, and int8 keeps the head's error small (int4 is too coarse
+    /// for the one matrix every token's choice goes through).
+    ///
+    /// The host copy is released once the upload succeeds; on failure (VRAM
+    /// exhausted, say) the generator is untouched and keeps the host head.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn place_lm_head_on_gpu(&mut self, quantize_int8: bool) -> Result<()> {
+        use crate::forward::Weights;
+        let head = if quantize_int8 {
+            Weights::quantize_int8(&self.lm_head, crate::forward::QUANT_GROUP_SIZE)?
+        } else if self.lm_head.iter().all(|v| v.to_bits() & 0xFFFF == 0) {
+            Weights::Bf16(
+                self.lm_head
+                    .iter()
+                    .map(|v| (v.to_bits() >> 16) as u16)
+                    .collect(),
+            )
+        } else {
+            Weights::from_f32(self.lm_head.clone())
+        };
+        self.gpu_head = Some(crate::forward::GpuLmHead::new(
+            &head,
+            self.vocab_size,
+            self.hidden_size,
+        )?);
+        self.lm_head = Vec::new();
+        Ok(())
+    }
+
+    /// [`place_lm_head_on_gpu`](Self::place_lm_head_on_gpu), falling back to the
+    /// host head with a warning rather than failing: a host head is slower, not
+    /// wrong.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn with_lm_head_on_gpu(mut self, quantize_int8: bool) -> Self {
+        if let Err(e) = self.place_lm_head_on_gpu(quantize_int8) {
+            eprintln!("warning: the LM head stays on the CPU ({e}); decoding will be slower");
+        }
+        self
+    }
+
     /// A fresh single-sequence orchestrator over this generator's kernel and KV
     /// budget.
     pub(crate) fn orchestrator(&self) -> ForwardOrchestrator<&K> {
@@ -449,10 +502,10 @@ impl<K: ComputeKernel> Generator<K> {
         hidden: &[f32],
         seen: &std::collections::HashSet<u32>,
         sampler: &Sampler,
-    ) -> Vec<(u32, f32)> {
-        let mut logits = self.logits(hidden);
+    ) -> Result<Vec<(u32, f32)>> {
+        let mut logits = self.logits(hidden)?;
         apply_repetition_penalty(&mut logits, seen, sampler.repetition_penalty());
-        sampler.distribution(&logits)
+        Ok(sampler.distribution(&logits))
     }
 
     pub(crate) fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
@@ -504,7 +557,7 @@ impl<K: ComputeKernel> Generator<K> {
         Ok(hiddens.split_off(hiddens.len() - self.hidden_size))
     }
 
-    fn logits(&self, hidden: &[f32]) -> Vec<f32> {
+    fn logits(&self, hidden: &[f32]) -> Result<Vec<f32>> {
         let normed = crate::forward::cpu::norm(
             hidden,
             &self.final_norm,
@@ -512,13 +565,19 @@ impl<K: ComputeKernel> Generator<K> {
             self.rms_eps,
             self.final_norm_kind,
         );
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        let mut out = match &self.gpu_head {
+            Some(head) => head.logits(&normed)?,
+            None => matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size),
+        };
+        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         let mut out = matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
         if let Some(cap) = self.final_logit_softcap {
             for l in out.iter_mut() {
                 *l = (*l / cap).tanh() * cap;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Greedy-decode a **batch** of prompts together, advancing all sequences
@@ -594,7 +653,7 @@ impl<K: ComputeKernel> Generator<K> {
                 if done[s] {
                     continue;
                 }
-                let mut logits = self.logits(&hidden[s]);
+                let mut logits = self.logits(&hidden[s])?;
                 apply_repetition_penalty(&mut logits, &seen[s], penalty);
                 let next = cfg.sampler.sample(&logits, &mut rngs[s]);
                 out[s].push(next);
@@ -647,7 +706,7 @@ impl<K: ComputeKernel> Generator<K> {
         let mut seen: std::collections::HashSet<u32> = prompt.iter().copied().collect();
         let mut generated = Vec::with_capacity(cfg.max_new_tokens);
         for _ in 0..cfg.max_new_tokens {
-            let mut logits = self.logits(&hidden);
+            let mut logits = self.logits(&hidden)?;
             apply_repetition_penalty(&mut logits, &seen, penalty);
             let next = cfg.sampler.sample(&logits, &mut rng);
             generated.push(next);
@@ -766,7 +825,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
 
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
-        let mut logits = self.generator.logits(&self.last_hidden);
+        let mut logits = self.generator.logits(&self.last_hidden)?;
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
         let next = self.sampler.sample(&logits, &mut self.rng);
         self.seen.insert(next);
@@ -839,10 +898,10 @@ mod tests {
     fn final_logit_softcap_compresses_without_reordering() {
         let hidden = vec![0.4f32, -0.7, 0.15, 0.9];
         let plain = counting_generator();
-        let raw = plain.logits(&hidden);
+        let raw = plain.logits(&hidden).unwrap();
 
         let capped_gen = counting_generator().with_final_logit_softcap(Some(0.5));
-        let capped = capped_gen.logits(&hidden);
+        let capped = capped_gen.logits(&hidden).unwrap();
 
         assert_eq!(raw.len(), capped.len());
         // Every capped logit is inside ±cap, and strictly smaller in magnitude
@@ -858,11 +917,12 @@ mod tests {
 
         // A non-positive cap is treated as "off", not as a divide-by-zero.
         let off = counting_generator().with_final_logit_softcap(Some(0.0));
-        assert_eq!(off.logits(&hidden), raw);
+        assert_eq!(off.logits(&hidden).unwrap(), raw);
         assert_eq!(
             counting_generator()
                 .with_final_logit_softcap(None)
-                .logits(&hidden),
+                .logits(&hidden)
+                .unwrap(),
             raw
         );
     }
