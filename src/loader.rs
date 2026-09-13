@@ -1496,16 +1496,16 @@ pub fn build_streaming_gpu_generator(
     )))
 }
 
+/// `(position_embedding, final_norm_bias)`; see [`load_head_extras`].
+type HeadExtras = (Option<Vec<f32>>, Option<Vec<f32>>);
+
 /// GPT-2's learned position embeddings (`wpe`), and the final-norm bias GPT-2
 /// and Falcon's LayerNorm head carries. Both `None` on every other family.
 ///
 /// Every generator builder needs these, not just the CPU one: a GPT-2 generator
 /// without `wpe` has no positional signal at all and repeats one token, and an
 /// RMSNorm head where a LayerNorm belongs is wrong without erroring.
-fn load_head_extras(
-    store: &MmapStore,
-    hidden: usize,
-) -> Result<(Option<Vec<f32>>, Option<Vec<f32>>)> {
+fn load_head_extras(store: &MmapStore, hidden: usize) -> Result<HeadExtras> {
     if is_gpt2_tree(store) {
         Ok((
             Some(load_floats(store, "wpe.weight")?),

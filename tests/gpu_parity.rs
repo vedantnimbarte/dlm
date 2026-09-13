@@ -1692,3 +1692,91 @@ fn gpu_lm_head_matches_host_head() {
         }
     }
 }
+
+// ── Non-Llama blocks: GPT-2 and Falcon ───────────────────────────────────────
+//
+// Both differ from the Llama block in ways that produce fluent garbage rather
+// than an error when missed: LayerNorm with biases, no gate, biases on the
+// output projection and the MLP; GPT-2 without rotary; Falcon with the FFN
+// reading the block input's norm. Norms and biases are non-uniform, so a norm
+// applied as RMSNorm or a bias left off moves the hidden state.
+
+/// A GPT-2- or Falcon-shaped layer stack for `cfg` (ungated, LayerNorm, biased).
+fn biased_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> {
+    let mut rng = Rng::new(seed);
+    let (h, s) = (cfg.hidden_size, 0.05);
+    (0..n)
+        .map(|_| LayerTensors {
+            q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * h, s)),
+            k_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+            v_proj: Weights::from_f32(rng.vec(cfg.kv_dim() * h, s)),
+            o_proj: Weights::from_f32(rng.vec(h * cfg.q_dim(), s)),
+            o_bias: Some(rng.vec(h, 0.1)),
+            q_bias: Some(rng.vec(cfg.q_dim(), 0.1)),
+            k_bias: Some(rng.vec(cfg.kv_dim(), 0.1)),
+            v_bias: Some(rng.vec(cfg.kv_dim(), 0.1)),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: Weights::F32(Vec::new()),
+                up: Weights::from_f32(rng.vec(cfg.intermediate_size * h, s)),
+                down: Weights::from_f32(rng.vec(h * cfg.intermediate_size, s)),
+                up_bias: Some(rng.vec(cfg.intermediate_size, 0.1)),
+                down_bias: Some(rng.vec(h, 0.1)),
+            }),
+            input_layernorm: (0..h).map(|i| 1.0 + i as f32 * 0.01).collect(),
+            input_layernorm_bias: Some(rng.vec(h, 0.2)),
+            post_attention_layernorm: (0..h).map(|i| 0.9 - i as f32 * 0.005).collect(),
+            post_attention_layernorm_bias: Some(rng.vec(h, 0.2)),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn gpt2_cfg() -> BlockConfig {
+    BlockConfig {
+        norm_kind: dlm::forward::cpu::NormKind::Layer,
+        ffn_kind: dlm::forward::cpu::FfnKind::Plain,
+        learned_positions: true,
+        activation: dlm::forward::Activation::GeluTanh,
+        num_kv_heads: 4,
+        ..small_cfg()
+    }
+}
+
+fn falcon_cfg() -> BlockConfig {
+    BlockConfig {
+        norm_kind: dlm::forward::cpu::NormKind::Layer,
+        ffn_kind: dlm::forward::cpu::FfnKind::Plain,
+        parallel_residual: true,
+        activation: dlm::forward::Activation::GeluTanh,
+        num_kv_heads: 1, // multi-query
+        ..small_cfg()
+    }
+}
+
+#[test]
+fn gpu_gpt2_block_matches_cpu() {
+    let cfg = gpt2_cfg();
+    assert_gpu_matches_cpu(cfg, biased_layers(&cfg, 3, 0x6E72), 1e-3, "gpt2");
+}
+
+#[test]
+fn gpu_falcon_block_matches_cpu() {
+    let cfg = falcon_cfg();
+    assert_gpu_matches_cpu(cfg, biased_layers(&cfg, 3, 0xFA1C), 1e-3, "falcon");
+}
+
+/// Both shapes through the batched block (resident and streamed prefill).
+#[test]
+fn gpu_gpt2_and_falcon_prefill_matches_cpu() {
+    for (what, cfg, seed) in [
+        ("gpt2", gpt2_cfg(), 0x6E73),
+        ("falcon", falcon_cfg(), 0xFA1D),
+    ] {
+        let layers = biased_layers(&cfg, 3, seed);
+        let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+        assert_prefill_matches_cpu(cfg, layers.clone(), gpu, what);
+        let streamed =
+            StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+        assert_prefill_matches_cpu(cfg, layers, streamed, &format!("{what} streamed"));
+    }
+}

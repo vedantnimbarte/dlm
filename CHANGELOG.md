@@ -44,6 +44,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   140 s to 10.5 s; the fully-resident prefill went from 8.4 s to 6.5 s. Output is
   unchanged, and six new parity tests pin dense, Gemma2, MoE and MLA+MoE prefill
   against the CPU oracle.
+- **GPT-2 and Falcon run on the GPU**, resident and streamed. The device block
+  gains LayerNorm (with bias), the ungated MLP, output-projection and MLP
+  biases, a no-RoPE mode, and Falcon's parallel residual, selected per layer
+  from the config. Previously `--device gpu` ran these models through the
+  Llama-shaped kernel and produced garbage without an error. GPT-2 answers
+  identically on CPU and GPU (0.36 s vs 2.5 s for 12 tokens on a GTX 1650);
+  Falcon is checked against the CPU oracle on synthetic weights, since no
+  runnable Falcon checkpoint fits the card.
 - **The LM head runs on the GPU.** Every GPU decode step used to finish with
   the vocabulary-wide GEMV on the host — 233M multiply-adds per token for
   Qwen2.5-1.5B — which cost more than the model's entire layer stack on the

@@ -43,7 +43,8 @@ use std::thread::JoinHandle;
 use crate::forward::gpu::{
     bias_ptr, dlm_apply_expert, dlm_apply_experts, dlm_decode_block, dlm_decode_block_batched,
     dlm_dense_ffn, dlm_mla_attn, dlm_moe_attn, dlm_moe_matvec, dlm_moe_norm, upload_bias,
-    upload_weight, DlmInts, DlmPtrs, DlmSlots, DlmWeights, GpuMla, DLM_MAX_BATCH, DLM_MAX_TOPK,
+    upload_weight, DlmBlockExt, DlmInts, DlmPtrs, DlmSlots, DlmWeights, GpuBlockBiases, GpuMla,
+    DLM_MAX_BATCH, DLM_MAX_TOPK,
 };
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -61,8 +62,10 @@ impl GpuExpert {
             gate: DeviceBuffer::from_bytes(e.gate.as_bytes(), e.gate.len())?,
             up: DeviceBuffer::from_bytes(e.up.as_bytes(), e.up.len())?,
             down: DeviceBuffer::from_bytes(e.down.as_bytes(), e.down.len())?,
-            w_dtype: e.gate.dtype_code(),
-            w_group_size: e.gate.group_size() as i32,
+            // `up`, not `gate`: an ungated MLP (GPT-2, Falcon) has an empty gate
+            // whose default dtype says nothing about the real projections.
+            w_dtype: e.up.dtype_code(),
+            w_group_size: e.up.group_size() as i32,
         })
     }
 }
@@ -107,6 +110,8 @@ struct GpuWeights {
     /// Gemma2's extra FFN norm pair; `None` elsewhere.
     pre_ffn_norm: Option<DeviceBuffer>,
     post_ffn_norm: Option<DeviceBuffer>,
+    /// LayerNorm, output-projection and MLP biases (GPT-2, Falcon).
+    biases: GpuBlockBiases,
     /// Native dtype of the attention projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -268,6 +273,7 @@ impl GpuWeights {
             mla: None,
             pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
             post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
+            biases: GpuBlockBiases::upload(t)?,
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
         })
@@ -335,6 +341,7 @@ impl GpuWeights {
             mla: t.mla.as_ref().map(GpuMla::upload).transpose()?,
             pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
             post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
+            biases: GpuBlockBiases::upload(t)?,
             w_dtype,
             w_group_size,
         })
@@ -1007,6 +1014,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             cfg.attn_logit_softcap.unwrap_or(0.0),
                             bias_ptr(&w.pre_ffn_norm),
                             bias_ptr(&w.post_ffn_norm),
+                            &DlmBlockExt::new(cfg, &w.biases),
                         )
                     };
                     if code != 0 {
@@ -1344,6 +1352,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         lcfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
+                        &DlmBlockExt::new(&lcfg, &w.biases),
                     )
                 };
                 if code != 0 {

@@ -67,6 +67,48 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* out, int n
     for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = x[i] * inv_rms * w[i];
 }
 
+// out[i] = (x[i] - mean(x)) * rsqrt(var(x) + eps) * w[i] + b[i]  (b may be NULL)
+//
+// LayerNorm (GPT-2, Falcon): RMSNorm's tree reduction twice over -- the mean
+// first, then the sum of squared deviations from it -- which is `layernorm()` in
+// src/forward/cpu.rs. Computing var as mean(x^2) - mean^2 in one pass would save
+// a reduction but cancels catastrophically on GPT-2's residual stream, whose
+// outlier dimensions dwarf the rest. `out` may alias `x`.
+__global__ void layernorm_kernel(const float* x, const float* w, const float* b, float* out,
+                                 int n, float eps) {
+    __shared__ float partial[RMS_THREADS];
+    __shared__ float mean;
+    __shared__ float inv_std;
+
+    float s = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) s += x[k];
+    partial[threadIdx.x] = s;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) mean = partial[0] / (float)n;
+    __syncthreads();
+
+    float ss = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        float d = x[k] - mean;
+        ss += d * d;
+    }
+    partial[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_std = rsqrtf(partial[0] / (float)n + eps);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        out[i] = (x[i] - mean) * inv_std * w[i] + (b ? b[i] : 0.0f);
+}
+
 // Row-major [out_dim, in_dim] matrix times vector, plus an optional bias.
 // Threads per block for the GEMV reduction; power of two for the tree reduction.
 #define MATVEC_THREADS 256
@@ -339,6 +381,13 @@ __global__ void swiglu_kernel(const float* gate, const float* up, float* out, in
     }
 }
 
+// out[i] = act(x[i]): the ungated MLP's activation (GPT-2, Falcon), where
+// SwiGLU would multiply by the up branch.
+__global__ void activate_kernel(const float* x, float* out, long n, int act) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = dlm_activate(x[i], act);
+}
+
 // Copy `n` floats device→device.
 __global__ void copy_kernel(const float* src, float* dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -386,6 +435,23 @@ static cudaError_t scratch_ensure(int i, int n) {
     if (e == cudaSuccess) g_scratch_cap[i] = n;
     return e;
 }
+
+// Block shape beyond the Llama default, for the families that are not
+// Llama-descended. Passing NULL means the default: RMSNorm, gated MLP, RoPE,
+// sequential residual, no output/MLP/norm biases. Must match `DlmBlockExt` in
+// src/forward/gpu.rs.
+typedef struct {
+    int layer_norm;               // 1: LayerNorm (+ bias) instead of RMSNorm (GPT-2, Falcon)
+    int gated;                    // 0: ungated MLP, down(act(up(x))) (GPT-2, Falcon)
+    int rope;                     // 0: no rotary (GPT-2's positions are in the embedding)
+    int parallel;                 // 1: the FFN reads the block input's norm (Falcon)
+    const float* in_norm_bias;    // LayerNorm biases; NULL when absent
+    const float* post_norm_bias;
+    const float* o_bias;          // output-projection bias
+    const float* up_bias;         // MLP biases
+    const float* down_bias;
+} DlmBlockExt;
+static const DlmBlockExt DLM_BLOCK_DEFAULT = {0, 1, 1, 0, 0, 0, 0, 0, 0};
 
 // Launch the three attention kernels for one query over `positions` cached
 // tokens. Scores live in scratch slot ATTN_SCORES.
@@ -436,10 +502,15 @@ extern "C" int dlm_decode_block(
     // Gemma2's extra norm pair; both NULL on every other architecture. When set,
     // `post_norm` normalizes the *attention output* and `pre_ffn_norm` the FFN
     // input, matching `decode_block` in src/forward/cpu.rs.
-    const float* pre_ffn_norm, const float* post_ffn_norm)
+    const float* pre_ffn_norm, const float* post_ffn_norm,
+    const DlmBlockExt* ext)                // NULL: the Llama block shape
 {
     const int B = 256;
     int total_pos = num_positions + 1;
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    #define DLM_NORM(src, w, bias, dst) { \
+        if (o->layer_norm) layernorm_kernel<<<1, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
+        else rmsnorm_kernel<<<1, RMS_THREADS>>>((src), (w), (dst), hidden_size, rms_eps); }
     if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
     const int gemma2 = (pre_ffn_norm != 0);
 
@@ -467,15 +538,17 @@ extern "C" int dlm_decode_block(
 
     if (e == cudaSuccess) {
         // Attention sublayer.
-        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+        DLM_NORM(x, in_norm, o->in_norm_bias, normed)
         launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
         launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
         // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
-        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, rope_mscale);
-        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
+        if (o->rope) {
+            rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, rope_mscale);
+            rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
+        }
 
         // Append this token's K/V into the persistent history at slot num_positions.
         copy_kernel<<<grid_for(kv_dim, B), B>>>(k, kv_keys + (long)num_positions * kv_dim, kv_dim);
@@ -484,19 +557,29 @@ extern "C" int dlm_decode_block(
         // Attend over history + this token, reading the persistent buffers directly.
         e = launch_attention(q, kv_keys, kv_values, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap);
         if (e != cudaSuccess) return (int)e;
-        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
+        launch_matvec(w_dtype, o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, w_group_size);
         // Gemma2 norms the attention output before the residual add (in place, so
         // the add below is unchanged); elsewhere it goes in raw.
         if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
+        // Falcon's parallel block: the FFN reads the norm of the block *input*,
+        // so take it before the attention output lands in `x`.
+        if (o->parallel) DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
 
-        // MLP sublayer (SwiGLU). Gemma2 uses its dedicated pre-FFN norm here,
-        // since `post_norm` was already spent on the attention output.
-        rmsnorm_kernel<<<1, RMS_THREADS>>>(x, gemma2 ? pre_ffn_norm : post_norm, normed2, hidden_size, rms_eps);
-        launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
-        launch_matvec(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size);
-        swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
-        launch_matvec(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size);
+        // MLP sublayer. Gemma2 uses its dedicated pre-FFN norm here, since
+        // `post_norm` was already spent on the attention output.
+        if (!o->parallel) {
+            if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
+            else DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
+        }
+        launch_matvec(w_dtype, up_proj, normed2, o->up_bias, up, inter, hidden_size, w_group_size);
+        if (o->gated) {
+            launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
+            swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
+        } else {
+            activate_kernel<<<grid_for(inter, B), B>>>(up, inter_buf, (long)inter, activation);
+        }
+        launch_matvec(w_dtype, down_proj, inter_buf, o->down_bias, down, hidden_size, inter, w_group_size);
         if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
@@ -511,6 +594,7 @@ extern "C" int dlm_decode_block(
         e = cudaGetLastError();
     }
 
+    #undef DLM_NORM
     // Scratch is persistent — not freed here. It is reused across every layer and
     // token and reclaimed by the driver at process exit.
     return (int)e;
@@ -604,6 +688,43 @@ __global__ void rmsnorm_batched_kernel(const float* x, const float* w, float* ou
     for (int i = threadIdx.x; i < n; i += blockDim.x) ob[i] = xb[i] * inv_rms * w[i];
 }
 
+// LayerNorm over B rows: one block per row, as rmsnorm_batched_kernel.
+__global__ void layernorm_batched_kernel(const float* x, const float* w, const float* b,
+                                         float* out, int n, float eps) {
+    __shared__ float partial[RMS_THREADS];
+    __shared__ float mean;
+    __shared__ float inv_std;
+    const float* xb = x + (long)blockIdx.x * n;
+    float* ob = out + (long)blockIdx.x * n;
+
+    float s = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) s += xb[k];
+    partial[threadIdx.x] = s;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) mean = partial[0] / (float)n;
+    __syncthreads();
+
+    float ss = 0.0f;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        float d = xb[k] - mean;
+        ss += d * d;
+    }
+    partial[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) inv_std = rsqrtf(partial[0] / (float)n + eps);
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        ob[i] = (xb[i] - mean) * inv_std * w[i] + (b ? b[i] : 0.0f);
+}
+
 // SwiGLU/GeGLU over the whole [batch, inter] plane.
 __global__ void swiglu_batched_kernel(const float* gate, const float* up, float* out, long n,
                                       int act) {
@@ -636,10 +757,15 @@ extern "C" int dlm_decode_block_batched(
     int batch,
     int sliding_window, int activation, float rope_mscale,
     float attn_scale, float attn_softcap,
-    const float* pre_ffn_norm, const float* post_ffn_norm)
+    const float* pre_ffn_norm, const float* post_ffn_norm,
+    const DlmBlockExt* ext)
 {
     const int B = 256;
     if (batch <= 0) return 0;
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    #define DLM_NORM_B(src, w, bias, dst) { \
+        if (o->layer_norm) layernorm_batched_kernel<<<batch, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
+        else rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>((src), (w), (dst), hidden_size, rms_eps); }
     if (batch > DLM_MAX_BATCH) return (int)cudaErrorInvalidValue;
     if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
     const int gemma2 = (pre_ffn_norm != 0);
@@ -666,7 +792,7 @@ extern "C" int dlm_decode_block_batched(
 
     // Attention sublayer. Projections are batched (one weight read for all
     // slots); everything downstream of them is per-slot state.
-    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    DLM_NORM_B(x, in_norm, o->in_norm_bias, normed)
     launch_matvec_batched(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size, batch);
     launch_matvec_batched(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size, batch);
     launch_matvec_batched(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size, batch);
@@ -682,8 +808,10 @@ extern "C" int dlm_decode_block_batched(
 
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(qb, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(kb, k_norm, num_kv_heads, head_dim, rms_eps);
-        rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(qb, num_heads, head_dim, pos, inv_freq, rope_mscale);
-        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(kb, num_kv_heads, head_dim, pos, inv_freq, rope_mscale);
+        if (o->rope) {
+            rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(qb, num_heads, head_dim, pos, inv_freq, rope_mscale);
+            rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(kb, num_kv_heads, head_dim, pos, inv_freq, rope_mscale);
+        }
         copy_kernel<<<grid_for(kv_dim, B), B>>>(kb, kv_keys->p[b] + (long)np * kv_dim, kv_dim);
         copy_kernel<<<grid_for(kv_dim, B), B>>>(vb, kv_values->p[b] + (long)np * kv_dim, kv_dim);
         e = launch_attention(qb, kv_keys->p[b], kv_values->p[b], ctxb, num_heads, num_kv_heads,
@@ -691,22 +819,31 @@ extern "C" int dlm_decode_block_batched(
         if (e != cudaSuccess) return (int)e;
     }
 
-    launch_matvec_batched(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size, batch);
+    launch_matvec_batched(w_dtype, o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, w_group_size, batch);
     if (gemma2) {
         rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
     }
+    if (o->parallel) DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
     add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, attn_out, (long)batch * hidden_size);
 
     // MLP sublayer — all batched.
-    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, gemma2 ? pre_ffn_norm : post_norm, normed2, hidden_size, rms_eps);
-    launch_matvec_batched(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size, batch);
-    launch_matvec_batched(w_dtype, up_proj, normed2, (const float*)0, up, inter, hidden_size, w_group_size, batch);
-    swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
-    launch_matvec_batched(w_dtype, down_proj, inter_buf, (const float*)0, down, hidden_size, inter, w_group_size, batch);
+    if (!o->parallel) {
+        if (gemma2) rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
+        else DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
+    }
+    launch_matvec_batched(w_dtype, up_proj, normed2, o->up_bias, up, inter, hidden_size, w_group_size, batch);
+    if (o->gated) {
+        launch_matvec_batched(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size, batch);
+        swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
+    } else {
+        activate_kernel<<<grid_for(batch * inter, B), B>>>(up, inter_buf, (long)batch * inter, activation);
+    }
+    launch_matvec_batched(w_dtype, down_proj, inter_buf, o->down_bias, down, hidden_size, inter, w_group_size, batch);
     if (gemma2) {
         rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
     }
     add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, down, (long)batch * hidden_size);
+    #undef DLM_NORM_B
     return (int)cudaGetLastError();
 }
 

@@ -77,6 +77,8 @@ extern "C" {
         // what `post_norm` means — see `decode_block` in cpu.rs.
         pre_ffn_norm: *const f32,
         post_ffn_norm: *const f32,
+        // Non-Llama block shape (GPT-2, Falcon); null for the Llama default.
+        ext: *const DlmBlockExt,
     ) -> i32;
 
     /// MoE layer, part 1: attention sublayer + post-attn norm. Leaves `normed2`
@@ -248,6 +250,8 @@ extern "C" {
         attn_softcap: f32,
         pre_ffn_norm: *const f32,
         post_ffn_norm: *const f32,
+        // Non-Llama block shape (GPT-2, Falcon); null for the Llama default.
+        ext: *const DlmBlockExt,
     ) -> i32;
 
     /// MoE layer, part 3 (**grouped**): apply all `n_experts` selected experts in
@@ -316,6 +320,68 @@ pub(crate) const DLM_MAX_BATCH: usize = 16;
 #[repr(C)]
 pub(crate) struct DlmSlots {
     pub(crate) p: [*mut f32; DLM_MAX_BATCH],
+}
+
+/// Block shape beyond the Llama default. Matches `DlmBlockExt` in
+/// `src/gpu/kernels.cu`, field for field.
+#[repr(C)]
+pub(crate) struct DlmBlockExt {
+    layer_norm: i32,
+    gated: i32,
+    rope: i32,
+    parallel: i32,
+    in_norm_bias: *const f32,
+    post_norm_bias: *const f32,
+    o_bias: *const f32,
+    up_bias: *const f32,
+    down_bias: *const f32,
+}
+
+impl DlmBlockExt {
+    /// The device block options for `cfg`, pointing at the layer's biases. Every
+    /// field falls out of the config or a bias's presence, so a Llama-shaped
+    /// layer yields exactly the kernel's default.
+    pub(crate) fn new(cfg: &BlockConfig, b: &GpuBlockBiases) -> Self {
+        use crate::forward::cpu::{FfnKind, NormKind};
+        Self {
+            layer_norm: (cfg.norm_kind == NormKind::Layer) as i32,
+            gated: (cfg.ffn_kind == FfnKind::Gated) as i32,
+            rope: (!cfg.learned_positions) as i32,
+            parallel: cfg.parallel_residual as i32,
+            in_norm_bias: bias_ptr(&b.in_norm),
+            post_norm_bias: bias_ptr(&b.post_norm),
+            o_bias: bias_ptr(&b.o),
+            up_bias: bias_ptr(&b.up),
+            down_bias: bias_ptr(&b.down),
+        }
+    }
+}
+
+/// The biases a Llama block does not have: LayerNorm's (GPT-2, Falcon), the
+/// output projection's, and the MLP's. All `None` elsewhere.
+#[derive(Default)]
+pub(crate) struct GpuBlockBiases {
+    pub(crate) in_norm: Option<DeviceBuffer>,
+    pub(crate) post_norm: Option<DeviceBuffer>,
+    pub(crate) o: Option<DeviceBuffer>,
+    pub(crate) up: Option<DeviceBuffer>,
+    pub(crate) down: Option<DeviceBuffer>,
+}
+
+impl GpuBlockBiases {
+    pub(crate) fn upload(t: &LayerTensors) -> Result<Self> {
+        let (up, down) = match &t.ffn {
+            crate::forward::Ffn::Dense(f) => (f.up_bias.as_ref(), f.down_bias.as_ref()),
+            crate::forward::Ffn::Moe { .. } => (None, None),
+        };
+        Ok(Self {
+            in_norm: upload_bias(t.input_layernorm_bias.as_ref())?,
+            post_norm: upload_bias(t.post_attention_layernorm_bias.as_ref())?,
+            o: upload_bias(t.o_bias.as_ref())?,
+            up: upload_bias(up)?,
+            down: upload_bias(down)?,
+        })
+    }
 }
 
 /// Per-slot integers (history length, RoPE position). Matches `DlmInts`.
@@ -428,6 +494,8 @@ struct GpuLayer {
     /// the device block to the Gemma2 norm placement.
     pre_ffn_norm: Option<DeviceBuffer>,
     post_ffn_norm: Option<DeviceBuffer>,
+    /// LayerNorm, output-projection and MLP biases (GPT-2, Falcon).
+    biases: GpuBlockBiases,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -495,6 +563,7 @@ impl GpuLayer {
             mla: t.mla.as_ref().map(GpuMla::upload).transpose()?,
             pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
             post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
+            biases: GpuBlockBiases::upload(t)?,
             w_dtype,
             w_group_size,
         })
@@ -635,6 +704,7 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
+                &DlmBlockExt::new(&cfg, &w.biases),
             )
         };
         if code != 0 {
@@ -961,6 +1031,7 @@ impl ComputeKernel for GpuKernel {
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
+                        &DlmBlockExt::new(&self.cfg, &w.biases),
                     )
                 };
                 if code != 0 {
