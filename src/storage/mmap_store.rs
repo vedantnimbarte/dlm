@@ -14,6 +14,43 @@ use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+/// The tensor index of a multimodal checkpoint as its text model: the language
+/// model's tensors under the names a text-only export uses, and the vision
+/// tower dropped. A no-op for a text-only checkpoint.
+///
+/// Gemma 3 4B+ stores its language model as `language_model.model.*` (or, from
+/// newer transformers, `model.language_model.*`) beside a SigLIP vision tower.
+/// dlm serves text, so the tower is not merely unused: its encoder blocks are
+/// named `...layers.N...`, which the catalog would count as transformer layers,
+/// and its bytes would be planned into VRAM as pinned overhead.
+fn text_model_view(
+    tensors: std::collections::BTreeMap<String, TensorInfo>,
+) -> std::collections::BTreeMap<String, TensorInfo> {
+    const VISION: [&str; 4] = [
+        "vision_tower.",
+        "multi_modal_projector.",
+        "model.vision_tower.",
+        "model.multi_modal_projector.",
+    ];
+    const TEXT: [(&str, &str); 3] = [
+        ("language_model.model.", "model."),
+        ("model.language_model.", "model."),
+        ("language_model.lm_head.", "lm_head."),
+    ];
+    tensors
+        .into_iter()
+        .filter(|(name, _)| !VISION.iter().any(|p| name.starts_with(p)))
+        .map(|(name, mut info)| {
+            let renamed = TEXT
+                .iter()
+                .find_map(|(from, to)| name.strip_prefix(from).map(|rest| format!("{to}{rest}")))
+                .unwrap_or(name);
+            info.name = renamed.clone();
+            (renamed, info)
+        })
+        .collect()
+}
+
 /// A single memory-mapped safetensors shard plus its parsed header.
 pub struct MmapShard {
     path: PathBuf,
@@ -63,7 +100,8 @@ impl MmapShard {
             let _ = mmap.advise(memmap2::Advice::Random);
         }
 
-        let header = SafetensorsHeader::parse(&mmap, file_len)?;
+        let mut header = SafetensorsHeader::parse(&mmap, file_len)?;
+        header.tensors = text_model_view(std::mem::take(&mut header.tensors));
 
         Ok(MmapShard { path, mmap, header })
     }
@@ -216,5 +254,63 @@ impl MmapStore {
     /// Iterate over every tensor across all shards.
     pub fn iter_tensors(&self) -> impl Iterator<Item = &TensorInfo> {
         self.shards.iter().flat_map(|s| s.tensors())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Dtype;
+
+    fn info(name: &str) -> (String, TensorInfo) {
+        (
+            name.to_string(),
+            TensorInfo {
+                name: name.to_string(),
+                dtype: Dtype::F32,
+                shape: vec![1],
+                begin: 0,
+                end: 4,
+            },
+        )
+    }
+
+    /// Both multimodal layouts come back as the text-only names, the vision
+    /// tower is gone, and a text-only checkpoint is left exactly as it was.
+    #[test]
+    fn multimodal_checkpoint_is_viewed_as_its_text_model() {
+        let names = [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.embed_tokens.weight",
+            "model.language_model.norm.weight",
+            "language_model.lm_head.weight",
+            "vision_tower.vision_model.encoder.layers.3.mlp.fc1.weight",
+            "multi_modal_projector.mm_input_projection_weight",
+            "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
+        ];
+        let view = text_model_view(names.iter().map(|n| info(n)).collect());
+        let got: Vec<&str> = view.keys().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            [
+                "lm_head.weight",
+                "model.embed_tokens.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.norm.weight"
+            ]
+        );
+        assert!(
+            view.iter().all(|(k, v)| *k == v.name),
+            "TensorInfo.name follows the key"
+        );
+
+        let text_only: std::collections::BTreeMap<_, _> =
+            ["model.layers.0.mlp.up_proj.weight", "lm_head.weight"]
+                .iter()
+                .map(|n| info(n))
+                .collect();
+        let before: Vec<String> = text_only.keys().cloned().collect();
+        let after: Vec<String> = text_model_view(text_only).keys().cloned().collect();
+        assert_eq!(before, after);
     }
 }

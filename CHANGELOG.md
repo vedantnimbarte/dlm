@@ -29,7 +29,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Gemma 3** (the text models: 270M, 1B). Per-head `(1 + w)` Q/K norms, the
+- **Gemma 3** (the text-only 270M and 1B). Per-head `(1 + w)` Q/K norms, the
   5:1 local/global layer pattern — read from `sliding_window_pattern`,
   `_sliding_window_pattern`, or a `layer_types` list (an irregular list is
   refused) — and a separate RoPE base for the windowed layers, with
@@ -37,7 +37,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   correctly on CPU and GPU, recalls a code from 1,500 tokens back, and scores a
   1,126-token passage at 1.80 nats/token (0.33 on the half only recall can
   predict); the local layers on the global RoPE base score 3.18, and Gemma 2's
-  layer rule 3.35. The multimodal 4B+ checkpoints are not loaded yet.
+  layer rule 3.35.
+- **Gemma 3 4B, 12B and 27B, as text models.** These are multimodal checkpoints:
+  dlm reads the language model out of `text_config` — filling in
+  `Gemma3TextConfig`'s defaults for what Google's sparse exports omit — and out
+  of `language_model.*` / `model.language_model.*` tensors, and drops the vision
+  tower, whose encoder blocks would otherwise be counted as transformer layers.
+  Images are not supported. On `gemma-3-4b-it` (8 GB bf16, streamed through a
+  4 GB card) it answers correctly, recalls a code from 1,500 tokens back at
+  `--quant int4`, and scores the 1,126-token passage at 1.53 nats/token in bf16.
 - `Generator::score`: the per-token log-probability of a sequence under teacher
   forcing, for checking a forward pass against a text's expected cross-entropy.
 - **Prompt prefill runs layer by layer on the streamed host path.** A prompt

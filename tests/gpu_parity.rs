@@ -1780,3 +1780,38 @@ fn gpu_gpt2_and_falcon_prefill_matches_cpu() {
         assert_prefill_matches_cpu(cfg, layers, streamed, &format!("{what} streamed"));
     }
 }
+
+/// Gemma 3's per-layer attention on the device: windowed layers rotate with the
+/// local base and no scaling, global layers with `rope_theta` and `rope_scaling`.
+/// The GPU kernels precompute one frequency buffer per kind, so a buffer built
+/// with the wrong scaling would pass every check that runs on the CPU. With a
+/// window of 2, a pattern of 3 and 44 prefilled positions, every layer kind is
+/// exercised well past its window, on the resident and streamed kernels.
+#[test]
+fn gpu_gemma3_layers_match_cpu() {
+    let (base, layers) = gemma2_fixture();
+    let cfg = BlockConfig {
+        sliding_window: Some(2),
+        sliding_window_pattern: Some(3),
+        rope_theta: 10_000.0,
+        rope_scaling: Some(dlm::forward::cpu::RopeScaling::Linear { factor: 8.0 }),
+        rope_local_theta: Some(100.0),
+        attn_logit_softcap: None,
+        ..base
+    };
+    let mut rng = Rng::new(0x6E33);
+    let layers: Vec<LayerTensors> = layers
+        .into_iter()
+        .chain(gemma2_fixture().1.into_iter().take(2))
+        .map(|l| LayerTensors {
+            q_norm: Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect()),
+            k_norm: Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect()),
+            ..l
+        })
+        .collect();
+    assert_eq!(layers.len(), 6);
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu(cfg, layers.clone(), gpu, "gemma3");
+    let streamed = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu(cfg, layers, streamed, "gemma3 streamed");
+}

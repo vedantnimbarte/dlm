@@ -150,3 +150,81 @@ fn gemma3_long_context_fit() {
         "streamed GPU scores {streamed_all:.4}, resident {all:.4}"
     );
 }
+
+/// The multimodal 4B checkpoint, seen as its text model.
+fn model_dir_4b() -> Option<PathBuf> {
+    let dir = PathBuf::from(
+        std::env::var("DLM_GEMMA3_4B_MODEL").unwrap_or_else(|_| "models/gemma-3-4b".to_string()),
+    );
+    dir.join("config.json").exists().then_some(dir)
+}
+
+/// Gemma 3 4B stores its language model under `language_model.` beside a SigLIP
+/// vision tower whose encoder blocks are also named `...layers.N...`. The store
+/// must present exactly the text model: 34 transformer layers, the text names,
+/// and no vision tensor anywhere -- counted as layers they would corrupt the
+/// catalog, and counted as pinned they would be planned into VRAM.
+#[test]
+fn gemma3_4b_is_read_as_its_text_model() {
+    let Some(dir) = model_dir_4b() else {
+        eprintln!("skipping: no Gemma 3 4B checkpoint");
+        return;
+    };
+    let config = ModelConfig::from_path(&dir, QuantScheme::Fp16).unwrap();
+    assert_eq!((config.num_layers, config.hidden_size), (34, 2560));
+    let store = MmapStore::open_dir(&dir).unwrap();
+    assert!(store.locate("model.embed_tokens.weight").is_some());
+    assert!(store
+        .locate("model.layers.33.self_attn.q_norm.weight")
+        .is_some());
+    assert!(
+        store
+            .iter_tensors()
+            .all(|t| !t.name.contains("vision") && !t.name.contains("multi_modal")),
+        "vision tensors leaked into the text model's index"
+    );
+    let catalog = dlm::storage::LayerCatalog::build(&store);
+    assert_eq!(
+        catalog.num_layers(),
+        34,
+        "vision encoder blocks counted as layers"
+    );
+}
+
+/// Cross-entropy of the doubled [`PASSAGE`] on the 4B, in bf16 (so the number
+/// measures the forward pass, not quantization), streamed through the GPU since
+/// the weights are twice the card.
+#[cfg(feature = "cuda-kernels")]
+#[test]
+fn gemma3_4b_long_context_fit() {
+    let Some(dir) = model_dir_4b() else {
+        eprintln!("skipping: no Gemma 3 4B checkpoint");
+        return;
+    };
+    let config = ModelConfig::from_path(&dir, QuantScheme::Fp16).unwrap();
+    let tokenizer = BpeTokenizer::from_dir(&dir).unwrap();
+    let ids = tokenizer
+        .encode(&format!("{PASSAGE}\n\n{PASSAGE}"))
+        .unwrap();
+    let store = MmapStore::open_dir(&dir).unwrap();
+    let g = dlm::loader::build_streaming_gpu_generator(store, &config, 1536, 8, 0, 0).unwrap();
+    let t = std::time::Instant::now();
+    let lp = g.score(&ids).unwrap();
+    let nll = |s: &[f32]| -s.iter().map(|&x| x as f64).sum::<f64>() / s.len() as f64;
+    let (all, late) = (nll(&lp), nll(&lp[1024..]));
+    eprintln!(
+        "gemma3 4B NLL: all {all:.4}, past the window {late:.4} ({} tokens, {:?})",
+        ids.len(),
+        t.elapsed()
+    );
+    // Measured on the GTX 1650: 1.53 overall, ~0 past the window (a 4B copies
+    // the repeat). Scaling the local layers' RoPE by the global layers' x8 scores
+    // 5.01. Dropping the x8 from the global layers moves this passage by under
+    // 0.001 -- linear scaling of a 1M base only matters far past 1,126 tokens --
+    // so that case is pinned by `gpu_gemma3_layers_match_cpu` instead.
+    assert!(all < 1.9, "cross-entropy {all:.3} over the whole passage");
+    assert!(
+        late < 0.3,
+        "cross-entropy {late:.3} past the window: recall is broken"
+    );
+}

@@ -522,12 +522,17 @@ fn chat_template_auto_detection_per_family() {
 
 /// Gemma 3: Gemma 2's norm layout and (1+w) norms, plus a 5:1 local/global layer
 /// pattern whose local layers use their own RoPE base. The 1B states the pattern
-/// as `sliding_window_pattern: 6`; the 270M as a `layer_types` list. Both must
-/// resolve to the same rule, and to layers 5, 11, 17, ... being the global ones.
+/// as `sliding_window_pattern: 6`; the 270M as a `layer_types` list; the 4B nests
+/// the whole text model in a multimodal config's `text_config`. All must resolve
+/// to the same rule, and to layers 5, 11, 17, ... being the global ones.
 #[test]
 fn gemma3_family_fixtures() {
     use dlm::server::engine::ChatTemplate;
-    for family in ["gemma-3", "gemma-3-270m"] {
+    for (family, window) in [
+        ("gemma-3", 512),
+        ("gemma-3-270m", 512),
+        ("gemma-3-4b", 1024),
+    ] {
         let Some(dir) = fixture(family) else {
             eprintln!("skipping {family}: fixture absent");
             return;
@@ -535,7 +540,7 @@ fn gemma3_family_fixtures() {
         let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16)
             .unwrap_or_else(|e| panic!("{family} config.json: {e}"));
         assert_eq!(cfg.sliding_window_pattern, Some(6), "{family}");
-        assert_eq!(cfg.sliding_window, Some(512), "{family}");
+        assert_eq!(cfg.sliding_window, Some(window), "{family}");
         assert_eq!(cfg.rope_local_theta, Some(10_000.0), "{family}");
         assert_eq!(cfg.rope_theta, 1_000_000.0, "{family}");
         assert!(cfg.gemma2_norms && cfg.norm_add_one, "{family}");

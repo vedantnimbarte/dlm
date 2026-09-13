@@ -651,6 +651,58 @@ pub struct ModelConfig {
     pub gemma2_norms: bool,
 }
 
+/// The text model of a multimodal Gemma 3 config (`model_type: "gemma3"`, the
+/// 4B/12B/27B checkpoints), or `json` unchanged for anything else.
+///
+/// Those configs nest the language model under `text_config`, next to a vision
+/// tower dlm does not run. Google's own exports keep `text_config` sparse and
+/// rely on `Gemma3TextConfig`'s defaults for everything they omit, so the
+/// defaults are filled in here -- a missing head count or window must not fall
+/// through to a generic default that happens to parse. Top-level keys the text
+/// model also needs (the EOS/BOS ids, a quantization block) are carried over
+/// unless `text_config` sets them itself.
+fn gemma3_text_config(json: serde_json::Value) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let is_multimodal_gemma3 = json.get("model_type").and_then(Value::as_str) == Some("gemma3");
+    let Some(Value::Object(mut text)) = json
+        .get("text_config")
+        .cloned()
+        .filter(|_| is_multimodal_gemma3)
+    else {
+        return json;
+    };
+    for key in [
+        "eos_token_id",
+        "bos_token_id",
+        "pad_token_id",
+        "quantization_config",
+    ] {
+        if let (false, Some(v)) = (text.contains_key(key), json.get(key)) {
+            text.insert(key.to_string(), v.clone());
+        }
+    }
+    // transformers' Gemma3TextConfig defaults, for the keys a sparse export omits.
+    let defaults = json!({
+        "model_type": "gemma3_text",
+        "vocab_size": 262208,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "max_position_embeddings": 131072,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1000000.0,
+        "rope_local_base_freq": 10000.0,
+        "query_pre_attn_scalar": 256,
+        "sliding_window": 4096,
+        "sliding_window_pattern": 6,
+    });
+    for (key, value) in defaults.as_object().expect("literal object") {
+        text.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    Value::Object(text)
+}
+
 /// Turn Gemma3's `layer_types` list into the `n` of "every `n`-th layer is
 /// global". Only that regular shape is accepted: a list dlm cannot express as a
 /// pattern is refused rather than approximated, since windowing a global layer
@@ -746,10 +798,16 @@ impl ModelConfig {
     /// Parse a config from raw JSON bytes. Separated from [`from_path`] so it
     /// can be unit-tested without touching the filesystem.
     pub fn from_json_bytes(bytes: &[u8], quant: QuantScheme) -> Result<Self> {
-        let raw: RawConfig = serde_json::from_slice(bytes).map_err(|source| DlmError::Json {
-            context: "config.json".to_string(),
-            source,
-        })?;
+        let json: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|source| DlmError::Json {
+                context: "config.json".to_string(),
+                source,
+            })?;
+        let raw: RawConfig =
+            serde_json::from_value(gemma3_text_config(json)).map_err(|source| DlmError::Json {
+                context: "config.json".to_string(),
+                source,
+            })?;
 
         // Reject quant formats the decoder would silently mis-decode; keep the
         // layout of the one it can.
@@ -1054,6 +1112,41 @@ mod tests {
 
     /// Gemma 3 states its layer layout two ways; both mean "every 6th layer is
     /// global". An irregular list is refused, not approximated.
+    /// A multimodal Gemma 3 config as Google exports the 27B: the text model is
+    /// nested and sparse. Everything omitted must come from Gemma3TextConfig's
+    /// defaults, and the EOS id from the top level.
+    #[test]
+    fn multimodal_gemma3_config_reads_its_sparse_text_config() {
+        let json = br#"{"architectures":["Gemma3ForConditionalGeneration"],
+            "model_type":"gemma3","eos_token_id":[1,106],
+            "text_config":{"head_dim":128,"hidden_size":5376,"intermediate_size":21504,
+              "model_type":"gemma3_text","num_attention_heads":32,"num_hidden_layers":62,
+              "num_key_value_heads":16,"query_pre_attn_scalar":168,
+              "rope_scaling":{"factor":8.0,"rope_type":"linear"},"sliding_window":1024},
+            "vision_config":{"hidden_size":1152,"num_hidden_layers":27}}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        assert_eq!(
+            (c.hidden_size, c.num_layers),
+            (5376, 62),
+            "not the vision tower's"
+        );
+        assert_eq!((c.num_attention_heads, c.num_kv_heads), (32, 16));
+        assert_eq!(c.head_dim(), 128);
+        assert_eq!(c.vocab_size, 262208, "default");
+        assert_eq!(c.sliding_window, Some(1024));
+        assert_eq!(c.sliding_window_pattern, Some(6), "default");
+        assert_eq!(c.rope_local_theta, Some(10_000.0));
+        assert_eq!(c.rope_theta, 1_000_000.0, "default");
+        assert_eq!(c.query_pre_attn_scalar, Some(168.0));
+        assert!(matches!(
+            c.rope_scaling,
+            Some(crate::forward::cpu::RopeScaling::Linear { .. })
+        ));
+        assert_eq!(c.eos_token_ids, vec![1, 106], "carried from the top level");
+        assert!(c.gemma2_norms && c.norm_add_one);
+        assert!((c.rms_eps - 1e-6).abs() < 1e-9, "default");
+    }
+
     #[test]
     fn gemma3_layer_pattern_from_either_spelling() {
         let base = r#""model_type":"gemma3_text","hidden_size":16,"num_attention_heads":4,

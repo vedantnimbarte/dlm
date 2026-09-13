@@ -58,6 +58,8 @@ fetch gemma-1     unsloth/gemma-1.1-2b-it                     # (1+w) norm, no s
 # pattern as `sliding_window_pattern`; the 270M as a `layer_types` list.
 fetch gemma-3      unsloth/gemma-3-1b-it   chat_template.jinja # sliding_window_pattern
 fetch gemma-3-270m unsloth/gemma-3-270m-it chat_template.jinja # layer_types
+# The 4B+ are multimodal: the text model is nested in `text_config`.
+fetch gemma-3-4b   unsloth/gemma-3-4b-it   chat_template.jinja # text_config
 fetch qwen3       Qwen/Qwen3-0.6B                             # explicit head_dim != derived
 fetch qwen2-moe   Qwen/Qwen1.5-MoE-A2.7B-Chat                 # gated shared expert
 # Mixtral's own repos are gated; this is a Mixtral-layout checkpoint, which is
