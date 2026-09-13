@@ -647,10 +647,12 @@ check your model's output rather than assuming. Three caveats worth knowing:
 - **Quantizing costs load time** (it runs over every weight) and reads the full
   16-bit tensors from disk regardless; the win is in VRAM and on the bus, not in
   what is read.
-- **`--stream` + a quantized `--quant` currently re-quantizes a layer on every
-  window miss**, which is far slower than either flag alone. Pair it with
-  `--ram-cache-gb` (which caches the quantized layer), or drop `--stream` — once
-  quantized, the model often no longer needs it.
+- **`--stream` + `--quant` holds the quantized layers in a host-RAM cache by
+  default**, since re-quantizing a layer on every window miss measured 12x
+  slower. The default is capped at a quarter of physical RAM (at least 4 GiB); a
+  quantized model bigger than that still re-quantizes the layers that don't fit,
+  so raise `--ram-cache-gb`, or drop `--stream` — once quantized, the model
+  often no longer needs it.
 - **A quantized weight is still lossy even if it fits.** Verify on your own
   prompts; a model that fits but answers worse is not obviously a win.
 
