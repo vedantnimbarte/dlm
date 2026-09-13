@@ -286,7 +286,7 @@ cargo run -- profile
 Example output:
 
 ```
-dlm v0.3.0
+dlm v0.4.0
   gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
@@ -369,11 +369,11 @@ Concurrent requests are continuously batched by a background scheduler, and
 With `--distributed-mode worker` the process instead serves its layer shard to a
 master over TCP (see [Distributed & scaling](#distributed--scaling)).
 
-**`generate`** — drives the full CPU generation loop (embedding → transformer
-stack → LM head → greedy sampling) on a **randomly-initialized** synthetic model.
-There is no checkpoint loader or tokenizer yet, so it operates on token ids and
-the output is deterministic-but-meaningless — it exercises the whole pipeline
-end-to-end through the binary:
+**`generate`** — drives the full generation loop (embedding → transformer
+stack → LM head → greedy sampling). With no `--model-path` it runs a
+**randomly-initialized** synthetic model on token ids, so the output is
+deterministic-but-meaningless — it exercises the whole pipeline end-to-end
+through the binary:
 
 ```bash
 cargo run -- generate --prompt 1,2,3 --max-new-tokens 8 --seed 42
@@ -434,9 +434,9 @@ names. That covers:
 | Phi-3 / Phi-3.5 | supported — fused `qkv_proj` and `gate_up_proj` are split at load; the block is otherwise Llama-shaped. The 128k `longrope` variant is **refused** (dlm does not implement that scaling, and running without it yields fluent nonsense) |
 | GPT-2 | supported — LayerNorm (not RMSNorm), learned position embeddings instead of RoPE, an ungated MLP, biases on every projection, and `Conv1D` weights transposed at load. CPU only: the GPU kernels implement RMSNorm and a gated FFN, so `--device gpu` is refused |
 | Falcon | supported — parallel attention/FFN, multi-query (`multi_query` is a flag, not a count), LayerNorm, ungated MLP, fused `query_key_value`. **Config-verified, not run**: the smallest RoPE Falcon is 14 GB. `alibi: true` (falcon-rw-*) and `new_decoder_architecture` (Falcon-40B) are **refused** rather than mis-decoded. CPU only |
-| GPT-2 / Falcon / other layouts | other layouts **not supported** — errors on unknown tensor names |
 | DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU. MLA + MoE runs on the streaming GPU path (the resident kernel holds no routed experts, so `--no-stream` refuses it) |
 | Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
+| anything else | **not supported** — errors on unknown tensor names |
 
 **MoE models** route each token through the top-k experts the router selects
 (softmax over all experts, then top-k, then renormalized — the Mixtral/Qwen

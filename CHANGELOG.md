@@ -10,6 +10,24 @@ between releases, which is the part a user upgrading actually needs.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-layer flow telemetry.** `dlm serve --telemetry` exposes `GET
+  /v1/telemetry`, a Server-Sent Events stream of timestamped per-layer events
+  (mmap read, RAM-cache hit/miss, staging, H2D copy, compute, eviction,
+  prefetch), so a streamed run can answer "where did the time go?" rather than
+  only "is the window working?". H2D copies are timed by device events
+  (`cudaEventElapsedTime` / `hipEventElapsedTime`), not wall-clock around an
+  enqueue; an event without a device timing is flagged estimated. Collection
+  runs only while a subscriber is attached, events carry timings, byte counts
+  and layer indices only — never prompt or completion text — and the route sits
+  behind `--api-key` like `/metrics`. The ring is bounded and drop-oldest, with a
+  cumulative loss count.
+- `hub::pull_with_progress`, reporting download and SHA-256 verification
+  progress to a callback.
+
 ## [0.4.0] - 2026-07-31
 
 ### Verified
