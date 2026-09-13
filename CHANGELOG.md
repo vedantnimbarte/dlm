@@ -14,6 +14,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **GPT-2 with `--stream` produced garbage** (`" labor labor labor…"`), and
+  Falcon's streamed and GPU generators had the wrong final norm. Only the CPU
+  resident builder attached GPT-2's learned position embeddings and the
+  LayerNorm head (with its bias); every other generator ran without position
+  information and with an RMSNorm head. All builders now load and attach them.
 - **`dlm pull` failed on every repo.** Since 0.4.0 moved the token out of
   `argv`, curl was spawned with its output inherited rather than captured, so
   the model-info request returned an empty body and the pull stopped with
