@@ -39,6 +39,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   140 s to 10.5 s; the fully-resident prefill went from 8.4 s to 6.5 s. Output is
   unchanged, and six new parity tests pin dense, Gemma2, MoE and MLA+MoE prefill
   against the CPU oracle.
+- **Speculative decoding samples, and keeps its KV cache.** With
+  `--draft-model-path`, each verification used to rebuild the target's KV
+  cache and re-run the whole sequence for every token it checked, and request
+  sampling parameters were silently ignored (always greedy). The target now
+  scores the draft's proposals in one prefill, both models roll their caches back
+  to the accepted tokens, and acceptance uses the standard rejection rule, so
+  `temperature`, `top_p`, `top_k`, `min_p` and `repetition_penalty` are honored
+  and the output follows the target's distribution (greedy stays identical to
+  plain decoding). Qwen2.5-1.5B with a 0.5B draft reproduces plain greedy output
+  token for token at 80% acceptance.
 - **GPU attention no longer slows down linearly with context.** The attention
   kernel ran one thread per head, each walking the whole history in a scalar
   loop; it is now three launches parallel over (head, position) and (head,

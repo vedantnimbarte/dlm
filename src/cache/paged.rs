@@ -190,6 +190,19 @@ impl PagedKvCache {
         Ok(())
     }
 
+    /// Shrink a sequence to its first `len` tokens, returning blocks it no longer
+    /// needs to the pool. No-op if the sequence is unknown or already that short.
+    pub fn truncate_sequence(&mut self, seq_id: u64, len: u64) {
+        let keep = self.config.blocks_for_tokens(len) as usize;
+        if let Some(seq) = self.sequences.get_mut(&seq_id) {
+            if len < seq.length {
+                seq.length = len;
+                let freed = seq.blocks.split_off(keep.min(seq.blocks.len()));
+                self.free.extend(freed);
+            }
+        }
+    }
+
     /// Free a sequence, returning all its blocks to the pool. No-op if unknown.
     pub fn free_sequence(&mut self, seq_id: u64) {
         if let Some(state) = self.sequences.remove(&seq_id) {

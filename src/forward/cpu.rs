@@ -1198,11 +1198,9 @@ impl KvLayerCache {
     }
 
     /// Drop cached positions beyond `n`, keeping the first `n` (a no-op if already
-    /// `<= n`). The rollback hook a **persistent-KV** speculative session would use
-    /// to discard rejected draft tokens — the current speculative path re-prefills
-    /// a fresh cache each verification, so this is not yet on the hot path. On the
-    /// GPU path the device slots are simply overwritten at the reduced length, so
-    /// only the host length (which drives `num_positions`) needs shrinking.
+    /// `<= n`). The speculative session's rollback for rejected draft tokens. On
+    /// the GPU path the device slots are simply overwritten at the reduced length,
+    /// so only the host length (which drives `num_positions`) needs shrinking.
     pub fn truncate(&mut self, n: usize) {
         let kv_dim = self.kv_dim;
         match &mut self.store {

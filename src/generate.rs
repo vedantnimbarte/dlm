@@ -106,6 +106,27 @@ impl Sampler {
         }
     }
 
+    /// The distribution [`sample`](Self::sample) draws from, as `(token, prob)`
+    /// pairs over the tokens that survive truncation, most likely first. Greedy
+    /// (or `temperature <= 0`) is the one-hot distribution on the argmax.
+    /// Speculative decoding needs the distributions themselves, not a draw.
+    pub fn distribution(&self, logits: &[f32]) -> Vec<(u32, f32)> {
+        match *self {
+            Sampler::TopPK {
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                ..
+            } if temperature > 0.0 && !logits.is_empty() => {
+                let (idx, probs) =
+                    topk_topp_distribution(logits, temperature, top_p, top_k as usize, min_p);
+                idx.into_iter().map(|i| i as u32).zip(probs).collect()
+            }
+            _ => vec![(argmax(logits), 1.0)],
+        }
+    }
+
     /// Pick the next token id from `logits`, advancing `rng` for stochastic
     /// samplers (unused by [`Greedy`](Sampler::Greedy)).
     pub fn sample(&self, logits: &[f32], rng: &mut SplitMix64) -> u32 {
@@ -164,6 +185,35 @@ fn sample_topk_topp(
     if logits.is_empty() {
         return 0;
     }
+    let (idx, probs) = topk_topp_distribution(logits, temperature, top_p, top_k, min_p);
+    let pairs: Vec<(u32, f32)> = idx.into_iter().map(|i| i as u32).zip(probs).collect();
+    sample_from(&pairs, rng)
+}
+
+/// Inverse-CDF draw from `(token, prob)` pairs, in the order given. Falls back
+/// to the last token when rounding leaves the cumulative mass just short of 1.
+pub(crate) fn sample_from(dist: &[(u32, f32)], rng: &mut SplitMix64) -> u32 {
+    let r = rng.next_f32();
+    let mut cum = 0.0f32;
+    for &(token, p) in dist {
+        cum += p;
+        if r < cum {
+            return token;
+        }
+    }
+    dist.last().map_or(0, |&(token, _)| token)
+}
+
+/// The filtered, renormalized distribution behind [`sample_topk_topp`]: token
+/// indices sorted by logit (descending) and their probabilities. `logits` must
+/// be non-empty.
+fn topk_topp_distribution(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    min_p: f32,
+) -> (Vec<usize>, Vec<f32>) {
     // Candidate indices sorted by logit, descending.
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_unstable_by(|&a, &b| {
@@ -223,16 +273,7 @@ fn sample_topk_topp(
         }
     }
 
-    // Inverse-CDF sample.
-    let r = rng.next_f32();
-    let mut cum = 0.0f32;
-    for (j, &p) in probs.iter().enumerate() {
-        cum += p;
-        if r < cum {
-            return idx[j] as u32;
-        }
-    }
-    idx[idx.len() - 1] as u32
+    (idx, probs)
 }
 
 /// Generation parameters.
@@ -391,7 +432,30 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// Embed a token id into a fresh hidden vector.
-    fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
+    /// A fresh single-sequence orchestrator over this generator's kernel and KV
+    /// budget.
+    pub(crate) fn orchestrator(&self) -> ForwardOrchestrator<&K> {
+        ForwardOrchestrator::new(
+            &self.kernel,
+            PagedKvCache::new(self.kv_config, self.kv_total_blocks),
+            self.kv_quant,
+        )
+    }
+
+    /// The sampler's next-token distribution after `hidden`, with the repetition
+    /// penalty applied over `seen` -- exactly what a session samples from.
+    pub(crate) fn distribution(
+        &self,
+        hidden: &[f32],
+        seen: &std::collections::HashSet<u32>,
+        sampler: &Sampler,
+    ) -> Vec<(u32, f32)> {
+        let mut logits = self.logits(hidden);
+        apply_repetition_penalty(&mut logits, seen, sampler.repetition_penalty());
+        sampler.distribution(&logits)
+    }
+
+    pub(crate) fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
         let idx = token as usize;
         if idx >= self.vocab_size {
             return Err(DlmError::InvalidConfig(format!(
@@ -424,7 +488,11 @@ impl<K: ComputeKernel> Generator<K> {
     /// Run `tokens` (non-empty) through the model as one prefill, in chunks of
     /// [`PREFILL_CHUNK`] so a long prompt's staged hidden states stay bounded.
     /// Returns the last token's hidden state.
-    fn prefill(&self, orch: &mut ForwardOrchestrator<&K>, tokens: &[u32]) -> Result<Vec<f32>> {
+    pub(crate) fn prefill(
+        &self,
+        orch: &mut ForwardOrchestrator<&K>,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
         let mut hiddens = Vec::new();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             hiddens.clear();

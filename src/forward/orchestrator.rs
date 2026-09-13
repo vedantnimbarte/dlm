@@ -162,6 +162,20 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         Ok(())
     }
 
+    /// Roll the sequence back to its first `len` tokens, discarding the K/V and
+    /// budget of everything after (a no-op if it holds `len` or fewer). How a
+    /// speculative round drops the draft tokens the target rejected.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.position {
+            return;
+        }
+        for kv in &mut self.kv_layers {
+            kv.truncate(len);
+        }
+        self.budget.truncate_sequence(SEQ_ID, len as u64);
+        self.position = len;
+    }
+
     /// Absolute position of the next token (tokens decoded so far).
     pub fn position(&self) -> usize {
         self.position

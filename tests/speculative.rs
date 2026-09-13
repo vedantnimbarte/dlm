@@ -102,15 +102,21 @@ fn speculative_output_equals_target_greedy() {
     let n = 8;
 
     // Different draft (seed 2) vs. target (seed 1): output must still be exact.
-    let decoder = SpeculativeDecoder::new(build_generator(1), build_generator(2), 4);
-    let spec = decoder.generate(&prompt, n).unwrap();
+    // Every gamma, because a rejection at the *last* proposal is its own case
+    // (it must not also draw a bonus token), and gamma 1 makes it the only case.
     let reference = greedy(&build_generator(1), &prompt, n);
-
-    assert_eq!(
-        spec.tokens, reference,
-        "speculative diverged from target-greedy"
-    );
-    assert_eq!(spec.tokens.len(), n);
+    for gamma in [1, 2, 3, 4] {
+        let decoder = SpeculativeDecoder::new(build_generator(1), build_generator(2), gamma);
+        let spec = decoder.generate(&prompt, n).unwrap();
+        assert_eq!(
+            spec.tokens, reference,
+            "gamma {gamma}: speculative diverged from target-greedy"
+        );
+        assert!(
+            spec.accepted < spec.proposed,
+            "gamma {gamma}: no rejection exercised"
+        );
+    }
 }
 
 #[test]
@@ -136,7 +142,8 @@ fn session_round_by_round_equals_target_greedy() {
 
     // Drive the resumable session one round at a time (as the scheduler does),
     // capping each round to the tokens still wanted.
-    let mut session = SpeculativeSession::new(&target, &draft, 4, &prompt);
+    let mut session =
+        SpeculativeSession::new(&target, &draft, 4, &prompt, Sampler::Greedy).unwrap();
     let mut out = Vec::new();
     while out.len() < n {
         let emitted = session.step(n - out.len()).unwrap();
@@ -194,4 +201,71 @@ fn speculative_scheduler_respects_eos() {
     // Stops at EOS (included), before the 10-token cap, matching plain decoding.
     assert_eq!(*results[0].tokens.last().unwrap(), eos);
     assert_eq!(results[0].tokens, two);
+}
+
+/// Sampled speculation must follow the **target's** distribution, not the
+/// draft's. Over many seeds, the first two emitted tokens' marginals under
+/// speculation must match plain target sampling, while plain draft sampling
+/// visibly does not — so a session that passed draft tokens through unchecked,
+/// or resampled rejections from the wrong distribution, fails.
+///
+/// A low temperature sharpens both models' distributions, so target and draft
+/// disagree enough for the test to have teeth. The first token exercises
+/// accept/reject against the draft; the second also exercises the bonus draw
+/// and the KV rollback between rounds (gamma 1 makes every token its own round).
+#[test]
+fn sampled_speculation_follows_the_target_distribution() {
+    let (target, draft) = (build_generator(1), build_generator(2));
+    let prompt = [3u32, 9];
+    let runs = 8000;
+    let sampler = |seed| Sampler::TopPK {
+        temperature: 0.08,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        seed,
+    };
+    let vocab = 32;
+    let mut spec = vec![vec![0f64; vocab]; 2];
+    let mut plain_target = vec![vec![0f64; vocab]; 2];
+    let mut plain_draft = vec![vec![0f64; vocab]; 2];
+    for seed in 0..runs as u64 {
+        let mut s = SpeculativeSession::new(&target, &draft, 1, &prompt, sampler(seed)).unwrap();
+        let mut out = Vec::new();
+        while out.len() < 2 {
+            out.extend(s.step(2 - out.len()).unwrap());
+        }
+        let cfg = GenerationConfig {
+            max_new_tokens: 2,
+            eos_token: None,
+            sampler: sampler(seed + 1_000_000),
+        };
+        let t = target.generate(&prompt, &cfg).unwrap();
+        let d = draft.generate(&prompt, &cfg).unwrap();
+        for i in 0..2 {
+            spec[i][out[i] as usize] += 1.0;
+            plain_target[i][t[i] as usize] += 1.0;
+            plain_draft[i][d[i] as usize] += 1.0;
+        }
+    }
+    let tv = |a: &[f64], b: &[f64]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs() / runs as f64)
+            .sum::<f64>()
+            / 2.0
+    };
+    for i in 0..2 {
+        let separation = tv(&plain_draft[i], &plain_target[i]);
+        assert!(
+            separation > 0.3,
+            "token {i}: draft and target too alike ({separation:.3}) for this test to mean anything"
+        );
+        let err = tv(&spec[i], &plain_target[i]);
+        assert!(
+            err < 0.06,
+            "token {i}: speculative marginal is {err:.3} from the target's (draft is {separation:.3})"
+        );
+    }
 }

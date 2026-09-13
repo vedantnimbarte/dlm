@@ -84,8 +84,7 @@ struct Pending {
     max_new_tokens: usize,
     /// Stop when any of these token ids is produced; empty means run to length.
     eos: Vec<u32>,
-    /// Sampler for the plain (non-speculative) path. Ignored when the scheduler
-    /// speculates — speculative decoding is greedy-exact by construction.
+    /// How tokens are chosen, on the plain and the speculative path alike.
     sampler: Sampler,
 }
 
@@ -240,9 +239,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         self.submit_sampled(id, prompt, max_new_tokens, eos, Sampler::Greedy)
     }
 
-    /// Queue a request with an explicit `sampler` for the plain path. The sampler
-    /// is honored only when the scheduler is not speculating (speculative
-    /// decoding is greedy-exact); otherwise it is ignored.
+    /// Queue a request with an explicit `sampler`. A speculating scheduler
+    /// honors it too: its output follows the target's sampled distribution, and
+    /// is identical to plain decoding under greedy.
     pub fn submit_sampled(
         &mut self,
         id: u64,
@@ -304,7 +303,8 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     draft,
                     self.gamma,
                     &p.prompt,
-                )),
+                    p.sampler,
+                )?),
                 None => {
                     // Resume from the longest cached prefix if one exists;
                     // otherwise prefill from scratch. Either way, cache the
