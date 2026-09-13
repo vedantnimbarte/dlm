@@ -31,6 +31,8 @@
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaGetDevice hipGetDevice
+#define cudaErrorInvalidDevice hipErrorInvalidDevice
 #else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -405,11 +407,14 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // CPU. The scratch sizes are fixed by model geometry, so allocate once and reuse
 // across every layer and token; realloc only if a later call needs a bigger
 // buffer.
-// thread_local so each inference thread owns its scratch: the multi-GPU path runs
-// one thread per device (each with its own CUDA context), and the test harness
-// runs cases in parallel threads — a single global would race and corrupt
-// buffers across them. Per-thread scratch is allocated on that thread's current
-// device and reclaimed by the driver at process exit.
+// Keyed by thread *and* device. thread_local because the test harness (and any
+// embedder) runs inference on several threads at once, and a single global would
+// race. Per device because one thread can drive several GPUs: the multi-GPU
+// pipeline runs every stage on the inference thread, calling cudaSetDevice
+// before each layer. Scratch keyed by thread alone was allocated on the first
+// stage's device and then handed to every later stage's kernels -- device memory
+// from another GPU, which a launch cannot address. Each (thread, device) pair
+// now allocates its own on that device; the driver reclaims them at exit.
 // Slots 0-10 are the dense decode block's scratch. Slots 11-12 are MoE-only:
 // 11 holds `normed2` (the FFN input) so it survives from `dlm_moe_attn` across
 // the router matvec and every per-expert apply on the same stream; 12 is the
@@ -423,11 +428,29 @@ enum { SCRATCH_N = 24 };
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
-static thread_local float* g_scratch[SCRATCH_N] = {0};
-static thread_local int g_scratch_cap[SCRATCH_N] = {0}; // capacity in floats
+enum { DLM_MAX_DEVICES = 16 };
+static thread_local float* g_scratch_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}};
+static thread_local int g_scratch_cap_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}}; // floats
 
-// Ensure scratch slot `i` holds at least `n` floats; (re)allocates only on growth.
+// The current device's index into the scratch tables. A device id past the table
+// is refused by scratch_ensure, which every entry point calls before it reads a
+// slot, so the clamp here only keeps an unreachable index in bounds.
+static inline int scratch_device() {
+    int d = 0;
+    if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= DLM_MAX_DEVICES) return 0;
+    return d;
+}
+// Every existing `g_scratch[i]` / `g_scratch_cap[i]` reads the current device's row.
+#define g_scratch (g_scratch_by_device[scratch_device()])
+#define g_scratch_cap (g_scratch_cap_by_device[scratch_device()])
+
+// Ensure scratch slot `i` holds at least `n` floats on the current device;
+// (re)allocates only on growth.
 static cudaError_t scratch_ensure(int i, int n) {
+    int device = 0;
+    cudaError_t de = cudaGetDevice(&device);
+    if (de != cudaSuccess) return de;
+    if (device < 0 || device >= DLM_MAX_DEVICES) return cudaErrorInvalidDevice;
     if (g_scratch_cap[i] >= n) return cudaSuccess;
     if (g_scratch[i]) cudaFree(g_scratch[i]);
     g_scratch[i] = 0;

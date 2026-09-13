@@ -14,6 +14,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Multi-GPU stages shared one device's scratch memory.** The CUDA kernels'
+  scratch buffers were kept per thread, on the assumption that a multi-GPU
+  pipeline runs one thread per device. It does not: every stage runs on the
+  inference thread, switching devices per layer, so later stages were handed
+  buffers allocated on the first stage's GPU. Scratch is now kept per thread and
+  per device. Untested across two real GPUs.
 - **Host `--stream` ignored per-layer attention windows.** The streamed CPU
   kernel handed every layer the model-wide config, so Gemma 2's global layers
   were windowed too — invisible until a context passed 4,096 tokens.
