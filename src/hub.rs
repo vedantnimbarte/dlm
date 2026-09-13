@@ -461,7 +461,9 @@ mod tests {
         std::fs::write(&path, br#"{"ok":true}"#).unwrap();
         let url = format!(
             "file:///{}",
-            path.to_string_lossy().replace('\\', "/").trim_start_matches('/')
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches('/')
         );
         for token in [None, Some("secret")] {
             match curl_json(&url, token) {
