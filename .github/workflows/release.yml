@@ -151,7 +151,7 @@ jobs:
       # older compiler. Full toolkit (no sub-packages) because CUDA 13 no longer
       # bundles crt/host_config.h in the ["nvcc","cudart"] subset. Linux also needs
       # libstdc++ at link time now — handled in build.rs.
-      - uses: Jimver/cuda-toolkit@v0.2.35
+      - uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "13.2.0"
           method: network
