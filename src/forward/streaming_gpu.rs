@@ -154,13 +154,7 @@ impl GpuWeights {
     /// the (non-blocking) copy stream, then wait for it. Because the copy runs on
     /// its own stream, it overlaps kernels on the default stream — the caller's
     /// wait doesn't stop the GPU. On return the uploads are complete and `staging`
-    /// is free to reuse.
-    fn upload_async(t: &LayerTensors, stream: &Stream, staging: &mut PinnedBuffer) -> Result<Self> {
-        Self::upload_async_traced(t, stream, staging, None)
-    }
-
-    /// [`upload_async`](Self::upload_async), reporting per-stage cost for
-    /// `layer` when telemetry is on.
+    /// is free to reuse. Reports per-stage cost for `layer` when telemetry is on.
     ///
     /// The two phases below are already separate in this function, which is why
     /// they can be reported separately: staging is a host memcpy into pinned
