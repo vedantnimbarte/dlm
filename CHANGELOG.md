@@ -14,6 +14,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Host `--stream` ignored per-layer attention windows.** The streamed CPU
+  kernel handed every layer the model-wide config, so Gemma 2's global layers
+  were windowed too — invisible until a context passed 4,096 tokens.
 - **GPT-2 with `--stream` produced garbage** (`" labor labor labor…"`), and
   Falcon's streamed and GPU generators had the wrong final norm. Only the CPU
   resident builder attached GPT-2's learned position embeddings and the
@@ -26,6 +29,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Gemma 3** (the text models: 270M, 1B). Per-head `(1 + w)` Q/K norms, the
+  5:1 local/global layer pattern — read from `sliding_window_pattern`,
+  `_sliding_window_pattern`, or a `layer_types` list (an irregular list is
+  refused) — and a separate RoPE base for the windowed layers, with
+  `rope_scaling` applied to the global layers only. On `gemma-3-1b-it` it answers
+  correctly on CPU and GPU, recalls a code from 1,500 tokens back, and scores a
+  1,126-token passage at 1.80 nats/token (0.33 on the half only recall can
+  predict); the local layers on the global RoPE base score 3.18, and Gemma 2's
+  layer rule 3.35. The multimodal 4B+ checkpoints are not loaded yet.
+- `Generator::score`: the per-token log-probability of a sequence under teacher
+  forcing, for checking a forward pass against a text's expected cross-entropy.
 - **Prompt prefill runs layer by layer on the streamed host path.** A prompt
   used to go through the model one token at a time, so with `--stream` every
   prompt token re-streamed the whole window; now each layer loads once per

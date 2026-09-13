@@ -124,6 +124,7 @@ fn tiny_cfg() -> BlockConfig {
         activation: Default::default(),
         mla: None,
         sliding_window_pattern: None,
+        rope_local_theta: None,
         attn_logit_softcap: None,
         query_pre_attn_scalar: None,
         gemma2_norms: false,

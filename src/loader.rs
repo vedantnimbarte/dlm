@@ -624,6 +624,7 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         learned_positions: config.learned_positions,
         mla: config.mla,
         sliding_window_pattern: config.sliding_window_pattern,
+        rope_local_theta: config.rope_local_theta,
         attn_logit_softcap: config.attn_logit_softcap,
         query_pre_attn_scalar: config.query_pre_attn_scalar,
         gemma2_norms: config.gemma2_norms,
@@ -1000,9 +1001,20 @@ pub(crate) fn load_layer_tensors_opt(
             q_bias: load_bias(store, &name("self_attn.q_proj"), q_dim)?,
             k_bias: load_bias(store, &name("self_attn.k_proj"), kv_dim)?,
             v_bias: load_bias(store, &name("self_attn.v_proj"), kv_dim)?,
-            // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3.
-            q_norm: load_optional(store, &name("self_attn.q_norm.weight"), cfg.head_dim)?,
-            k_norm: load_optional(store, &name("self_attn.k_norm.weight"), cfg.head_dim)?,
+            // Per-head Q/K RMSNorm (`[head_dim]`), present on Qwen3 and Gemma3.
+            // Gemma3's are `(1 + w)` like its other norms.
+            q_norm: load_norm_optional(
+                store,
+                &name("self_attn.q_norm.weight"),
+                cfg.head_dim,
+                norm_add_one,
+            )?,
+            k_norm: load_norm_optional(
+                store,
+                &name("self_attn.k_norm.weight"),
+                cfg.head_dim,
+                norm_add_one,
+            )?,
             mla: None,
             // Gemma2's extra norm pair; absent on every other architecture.
             pre_feedforward_layernorm: load_norm_optional(

@@ -519,3 +519,39 @@ fn chat_template_auto_detection_per_family() {
         }
     }
 }
+
+/// Gemma 3: Gemma 2's norm layout and (1+w) norms, plus a 5:1 local/global layer
+/// pattern whose local layers use their own RoPE base. The 1B states the pattern
+/// as `sliding_window_pattern: 6`; the 270M as a `layer_types` list. Both must
+/// resolve to the same rule, and to layers 5, 11, 17, ... being the global ones.
+#[test]
+fn gemma3_family_fixtures() {
+    use dlm::server::engine::ChatTemplate;
+    for family in ["gemma-3", "gemma-3-270m"] {
+        let Some(dir) = fixture(family) else {
+            eprintln!("skipping {family}: fixture absent");
+            return;
+        };
+        let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16)
+            .unwrap_or_else(|e| panic!("{family} config.json: {e}"));
+        assert_eq!(cfg.sliding_window_pattern, Some(6), "{family}");
+        assert_eq!(cfg.sliding_window, Some(512), "{family}");
+        assert_eq!(cfg.rope_local_theta, Some(10_000.0), "{family}");
+        assert_eq!(cfg.rope_theta, 1_000_000.0, "{family}");
+        assert!(cfg.gemma2_norms && cfg.norm_add_one, "{family}");
+        assert_eq!(
+            cfg.attn_logit_softcap, None,
+            "{family}: Gemma 3 dropped softcapping"
+        );
+        assert_eq!(cfg.final_logit_softcap, None, "{family}");
+        assert_eq!(cfg.explicit_head_dim, Some(256), "{family}");
+
+        let tok = BpeTokenizer::from_dir(&dir).expect("gemma-3 tokenizer");
+        assert!(tok.bos_id().is_some(), "{family}: trained with <bos>");
+        assert!(tok.id_of("<end_of_turn>").is_some(), "{family}");
+        assert_round_trip(&tok, family);
+
+        let template = ChatTemplate::read_jinja(&dir).and_then(|j| ChatTemplate::detect(&j));
+        assert_eq!(template, Some(ChatTemplate::Gemma), "{family}");
+    }
+}

@@ -578,6 +578,8 @@ pub struct GpuKernel {
     /// oracle uses ([`rope_inv_freqs`]) and kept resident so the kernel indexes
     /// it instead of recomputing (and possibly diverging from) the formula.
     inv_freq: DeviceBuffer,
+    /// Gemma3's local-layer frequencies; `None` when every layer shares `inv_freq`.
+    local_inv_freq: Option<DeviceBuffer>,
     /// Max tokens the per-layer KV buffers can hold.
     kv_capacity_tokens: usize,
     /// Persistent device buffer for the hidden vector, reused across every layer
@@ -620,6 +622,17 @@ impl GpuKernel {
             cfg.rope_theta,
             cfg.rope_scaling,
         ))?;
+        // Gemma3's windowed layers rotate with their own base, unscaled.
+        let local_inv_freq = cfg
+            .rope_local_theta
+            .map(|theta| {
+                DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
+                    cfg.head_dim,
+                    theta,
+                    None,
+                ))
+            })
+            .transpose()?;
         // MLA rotates only its qk_rope sub-dimension.
         let mla_inv_freq = match &cfg.mla {
             Some(m) => Some(DeviceBuffer::from_slice(
@@ -636,6 +649,7 @@ impl GpuKernel {
             cfg,
             layers: gpu_layers,
             inv_freq,
+            local_inv_freq,
             kv_capacity_tokens: cap,
             d_hidden,
             mla_inv_freq,
@@ -644,6 +658,14 @@ impl GpuKernel {
 }
 
 impl GpuKernel {
+    /// The RoPE inverse frequencies `layer` rotates with.
+    fn inv_freq_for(&self, layer: u32) -> *const f32 {
+        match &self.local_inv_freq {
+            Some(local) if self.cfg.uses_local_rope(layer) => local.as_ptr(),
+            _ => self.inv_freq.as_ptr(),
+        }
+    }
+
     /// One `dlm_decode_block_batched` call over the `[batch, hidden]` device block
     /// at `x`, for dense standard-attention layer `layer`. The caller owns the
     /// slot tables and the host KV length bookkeeping.
@@ -690,7 +712,7 @@ impl GpuKernel {
                 bias_ptr(&w.v_bias),
                 bias_ptr(&w.q_norm),
                 bias_ptr(&w.k_norm),
-                self.inv_freq.as_ptr(),
+                self.inv_freq_for(layer),
                 x,
                 slot_keys,
                 slot_values,
@@ -1014,7 +1036,7 @@ impl ComputeKernel for GpuKernel {
                         bias_ptr(&w.v_bias),
                         bias_ptr(&w.q_norm),
                         bias_ptr(&w.k_norm),
-                        self.inv_freq.as_ptr(),
+                        self.inv_freq_for(layer),
                         d_hidden.as_mut_ptr(),
                         kv_keys,
                         kv_values,
@@ -1026,7 +1048,7 @@ impl ComputeKernel for GpuKernel {
                         // `sliding_window` would clip the global layers too.
                         self.cfg.window_for_layer(layer).unwrap_or(0) as i32,
                         self.cfg.activation.code(),
-                        crate::forward::cpu::rope_mscale(self.cfg.rope_scaling),
+                        crate::forward::cpu::rope_mscale(self.cfg.for_layer(layer).rope_scaling),
                         self.cfg.attn_scale(),
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),

@@ -158,6 +158,17 @@ struct RawConfig {
     /// `model_type == "gemma2"`.
     #[serde(default)]
     sliding_window_pattern: Option<u32>,
+    /// The same, as newer Gemma3 exports spell it. A separate field rather than
+    /// an alias, so a config carrying both keys still parses.
+    #[serde(default, rename = "_sliding_window_pattern")]
+    sliding_window_pattern_private: Option<u32>,
+    /// Per-layer attention kind (`"sliding_attention"` / `"full_attention"`),
+    /// which newer Gemma3 exports ship in place of a pattern.
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    /// Gemma3's RoPE base for its windowed layers.
+    #[serde(default)]
+    rope_local_base_freq: Option<f32>,
     /// Gemma2 attention-logit softcap (`tanh(score/cap)*cap`); typically 50.0.
     #[serde(default)]
     attn_logit_softcapping: Option<f32>,
@@ -623,9 +634,11 @@ pub struct ModelConfig {
     pub embed_scale: Option<f32>,
     /// Gated-MLP activation (SiLU for most, GELU for Gemma).
     pub activation: crate::forward::cpu::Activation,
-    /// Gemma2 windows only every `n`-th layer instead of all of them; `None`
+    /// Gemma2/3 make every `n`-th layer global and window the rest; `None`
     /// applies [`sliding_window`](Self::sliding_window) uniformly.
     pub sliding_window_pattern: Option<u32>,
+    /// Gemma3's RoPE base for windowed layers; `None` elsewhere.
+    pub rope_local_theta: Option<f32>,
     /// Gemma2 attention-logit softcap (`tanh(score/cap)*cap`).
     pub attn_logit_softcap: Option<f32>,
     /// Gemma2 LM-head logit softcap, applied to the final logits before sampling.
@@ -636,6 +649,30 @@ pub struct ModelConfig {
     /// changes where the other two norms apply (see
     /// [`LayerTensors::is_gemma2_style`](crate::forward::LayerTensors::is_gemma2_style)).
     pub gemma2_norms: bool,
+}
+
+/// Turn Gemma3's `layer_types` list into the `n` of "every `n`-th layer is
+/// global". Only that regular shape is accepted: a list dlm cannot express as a
+/// pattern is refused rather than approximated, since windowing a global layer
+/// (or the reverse) runs quietly wrong past the window length.
+fn pattern_from_layer_types(types: &[String]) -> Result<Option<u32>> {
+    let global = |t: &String| t == "full_attention";
+    let Some(first) = types.iter().position(global) else {
+        return Ok(None); // every layer windowed: a uniform window
+    };
+    let n = first + 1;
+    let regular = types.iter().enumerate().all(|(i, t)| {
+        let expect_global = (i + 1) % n == 0;
+        global(t) == expect_global && (global(t) || t == "sliding_attention")
+    });
+    if !regular {
+        return Err(DlmError::InvalidConfig(format!(
+            "layer_types {types:?} is not a regular sliding/full pattern; dlm supports \
+             every n-th layer global (Gemma2/Gemma3), and running an irregular layout \
+             under that rule would window the wrong layers"
+        )));
+    }
+    Ok(Some(n as u32))
 }
 
 impl ModelConfig {
@@ -729,7 +766,11 @@ impl ModelConfig {
         // attention scale, and a second norm pair per layer.
         let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
         let is_gemma2 = model_type == "gemma2";
-        let is_gemma = model_type == "gemma" || is_gemma2;
+        // Gemma3: Gemma2's norm layout plus per-head Q/K norms (loaded when
+        // present), a 5:1 local/global pattern, and a separate RoPE base for the
+        // local layers. `gemma3_text` is the text-only export (270M, 1B).
+        let is_gemma3 = model_type == "gemma3_text" || model_type == "gemma3";
+        let is_gemma = model_type == "gemma" || is_gemma2 || is_gemma3;
         // GPT-2 and Falcon are the two families that are not Llama-descended:
         // both normalize with LayerNorm rather than RMSNorm, and each changes the
         // block in one further way. Keyed on `model_type` rather than
@@ -837,14 +878,25 @@ impl ModelConfig {
             // HF hard-codes the alternation in the Gemma2 model class rather than
             // the config (`is_sliding = not bool(layer_idx % 2)`), so default it
             // here instead of requiring a key the checkpoints don't ship.
-            sliding_window_pattern: raw
-                .sliding_window_pattern
-                .or(if is_gemma2 { Some(2) } else { None })
-                .filter(|&n| n > 1),
+            sliding_window_pattern: match (&raw.layer_types, is_gemma3) {
+                (Some(types), true) => pattern_from_layer_types(types)?,
+                _ => raw
+                    .sliding_window_pattern
+                    .or(raw.sliding_window_pattern_private)
+                    .or(if is_gemma2 {
+                        Some(2)
+                    } else if is_gemma3 {
+                        Some(6)
+                    } else {
+                        None
+                    }),
+            }
+            .filter(|&n| n > 1),
+            rope_local_theta: is_gemma3.then(|| raw.rope_local_base_freq.unwrap_or(10_000.0)),
             attn_logit_softcap: raw.attn_logit_softcapping.filter(|c| *c > 0.0),
             final_logit_softcap: raw.final_logit_softcapping.filter(|c| *c > 0.0),
             query_pre_attn_scalar: raw.query_pre_attn_scalar.filter(|s| *s > 0.0),
-            gemma2_norms: is_gemma2,
+            gemma2_norms: is_gemma2 || is_gemma3,
         };
 
         config.validate()?;
@@ -999,6 +1051,46 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gemma 3 states its layer layout two ways; both mean "every 6th layer is
+    /// global". An irregular list is refused, not approximated.
+    #[test]
+    fn gemma3_layer_pattern_from_either_spelling() {
+        let base = r#""model_type":"gemma3_text","hidden_size":16,"num_attention_heads":4,
+            "num_key_value_heads":1,"num_hidden_layers":12,"vocab_size":32,
+            "intermediate_size":32,"sliding_window":8,"rope_local_base_freq":10000"#;
+        let parse = |extra: &str| {
+            ModelConfig::from_json_bytes(format!("{{{base}{extra}}}").as_bytes(), QuantScheme::Fp16)
+        };
+        let kinds = |globals: &[usize]| {
+            let v: Vec<String> = (0..12)
+                .map(|i| {
+                    format!(
+                        "{:?}",
+                        if globals.contains(&i) {
+                            "full_attention"
+                        } else {
+                            "sliding_attention"
+                        }
+                    )
+                })
+                .collect();
+            format!(r#","layer_types":[{}]"#, v.join(","))
+        };
+        for extra in [
+            r#","sliding_window_pattern":6"#.to_string(),
+            r#","_sliding_window_pattern":6"#.to_string(),
+            kinds(&[5, 11]),
+            String::new(), // absent: Gemma 3's default
+        ] {
+            let c = parse(&extra).unwrap();
+            assert_eq!(c.sliding_window_pattern, Some(6), "{extra}");
+            assert_eq!(c.rope_local_theta, Some(10_000.0));
+            assert!(c.gemma2_norms && c.norm_add_one);
+        }
+        let err = parse(&kinds(&[4, 11])).expect_err("irregular layout must be refused");
+        assert!(format!("{err}").contains("layer_types"), "{err}");
+    }
 
     /// DeepSeek-V2/V3 spells its MoE fields differently from Mixtral and Qwen.
     /// Reading only the other two spellings left `moe: None`, so every layer

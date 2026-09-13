@@ -537,7 +537,6 @@ impl<K: ComputeKernel> Generator<K> {
         Ok(v)
     }
 
-    /// Project a hidden state to vocabulary logits via final norm + LM head.
     /// Run `tokens` (non-empty) through the model as one prefill, in chunks of
     /// [`PREFILL_CHUNK`] so a long prompt's staged hidden states stay bounded.
     /// Returns the last token's hidden state.
@@ -557,6 +556,40 @@ impl<K: ComputeKernel> Generator<K> {
         Ok(hiddens.split_off(hiddens.len() - self.hidden_size))
     }
 
+    /// The log-probability the model assigns each token given the ones before it
+    /// (teacher forcing): `out[i]` is `log p(tokens[i + 1] | tokens[..=i])`, so
+    /// the result is one shorter than `tokens`. The mean of its negation is the
+    /// text's cross-entropy -- the number that tells a subtly wrong forward pass
+    /// (a misplaced norm, a wrong RoPE base) from a right one when greedy output
+    /// still looks fine.
+    pub fn score(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut orch = self.orchestrator();
+        let mut out = Vec::with_capacity(tokens.len().saturating_sub(1));
+        for (c, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+            let mut hiddens = Vec::with_capacity(chunk.len() * self.hidden_size);
+            for (i, &token) in chunk.iter().enumerate() {
+                hiddens.extend(self.embed(token, orch.position() + i)?);
+            }
+            orch.prefill(&mut hiddens)?;
+            for (i, hidden) in hiddens.chunks(self.hidden_size).enumerate() {
+                let Some(&next) = tokens.get(c * PREFILL_CHUNK + i + 1) else {
+                    break;
+                };
+                let logits = self.logits(hidden)?;
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let lse = max
+                    + logits
+                        .iter()
+                        .map(|&l| ((l - max) as f64).exp())
+                        .sum::<f64>()
+                        .ln() as f32;
+                out.push(logits[next as usize] - lse);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Project a hidden state to vocabulary logits via final norm + LM head.
     fn logits(&self, hidden: &[f32]) -> Result<Vec<f32>> {
         let normed = crate::forward::cpu::norm(
             hidden,
@@ -888,6 +921,29 @@ mod tests {
             kernel, embedding, final_norm, lm_head, vocab, 1e-5, kv_config, 8,
         )
         .unwrap()
+    }
+
+    /// `score` must be the log-softmax of the next token, computed the slow way:
+    /// one decode step at a time, full logits, explicit normalization.
+    #[test]
+    fn score_is_the_next_tokens_log_softmax() {
+        let g = counting_generator();
+        let tokens = [0u32, 1, 3, 2, 2];
+        let got = g.score(&tokens).unwrap();
+        assert_eq!(got.len(), tokens.len() - 1);
+        let mut orch = g.orchestrator();
+        for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+            let mut h = g.embed(t, i).unwrap();
+            orch.decode_token(&mut h).unwrap();
+            let logits = g.logits(&h).unwrap();
+            let z: f32 = logits.iter().map(|l| l.exp()).sum();
+            let want = logits[tokens[i + 1] as usize] - z.ln();
+            assert!(
+                (got[i] - want).abs() < 1e-5,
+                "token {i}: {} vs {want}",
+                got[i]
+            );
+        }
     }
 
     /// Gemma2's final-logit softcap squashes logits through `tanh(l/cap)*cap`

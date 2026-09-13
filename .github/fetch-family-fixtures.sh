@@ -15,16 +15,19 @@ dest="${1:-models/fixtures}"
 
 # family|repo|extra files beyond config.json + tokenizer.json
 fetch() {
-  name="$1"; repo="$2"
+  name="$1"; repo="$2"; shift 2
   dir="$dest/$name"
   mkdir -p "$dir"
-  for f in config.json tokenizer.json tokenizer_config.json; do
+  for f in config.json tokenizer.json tokenizer_config.json "$@"; do
     url="https://huggingface.co/$repo/resolve/main/$f"
     # tokenizer_config.json carries add_bos_token and is required for Gemma and
-    # Llama; a family without one is not an error.
+    # Llama; a family without one is not an error. Extra files named after the
+    # repo (Gemma 3's separate chat_template.jinja) are fetched the same way --
+    # only where listed, since curl retries a 404 five times.
     if ! curl -fsSL --retry 5 --retry-all-errors "$url" -o "$dir/$f"; then
       rm -f "$dir/$f"
-      [ "$f" = tokenizer_config.json ] || {
+      case "$f" in tokenizer_config.json|chat_template.jinja) continue ;; esac
+      {
         echo "error: $repo is missing $f" >&2
         exit 1
       }
@@ -51,6 +54,10 @@ fetch qwen2.5     Qwen/Qwen2.5-0.5B-Instruct
 # parses wrong yields fluent nonsense rather than an error.
 fetch llama-3     unsloth/Llama-3.2-1B-Instruct               # llama3 rope scaling
 fetch gemma-1     unsloth/gemma-1.1-2b-it                     # (1+w) norm, no softcap
+# Gemma 3: 5:1 local/global layers with their own RoPE base. The 1B states the
+# pattern as `sliding_window_pattern`; the 270M as a `layer_types` list.
+fetch gemma-3      unsloth/gemma-3-1b-it   chat_template.jinja # sliding_window_pattern
+fetch gemma-3-270m unsloth/gemma-3-270m-it chat_template.jinja # layer_types
 fetch qwen3       Qwen/Qwen3-0.6B                             # explicit head_dim != derived
 fetch qwen2-moe   Qwen/Qwen1.5-MoE-A2.7B-Chat                 # gated shared expert
 # Mixtral's own repos are gated; this is a Mixtral-layout checkpoint, which is

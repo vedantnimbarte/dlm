@@ -663,6 +663,8 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     /// RoPE inverse frequencies (see [`GpuKernel`](crate::forward::GpuKernel)):
     /// computed once by the shared host function, resident for the kernel's life.
     inv_freq: DeviceBuffer,
+    /// Gemma3's local-layer frequencies; `None` when every layer shares `inv_freq`.
+    local_inv_freq: Option<DeviceBuffer>,
     /// MLA decoupled-RoPE frequencies (over `qk_rope_head_dim`); `None` for
     /// standard attention.
     mla_inv_freq: Option<DeviceBuffer>,
@@ -677,6 +679,14 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
 }
 
 impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
+    /// The RoPE inverse frequencies `layer` rotates with.
+    fn inv_freq_for(&self, layer: u32) -> *const f32 {
+        match &self.local_inv_freq {
+            Some(local) if self.shared.cfg.uses_local_rope(layer) => local.as_ptr(),
+            _ => self.inv_freq.as_ptr(),
+        }
+    }
+
     /// Build a streaming GPU kernel: allocate per-layer KV for up to
     /// `max_kv_tokens` positions and stream weights keeping at most
     /// `resident_layers` sets in VRAM, prefetching one layer ahead.
@@ -750,6 +760,17 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             cfg.rope_theta,
             cfg.rope_scaling,
         ))?;
+        // Gemma3's windowed layers rotate with their own base, unscaled.
+        let local_inv_freq = cfg
+            .rope_local_theta
+            .map(|theta| {
+                DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
+                    cfg.head_dim,
+                    theta,
+                    None,
+                ))
+            })
+            .transpose()?;
         // MLA rotates only its decoupled qk_rope sub-dimension (same rule as the
         // resident `GpuKernel`).
         let mla_inv_freq = match &cfg.mla {
@@ -768,6 +789,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             num_layers,
             kv_capacity_tokens: cap,
             inv_freq,
+            local_inv_freq,
             mla_inv_freq,
             d_hidden,
             prefetch_tx: Some(tx),
@@ -829,7 +851,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 bias_ptr(&w.v_bias),
                 bias_ptr(&w.q_norm),
                 bias_ptr(&w.k_norm),
-                self.inv_freq.as_ptr(),
+                self.inv_freq_for(layer),
                 d_hidden.as_mut_ptr(),
                 kv_keys,
                 kv_values,
@@ -1000,7 +1022,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             bias_ptr(&w.v_bias),
                             bias_ptr(&w.q_norm),
                             bias_ptr(&w.k_norm),
-                            self.inv_freq.as_ptr(),
+                            self.inv_freq_for(layer),
                             d_hidden.as_mut_ptr(),
                             kv_keys,
                             kv_values,
@@ -1009,7 +1031,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             // Per-layer window: Gemma2's global layers must not be clipped.
                             cfg.window_for_layer(layer).unwrap_or(0) as i32,
                             cfg.activation.code(),
-                            crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                            crate::forward::cpu::rope_mscale(cfg.for_layer(layer).rope_scaling),
                             cfg.attn_scale(),
                             cfg.attn_logit_softcap.unwrap_or(0.0),
                             bias_ptr(&w.pre_ffn_norm),
@@ -1338,7 +1360,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         bias_ptr(&w.v_bias),
                         bias_ptr(&w.q_norm),
                         bias_ptr(&w.k_norm),
-                        self.inv_freq.as_ptr(),
+                        self.inv_freq_for(layer),
                         d_chunk.as_mut_ptr(),
                         &slot_keys,
                         &slot_values,

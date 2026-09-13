@@ -436,6 +436,7 @@ names. That covers:
 | Falcon | supported — parallel attention/FFN, multi-query (`multi_query` is a flag, not a count), LayerNorm, ungated MLP, fused `query_key_value`. **Config-verified, not run**: the smallest RoPE Falcon is 14 GB. `alibi: true` (falcon-rw-*) and `new_decoder_architecture` (Falcon-40B) are **refused** rather than mis-decoded. CPU and GPU; the GPU block is checked against the CPU oracle on synthetic Falcon-shaped weights |
 | DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU. MLA + MoE runs on the streaming GPU path (the resident kernel holds no routed experts, so `--no-stream` refuses it) |
 | Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
+| Gemma 3 (text: 270M, 1B) | supported — Gemma 2's norm layout without softcapping, per-head (1+w) Q/K norms, five sliding-window layers to each global one (from `sliding_window_pattern` or `layer_types`), and a separate RoPE base for the windowed layers. CPU and GPU, resident and streamed; checked on the real `gemma-3-1b-it` by its answers and by the cross-entropy of a passage twice the window. The 4B+ checkpoints are multimodal (`Gemma3ForConditionalGeneration`) and are **not yet loaded** |
 | anything else | **not supported** — errors on unknown tensor names |
 
 **MoE models** route each token through the top-k experts the router selects

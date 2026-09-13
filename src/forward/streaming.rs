@@ -732,15 +732,21 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         }
         // Compute without holding the cache lock — the worker loads in parallel.
         let t = std::time::Instant::now();
+        // The layer's own window and RoPE (Gemma2/3). The MoE decision stays on
+        // the model-wide config, as it was.
+        let lcfg = BlockConfig {
+            moe: self.shared.cfg.moe,
+            ..self.shared.cfg.for_layer(layer)
+        };
         let out = if self.shared.cfg.moe.is_some() {
             // Streamed MoE: `tensors` is the resident core; pull each selected
             // routed expert on demand through the host expert cache.
             let shared = &self.shared;
-            decode_block_streaming_moe(&shared.cfg, &tensors, hidden, kv, position, |e| {
+            decode_block_streaming_moe(&lcfg, &tensors, hidden, kv, position, |e| {
                 shared.ensure_expert(layer, e as u32)
             })?
         } else {
-            decode_block(&self.shared.cfg, &tensors, hidden, kv, position)?
+            decode_block(&lcfg, &tensors, hidden, kv, position)?
         };
         let compute_ns = t.elapsed().as_nanos() as u64;
         if self.auto {
@@ -985,6 +991,35 @@ mod tests {
         assert_eq!(
             loads, 6,
             "each layer should stream in once for the whole prompt"
+        );
+    }
+
+    /// The streaming kernel must resolve each layer's window and RoPE base the
+    /// way the resident one does (Gemma 2/3). It once handed the model-wide config
+    /// to every layer, windowing the global layers too -- invisible until the
+    /// context outgrew the window.
+    #[test]
+    fn streamed_layers_resolve_their_own_window_and_rope() {
+        let c = BlockConfig {
+            sliding_window: Some(2),
+            sliding_window_pattern: Some(2),
+            rope_local_theta: Some(10.0),
+            ..cfg()
+        };
+        let ls = layers(&c, 4);
+        let resident = CpuKernel::new(c, ls.clone()).unwrap();
+        let streaming = StreamingKernel::new(c, VecSource(ls), 2).with_prefetch_depth(0);
+        let tokens = 6; // three times the window
+        let mut want: Vec<f32> = (0..tokens * 8).map(|i| (i as f32 * 0.61).cos()).collect();
+        let mut got = want.clone();
+        let mut kv_want: Vec<KvLayerCache> =
+            (0..4).map(|_| KvLayerCache::new(c.kv_dim())).collect();
+        let mut kv_got = kv_want.clone();
+        resident.prefill(&mut want, &mut kv_want, 0).unwrap();
+        streaming.prefill(&mut got, &mut kv_got, 0).unwrap();
+        assert_eq!(
+            want, got,
+            "streamed layers ignored their per-layer window or RoPE"
         );
     }
 
