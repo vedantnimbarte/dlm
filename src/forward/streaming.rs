@@ -683,6 +683,17 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         Some(self.stats())
     }
 
+    /// Layer by layer: `run_block` keeps nothing across layers, and a prompt
+    /// that went token by token would stream the whole model once per token.
+    fn prefill(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        crate::forward::kernel::prefill_layer_by_layer(self, hiddens, kv_layers, start)
+    }
+
     fn run_block(
         &self,
         layer: u32,
@@ -939,6 +950,41 @@ mod tests {
         assert!(
             streaming.stats().evictions > 0,
             "expected eviction with a small window"
+        );
+    }
+
+    /// Prefill must match token-by-token decoding bit for bit, and load each
+    /// layer once rather than once per prompt token — the point of going layer
+    /// by layer on a streamed model.
+    #[test]
+    fn prefill_matches_decode_and_loads_each_layer_once() {
+        let c = cfg();
+        let ls = layers(&c, 6);
+        let resident = CpuKernel::new(c, ls.clone()).unwrap();
+        let streaming = StreamingKernel::new(c, CountingSource(ls, AtomicU64::new(0)), 2)
+            .with_prefetch_depth(0);
+
+        let tokens = 5;
+        let mut want: Vec<f32> = (0..tokens * 8).map(|i| (i as f32 * 0.37).sin()).collect();
+        let mut got = want.clone();
+        let mut kv_want: Vec<KvLayerCache> =
+            (0..6).map(|_| KvLayerCache::new(c.kv_dim())).collect();
+        let mut kv_got = kv_want.clone();
+
+        for (i, hidden) in want.chunks_mut(8).enumerate() {
+            for layer in 0..6 {
+                resident
+                    .run_block(layer, hidden, &mut kv_want[layer as usize], 3 + i)
+                    .unwrap();
+            }
+        }
+        streaming.prefill(&mut got, &mut kv_got, 3).unwrap();
+
+        assert_eq!(want, got, "layer-major prefill diverged from decoding");
+        let loads = streaming.shared.source.1.load(Ordering::Relaxed);
+        assert_eq!(
+            loads, 6,
+            "each layer should stream in once for the whole prompt"
         );
     }
 

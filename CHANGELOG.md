@@ -21,6 +21,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Prompt prefill runs layer by layer on the streamed host path.** A prompt
+  used to go through the model one token at a time, so with `--stream` every
+  prompt token re-streamed the whole window; now each layer loads once per
+  prompt (in chunks of 512 tokens). A 204-token prompt on Qwen2.5-0.5B with
+  `--stream --resident-layers 4` prefills in 26 s instead of 56 s — the same as
+  the fully-resident run. Output is bit-identical. Kernels gain a stack-level
+  `ComputeKernel::prefill`, whose default keeps the old order.
 - **Chat template auto-detection.** `--chat-template` now defaults to `auto`,
   which fingerprints the checkpoint's Jinja template and picks the matching
   built-in format. Five formats are new — `llama2`, `mistral`, `gemma`,

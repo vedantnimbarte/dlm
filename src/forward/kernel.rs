@@ -59,6 +59,30 @@ pub trait ComputeKernel {
         Ok(())
     }
 
+    /// Run the whole stack over `n` consecutive tokens of one sequence — a
+    /// prompt prefill. `hiddens` is `n × hidden_size`, token `i` sits at absolute
+    /// position `start + i`, and `kv_layers[l]` is layer `l`'s history.
+    ///
+    /// The default runs token by token through every layer, exactly as decoding
+    /// does, because a kernel may keep state across a token's layer sweep (the
+    /// GPU kernels hold the hidden state on the device from layer 0 to the last).
+    /// A kernel without such state can go layer by layer instead
+    /// ([`prefill_layer_by_layer`]) — the same arithmetic in a different order,
+    /// which a streaming kernel turns into one load per layer per prompt.
+    fn prefill(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        for (i, hidden) in hiddens.chunks_mut(self.hidden_size()).enumerate() {
+            for layer in 0..self.num_layers() {
+                self.run_block(layer, hidden, &mut kv_layers[layer as usize], start + i)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Layer-streaming cache stats, if this kernel streams weights. Resident
     /// kernels (everything held in memory) return `None`; the streaming kernel
     /// overrides it so the server can surface hit rate / prefetch effectiveness.
@@ -105,6 +129,37 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         // Forward to the concrete kernel so a borrowed GPU kernel keeps its fusion.
         (**self).run_block_batched(layer, hiddens, kvs, positions)
     }
+
+    fn prefill(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        (**self).prefill(hiddens, kv_layers, start)
+    }
+}
+
+/// [`ComputeKernel::prefill`] in layer-major order: every token through layer 0,
+/// then every token through layer 1, and so on.
+///
+/// Exact, not approximate: token `i` at layer `l` reads only layer `l`'s K/V for
+/// tokens `< i`, all of which this order has already written. Only for kernels
+/// whose [`run_block`](ComputeKernel::run_block) carries no state from one layer
+/// to the next within a token.
+pub fn prefill_layer_by_layer<K: ComputeKernel + ?Sized>(
+    kernel: &K,
+    hiddens: &mut [f32],
+    kv_layers: &mut [KvLayerCache],
+    start: usize,
+) -> Result<()> {
+    for layer in 0..kernel.num_layers() {
+        let kv = &mut kv_layers[layer as usize];
+        for (i, hidden) in hiddens.chunks_mut(kernel.hidden_size()).enumerate() {
+            kernel.run_block(layer, hidden, kv, start + i)?;
+        }
+    }
+    Ok(())
 }
 
 /// A deterministic stand-in for a real kernel.

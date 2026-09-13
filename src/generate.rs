@@ -18,6 +18,10 @@ use crate::error::{DlmError, Result};
 use crate::forward::cpu::{matvec, KvLayerCache};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
 
+/// Prompt tokens staged per prefill call. Bounds the `tokens × hidden` buffer on
+/// a long prompt; a streaming kernel loads each layer once per chunk.
+const PREFILL_CHUNK: usize = 512;
+
 /// Index of the largest logit (greedy pick; first max wins on ties).
 pub fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -417,6 +421,21 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// Project a hidden state to vocabulary logits via final norm + LM head.
+    /// Run `tokens` (non-empty) through the model as one prefill, in chunks of
+    /// [`PREFILL_CHUNK`] so a long prompt's staged hidden states stay bounded.
+    /// Returns the last token's hidden state.
+    fn prefill(&self, orch: &mut ForwardOrchestrator<&K>, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut hiddens = Vec::new();
+        for chunk in tokens.chunks(PREFILL_CHUNK) {
+            hiddens.clear();
+            for (i, &token) in chunk.iter().enumerate() {
+                hiddens.extend(self.embed(token, orch.position() + i)?);
+            }
+            orch.prefill(&mut hiddens)?;
+        }
+        Ok(hiddens.split_off(hiddens.len() - self.hidden_size))
+    }
+
     fn logits(&self, hidden: &[f32]) -> Vec<f32> {
         let normed = crate::forward::cpu::norm(
             hidden,
@@ -551,11 +570,7 @@ impl<K: ComputeKernel> Generator<K> {
         let mut orch = ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
 
         // Prefill: run every prompt token, carrying the last hidden state.
-        let mut hidden = vec![0.0f32; self.hidden_size];
-        for &token in prompt {
-            hidden = self.embed(token, orch.position())?;
-            orch.decode_token(&mut hidden)?;
-        }
+        let mut hidden = self.prefill(&mut orch, prompt)?;
 
         // Decode loop. `seen` tracks the full context (prompt + generated) for
         // the repetition penalty.
@@ -607,11 +622,7 @@ impl<K: ComputeKernel> Generator<K> {
         let budget = crate::cache::PagedKvCache::new(self.kv_config, self.kv_total_blocks);
         let mut orchestrator =
             crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
-        let mut hidden = vec![0.0f32; self.hidden_size];
-        for &token in prompt {
-            hidden = self.embed(token, orchestrator.position())?;
-            orchestrator.decode_token(&mut hidden)?;
-        }
+        let hidden = self.prefill(&mut orchestrator, prompt)?;
         Ok(GenerationSession {
             generator: self,
             orchestrator,
@@ -654,11 +665,7 @@ impl<K: ComputeKernel> Generator<K> {
         }
         let budget = PagedKvCache::new(self.kv_config, self.kv_total_blocks);
         let mut orchestrator = ForwardOrchestrator::resume(&self.kernel, budget, snapshot)?;
-        let mut hidden = vec![0.0f32; self.hidden_size];
-        for &token in suffix {
-            hidden = self.embed(token, orchestrator.position())?;
-            orchestrator.decode_token(&mut hidden)?;
-        }
+        let hidden = self.prefill(&mut orchestrator, suffix)?;
         Ok(GenerationSession {
             generator: self,
             orchestrator,
