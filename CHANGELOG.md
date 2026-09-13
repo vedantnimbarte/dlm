@@ -27,6 +27,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the model-info request returned an empty body and the pull stopped with
   "could not read model info … private/gated?".
 
+### Changed
+
+- **`--stream` caches layers in host RAM by default, quantized or not**, when the
+  whole layer set (plus 25%) fits under a quarter of physical RAM. It was on
+  only with `--quant`; unquantized streaming re-read every layer from the mmap on
+  every window miss, which took streamed Gemma 3 1B from 46 s to 268 s on a
+  1,500-token prompt. When the set does not fit, the cache is now off rather
+  than partial (a smaller LRU never hits on a cyclic scan), and serve says so.
+  `--ram-cache-gb` still overrides either way.
+
 ### Added
 
 - **Gemma 3** (the text-only 270M and 1B). Per-head `(1 + w)` Q/K norms, the

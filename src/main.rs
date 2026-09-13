@@ -784,7 +784,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 }
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
-                let ram_cache = resolve_ram_cache_bytes(&args, quant, &plan);
+                let ram_cache = resolve_ram_cache_bytes(&args, &plan);
                 publish_telemetry_snapshot(&config, &store, window as u32, true, device);
                 println!();
                 let dest = if device == Device::Gpu {
@@ -814,8 +814,18 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                         if args.ram_cache_gb.is_some() {
                             ""
                         } else {
-                            " (default: weights are quantized at load)"
+                            " (default: every layer fits)"
                         },
+                    );
+                } else if args.ram_cache_gb.is_none() {
+                    let layers = plan.per_layer_weight_bytes * plan.num_layers as u64;
+                    let need = layers + layers / 4; // the headroom the default would add
+                    println!(
+                        "  ram cache  : off: caching every layer needs ~{:.1} GiB, over the default \
+                         cap ({:.1} GiB, a quarter of RAM), so every miss re-reads the checkpoint. \
+                         Pass --ram-cache-gb to cache them anyway.",
+                        need as f64 / GIB as f64,
+                        ram_cache_cap() as f64 / GIB as f64,
                     );
                 }
                 if device == Device::Gpu {
@@ -1691,37 +1701,48 @@ fn ram_cache_cap() -> u64 {
 
 /// Host-RAM budget for the streaming layer cache.
 ///
-/// `--ram-cache-gb` wins when given (including `0` to disable). Otherwise the
-/// cache defaults **on only when the weights are being quantized at load and
-/// streamed**, sized to hold the whole quantized layer set (capped).
+/// `--ram-cache-gb` wins when given (including `0` to disable). Otherwise a
+/// streamed model gets a cache big enough to hold every layer, when that fits
+/// under [`ram_cache_cap`], and none when it does not.
 ///
-/// That combination is the one case where the cache is not an optimization but a
-/// correctness-of-design fix: a streamed layer is re-materialized on every window
-/// miss, so quantizing per-miss redoes the same arithmetic on the same bytes for
-/// the life of the process — measured at 12x slower than caching it (0.025 vs
-/// 0.295 tok/s on a 3B). Quantizing also makes the cache cheap: the set to hold
-/// is 2-4x smaller precisely because it was quantized. Unquantized streaming
-/// stays opt-in, where the cache duplicates full-size weights on top of the OS
-/// page cache and can lose.
-fn resolve_ram_cache_bytes(args: &ServeArgs, quant: QuantScheme, plan: &VramPlan) -> usize {
+/// Without it, every window miss re-materializes the layer from the checkpoint:
+/// re-reading it from the mmap, and re-quantizing it under `--quant` (measured
+/// 12x slower on a 3B). Unquantized streaming pays the read alone, and that
+/// alone was the bulk of the time: streamed Gemma 3 1B answering a 1,500-token
+/// prompt took 268 s without the cache and 46 s with it. The cache does
+/// duplicate weights on top of the OS page cache, which is why it is bounded.
+///
+/// All or nothing, because a partial cache buys nothing: layers stream in a
+/// fixed cycle, so an LRU smaller than the layer set evicts each layer before it
+/// comes round again and never records a hit -- it only costs RAM.
+fn resolve_ram_cache_bytes(args: &ServeArgs, plan: &VramPlan) -> usize {
     if let Some(gb) = args.ram_cache_gb {
         return (gb.max(0.0) * GIB as f64) as usize;
     }
-    let quantizing = matches!(quant, QuantScheme::Int4 | QuantScheme::Int8);
-    if !(quantizing && args.stream) {
+    if !args.stream {
         return 0;
     }
-    // Headroom matters more than precision here. `per_layer_weight_bytes` is what
-    // a layer costs in *VRAM* — bare codes. The host cache holds the whole
-    // materialized layer: codes plus the per-group scales and zero-points (at
-    // group 128 that alone is +12.5% for int4), plus the f32 norms and biases. A
-    // budget a few percent short does not degrade gracefully — the LRU evicts
-    // every layer before it comes round again and the hit rate collapses to zero,
-    // which is the exact cliff this default exists to prevent. Overshooting only
-    // reserves RAM the cache never fills.
-    let whole_model = plan.per_layer_weight_bytes * plan.num_layers as u64;
+    default_ram_cache_bytes(
+        plan.per_layer_weight_bytes,
+        plan.num_layers,
+        ram_cache_cap(),
+    )
+    .unwrap_or(0) as usize
+}
+
+/// The default cache for a streamed model: the whole layer set plus headroom,
+/// or `None` when that exceeds `cap`.
+///
+/// Headroom matters more than precision here. `layer_bytes` is what a layer
+/// costs in *VRAM* -- bare codes. The host cache holds the whole materialized
+/// layer: under `--quant` the per-group scales and zero-points too (+12.5% for
+/// int4 at group 128), plus the f32 norms and biases. A budget a few percent
+/// short is not a slightly worse cache but no cache at all, for the reason
+/// above; overshooting only reserves RAM the cache never fills.
+fn default_ram_cache_bytes(layer_bytes: u64, num_layers: u32, cap: u64) -> Option<u64> {
+    let whole_model = layer_bytes * num_layers as u64;
     let with_headroom = whole_model + whole_model / 4; // +25%
-    with_headroom.min(ram_cache_cap()) as usize
+    (with_headroom <= cap).then_some(with_headroom)
 }
 
 fn resolve_free_bytes(vram_budget_gb: Option<f64>) -> (u64, String) {
@@ -1800,6 +1821,26 @@ fn sample_70b_config(quant: QuantScheme) -> ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default cache holds the whole streamed layer set or nothing: a
+    /// cache that cannot hold every layer never gets a hit on a cyclic scan.
+    #[test]
+    fn default_ram_cache_is_all_or_nothing() {
+        let mib = 1024 * 1024;
+        // 28 layers of 50 MiB with 25% headroom = 1750 MiB: fits under 4 GiB.
+        assert_eq!(
+            default_ram_cache_bytes(50 * mib, 28, 4 * GIB),
+            Some(1750 * mib)
+        );
+        // 34 layers of 222 MiB (Gemma 3 4B in bf16) need ~9.4 GiB: no cache.
+        assert_eq!(default_ram_cache_bytes(222 * mib, 34, 8 * GIB), None);
+        // Exactly at the cap still fits.
+        assert_eq!(
+            default_ram_cache_bytes(800 * mib, 1, 1000 * mib),
+            Some(1000 * mib)
+        );
+        assert_eq!(default_ram_cache_bytes(801 * mib, 1, 1000 * mib), None);
+    }
 
     #[test]
     fn batch_kv_fit_check_accepts_and_refuses() {

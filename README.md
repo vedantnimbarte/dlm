@@ -173,7 +173,7 @@ mmap weights ──► host RAM cache ──► pinned staging buffer ──► 
 ```
 
 Memory-mapping skips the OS read-buffer copy; the optional host-RAM cache
-(`--ram-cache-gb`, off by default) keeps materialized layers across token steps
+(`--ram-cache-gb`; on by default with `--stream` when every layer fits) keeps materialized layers across token steps
 so a miss doesn't re-read and re-decode them; and the page-locked (pinned) host
 buffer lets the PCIe controller DMA into VRAM on the copy stream.
 
@@ -648,12 +648,13 @@ check your model's output rather than assuming. Three caveats worth knowing:
 - **Quantizing costs load time** (it runs over every weight) and reads the full
   16-bit tensors from disk regardless; the win is in VRAM and on the bus, not in
   what is read.
-- **`--stream` + `--quant` holds the quantized layers in a host-RAM cache by
-  default**, since re-quantizing a layer on every window miss measured 12x
-  slower. The default is capped at a quarter of physical RAM (at least 4 GiB); a
-  quantized model bigger than that still re-quantizes the layers that don't fit,
-  so raise `--ram-cache-gb`, or drop `--stream` — once quantized, the model
-  often no longer needs it.
+- **`--stream` holds the materialized layers in a host-RAM cache by default**,
+  since re-quantizing a layer on every window miss measured 12x slower. The
+  default applies only when every layer fits under a quarter of physical RAM
+  (at least 4 GiB), because a smaller cache never gets a hit on a cyclic scan;
+  a quantized model bigger than that re-quantizes on every miss, so raise
+  `--ram-cache-gb`, or drop `--stream` — once quantized, the model often no
+  longer needs it.
 - **A quantized weight is still lossy even if it fits.** Verify on your own
   prompts; a model that fits but answers worse is not obviously a win.
 
@@ -740,8 +741,11 @@ inference engine):
     `--ram-cache-gb N` keeps materialized layers in a host-RAM LRU of at most `N`
     GiB, so a layer evicted from the window is not re-read and re-materialized
     from the checkpoint the next time it comes round — roughly **2x** on the
-    streamed path. Off by default: the cache duplicates weights in RAM on top of
-    the OS page cache, and on a memory-tight box that trade is a loss.
+    streamed path, and far more where reading the mmap is slow (Gemma 3 1B
+    streamed on the GPU: 268 s → 46 s). On by default when the whole layer set
+    fits in a quarter of physical RAM (at least 4 GiB) and off otherwise, since a
+    cache smaller than the layer set never gets a hit on a cyclic scan; `0`
+    disables it. It duplicates weights on top of the OS page cache.
   - `--device gpu` — run the batched engine on the CUDA `GpuKernel`
     (all layers resident in VRAM; requires a `cuda-kernels` build).
   - `--stream --device gpu` — stream a window of layer weights **through VRAM**
