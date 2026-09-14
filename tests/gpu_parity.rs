@@ -534,27 +534,35 @@ fn gpu_matches_cpu_with_int4_weights() {
         ..Default::default()
     };
     // Quantize the same random weights both kernels would otherwise share.
-    let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
-        .into_iter()
-        .map(|mut l| {
-            let q = |w: &dlm::forward::Weights| {
-                let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
-                dlm::forward::Weights::quantize_int4(&floats, dlm::forward::QUANT_GROUP_SIZE)
-                    .unwrap()
-            };
-            l.q_proj = q(&l.q_proj);
-            l.k_proj = q(&l.k_proj);
-            l.v_proj = q(&l.v_proj);
-            l.o_proj = q(&l.o_proj);
-            if let Ffn::Dense(f) = &mut l.ffn {
-                f.gate = q(&f.gate);
-                f.up = q(&f.up);
-                f.down = q(&f.down);
-            }
-            l
-        })
-        .collect();
-    assert_gpu_matches_cpu(cfg, quantized, 2e-3, "int4 weights");
+    // 128 takes the kernel's shift path for the group index; 100 takes its
+    // division fallback.
+    for group in [dlm::forward::QUANT_GROUP_SIZE, 100] {
+        let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
+            .into_iter()
+            .map(|mut l| {
+                let q = |w: &dlm::forward::Weights| {
+                    let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
+                    dlm::forward::Weights::quantize_int4(&floats, group).unwrap()
+                };
+                l.q_proj = q(&l.q_proj);
+                l.k_proj = q(&l.k_proj);
+                l.v_proj = q(&l.v_proj);
+                l.o_proj = q(&l.o_proj);
+                if let Ffn::Dense(f) = &mut l.ffn {
+                    f.gate = q(&f.gate);
+                    f.up = q(&f.up);
+                    f.down = q(&f.down);
+                }
+                l
+            })
+            .collect();
+        assert_gpu_matches_cpu(
+            cfg,
+            quantized,
+            2e-3,
+            &format!("int4 weights, group {group}"),
+        );
+    }
 }
 
 /// Same contract as the int4 case, one bit-width up: int8 codes must decode
@@ -578,27 +586,35 @@ fn gpu_matches_cpu_with_int8_weights() {
         mla: None,
         ..Default::default()
     };
-    let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
-        .into_iter()
-        .map(|mut l| {
-            let q = |w: &dlm::forward::Weights| {
-                let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
-                dlm::forward::Weights::quantize_int8(&floats, dlm::forward::QUANT_GROUP_SIZE)
-                    .unwrap()
-            };
-            l.q_proj = q(&l.q_proj);
-            l.k_proj = q(&l.k_proj);
-            l.v_proj = q(&l.v_proj);
-            l.o_proj = q(&l.o_proj);
-            if let Ffn::Dense(f) = &mut l.ffn {
-                f.gate = q(&f.gate);
-                f.up = q(&f.up);
-                f.down = q(&f.down);
-            }
-            l
-        })
-        .collect();
-    assert_gpu_matches_cpu(cfg, quantized, 2e-3, "int8 weights");
+    // 128 takes the kernel's shift path for the group index; 100 takes its
+    // division fallback.
+    for group in [dlm::forward::QUANT_GROUP_SIZE, 100] {
+        let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
+            .into_iter()
+            .map(|mut l| {
+                let q = |w: &dlm::forward::Weights| {
+                    let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
+                    dlm::forward::Weights::quantize_int8(&floats, group).unwrap()
+                };
+                l.q_proj = q(&l.q_proj);
+                l.k_proj = q(&l.k_proj);
+                l.v_proj = q(&l.v_proj);
+                l.o_proj = q(&l.o_proj);
+                if let Ffn::Dense(f) = &mut l.ffn {
+                    f.gate = q(&f.gate);
+                    f.up = q(&f.up);
+                    f.down = q(&f.down);
+                }
+                l
+            })
+            .collect();
+        assert_gpu_matches_cpu(
+            cfg,
+            quantized,
+            2e-3,
+            &format!("int8 weights, group {group}"),
+        );
+    }
 }
 
 /// Every real model has `hidden_size >= 2048`. The RMSNorm kernel used to launch

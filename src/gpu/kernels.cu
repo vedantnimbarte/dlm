@@ -195,6 +195,65 @@ __device__ __forceinline__ float load_w<DLM_W_INT8>(const void* W, long i, long 
     return (code - zeros[g]) * scales[g];
 }
 
+// One thread's share of a row dot product: the sum over `i = start, start +
+// step, ... < in_dim` of `W[base + i] * x[i]`.
+template <int DT>
+__device__ __forceinline__ float row_dot(const void* W, const float* x, long base, int start,
+                                         int step, int in_dim, long n, int group_size) {
+    float s = 0.0f;
+    for (int i = start; i < in_dim; i += step) s += load_w<DT>(W, base + i, n, group_size) * x[i];
+    return s;
+}
+
+// The quantized rows find their scales and zeros once per call. Going through
+// `load_w` recomputed both offsets for every element (two divisions by the
+// group size) plus a third division for the group index. A power-of-two group
+// (`--quant` uses 128) takes that index by shift instead. Each element still
+// decodes as `(code - zero) * scale` and accumulates in the same order as
+// `load_w`, so the result is bit-identical.
+__device__ __forceinline__ int group_shift(int group_size) {
+    int shift = 0;
+    while ((1 << shift) < group_size) ++shift;
+    return (1 << shift) == group_size ? shift : -1;
+}
+
+template <>
+__device__ __forceinline__ float row_dot<DLM_W_INT4>(const void* W, const float* x, long base,
+                                                     int start, int step, int in_dim, long n,
+                                                     int group_size) {
+    const unsigned char* bytes = (const unsigned char*)W;
+    long code_bytes = (n + 1) / 2;
+    const float* scales = (const float*)(bytes + q_scales_off(code_bytes));
+    const float* zeros = (const float*)(bytes + q_zeros_off(code_bytes, n, group_size));
+    int shift = group_shift(group_size);
+    float s = 0.0f;
+    for (int i = start; i < in_dim; i += step) {
+        long e = base + i;
+        unsigned char byte = bytes[e >> 1];
+        float code = (float)((e & 1) ? (byte >> 4) : (byte & 0x0F));
+        long g = shift >= 0 ? (e >> shift) : e / group_size;
+        s += (code - zeros[g]) * scales[g] * x[i];
+    }
+    return s;
+}
+
+template <>
+__device__ __forceinline__ float row_dot<DLM_W_INT8>(const void* W, const float* x, long base,
+                                                     int start, int step, int in_dim, long n,
+                                                     int group_size) {
+    const unsigned char* bytes = (const unsigned char*)W;
+    const float* scales = (const float*)(bytes + q_scales_off(n));
+    const float* zeros = (const float*)(bytes + q_zeros_off(n, n, group_size));
+    int shift = group_shift(group_size);
+    float s = 0.0f;
+    for (int i = start; i < in_dim; i += step) {
+        long e = base + i;
+        long g = shift >= 0 ? (e >> shift) : e / group_size;
+        s += ((float)bytes[e] - zeros[g]) * scales[g] * x[i];
+    }
+    return s;
+}
+
 // out[o] = dot(W[o], x) (+ bias[o]). `bias` may be NULL (Llama/Mistral have no
 // attention bias; Qwen2 does — dropping it silently corrupts attention).
 //
@@ -216,10 +275,7 @@ __global__ void matvec_kernel(const void* W, const float* x, const float* bias, 
     long base = (long)o * in_dim;
     long n = (long)out_dim * in_dim;   // the tensor's element count (INT4 layout)
     __shared__ float partial[MATVEC_THREADS];
-    float s = 0.0f;
-    for (int i = threadIdx.x; i < in_dim; i += blockDim.x)
-        s += load_w<DT>(W, base + i, n, group_size) * x[i];
-    partial[threadIdx.x] = s;
+    partial[threadIdx.x] = row_dot<DT>(W, x, base, threadIdx.x, blockDim.x, in_dim, n, group_size);
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
@@ -665,11 +721,8 @@ __global__ void matvec_batched_kernel(const void* W, const float* x, const float
 
     for (int b = 0; b < batch; ++b) {
         const float* xb = x + (long)b * in_dim;
-        float acc = 0.0f;
-        for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-            acc += load_w<DT>(W, base + i, n, group_size) * xb[i];
-        }
-        partial[threadIdx.x] = acc;
+        partial[threadIdx.x] =
+            row_dot<DT>(W, xb, base, threadIdx.x, blockDim.x, in_dim, n, group_size);
         __syncthreads();
         for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
@@ -1053,11 +1106,7 @@ __global__ void grouped_matvec_kernel(DlmPtrs W, const float* x, float* out,
     long base = (long)row * in_dim;
     long n = (long)out_dim * in_dim;
 
-    float acc = 0.0f;
-    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        acc += load_w<DT>(We, base + i, n, group_size) * x[i];
-    }
-    partial[threadIdx.x] = acc;
+    partial[threadIdx.x] = row_dot<DT>(We, x, base, threadIdx.x, blockDim.x, in_dim, n, group_size);
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
