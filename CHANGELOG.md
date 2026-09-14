@@ -45,6 +45,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`dlm bench`**, a speed harness.
+  - **Loading:** it builds the model through `serve`'s own loading path, so
+    every `serve` flag that shapes the model applies.
+  - **Workload:** a fixed greedy prompt/decode run at one or more batch sizes.
+  - **Output:** prefill tok/s, time to first token, decode tok/s and ms per
+    step, as the median over `--runs`. It also reports peak RSS, VRAM in use,
+    and optional JSON.
+  - **`--breakdown`:** splits streamed decode time by pipeline stage.
+  - **Reason:** until now no speed claim could be reproduced with one command.
+  - **Baselines:** the GTX 1650 numbers are in `bench/BASELINES.md`.
+- **`generate` prints prefill and decode speed**, and samples with
+  `--temperature`/`--top-p`/`--top-k`/`--seed` instead of decoding greedily only.
 - **Gemma 3** (the text-only 270M and 1B). Per-head `(1 + w)` Q/K norms, the
   5:1 local/global layer pattern — read from `sliding_window_pattern`,
   `_sliding_window_pattern`, or a `layer_types` list (an irregular list is

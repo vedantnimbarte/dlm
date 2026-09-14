@@ -254,6 +254,7 @@ cargo run -- --help          # top-level help
 cargo run -- search llama    # search the Hugging Face hub for models
 cargo run -- pull <org/model># download a model locally (via curl, no hf CLI)
 cargo run -- profile         # profile a sample 70B-class model (no GPU needed)
+cargo run -- bench --help    # measure prefill/decode speed on a real model
 cargo run -- serve --help    # full serve flag list (specs §4)
 cargo run -- generate --help # end-to-end CPU generation on a synthetic model
 cargo run -- tokenize --help # byte-level BPE encode/decode round-trip
@@ -415,6 +416,36 @@ cargo run -- tokenize --text "Hello, world!"
 # ids        : [72, 101, 108, 108, 111, 44, 32, 119, 111, 114, 108, 100, 33]
 # round-trip : "Hello, world!" (ok)
 ```
+
+**`bench`** measures a model's speed. It loads the model exactly as `serve` would
+with the same flags (`--quant`, `--stream`, `--device`, `--kv-quant`, ...), then
+runs a fixed greedy workload instead of opening a port:
+
+```bash
+dlm bench --model-path ./models/Qwen2.5-0.5B-Instruct --quant int4           --context-length 1024 --prompt-len 512 --gen-len 64 --batch 1,4 --json out.json
+```
+
+For each batch size, it reports:
+
+- prefill tok/s
+- time to first token
+- decode tok/s and ms per step
+
+It also reports the process's peak RSS and, on a GPU, VRAM in use.
+
+`--runs` repeats each measurement (3 by default) and the summary takes the
+median. The first run includes cold caches, so it is usually the slowest.
+
+`--breakdown` splits streamed decode time by stage (disk read, RAM cache,
+pinned staging, H2D, compute). It is off by default because timing the stages
+has a cost of its own.
+
+Measured numbers for the reference card live in
+[`bench/BASELINES.md`](bench/BASELINES.md).
+
+`generate` also prints prefill and decode speed to stderr. It samples with
+`--temperature`, `--top-p`, `--top-k` and `--seed` when `--temperature` is
+set, and decodes greedily otherwise.
 
 ### Supported models
 

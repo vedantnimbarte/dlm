@@ -5,6 +5,7 @@
 
 pub mod activation;
 pub mod batching;
+pub mod bench;
 pub mod cache;
 pub mod cli;
 pub mod distributed;

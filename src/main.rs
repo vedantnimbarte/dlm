@@ -10,8 +10,8 @@
 use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
-    Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs, GenerateArgs, ProfileArgs,
-    PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
+    BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
+    GenerateArgs, ProfileArgs, PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -34,6 +34,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Profile(args) => run_profile(args),
         Command::Serve(args) => run_serve(args),
+        Command::Bench(args) => run_bench(args),
         Command::Generate(args) => run_generate(args),
         Command::Tokenize(args) => run_tokenize(args),
         Command::Doctor(args) => run_doctor(args),
@@ -304,7 +305,17 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     let gen_cfg = GenerationConfig {
         max_new_tokens: args.max_new_tokens,
         eos_token: args.eos_token,
-        sampler: Sampler::Greedy,
+        sampler: match args.temperature {
+            Some(temperature) if temperature > 0.0 => Sampler::TopPK {
+                temperature,
+                top_p: args.top_p,
+                top_k: args.top_k,
+                min_p: 0.0,
+                repetition_penalty: 1.0,
+                seed: args.seed,
+            },
+            _ => Sampler::Greedy,
+        },
     };
 
     // A tokenizer is needed only for a text prompt.
@@ -417,7 +428,28 @@ fn run_generation<K: ComputeKernel>(
     gen_cfg: &GenerationConfig,
     tokenizer: Option<&BpeTokenizer>,
 ) -> Result<()> {
-    let generated = generator.generate(prompt_ids, gen_cfg)?;
+    // Step a session rather than calling `generate`, so prefill and decode can
+    // be timed apart: a long prompt would otherwise hide the decode speed.
+    let start = std::time::Instant::now();
+    let mut session = generator.start_session(prompt_ids, gen_cfg.sampler)?;
+    let prefill = start.elapsed().as_secs_f64();
+    let decode_start = std::time::Instant::now();
+    let mut generated = Vec::with_capacity(gen_cfg.max_new_tokens);
+    while generated.len() < gen_cfg.max_new_tokens {
+        let next = session.step()?;
+        generated.push(next);
+        if gen_cfg.eos_token == Some(next) {
+            break;
+        }
+    }
+    let decode = decode_start.elapsed().as_secs_f64();
+    eprintln!(
+        "timing       : prefill {} tokens in {prefill:.2} s ({:.1} tok/s), decode {} tokens in {decode:.2} s ({:.2} tok/s)",
+        prompt_ids.len(),
+        prompt_ids.len() as f64 / prefill,
+        generated.len(),
+        generated.len() as f64 / decode,
+    );
     println!("generated ids: {generated:?}");
     if let Some(tok) = tokenizer {
         println!("generated txt: {:?}", tok.decode(&generated)?);
@@ -1381,6 +1413,9 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     let kv_quant = args.kv_quant.to_kv_quant();
     let generator = generator.with_kv_quant(kv_quant);
     let draft = draft.map(|d| d.with_kv_quant(kv_quant));
+    if let Some(opts) = &args.bench {
+        return bench_generator(&generator, &tokenizer, opts, args, config);
+    }
 
     // Batched, streaming engine: a background scheduler interleaves concurrent
     // requests a token at a time. With a draft model it decodes speculatively
@@ -1455,6 +1490,111 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     let router = dlm::server::engine::secured_router(engine, args.api_key.clone());
     let shutdown = install_signal_handler();
     server.serve_with_shutdown(router, shutdown) // blocks until signalled
+}
+
+/// English text the benchmark prompt is tokenized from, so MoE routing and the
+/// expert cache see a realistic token mix rather than arbitrary ids.
+const BENCH_TEXT: &str = "The river wound through the valley for many miles before it reached the sea. Along its banks, small towns had grown up over the centuries, each with its own market, its own bridge, and its own stories about floods and dry summers. Farmers brought grain and fruit to the markets every week, and traders carried salt, cloth and tools back upstream. When the railway arrived, the river mattered less for moving goods, but people still gathered by the water in the evenings to talk, to fish, and to watch the light change over the hills. ";
+
+/// `dlm bench`: load the model through `serve`'s own path, then measure it
+/// instead of serving it (see [`bench_generator`]).
+fn run_bench(args: BenchArgs) -> Result<()> {
+    let BenchArgs { mut serve, opts } = args;
+    if serve.draft_model_path.is_some() || serve.distributed_mode != DistributedMode::Standalone {
+        return Err(DlmError::InvalidConfig(
+            "bench measures a single standalone model; drop --draft-model-path and --distributed-mode"
+                .into(),
+        ));
+    }
+    let needed = opts.prompt_len + opts.gen_len;
+    if needed > serve.context_length as usize {
+        return Err(DlmError::InvalidConfig(format!(
+            "--prompt-len + --gen-len ({needed}) exceeds --context-length ({})",
+            serve.context_length
+        )));
+    }
+    // Size the batch-KV fit checks for the largest batch actually measured.
+    serve.max_batch = opts.batch.iter().copied().max().unwrap_or(1).max(1);
+    serve.bench = Some(opts);
+    run_serve(serve)
+}
+
+fn bench_generator<K: ComputeKernel>(
+    generator: &Generator<K>,
+    tokenizer: &BpeTokenizer,
+    opts: &BenchOpts,
+    args: &ServeArgs,
+    config: &ModelConfig,
+) -> Result<()> {
+    let seed = tokenizer.encode(BENCH_TEXT)?;
+    let prompt = dlm::bench::prompt_ids(&seed, opts.prompt_len, config.vocab_size as usize);
+    let row = |r: &dlm::bench::RunResult| {
+        format!(
+            "prefill {:>9.1} tok/s | ttft {:>9.1} ms | decode {:>8.2} tok/s ({:.1} ms/step)",
+            r.prefill_tok_s, r.ttft_ms, r.decode_tok_s, r.ms_per_step
+        )
+    };
+    println!();
+    println!(
+        "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, greedy",
+        opts.prompt_len, opts.gen_len, opts.batch, opts.runs
+    );
+    let results = dlm::bench::run(generator, &prompt, opts, |r, run| {
+        println!("  b{:<3} run {:<2}: {}", r.batch, run + 1, row(r));
+    })?;
+
+    let summary = dlm::bench::summarize(&results);
+    println!();
+    println!("median       :");
+    for r in &summary {
+        println!("  batch {:<5}: {}", r.batch, row(r));
+        for (stage, ms) in &r.stage_ms_per_token {
+            println!("    {stage:<9}: {ms:>8.2} ms/token");
+        }
+    }
+    let peak_rss = dlm::bench::peak_rss_bytes();
+    if let Some(b) = peak_rss {
+        println!("peak rss     : {:.2} GiB", b as f64 / GIB as f64);
+    }
+    // Device-wide, so another process on the GPU counts too.
+    let gpu_in_use = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();
+    let vram_used = gpu::mem_get_info()
+        .ok()
+        .filter(|_| gpu_in_use)
+        .map(|m| m.total - m.free);
+    if let Some(b) = vram_used {
+        println!(
+            "vram in use  : {:.2} GiB (whole device)",
+            b as f64 / GIB as f64
+        );
+    }
+
+    if let Some(path) = &opts.json {
+        let report = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "model": args.model_path,
+            "device": format!("{:?}", args.device).to_lowercase(),
+            "gpu_backend": gpu::active_vendor().label(),
+            "quant": format!("{:?}", config.quant),
+            "stream": args.stream,
+            "kv_quant": format!("{:?}", args.kv_quant).to_lowercase(),
+            "context_length": args.context_length,
+            "prompt_len": opts.prompt_len,
+            "gen_len": opts.gen_len,
+            "runs": results,
+            "summary": summary,
+            "peak_rss_bytes": peak_rss,
+            "vram_used_bytes": vram_used,
+        });
+        let text = serde_json::to_string_pretty(&report)
+            .map_err(|e| DlmError::InvalidConfig(format!("bench json: {e}")))?;
+        std::fs::write(path, text).map_err(|source| DlmError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        println!("json         : {}", path.display());
+    }
+    Ok(())
 }
 
 /// Return a [`Shutdown`] wired to `SIGTERM`/`SIGINT` where the platform allows.
