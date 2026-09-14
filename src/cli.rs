@@ -23,6 +23,9 @@ pub enum Command {
     Serve(ServeArgs),
     /// Profile a model and print the VRAM plan + streaming schedule (no server).
     Profile(ProfileArgs),
+    /// Measure prefill and decode speed on a model, loaded exactly as `serve`
+    /// would load it with the same flags (no server).
+    Bench(BenchArgs),
     /// Run the end-to-end CPU generation loop on a synthetic model (demo). To run
     /// a real model — including VRAM-streaming on the GPU — use `serve` instead.
     Generate(GenerateArgs),
@@ -347,6 +350,55 @@ pub struct ServeArgs {
     /// completion text. The route sits behind `--api-key` like `/metrics`.
     #[arg(long, default_value_t = false)]
     pub telemetry: bool,
+
+    /// Set by `dlm bench`: build the model as serving would, then benchmark it
+    /// instead of binding the port.
+    #[arg(skip)]
+    pub bench: Option<BenchOpts>,
+}
+
+/// Arguments for `dlm bench`: every `serve` flag that shapes the model
+/// (`--quant`, `--stream`, `--device`, `--kv-quant`, `--context-length`, ...),
+/// plus the workload. Server-only flags (`--port`, `--api-key`, ...) are
+/// accepted and ignored.
+#[derive(Debug, Args)]
+pub struct BenchArgs {
+    #[command(flatten)]
+    pub serve: ServeArgs,
+
+    #[command(flatten)]
+    pub opts: BenchOpts,
+}
+
+/// The benchmark workload.
+#[derive(Debug, Clone, Args)]
+pub struct BenchOpts {
+    /// Prompt tokens prefilled per sequence.
+    #[arg(long, default_value_t = 512)]
+    pub prompt_len: usize,
+
+    /// Tokens decoded per sequence.
+    #[arg(long, default_value_t = 128)]
+    pub gen_len: usize,
+
+    /// Concurrent sequences to measure, comma-separated (e.g. `1,4,8`). Sessions
+    /// are stepped in turn, as the server's scheduler does.
+    #[arg(long, value_delimiter = ',', default_value = "1")]
+    pub batch: Vec<usize>,
+
+    /// Repetitions per batch size; the summary reports the median.
+    #[arg(long, default_value_t = 3)]
+    pub runs: usize,
+
+    /// Also write the results as JSON to this file.
+    #[arg(long, value_name = "FILE")]
+    pub json: Option<PathBuf>,
+
+    /// Break decode time down by streaming stage (mmap, H2D, compute, ...).
+    /// Streaming paths only. Off by default: timing the stages adds overhead of
+    /// its own, so leave it off when the headline numbers matter.
+    #[arg(long, default_value_t = false)]
+    pub breakdown: bool,
 }
 
 /// Arguments for `dlm profile`.
@@ -442,9 +494,23 @@ pub struct GenerateArgs {
     #[arg(long, default_value_t = 128)]
     pub intermediate_size: usize,
 
-    /// PRNG seed for the synthetic weights.
+    /// PRNG seed for the synthetic weights and for sampling.
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
+
+    /// Sampling temperature. Unset (or `0`) decodes greedily.
+    #[arg(long)]
+    pub temperature: Option<f32>,
+
+    /// Nucleus sampling: keep the smallest set of tokens whose probability sums
+    /// to this. `1.0` disables it. Needs `--temperature`.
+    #[arg(long, default_value_t = 1.0)]
+    pub top_p: f32,
+
+    /// Keep only the `k` most likely tokens. `0` disables it. Needs
+    /// `--temperature`.
+    #[arg(long, default_value_t = 0)]
+    pub top_k: u32,
 
     /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`);
     /// pass `--device cpu` to force CPU. Falls back to CPU with a warning if no
@@ -581,6 +647,33 @@ mod tests {
         // Default flips to Gpu when built with device kernels; assert the same
         // compile-time constant the parser uses, not a hard-coded Cpu.
         assert_eq!(a.device, Device::DEFAULT); // default
+    }
+
+    #[test]
+    fn bench_takes_serve_flags_and_workload() {
+        let cli = Cli::try_parse_from([
+            "dlm",
+            "bench",
+            "--model-path",
+            "/m",
+            "--stream",
+            "--quant",
+            "int4",
+            "--batch",
+            "1,4",
+            "--gen-len",
+            "32",
+        ])
+        .unwrap();
+        let Command::Bench(a) = cli.command else {
+            panic!("expected bench");
+        };
+        assert!(a.serve.stream);
+        assert_eq!(a.serve.quant, Some(QuantArg::Int4));
+        assert_eq!(a.opts.batch, vec![1, 4]);
+        assert_eq!(a.opts.gen_len, 32);
+        assert_eq!(a.opts.prompt_len, 512);
+        assert!(a.serve.bench.is_none());
     }
 
     #[test]
