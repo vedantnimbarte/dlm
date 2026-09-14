@@ -120,6 +120,8 @@ extern "C" {
         attn_scale: f32,
         // Gemma2 attention-logit softcap; 0 = off.
         attn_softcap: f32,
+        // 1: the KV buffers hold fp16.
+        kv_half: i32,
     ) -> i32;
 
     /// Post-attention norm for a MoE layer whose attention ran in a separate call
@@ -335,13 +337,15 @@ pub(crate) struct DlmBlockExt {
     o_bias: *const f32,
     up_bias: *const f32,
     down_bias: *const f32,
+    /// 1: the KV buffers hold fp16 (see [`KvLayerCache::device_half`]).
+    kv_half: i32,
 }
 
 impl DlmBlockExt {
     /// The device block options for `cfg`, pointing at the layer's biases. Every
     /// field falls out of the config or a bias's presence, so a Llama-shaped
     /// layer yields exactly the kernel's default.
-    pub(crate) fn new(cfg: &BlockConfig, b: &GpuBlockBiases) -> Self {
+    pub(crate) fn new(cfg: &BlockConfig, b: &GpuBlockBiases, kv_half: bool) -> Self {
         use crate::forward::cpu::{FfnKind, NormKind};
         Self {
             layer_norm: (cfg.norm_kind == NormKind::Layer) as i32,
@@ -353,6 +357,7 @@ impl DlmBlockExt {
             o_bias: bias_ptr(&b.o),
             up_bias: bias_ptr(&b.up),
             down_bias: bias_ptr(&b.down),
+            kv_half: kv_half as i32,
         }
     }
 }
@@ -695,6 +700,7 @@ impl GpuKernel {
         num_positions: &DlmInts,
         slot_positions: &DlmInts,
         batch: usize,
+        kv_half: bool,
     ) -> Result<()> {
         let w = &self.layers[layer as usize];
         let cfg = self.cfg.for_layer(layer);
@@ -742,7 +748,7 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&cfg, &w.biases),
+                &DlmBlockExt::new(&cfg, &w.biases, kv_half),
             )
         };
         if code != 0 {
@@ -840,6 +846,7 @@ impl ComputeKernel for GpuKernel {
             &num_positions,
             &slot_positions,
             batch,
+            kvs.first().is_some_and(|kv| kv.device_half()),
         )?;
         d_batch.download(&mut staged)?;
         for (b, hidden) in hiddens.iter_mut().enumerate() {
@@ -909,6 +916,7 @@ impl ComputeKernel for GpuKernel {
                     &num_positions,
                     &slot_positions,
                     batch,
+                    kv.device_half(),
                 )?;
                 kv.advance(batch);
             }
@@ -1064,7 +1072,7 @@ impl ComputeKernel for GpuKernel {
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&self.cfg, &w.biases),
+                        &DlmBlockExt::new(&self.cfg, &w.biases, kv.device_half()),
                     )
                 };
                 if code != 0 {

@@ -165,9 +165,13 @@ impl QuantArg {
 pub enum KvQuantArg {
     /// Exact f32 (default).
     None,
-    /// int8 — about half the KV memory.
+    /// Half precision: half the KV VRAM, near-exact. GPU only; the CPU
+    /// kernels keep f32.
+    F16,
+    /// int8 — about half the KV memory. On the GPU, stored as fp16.
     Int8,
-    /// int4 — about a quarter of the KV memory, more error.
+    /// int4 — about a quarter of the KV memory, more error. On the GPU, stored as
+    /// fp16 (half).
     Int4,
 }
 
@@ -176,6 +180,7 @@ impl KvQuantArg {
     pub fn to_kv_quant(self) -> crate::forward::KvQuant {
         match self {
             KvQuantArg::None => crate::forward::KvQuant::None,
+            KvQuantArg::F16 => crate::forward::KvQuant::F16,
             KvQuantArg::Int8 => crate::forward::KvQuant::Int8,
             KvQuantArg::Int4 => crate::forward::KvQuant::Int4,
         }

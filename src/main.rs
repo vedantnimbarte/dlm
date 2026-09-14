@@ -11,7 +11,7 @@ use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
-    GenerateArgs, ProfileArgs, PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
+    GenerateArgs, KvQuantArg, ProfileArgs, PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -1026,6 +1026,7 @@ fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> Vra
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
+        args.kv_quant != KvQuantArg::None,
     );
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
@@ -1112,8 +1113,11 @@ fn build_profiler(
     context_length: u32,
     safety_margin_gb: Option<f64>,
     max_batch: u32,
+    half_kv: bool,
 ) -> VramProfiler {
-    let p = VramProfiler::new(context_length).with_max_batch(max_batch);
+    let p = VramProfiler::new(context_length)
+        .with_max_batch(max_batch)
+        .with_half_kv(half_kv);
     match safety_margin_gb {
         Some(gb) => p.with_safety_margin_bytes((gb.max(0.0) * GIB as f64) as u64),
         None => p,
@@ -1213,6 +1217,7 @@ fn serve_on_gpu(
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
+        args.kv_quant != KvQuantArg::None,
     );
     let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
     ensure_batch_kv_fits(
@@ -1477,12 +1482,16 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         );
     }
     if kv_quant != dlm::forward::KvQuant::None {
-        let (label, frac) = match kv_quant {
-            dlm::forward::KvQuant::Int8 => ("int8", "half"),
-            dlm::forward::KvQuant::Int4 => ("int4", "quarter"),
-            dlm::forward::KvQuant::None => unreachable!(),
+        let on_gpu = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();
+        let note = match kv_quant {
+            // The GPU kernels have one approximate KV format, fp16; the CPU
+            // kernels have int8/int4 but no fp16.
+            _ if on_gpu => "fp16 on the GPU (half the KV memory)",
+            dlm::forward::KvQuant::Int8 => "int8 (≈half memory, approximate)",
+            dlm::forward::KvQuant::Int4 => "int4 (≈quarter memory, approximate)",
+            _ => "f32: the CPU kernels have no fp16 store",
         };
-        println!("  kv cache   : {label} (≈{frac} memory, approximate)");
+        println!("  kv cache   : {note}");
     }
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
@@ -1556,15 +1565,17 @@ fn bench_generator<K: ComputeKernel>(
     if let Some(b) = peak_rss {
         println!("peak rss     : {:.2} GiB", b as f64 / GIB as f64);
     }
-    // Device-wide, so another process on the GPU counts too.
+    // Device-wide, so another process on the GPU counts too. Taken at the end of
+    // decode, while the KV caches are still allocated.
     let gpu_in_use = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();
-    let vram_used = gpu::mem_get_info()
-        .ok()
-        .filter(|_| gpu_in_use)
-        .map(|m| m.total - m.free);
+    let vram_used = summary
+        .iter()
+        .filter_map(|r| r.vram_used_bytes)
+        .max()
+        .filter(|_| gpu_in_use);
     if let Some(b) = vram_used {
         println!(
-            "vram in use  : {:.2} GiB (whole device)",
+            "vram in use  : {:.2} GiB at the end of decode (whole device)",
             b as f64 / GIB as f64
         );
     }
@@ -1695,7 +1706,7 @@ fn report_plan(
 
     // Resolve free VRAM: explicit budget > live device query > simulated 16 GiB.
     // `profile` plans for a single sequence (batch is a serve-time concern).
-    let profiler = build_profiler(context_length, safety_margin_gb, 1);
+    let profiler = build_profiler(context_length, safety_margin_gb, 1, false);
     let (free_bytes, free_source) = resolve_free_bytes(vram_budget_gb);
     println!("free VRAM    : {free_source}");
 

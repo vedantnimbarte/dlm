@@ -874,6 +874,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         w: &GpuWeights,
         kv_keys: *mut f32,
         kv_values: *mut f32,
+        kv_half: bool,
         d_hidden: &DeviceBuffer,
         num_positions: usize,
         position: usize,
@@ -915,6 +916,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 crate::forward::cpu::rope_mscale(cfg.rope_scaling),
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
+                kv_half as i32,
             )
         };
         if code != 0 {
@@ -1089,7 +1091,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             cfg.attn_logit_softcap.unwrap_or(0.0),
                             bias_ptr(&w.pre_ffn_norm),
                             bias_ptr(&w.post_ffn_norm),
-                            &DlmBlockExt::new(cfg, &w.biases),
+                            &DlmBlockExt::new(cfg, &w.biases, kv.device_half()),
                         )
                     };
                     if code != 0 {
@@ -1105,6 +1107,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                         w,
                         kv_keys,
                         kv_values,
+                        kv.device_half(),
                         d_hidden,
                         num_positions,
                         position,
@@ -1426,7 +1429,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         lcfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&lcfg, &w.biases),
+                        &DlmBlockExt::new(&lcfg, &w.biases, kv.device_half()),
                     )
                 };
                 if code != 0 {

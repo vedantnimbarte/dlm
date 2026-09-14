@@ -87,6 +87,16 @@ impl DeviceBuffer {
         )
     }
 
+    /// Copy raw bytes from host into the start of this buffer.
+    pub fn upload_bytes(&self, data: &[u8]) -> Result<()> {
+        backend::copy_h2d(self.ptr, data.as_ptr() as *const c_void, data.len())
+    }
+
+    /// Copy the first `out.len()` bytes of this buffer to the host.
+    pub fn download_bytes(&self, out: &mut [u8]) -> Result<()> {
+        backend::copy_d2h(out.as_mut_ptr() as *mut c_void, self.ptr, out.len())
+    }
+
     /// Copy this buffer's contents into `out` on the host.
     pub fn download(&self, out: &mut [f32]) -> Result<()> {
         backend::copy_d2h(

@@ -29,6 +29,11 @@ pub struct RunResult {
     /// stage. Empty when off, or on paths that emit no stage events.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub stage_ms_per_token: BTreeMap<String, f64>,
+    /// Device memory in use at the end of decode, with every sequence's KV cache
+    /// still allocated. Whole device, so other processes count. `None` without
+    /// a GPU.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vram_used_bytes: Option<u64>,
 }
 
 /// A prompt of exactly `len` tokens: `seed` repeated, folded into the vocab.
@@ -122,6 +127,8 @@ fn run_once<K: ComputeKernel>(
         }
     }
     let decode = decode_start.elapsed().as_secs_f64();
+    // Before `sessions` drops: their KV buffers are freed with them.
+    let vram_used_bytes = crate::gpu::mem_get_info().ok().map(|m| m.total - m.free);
 
     let tokens = (batch * gen_len) as f64;
     Ok(RunResult {
@@ -134,6 +141,7 @@ fn run_once<K: ComputeKernel>(
             .into_iter()
             .map(|(k, us)| (k, us as f64 / 1e3 / tokens))
             .collect(),
+        vram_used_bytes,
     })
 }
 
@@ -167,6 +175,7 @@ pub fn summarize(results: &[RunResult]) -> Vec<RunResult> {
                 decode_tok_s: med(&|r| r.decode_tok_s),
                 ms_per_step: med(&|r| r.ms_per_step),
                 stage_ms_per_token: stages,
+                vram_used_bytes: runs.iter().filter_map(|r| r.vram_used_bytes).max(),
             }
         })
         .collect()
@@ -237,6 +246,7 @@ mod tests {
             decode_tok_s: decode,
             ms_per_step: 1e3 / decode,
             stage_ms_per_token: BTreeMap::new(),
+            vram_used_bytes: None,
         }
     }
 

@@ -84,6 +84,42 @@ struct RawTensor {
 }
 
 /// Convert a half-precision (IEEE 754 binary16) bit pattern to `f32`.
+/// Encode an `f32` as IEEE half precision, rounding to nearest (ties to even),
+/// overflowing to infinity and underflowing through subnormals to zero. The
+/// inverse of [`f16_to_f32`] for every value half precision can hold.
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+pub(crate) fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    // Round `m >> shift` to nearest, ties to even.
+    let round = |m: u32, shift: u32| -> u32 {
+        let q = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        q + u32::from(rem > half || (rem == half && q & 1 == 1))
+    };
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // Subnormal: the implicit leading one joins the mantissa. A round up to
+        // 0x400 lands on the smallest normal, which is the right encoding.
+        return sign | round(mant | 0x0080_0000, (14 - e) as u32) as u16;
+    }
+    // A mantissa that rounds up to 0x400 carries into the exponent, and one that
+    // carries past the largest exponent becomes infinity: both are correct.
+    sign | (((e as u32) << 10) as u16 + round(mant, 13) as u16)
+}
+
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = (h >> 15) & 1;
     let exp = (h >> 10) & 0x1f;
@@ -313,5 +349,50 @@ impl SafetensorsHeader {
             tensors,
             metadata,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{f16_to_f32, f32_to_f16};
+
+    /// Every half-precision bit pattern survives decode then encode, which pins
+    /// the exponent bias, subnormals, infinities and signed zero. NaN payloads are
+    /// not preserved and only need to stay NaN.
+    #[test]
+    fn f16_round_trips_every_bit_pattern() {
+        for h in 0..=u16::MAX {
+            let v = f16_to_f32(h);
+            if v.is_nan() {
+                assert!(f16_to_f32(f32_to_f16(v)).is_nan(), "{h:#06x}");
+            } else {
+                assert_eq!(f32_to_f16(v), h, "{h:#06x} decodes to {v}");
+            }
+        }
+    }
+
+    /// Values between representable halves round to the nearest one, ties to
+    /// even, and values out of range saturate to infinity or zero.
+    #[test]
+    fn f16_encoding_rounds_to_nearest() {
+        let one = 0x3c00u16; // 1.0
+        let step = 1.0 / 1024.0; // spacing of halves just above 1.0
+        assert_eq!(f32_to_f16(1.0 + 0.4 * step), one);
+        assert_eq!(f32_to_f16(1.0 + 0.6 * step), one + 1);
+        assert_eq!(
+            f32_to_f16(1.0 + 0.5 * step),
+            one,
+            "tie goes to the even mantissa"
+        );
+        assert_eq!(
+            f32_to_f16(1.0 + 1.5 * step),
+            one + 2,
+            "tie goes to the even mantissa"
+        );
+        assert_eq!(f32_to_f16(1e6), 0x7c00);
+        assert_eq!(f32_to_f16(-1e6), 0xfc00);
+        assert_eq!(f32_to_f16(1e-30), 0);
+        let max = f16_to_f32(0x7bff);
+        assert_eq!(f32_to_f16(max), 0x7bff);
     }
 }

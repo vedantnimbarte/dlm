@@ -788,10 +788,18 @@ inference engine):
 
   Two orthogonal memory knobs apply to any kernel:
   - `--quant {int4,int8}` — see [weight precision](#weight-precision---quant) below.
-  - `--kv-quant {none,int8,int4}` — quantize the KV cache to int8 (~½ the KV
-    memory) or int4 (~¼, more error), trading precision for a longer context in
-    the same budget. Defaults to exact `f32`. Independent of `--quant`: one sizes
-    the weights, the other the KV history.
+  - `--kv-quant {none,f16,int8,int4}` shrinks the KV cache, trading precision
+    for a longer context or a bigger batch in the same memory. It is independent
+    of `--quant`: one sizes the weights, the other the KV history.
+    - `none` (the default) is exact `f32`.
+    - **On the GPU**, every other value stores the cache as fp16, half the KV
+      VRAM. On Qwen2.5-0.5B and Gemma 3 1B, greedy output was identical to
+      `f32` for 96 of 96 tokens, and decode speed is unchanged. The GPU kernels
+      have no int8/int4 format yet, so `int8` and `int4` also give fp16 there.
+      MLA models keep `f32`.
+    - **On the CPU kernels**, `int8` gives about half the memory and `int4`
+      about a quarter, with more error. The CPU kernels have no fp16 store, so
+      `f16` stays `f32` there.
   - `--prefix-cache-size N` — cache up to `N` prompt-prefix KV snapshots so
     requests sharing a prefix (e.g. a common system prompt) skip re-prefilling it.
     Each entry holds its prefix's KV in RAM; `0` disables it. Works on CPU and

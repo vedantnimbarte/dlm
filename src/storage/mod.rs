@@ -8,4 +8,6 @@ pub mod sha256;
 pub use catalog::LayerCatalog;
 pub use mmap_store::{MmapShard, MmapStore};
 pub(crate) use safetensors::f16_to_f32;
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) use safetensors::f32_to_f16;
 pub use safetensors::{bytes_to_f32, bytes_to_i32, Dtype, SafetensorsHeader, TensorInfo};

@@ -75,6 +75,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--kv-quant f16`: the GPU keeps the KV cache in fp16.**
+  - **Before:** device KV was always f32, and `--kv-quant` had no effect on it.
+  - **Now:** `f16`, `int8` and `int4` all store device KV as fp16, halving KV
+    VRAM. The fit checks reserve accordingly.
+  - **Measured:** Qwen2.5-0.5B, 4 sequences at an 8k context: 2.35 GiB -> 1.98
+    GiB VRAM in use, with decode speed unchanged.
+  - **Output:** greedy output matched f32 KV for 96 of 96 tokens on
+    Qwen2.5-0.5B and on Gemma 3 1B.
+  - **Unchanged:** the default is still exact f32, MLA stays f32, and the CPU
+    kernels keep their f32/int8/int4 stores.
 - **`dlm bench`**, a speed harness.
   - **Loading:** it builds the model through `serve`'s own loading path, so
     every `serve` flag that shapes the model applies.
