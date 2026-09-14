@@ -214,29 +214,51 @@ fn topk_topp_distribution(
     top_k: usize,
     min_p: f32,
 ) -> (Vec<usize>, Vec<f32>) {
-    // Candidate indices sorted by logit, descending.
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| {
-        logits[b]
-            .partial_cmp(&logits[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    // top-k cap.
-    let k = if top_k > 0 {
-        top_k.min(idx.len())
-    } else {
-        idx.len()
+    // Candidates by logit, descending, ties broken by token id so a seed always
+    // draws the same token. Only a prefix of that order is ever used, so select
+    // the prefix before sorting instead of sorting the whole vocabulary (152k
+    // entries for Qwen, every sampled token).
+    let desc = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+    let top = |k: usize| -> Vec<(f32, u32)> {
+        let mut c: Vec<(f32, u32)> = logits.iter().copied().zip(0u32..).collect();
+        if k < c.len() {
+            c.select_nth_unstable_by(k - 1, desc);
+            c.truncate(k);
+        }
+        c.sort_unstable_by(desc);
+        c
     };
-    idx.truncate(k);
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let weight = |l: f32| ((l - max_logit) / temperature).exp();
 
-    // Softmax with temperature over the retained logits (subtract the max for
-    // numerical stability; idx[0] is the global max since we sorted).
-    let max_logit = logits[idx[0]];
-    let mut probs: Vec<f32> = idx
-        .iter()
-        .map(|&i| ((logits[i] - max_logit) / temperature).exp())
-        .collect();
-    let sum: f32 = probs.iter().sum();
+    let cand = if top_k > 0 {
+        top(top_k)
+    } else if top_p > 0.0 && top_p < 1.0 {
+        // The nucleus is the shortest prefix holding `top_p` of the mass. Grow
+        // the selected prefix until it holds that much.
+        let total: f32 = logits.iter().map(|&l| weight(l)).sum();
+        let mut k = 256;
+        loop {
+            let c = top(k.min(logits.len()));
+            let mass: f32 = c.iter().map(|&(l, _)| weight(l)).sum();
+            if mass >= top_p * total || k >= logits.len() {
+                break c;
+            }
+            k *= 4;
+        }
+    } else {
+        top(logits.len())
+    };
+    let mut idx: Vec<usize> = cand.iter().map(|&(_, i)| i as usize).collect();
+
+    // Softmax with temperature. Top-k renormalizes over the tokens it keeps;
+    // otherwise probabilities are over the whole vocabulary.
+    let mut probs: Vec<f32> = cand.iter().map(|&(l, _)| weight(l)).collect();
+    let sum: f32 = if top_k > 0 {
+        probs.iter().sum()
+    } else {
+        logits.iter().map(|&l| weight(l)).sum()
+    };
     for p in &mut probs {
         *p /= sum;
     }
@@ -1293,6 +1315,60 @@ mod tests {
             .unwrap();
         // From token 0, counts up: 1, 2, 3.
         assert_eq!(out, vec![1, 2, 3]);
+    }
+
+    /// Selecting a prefix before sorting must give the distribution a full sort
+    /// gives: the same tokens in the same order, the same probabilities. Covers
+    /// a peaked vocabulary (the nucleus fits the first selection) and a flat one
+    /// (the selection has to grow).
+    #[test]
+    fn prefix_selection_matches_a_full_sort() {
+        let mut r = SplitMix64::new(11);
+        let n = 20_000;
+        let peaked: Vec<f32> = (0..n)
+            .map(|i| r.next_f32() * 6.0 + if i % 997 == 0 { 12.0 } else { 0.0 })
+            .collect();
+        let flat: Vec<f32> = (0..n).map(|_| r.next_f32() * 2.0).collect();
+        for logits in [&peaked, &flat] {
+            for (t, top_p, top_k, min_p) in [
+                (0.7, 0.9, 0, 0.0),
+                (1.0, 1.0, 0, 0.0),
+                (0.8, 0.95, 40, 0.05),
+            ] {
+                // Reference: sort everything, keep top-k, softmax, then the cuts.
+                let mut all: Vec<(f32, u32)> = logits.iter().copied().zip(0u32..).collect();
+                all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                if top_k > 0 {
+                    all.truncate(top_k);
+                }
+                let max = all[0].0;
+                let w: Vec<f32> = all.iter().map(|&(l, _)| ((l - max) / t).exp()).collect();
+                let z: f32 = w.iter().sum();
+                let mut want: Vec<(u32, f32)> =
+                    all.iter().zip(&w).map(|(&(_, i), &p)| (i, p / z)).collect();
+                if top_p < 1.0 {
+                    let mut cum = 0.0;
+                    let cut = want.iter().position(|&(_, p)| {
+                        cum += p;
+                        cum >= top_p
+                    });
+                    want.truncate(cut.map_or(want.len(), |c| c + 1));
+                }
+                if min_p > 0.0 {
+                    let th = min_p * want[0].1;
+                    want.truncate(want.iter().take_while(|&&(_, p)| p >= th).count());
+                }
+
+                let (idx, probs) = topk_topp_distribution(logits, t, top_p, top_k, min_p);
+                let got_ids: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+                let want_ids: Vec<u32> = want.iter().map(|&(i, _)| i).collect();
+                assert_eq!(got_ids, want_ids, "t {t} top_p {top_p} top_k {top_k}");
+                let wz: f32 = want.iter().map(|&(_, p)| p).sum();
+                for (g, &(_, p)) in probs.iter().zip(&want) {
+                    assert!((g - p / wz).abs() < 1e-4, "{g} vs {}", p / wz);
+                }
+            }
+        }
     }
 
     #[test]

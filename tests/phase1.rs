@@ -150,10 +150,10 @@ fn vram_math_matches_hand_computation() {
 
     let profiler = VramProfiler::new(2048).with_safety_margin_bytes(0);
 
-    // KV per layer = 2 * kv_heads(4) * head_dim(64) * 2 bytes * ctx(2048)
-    //             = 2*4*64*2*2048 = 2,097,152 bytes
+    // KV per layer = 2 * kv_heads(4) * head_dim(64) * 4 bytes (f32) * ctx(2048)
+    //             = 4,194,304 bytes
     let kv_layer = profiler.kv_bytes_per_layer(&config);
-    assert_eq!(kv_layer, 2 * 4 * 64 * 2 * 2048);
+    assert_eq!(kv_layer, 2 * 4 * 64 * 4 * 2048);
     // Total across 10 layers.
     assert_eq!(profiler.kv_total_bytes(&config), kv_layer * 10);
 

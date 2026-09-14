@@ -165,11 +165,16 @@ impl GpuWeights {
     /// they can be reported separately: staging is a host memcpy into pinned
     /// memory, the copy is the PCIe transfer. Conflating them would hide which
     /// of the two is actually the bottleneck.
+    ///
+    /// `spare` holds an evicted layer's weight buffers. A tensor whose size
+    /// matches one is copied into it instead of a fresh allocation, so a
+    /// steady-state miss allocates and frees nothing.
     fn upload_async_traced(
         t: &LayerTensors,
         stream: &Stream,
         staging: &mut PinnedBuffer,
         layer: Option<u32>,
+        mut spare: Vec<DeviceBuffer>,
     ) -> Result<Self> {
         let tensors = Self::tensors(t)?;
         let trace = layer.filter(|_| crate::telemetry::is_enabled());
@@ -211,7 +216,13 @@ impl GpuWeights {
         let base = staging.as_ptr();
         let mut bufs: Vec<DeviceBuffer> = Vec::with_capacity(9);
         for &(off, bytes, len) in &layout {
-            let buf = DeviceBuffer::new_bytes(bytes, len.max(1))?;
+            let reuse = spare
+                .iter()
+                .position(|b| b.bytes() == bytes.max(1) && b.len() == len.max(1));
+            let buf = match reuse {
+                Some(i) => spare.swap_remove(i),
+                None => DeviceBuffer::new_bytes(bytes, len.max(1))?,
+            };
             let pinned = unsafe { base.add(off) } as *const std::ffi::c_void;
             buf.upload_async_bytes(pinned, bytes, stream)?;
             bufs.push(buf);
@@ -277,6 +288,18 @@ impl GpuWeights {
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
         })
+    }
+
+    /// The nine buffers [`upload_async_traced`](Self::upload_async_traced) fills,
+    /// for reuse by the next upload. Other buffers (biases, norms that are not
+    /// staged) are freed.
+    fn into_staged_buffers(self) -> Vec<DeviceBuffer> {
+        let mut v = vec![self.q_proj, self.k_proj, self.v_proj, self.o_proj];
+        if let GpuFfn::Dense(f) = self.ffn {
+            v.extend([f.gate, f.up, f.down]);
+        }
+        v.extend([self.input_layernorm, self.post_attention_layernorm]);
+        v
     }
 
     /// Upload a layer **synchronously**, with plain per-tensor copies, for every
@@ -413,6 +436,29 @@ impl WeightLru {
         }
         self.map.insert(layer, weights);
         self.order.push_back(layer);
+    }
+
+    /// Evict, ahead of loading `layer`, the entry [`insert`](Self::insert)
+    /// would evict for it (most recently used, not `layer`), provided no compute
+    /// call is holding it, and hand back its weights so their buffers can take
+    /// the new layer. `None` while the window still has room.
+    ///
+    /// Evicting before the upload rather than after also means the window never
+    /// holds `capacity + 1` layers mid-load.
+    fn take_idle_victim(&mut self, layer: u32) -> Option<GpuWeights> {
+        if self.map.len() < self.capacity {
+            return None;
+        }
+        // Every clone of a cached `Arc` is taken under this lock, so a count of
+        // one here cannot rise before the entry is removed.
+        let i = (0..self.order.len()).rev().find(|&i| {
+            let l = self.order[i];
+            l != layer && self.map.get(&l).is_some_and(|w| Arc::strong_count(w) == 1)
+        })?;
+        let evicted = self.order.remove(i)?;
+        let w = self.map.remove(&evicted)?;
+        self.stats.evictions += 1;
+        Arc::try_unwrap(w).ok()
     }
 }
 
@@ -557,6 +603,12 @@ impl<S: LayerSource> GpuShared<S> {
                 continue;
             }
             cache.loading.insert(layer);
+            let dense = self.cfg.moe.is_none() && self.cfg.mla.is_none();
+            let victim = if dense {
+                cache.take_idle_victim(layer)
+            } else {
+                None
+            };
             drop(cache);
             // Expensive part — host load (disk + dequant) then VRAM upload — runs
             // with the cache lock released, so it overlaps the compute thread. The
@@ -582,6 +634,7 @@ impl<S: LayerSource> GpuShared<S> {
                         &self.copy_stream,
                         &mut staging,
                         Some(layer),
+                        victim.map_or_else(Vec::new, GpuWeights::into_staged_buffers),
                     )
                     .map(Arc::new)
                 })
@@ -1286,7 +1339,6 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         let hidden_size = cfg.hidden_size;
         let kv_dim = cfg.kv_dim();
         let n = hiddens.len() / hidden_size;
-        let zeros = vec![0.0f32; kv_dim];
         if kv_layers.first().map_or(0, |kv| kv.len()) + n > self.kv_capacity_tokens {
             return Err(DlmError::InvalidConfig(format!(
                 "GPU KV capacity {} exceeded at position {}",
@@ -1307,7 +1359,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                     self.run_layer(layer, &w, kv, start + i, &self.d_hidden)?;
                     synchronize_default()?;
                     self.d_hidden.download(hidden)?;
-                    kv.append(&zeros, &zeros)?;
+                    kv.advance(1);
                 }
                 continue;
             }
@@ -1384,9 +1436,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                     });
                 }
                 d_chunk.download(chunk)?;
-                for _ in 0..batch {
-                    kv.append(&zeros, &zeros)?;
-                }
+                kv.advance(batch);
             }
         }
         Ok(())
@@ -1399,7 +1449,6 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         kv: &mut KvLayerCache,
         position: usize,
     ) -> Result<()> {
-        let kv_dim = self.shared.cfg.kv_dim();
         let num_positions = kv.len();
         if num_positions >= self.kv_capacity_tokens {
             return Err(DlmError::InvalidConfig(format!(
@@ -1435,7 +1484,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         }
 
         // Keep the orchestrator's length bookkeeping in step (real K/V is in VRAM).
-        kv.append(&vec![0.0; kv_dim], &vec![0.0; kv_dim])?;
+        kv.advance(1);
         Ok(())
     }
 }
