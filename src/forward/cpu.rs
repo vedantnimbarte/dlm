@@ -974,6 +974,8 @@ impl LayerTensors {
 struct GpuKvHandle {
     keys: crate::gpu::device::DeviceBuffer,
     values: crate::gpu::device::DeviceBuffer,
+    /// The buffers hold fp16, not f32.
+    half: bool,
 }
 
 /// Real f32 K/V history for one layer (what attention reads). The paged
@@ -990,6 +992,8 @@ pub struct KvLayerCache {
     /// Positions past the host `store` whose K/V exist only on the device (see
     /// [`advance`](Self::advance)).
     device_tokens: usize,
+    /// The GPU keeps this layer's K/V as fp16 (any `KvQuant` but `None`).
+    device_half: bool,
     /// Device K/V for the GPU path; `None` until the first GPU `run_block` for
     /// this session+layer allocates it.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1002,6 +1006,7 @@ impl Clone for KvLayerCache {
             kv_dim: self.kv_dim,
             store: self.store.clone(),
             device_tokens: self.device_tokens,
+            device_half: self.device_half,
             // GPU KV is per-session device memory; a clone (a KV snapshot for the
             // prefix cache) starts with none and re-allocates on next GPU use.
             #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1018,6 +1023,9 @@ pub enum KvQuant {
     /// Exact `f32` (default).
     #[default]
     None,
+    /// Half precision on the GPU: half the KV VRAM, error around 1e-4 relative.
+    /// The CPU kernels have no fp16 store and keep exact `f32`.
+    F16,
     /// int8, half the memory — small, well-bounded error.
     Int8,
     /// int4 (2 codes/byte), a quarter of the memory — more error.
@@ -1107,7 +1115,7 @@ impl KvLayerCache {
     /// Empty history at the given precision for a layer of width `kv_dim`.
     pub fn new_quant(kv_dim: usize, quant: KvQuant) -> Self {
         let store = match quant {
-            KvQuant::None => KvStore::Full {
+            KvQuant::None | KvQuant::F16 => KvStore::Full {
                 keys: Vec::new(),
                 values: Vec::new(),
             },
@@ -1128,6 +1136,7 @@ impl KvLayerCache {
             kv_dim,
             store,
             device_tokens: 0,
+            device_half: quant != KvQuant::None,
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
         }
@@ -1152,11 +1161,22 @@ impl KvLayerCache {
         needs_values: bool,
     ) -> Result<(*mut f32, *mut f32)> {
         if self.gpu.is_none() {
+            use crate::gpu::device::DeviceBuffer;
             let len = capacity_tokens * self.kv_dim.max(1);
-            let values_len = if needs_values { len } else { 1 };
+            // MLA's latent cache is read by f32 kernels, so only standard
+            // attention goes to fp16.
+            let half = self.device_half && needs_values;
+            let alloc = |n: usize| {
+                if half {
+                    DeviceBuffer::new_bytes(n * 2, n)
+                } else {
+                    DeviceBuffer::new(n)
+                }
+            };
             let handle = GpuKvHandle {
-                keys: crate::gpu::device::DeviceBuffer::new(len)?,
-                values: crate::gpu::device::DeviceBuffer::new(values_len)?,
+                keys: alloc(len)?,
+                values: alloc(if needs_values { len } else { 1 })?,
+                half,
             };
             // A cache that already holds history is a **resumed prefix** (see
             // `sync_from_device`): seed the device with it, or the kernel would
@@ -1186,15 +1206,33 @@ impl KvLayerCache {
                 {
                     self.row_f32(i, k, v);
                 }
-                handle.keys.upload(&keys)?;
+                let put = |buf: &DeviceBuffer, rows: &[f32]| {
+                    if half {
+                        let bytes: Vec<u8> = rows
+                            .iter()
+                            .flat_map(|&v| crate::storage::f32_to_f16(v).to_le_bytes())
+                            .collect();
+                        buf.upload_bytes(&bytes)
+                    } else {
+                        buf.upload(rows)
+                    }
+                };
+                put(&handle.keys, &keys)?;
                 if needs_values {
-                    handle.values.upload(&values)?;
+                    put(&handle.values, &values)?;
                 }
             }
             self.gpu = Some(handle);
         }
         let h = self.gpu.as_ref().unwrap();
         Ok((h.keys.as_mut_ptr(), h.values.as_mut_ptr()))
+    }
+
+    /// Whether the kernels must read and write this layer's device K/V as fp16.
+    /// Meaningful once [`gpu_kv`](Self::gpu_kv) has allocated it.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub fn device_half(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|h| h.half)
     }
 
     /// Empty (exact `f32`) history for a layer whose K/V width is `kv_dim`.
@@ -1436,13 +1474,25 @@ impl KvLayerCache {
             return Ok(());
         }
         let d = self.kv_dim;
+        let get = |buf: &crate::gpu::device::DeviceBuffer, out: &mut [f32]| {
+            if h.half {
+                let mut bytes = vec![0u8; out.len() * 2];
+                buf.download_bytes(&mut bytes)?;
+                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                    *o = crate::storage::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                }
+                Ok(())
+            } else {
+                buf.download(out)
+            }
+        };
         let mut keys = vec![0.0f32; n * d];
-        h.keys.download(&mut keys)?;
+        get(&h.keys, &mut keys)?;
         // MLA reconstructs V from the cached latent and allocates no value
         // buffer, so there is nothing to read back for it.
         let mut values = vec![0.0f32; n * d];
         if h.values.len() >= n * d {
-            h.values.download(&mut values)?;
+            get(&h.values, &mut values)?;
         }
         // Rewrite through `append` so every quantization variant is handled by
         // the one code path that already knows how to store a row.

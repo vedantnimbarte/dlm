@@ -36,6 +36,10 @@ dlm bench --model-path <model> [--quant ...] --context-length 1024 \
 
 At batch 4, decode tok/s is the total over all four sequences.
 
+The VRAM figures here were sampled after the run, when the KV caches had
+already been freed, so they show the weights and scratch buffers without KV.
+`dlm bench` now samples at the end of decode.
+
 Gemma 3 4B needs `--safety-margin-gb 0.5` to fit. Under the default 1.5 GiB
 margin, the fit check refuses it: it needs 3.8 GiB and only 3.2 GiB is free.
 

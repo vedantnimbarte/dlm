@@ -44,6 +44,8 @@ pub struct VramProfiler {
     /// Each in-flight request owns a full-context KV cache, so `M_kv_total` scales
     /// with this; `1` sizes for a single sequence (the historical behavior).
     pub max_batch: u32,
+    /// Bytes per KV element on the device: 4 for f32, 2 for fp16.
+    pub kv_bytes_per_element: u64,
 }
 
 impl Default for VramProfiler {
@@ -52,6 +54,7 @@ impl Default for VramProfiler {
             target_context: 8192,
             safety_margin_bytes: DEFAULT_SAFETY_MARGIN_BYTES,
             max_batch: 1,
+            kv_bytes_per_element: KV_BYTES_PER_ELEMENT,
         }
     }
 }
@@ -123,11 +126,17 @@ impl VramProfiler {
         self
     }
 
+    /// Plan the device KV cache as fp16 (`--kv-quant` other than `none`).
+    pub fn with_half_kv(mut self, half: bool) -> Self {
+        self.kv_bytes_per_element = if half { 2 } else { KV_BYTES_PER_ELEMENT };
+        self
+    }
+
     /// KV-cache bytes for a **single** layer across the full target context:
-    /// `2 (K,V) × N_kv_heads × D_head × 4 bytes × L_context`.
+    /// `2 (K,V) × N_kv_heads × D_head × bytes per element × L_context`.
     pub fn kv_bytes_per_layer(&self, config: &ModelConfig) -> u64 {
         let per_token =
-            2 * config.num_kv_heads as u64 * config.head_dim() as u64 * KV_BYTES_PER_ELEMENT;
+            2 * config.num_kv_heads as u64 * config.head_dim() as u64 * self.kv_bytes_per_element;
         per_token * self.target_context as u64
     }
 
@@ -280,6 +289,18 @@ mod tests {
         assert!(
             batched.plan_with_free(&c, free).layers_to_load
                 <= single.plan_with_free(&c, free).layers_to_load
+        );
+    }
+
+    #[test]
+    fn half_kv_halves_the_reservation() {
+        let c = cfg();
+        let full = VramProfiler::new(2048);
+        let half = VramProfiler::new(2048).with_half_kv(true);
+        assert_eq!(2 * half.kv_total_bytes(&c), full.kv_total_bytes(&c));
+        assert_eq!(
+            half.with_half_kv(false).kv_total_bytes(&c),
+            full.kv_total_bytes(&c)
         );
     }
 

@@ -534,27 +534,35 @@ fn gpu_matches_cpu_with_int4_weights() {
         ..Default::default()
     };
     // Quantize the same random weights both kernels would otherwise share.
-    let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
-        .into_iter()
-        .map(|mut l| {
-            let q = |w: &dlm::forward::Weights| {
-                let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
-                dlm::forward::Weights::quantize_int4(&floats, dlm::forward::QUANT_GROUP_SIZE)
-                    .unwrap()
-            };
-            l.q_proj = q(&l.q_proj);
-            l.k_proj = q(&l.k_proj);
-            l.v_proj = q(&l.v_proj);
-            l.o_proj = q(&l.o_proj);
-            if let Ffn::Dense(f) = &mut l.ffn {
-                f.gate = q(&f.gate);
-                f.up = q(&f.up);
-                f.down = q(&f.down);
-            }
-            l
-        })
-        .collect();
-    assert_gpu_matches_cpu(cfg, quantized, 2e-3, "int4 weights");
+    // 128 takes the kernel's shift path for the group index; 100 takes its
+    // division fallback.
+    for group in [dlm::forward::QUANT_GROUP_SIZE, 100] {
+        let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x1174)
+            .into_iter()
+            .map(|mut l| {
+                let q = |w: &dlm::forward::Weights| {
+                    let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
+                    dlm::forward::Weights::quantize_int4(&floats, group).unwrap()
+                };
+                l.q_proj = q(&l.q_proj);
+                l.k_proj = q(&l.k_proj);
+                l.v_proj = q(&l.v_proj);
+                l.o_proj = q(&l.o_proj);
+                if let Ffn::Dense(f) = &mut l.ffn {
+                    f.gate = q(&f.gate);
+                    f.up = q(&f.up);
+                    f.down = q(&f.down);
+                }
+                l
+            })
+            .collect();
+        assert_gpu_matches_cpu(
+            cfg,
+            quantized,
+            2e-3,
+            &format!("int4 weights, group {group}"),
+        );
+    }
 }
 
 /// Same contract as the int4 case, one bit-width up: int8 codes must decode
@@ -578,27 +586,35 @@ fn gpu_matches_cpu_with_int8_weights() {
         mla: None,
         ..Default::default()
     };
-    let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
-        .into_iter()
-        .map(|mut l| {
-            let q = |w: &dlm::forward::Weights| {
-                let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
-                dlm::forward::Weights::quantize_int8(&floats, dlm::forward::QUANT_GROUP_SIZE)
-                    .unwrap()
-            };
-            l.q_proj = q(&l.q_proj);
-            l.k_proj = q(&l.k_proj);
-            l.v_proj = q(&l.v_proj);
-            l.o_proj = q(&l.o_proj);
-            if let Ffn::Dense(f) = &mut l.ffn {
-                f.gate = q(&f.gate);
-                f.up = q(&f.up);
-                f.down = q(&f.down);
-            }
-            l
-        })
-        .collect();
-    assert_gpu_matches_cpu(cfg, quantized, 2e-3, "int8 weights");
+    // 128 takes the kernel's shift path for the group index; 100 takes its
+    // division fallback.
+    for group in [dlm::forward::QUANT_GROUP_SIZE, 100] {
+        let quantized: Vec<LayerTensors> = random_layers(&cfg, 2, 0x8817)
+            .into_iter()
+            .map(|mut l| {
+                let q = |w: &dlm::forward::Weights| {
+                    let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
+                    dlm::forward::Weights::quantize_int8(&floats, group).unwrap()
+                };
+                l.q_proj = q(&l.q_proj);
+                l.k_proj = q(&l.k_proj);
+                l.v_proj = q(&l.v_proj);
+                l.o_proj = q(&l.o_proj);
+                if let Ffn::Dense(f) = &mut l.ffn {
+                    f.gate = q(&f.gate);
+                    f.up = q(&f.up);
+                    f.down = q(&f.down);
+                }
+                l
+            })
+            .collect();
+        assert_gpu_matches_cpu(
+            cfg,
+            quantized,
+            2e-3,
+            &format!("int8 weights, group {group}"),
+        );
+    }
 }
 
 /// Every real model has `hidden_size >= 2048`. The RMSNorm kernel used to launch
@@ -1305,42 +1321,42 @@ fn gpu_resumed_prefix_matches_full_prefill() {
 
     // Decode `steps` tokens, optionally snapshotting after `split` of them and
     // resuming from that snapshot — the two must agree step for step.
-    let run = |split: Option<usize>| -> Vec<Vec<f32>> {
-        let mut orch = ForwardOrchestrator::new(
-            &gpu,
-            PagedKvCache::new(kv_cfg, 16),
-            dlm::forward::KvQuant::None,
-        );
-        let mut h: Vec<f32> = (0..cfg.hidden_size)
-            .map(|i| (i as f32) * 0.02 - 0.3)
-            .collect();
-        let mut out = Vec::new();
-        for step in 0..6 {
-            if Some(step) == split {
-                // Round-trip the session through a synced snapshot.
-                let snap = orch.snapshot_synced().unwrap();
-                orch =
-                    ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap).unwrap();
+    // With fp16 KV the snapshot converts fp16 -> f32 on the way out and back on
+    // resume. Every fp16 value survives that exactly, so the tolerance is the same.
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+        let run = |split: Option<usize>| -> Vec<Vec<f32>> {
+            let mut orch = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+            let mut h: Vec<f32> = (0..cfg.hidden_size)
+                .map(|i| (i as f32) * 0.02 - 0.3)
+                .collect();
+            let mut out = Vec::new();
+            for step in 0..6 {
+                if Some(step) == split {
+                    // Round-trip the session through a synced snapshot.
+                    let snap = orch.snapshot_synced().unwrap();
+                    orch = ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap)
+                        .unwrap();
+                }
+                orch.decode_token(&mut h).unwrap();
+                out.push(h.clone());
             }
-            orch.decode_token(&mut h).unwrap();
-            out.push(h.clone());
-        }
-        out
-    };
+            out
+        };
 
-    let straight = run(None);
-    // Resume mid-sequence, where there is real history to carry across.
-    let resumed = run(Some(3));
-    for (step, (a, b)) in straight.iter().zip(&resumed).enumerate() {
-        let max_diff = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-4,
-            "step {step}: resumed prefix diverged from full prefill by {max_diff}"
-        );
+        let straight = run(None);
+        // Resume mid-sequence, where there is real history to carry across.
+        let resumed = run(Some(3));
+        for (step, (a, b)) in straight.iter().zip(&resumed).enumerate() {
+            let max_diff = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-4,
+                "{quant:?}: step {step}: resumed prefix diverged from full prefill by {max_diff}"
+            );
+        }
     }
 }
 
@@ -1368,55 +1384,53 @@ fn gpu_batched_block_matches_sequential() {
         })
         .collect();
 
-    // Reference: each sequence decoded alone through the per-slot path.
-    let solo: Vec<Vec<f32>> = starts
-        .iter()
-        .map(|start| {
-            let mut orch = ForwardOrchestrator::new(
-                &gpu,
-                PagedKvCache::new(kv_cfg, 16),
-                dlm::forward::KvQuant::None,
-            );
-            let mut h = start.clone();
-            for _ in 0..4 {
-                orch.decode_token(&mut h).unwrap();
-            }
-            h
-        })
-        .collect();
-
-    // Batched: all three stepped together through run_block_batched. Give the
-    // slots different starting positions so their KV lengths diverge.
-    let mut kvs: Vec<Vec<KvLayerCache>> = (0..starts.len())
-        .map(|_| {
-            (0..num_layers)
-                .map(|_| KvLayerCache::new(cfg.kv_dim()))
-                .collect()
-        })
-        .collect();
-    let mut hs: Vec<Vec<f32>> = starts.clone();
-    for step in 0..4 {
-        for l in 0..num_layers {
-            let mut hidden_refs: Vec<&mut [f32]> =
-                hs.iter_mut().map(|h| h.as_mut_slice()).collect();
-            let mut kv_refs: Vec<&mut KvLayerCache> =
-                kvs.iter_mut().map(|k| &mut k[l as usize]).collect();
-            let positions = vec![step; starts.len()];
-            gpu.run_block_batched(l, &mut hidden_refs, &mut kv_refs, &positions)
-                .unwrap();
-        }
-    }
-
-    for (b, (batched, alone)) in hs.iter().zip(&solo).enumerate() {
-        let max_diff = batched
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+        // Reference: each sequence decoded alone through the per-slot path.
+        let solo: Vec<Vec<f32>> = starts
             .iter()
-            .zip(alone)
-            .map(|(a, c)| (a - c).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-4,
-            "slot {b}: batched diverged from solo by {max_diff}"
-        );
+            .map(|start| {
+                let mut orch = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+                let mut h = start.clone();
+                for _ in 0..4 {
+                    orch.decode_token(&mut h).unwrap();
+                }
+                h
+            })
+            .collect();
+
+        // Batched: all three stepped together through run_block_batched. Give the
+        // slots different starting positions so their KV lengths diverge.
+        let mut kvs: Vec<Vec<KvLayerCache>> = (0..starts.len())
+            .map(|_| {
+                (0..num_layers)
+                    .map(|_| KvLayerCache::new_quant(cfg.kv_dim(), quant))
+                    .collect()
+            })
+            .collect();
+        let mut hs: Vec<Vec<f32>> = starts.clone();
+        for step in 0..4 {
+            for l in 0..num_layers {
+                let mut hidden_refs: Vec<&mut [f32]> =
+                    hs.iter_mut().map(|h| h.as_mut_slice()).collect();
+                let mut kv_refs: Vec<&mut KvLayerCache> =
+                    kvs.iter_mut().map(|k| &mut k[l as usize]).collect();
+                let positions = vec![step; starts.len()];
+                gpu.run_block_batched(l, &mut hidden_refs, &mut kv_refs, &positions)
+                    .unwrap();
+            }
+        }
+
+        for (b, (batched, alone)) in hs.iter().zip(&solo).enumerate() {
+            let max_diff = batched
+                .iter()
+                .zip(alone)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-4,
+                "{quant:?}: slot {b}: batched diverged from solo by {max_diff}"
+            );
+        }
     }
 }
 
@@ -1451,6 +1465,18 @@ fn assert_prefill_matches_cpu<K: ComputeKernel>(
     gpu: K,
     what: &str,
 ) {
+    assert_prefill_matches_cpu_kv(cfg, layers, gpu, what, dlm::forward::KvQuant::None)
+}
+
+/// [`assert_prefill_matches_cpu`] with the GPU's KV cache at `gpu_kv`. The CPU
+/// oracle keeps exact f32 KV throughout.
+fn assert_prefill_matches_cpu_kv<K: ComputeKernel>(
+    cfg: BlockConfig,
+    layers: Vec<LayerTensors>,
+    gpu: K,
+    what: &str,
+    gpu_kv: dlm::forward::KvQuant,
+) {
     let num_layers = layers.len() as u32;
     let cpu = CpuKernel::new(cfg, layers).unwrap();
     let kv_cfg = KvCacheConfig {
@@ -1464,11 +1490,7 @@ fn assert_prefill_matches_cpu<K: ComputeKernel>(
         PagedKvCache::new(kv_cfg, 16),
         dlm::forward::KvQuant::None,
     );
-    let mut orch_gpu = ForwardOrchestrator::new(
-        gpu,
-        PagedKvCache::new(kv_cfg, 16),
-        dlm::forward::KvQuant::None,
-    );
+    let mut orch_gpu = ForwardOrchestrator::new(gpu, PagedKvCache::new(kv_cfg, 16), gpu_kv);
 
     let h = cfg.hidden_size;
     let mut rng = Rng::new(0x9E1F11);
@@ -1502,6 +1524,31 @@ fn gpu_prefill_matches_cpu_decode() {
     let layers = random_layers(&cfg, 3, 0xBA7C4);
     let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
     assert_prefill_matches_cpu(cfg, layers, gpu, "dense");
+}
+
+/// fp16 device KV (`--kv-quant f16`) through prefill and decode, on the resident
+/// and the streaming kernel. The CPU oracle keeps f32 KV. The difference is the
+/// rounding of each stored key and value, which stays inside the same tolerance.
+#[test]
+fn gpu_prefill_matches_cpu_decode_with_f16_kv() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 3, 0xF16);
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu_kv(
+        cfg,
+        layers.clone(),
+        gpu,
+        "dense f16 kv",
+        dlm::forward::KvQuant::F16,
+    );
+    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu_kv(
+        cfg,
+        layers,
+        streaming,
+        "streaming f16 kv",
+        dlm::forward::KvQuant::F16,
+    );
 }
 
 /// Gemma2's windowed layers must clip inside a prefill chunk too: the window (2)
@@ -1547,7 +1594,16 @@ fn streaming_gpu_prefill_matches_cpu_decode_moe() {
     };
     let layers = random_moe_layers(&cfg, 4, 0x50FB);
     let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
-    assert_prefill_matches_cpu(cfg, layers, gpu, "streaming moe");
+    assert_prefill_matches_cpu(cfg, layers.clone(), gpu, "streaming moe");
+    // The MoE attention call (`dlm_moe_attn`) takes the KV type separately.
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu_kv(
+        cfg,
+        layers,
+        gpu,
+        "streaming moe f16 kv",
+        dlm::forward::KvQuant::F16,
+    );
 }
 
 /// DeepSeek's shape — MLA attention with MoE — also takes the per-token branch.
