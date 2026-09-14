@@ -113,7 +113,19 @@ __global__ void layernorm_kernel(const float* x, const float* w, const float* b,
 
 // Row-major [out_dim, in_dim] matrix times vector, plus an optional bias.
 // Threads per block for the GEMV reduction; power of two for the tree reduction.
-#define MATVEC_THREADS 256
+//
+// Measured on a GTX 1650, decode tok/s by thread count:
+//
+//   threads          32     64    128    256    512   1024
+//   Qwen2.5-0.5B   36.9   56.8   56.5   42.7   29.5   13.8
+//   Qwen2.5-1.5B   16.0   23.3   21.6   14.4      -      -   (int4)
+//   Gemma 3 4B      6.4    9.5    8.6    6.8      -      -   (int4)
+//
+// Each doubling adds a barrier to every row's reduction, so wide blocks pay for
+// synchronization they don't win back. Narrow blocks give each thread a long
+// scalar stride instead. Picking the count per matrix width (in_dim / k) lost to
+// a fixed 64 on all three models.
+#define MATVEC_THREADS 64
 
 // Weight dtype tags — must match `Weights::dtype_code()` in src/forward/cpu.rs.
 // Weights are uploaded in their NATIVE checkpoint dtype and decoded to f32 in the
