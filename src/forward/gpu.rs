@@ -791,7 +791,6 @@ impl ComputeKernel for GpuKernel {
             return Ok(());
         }
         let hidden_size = self.cfg.hidden_size;
-        let kv_dim = self.cfg.kv_dim();
 
         let mut slot_keys = DlmSlots {
             p: [std::ptr::null_mut(); DLM_MAX_BATCH],
@@ -848,7 +847,7 @@ impl ComputeKernel for GpuKernel {
         }
         // Keep each orchestrator's length bookkeeping in step (real K/V is in VRAM).
         for kv in kvs.iter_mut() {
-            kv.append(&vec![0.0; kv_dim], &vec![0.0; kv_dim])?;
+            kv.advance(1);
         }
         Ok(())
     }
@@ -873,8 +872,6 @@ impl ComputeKernel for GpuKernel {
         if n <= 1 || self.cfg.mla.is_some() {
             return crate::forward::kernel::prefill_token_by_token(self, hiddens, kv_layers, start);
         }
-        let kv_dim = self.cfg.kv_dim();
-        let zeros = vec![0.0f32; kv_dim];
         let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
         for layer in 0..self.num_layers() {
             let kv = &mut kv_layers[layer as usize];
@@ -913,9 +910,7 @@ impl ComputeKernel for GpuKernel {
                     &slot_positions,
                     batch,
                 )?;
-                for _ in 0..batch {
-                    kv.append(&zeros, &zeros)?;
-                }
+                kv.advance(batch);
             }
         }
         d_hiddens.download(hiddens)
@@ -1088,8 +1083,8 @@ impl ComputeKernel for GpuKernel {
         }
 
         // Keep the orchestrator's length bookkeeping in step. The real K/V is in
-        // VRAM; these host placeholders are never read on the GPU path.
-        kv.append(&vec![0.0; kv_dim], &vec![0.0; kv_dim])?;
+        // VRAM.
+        kv.advance(1);
         Ok(())
     }
 }

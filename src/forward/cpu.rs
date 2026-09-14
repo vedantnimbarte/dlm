@@ -979,14 +979,17 @@ struct GpuKvHandle {
 /// Real f32 K/V history for one layer (what attention reads). The paged
 /// `PagedKvCache` tracks the block bookkeeping; this holds the actual vectors.
 ///
-/// On the GPU kernels the host `store` holds only zero placeholders for length
-/// bookkeeping; the real K/V lives in the device buffers of [`gpu`](Self::gpu),
-/// which are **per-session** so continuous batching keeps each sequence's history
-/// isolated (the kernel is shared across sessions, the KV is not).
+/// On the GPU kernels the real K/V lives in the device buffers of
+/// [`gpu`](Self::gpu), which are **per-session** so continuous batching keeps
+/// each sequence's history isolated (the kernel is shared across sessions, the
+/// KV is not). The host side only counts those positions, in `device_tokens`.
 #[derive(Debug, Default)]
 pub struct KvLayerCache {
     kv_dim: usize,
     store: KvStore,
+    /// Positions past the host `store` whose K/V exist only on the device (see
+    /// [`advance`](Self::advance)).
+    device_tokens: usize,
     /// Device K/V for the GPU path; `None` until the first GPU `run_block` for
     /// this session+layer allocates it.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -998,6 +1001,7 @@ impl Clone for KvLayerCache {
         Self {
             kv_dim: self.kv_dim,
             store: self.store.clone(),
+            device_tokens: self.device_tokens,
             // GPU KV is per-session device memory; a clone (a KV snapshot for the
             // prefix cache) starts with none and re-allocates on next GPU use.
             #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1123,6 +1127,7 @@ impl KvLayerCache {
         Self {
             kv_dim,
             store,
+            device_tokens: 0,
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
         }
@@ -1157,7 +1162,14 @@ impl KvLayerCache {
             // `sync_from_device`): seed the device with it, or the kernel would
             // attend over a freshly-zeroed buffer while `len()` claims the tokens
             // are there. A fresh session has `len() == 0` and skips this.
-            let n = self.len();
+            if self.device_tokens > 0 {
+                // A clone taken without `sync_from_device`: its history was on a
+                // device buffer the clone does not have.
+                return Err(DlmError::InvalidConfig(
+                    "KV snapshot holds device-only history; take it with snapshot_synced".into(),
+                ));
+            }
+            let n = self.host_len();
             if n > 0 {
                 let d = self.kv_dim;
                 if n > capacity_tokens {
@@ -1203,6 +1215,17 @@ impl KvLayerCache {
 
     /// Cached token positions.
     pub fn len(&self) -> usize {
+        self.host_len() + self.device_tokens
+    }
+
+    /// Record `n` positions whose K/V a GPU kernel wrote straight into the
+    /// device buffers. Only the count is kept on the host.
+    pub fn advance(&mut self, n: usize) {
+        self.device_tokens += n;
+    }
+
+    /// Positions held in the host `store`.
+    fn host_len(&self) -> usize {
         match &self.store {
             KvStore::Full { keys, .. } => keys.len() / self.kv_dim.max(1),
             KvStore::Int8 { key_scales, .. } => key_scales.len(),
@@ -1220,6 +1243,12 @@ impl KvLayerCache {
     /// the GPU path the device slots are simply overwritten at the reduced length,
     /// so only the host length (which drives `num_positions`) needs shrinking.
     pub fn truncate(&mut self, n: usize) {
+        let host = self.host_len();
+        if n >= host {
+            self.device_tokens = self.device_tokens.min(n - host);
+            return;
+        }
+        self.device_tokens = 0;
         let kv_dim = self.kv_dim;
         match &mut self.store {
             KvStore::Full { keys, values } => {
@@ -1259,6 +1288,11 @@ impl KvLayerCache {
                 expected: self.kv_dim,
                 got: key.len().min(value.len()),
             });
+        }
+        if self.device_tokens > 0 {
+            return Err(DlmError::InvalidConfig(
+                "host KV append after device-only positions".into(),
+            ));
         }
         match &mut self.store {
             KvStore::Full { keys, values } => {
@@ -1389,13 +1423,11 @@ impl KvLayerCache {
         }
     }
 
-    /// Copy this session's **device** K/V back into the host store, replacing the
-    /// length placeholders the GPU path writes there.
+    /// Copy this session's **device** K/V back into the host store.
     ///
-    /// On the GPU kernels the real history lives in VRAM and the host cache holds
-    /// only zeros to keep lengths in step. A prefix-cache snapshot is host-side,
-    /// so without this it would capture those zeros and a resumed prefix would
-    /// attend over empty history — silently wrong output. Call before snapshotting.
+    /// On the GPU kernels the real history lives in VRAM and the host only counts
+    /// it. A prefix-cache snapshot is host-side, so it needs the rows themselves.
+    /// Call before snapshotting.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn sync_from_device(&mut self) -> Result<()> {
         let n = self.len();
@@ -1527,18 +1559,16 @@ where
 {
     debug_assert_eq!(x.len(), in_dim);
     let mut y = vec![0.0f32; out_dim];
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = super::pool::threads();
     if threads > 1 && out_dim.saturating_mul(in_dim) >= (1 << 20) {
         let rows_per = out_dim.div_ceil(threads);
-        let row_dot = &row_dot;
-        std::thread::scope(|s| {
-            for (chunk, yrows) in y.chunks_mut(rows_per).enumerate() {
-                let base = chunk * rows_per;
-                s.spawn(move || {
-                    for (i, slot) in yrows.iter_mut().enumerate() {
-                        *slot = row_dot(base + i, x);
-                    }
-                });
+        // One lock per chunk, each taken by exactly one pool thread.
+        let chunks: Vec<std::sync::Mutex<&mut [f32]>> =
+            y.chunks_mut(rows_per).map(std::sync::Mutex::new).collect();
+        super::pool::parallel_for(chunks.len(), &|c| {
+            let mut yrows = chunks[c].lock().unwrap();
+            for (i, slot) in yrows.iter_mut().enumerate() {
+                *slot = row_dot(c * rows_per + i, x);
             }
         });
     } else {
@@ -3133,6 +3163,31 @@ mod tests {
             base.iter().zip(&biased).any(|(a, b)| (a - b).abs() > 1e-6),
             "v_bias had no effect on the block output — bias is being dropped"
         );
+    }
+
+    /// Device-only positions count toward `len` without host memory, and
+    /// truncation trims them before any real host rows. A resumed prefix (host
+    /// rows) followed by GPU decode is the case that mixes the two.
+    #[test]
+    fn device_positions_are_counted_not_stored() {
+        let mut kv = KvLayerCache::new(2);
+        kv.append(&[1.0, 2.0], &[3.0, 4.0]).unwrap();
+        kv.advance(3);
+        assert_eq!(kv.len(), 4);
+        assert_eq!(kv.host_len(), 1);
+
+        kv.truncate(2);
+        assert_eq!((kv.len(), kv.host_len()), (2, 1));
+        assert!(
+            kv.append(&[0.0, 0.0], &[0.0, 0.0]).is_err(),
+            "a host row after device-only positions would sit at the wrong index"
+        );
+
+        kv.truncate(0);
+        assert_eq!((kv.len(), kv.host_len()), (0, 0));
+        kv.advance(5);
+        kv.truncate(9);
+        assert_eq!(kv.len(), 5, "truncating past the end is a no-op");
     }
 
     #[test]

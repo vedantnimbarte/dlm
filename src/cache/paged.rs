@@ -22,8 +22,7 @@ use std::collections::BTreeMap;
 /// A physical block index into the KV pool.
 pub type BlockId = u32;
 
-/// Bytes per KV element (FP16 cache, per).
-const KV_DTYPE_BYTES: u64 = 2;
+use crate::profiler::vram::KV_BYTES_PER_ELEMENT as KV_DTYPE_BYTES;
 
 /// Geometry of the KV cache: how big one block is, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +50,7 @@ impl KvCacheConfig {
     }
 
     /// Bytes of KV held for a single token across **all** layers
-    /// (`2 (K,V) × N_kv_heads × D_head × 2 bytes × N_layers`).
+    /// (`2 (K,V) × N_kv_heads × D_head × 4 bytes × N_layers`).
     pub fn bytes_per_token(&self) -> u64 {
         2 * self.num_kv_heads as u64
             * self.head_dim as u64
@@ -257,9 +256,9 @@ mod tests {
     #[test]
     fn block_sizing_math() {
         let c = cfg();
-        // per token = 2(K,V) * 2 kv-heads * 8 head_dim * 2 bytes * 4 layers = 256
-        assert_eq!(c.bytes_per_token(), 256);
-        assert_eq!(c.bytes_per_block(), 256 * 16);
+        // per token = 2(K,V) * 2 kv-heads * 8 head_dim * 4 bytes * 4 layers = 512
+        assert_eq!(c.bytes_per_token(), 512);
+        assert_eq!(c.bytes_per_block(), 512 * 16);
         assert_eq!(c.blocks_for_tokens(0), 0);
         assert_eq!(c.blocks_for_tokens(1), 1);
         assert_eq!(c.blocks_for_tokens(16), 1);

@@ -14,6 +14,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The VRAM planner sized the KV cache at half its real size.**
+  - **Cause:** it assumed 2 bytes per element, as for an fp16 cache, but the
+    device KV cache is f32. `--kv-quant` changes only the host-side stores.
+  - **Effect:** a plan that claimed to fit could run out of VRAM once the cache
+    filled. The fit checks for `serve` and `bench` now reserve the real amount.
+  - **Unchanged:** the paged pool's token capacity. Its budget comes from the
+    same plan, so the pool gets the same number of tokens.
 - **Multi-GPU stages shared one device's scratch memory.** The CUDA kernels'
   scratch buffers were kept per thread, on the assumption that a multi-GPU
   pipeline runs one thread per device. It does not: every stage runs on the
@@ -35,6 +42,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **CPU matmuls reuse a persistent thread pool.** Large GEMVs (MLP projections,
+  the LM head) used to start a fresh OS thread per chunk on every call. On
+  Qwen2.5-0.5B on CPU, measured against the previous binary back to back,
+  decode went from 7.38 to 8.28 tok/s and prefill from 9.1 to 10.8 tok/s.
+- **Sampling no longer sorts the whole vocabulary.**
+  - **`top_k`:** only the best k tokens are put in order.
+  - **Default `top_k = 0` with `top_p < 1`:** the nucleus is selected before it
+    is sorted.
+  - **Speed:** one sampled token from Qwen's 152k vocabulary took about 7 ms and
+    now takes 1.7 ms on peaked logits (0.7 ms with top-k 40).
+  - **Same output:** the distribution is identical to a full sort, and a test
+    pins it. Tied logits now order by token id, so a seed draws the same token
+    every run.
+- **Streamed layers are uploaded into the evicted layer's VRAM buffers.** The
+  eviction happens before the upload, not after, and a steady-state miss
+  allocates and frees nothing.
+  - **Allocations:** over a streamed Qwen2.5-1.5B run, `cudaMalloc` calls
+    dropped from 2,296 to 181 and time spent in `cudaMalloc` from 419 to 53 ms.
+  - **Peak VRAM:** the window no longer holds an extra layer while one loads.
+- **GPU paths no longer mirror the KV cache on the host.** Each layer and token
+  appended a zero-filled host row that nothing read. Now only a count is kept.
+  At the contexts measured this was tens of MiB, so peak RSS did not move.
+  Peak RSS on GPU runs comes from loading, not decode.
 - **`--stream` caches layers in host RAM by default, quantized or not**, when the
   whole layer set (plus 25%) fits under a quarter of physical RAM. It was on
   only with `--quant`; unquantized streaming re-read every layer from the mmap on

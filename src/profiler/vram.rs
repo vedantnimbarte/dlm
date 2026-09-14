@@ -27,8 +27,11 @@ use crate::storage::LayerCatalog;
 /// Default safety cushion: 1.5 GiB, per (`M_safety`).
 pub const DEFAULT_SAFETY_MARGIN_BYTES: u64 = 3 * 512 * 1024 * 1024; // 1.5 * 2^30
 
-/// Bytes per KV element. KV cache is stored FP16 (: "2 bytes").
-const KV_BYTES_PER_ELEMENT: u64 = 2;
+/// Bytes per KV element. The device KV cache is `f32`, whatever `--kv-quant`
+/// says: that flag shrinks only the host-side stores. Planning at 2 bytes
+/// reserved half the VRAM the cache really takes, so a "fitting" plan could
+/// run out of memory mid-request.
+pub const KV_BYTES_PER_ELEMENT: u64 = 4;
 
 /// Configurable inputs to the VRAM math.
 #[derive(Debug, Clone)]
@@ -121,7 +124,7 @@ impl VramProfiler {
     }
 
     /// KV-cache bytes for a **single** layer across the full target context:
-    /// `2 (K,V) × N_kv_heads × D_head × 2 bytes × L_context`.
+    /// `2 (K,V) × N_kv_heads × D_head × 4 bytes × L_context`.
     pub fn kv_bytes_per_layer(&self, config: &ModelConfig) -> u64 {
         let per_token =
             2 * config.num_kv_heads as u64 * config.head_dim() as u64 * KV_BYTES_PER_ELEMENT;

@@ -17,13 +17,16 @@ use std::os::raw::c_void;
 pub struct DeviceBuffer {
     ptr: *mut c_void,
     len: usize,
+    /// Allocated size in bytes.
+    bytes: usize,
 }
 
 impl DeviceBuffer {
     /// Allocate space for `len` `f32`s (uninitialized).
     pub fn new(len: usize) -> Result<Self> {
-        let ptr = backend::device_malloc(len * std::mem::size_of::<f32>())?;
-        Ok(Self { ptr, len })
+        let bytes = len * std::mem::size_of::<f32>();
+        let ptr = backend::device_malloc(bytes)?;
+        Ok(Self { ptr, len, bytes })
     }
 
     /// Allocate and upload `data`.
@@ -53,7 +56,16 @@ impl DeviceBuffer {
     /// (uninitialized). For weights whose byte length is not `len * 4`.
     pub fn new_bytes(bytes: usize, len: usize) -> Result<Self> {
         let ptr = backend::device_malloc(bytes.max(1))?;
-        Ok(Self { ptr, len })
+        Ok(Self {
+            ptr,
+            len,
+            bytes: bytes.max(1),
+        })
+    }
+
+    /// Allocated size in bytes.
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Element count.

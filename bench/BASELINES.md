@@ -64,7 +64,12 @@ Workload: prompt 128 tokens, 16 generated, `--context-length 512 --device cpu`.
 
 | Model | Quant | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | Peak RSS |
 |---|---|---|---|---|---|---|
-| Qwen2.5-0.5B | bf16 | 1.3 | 97,323 | 0.75 | 1,340.2 | 2.66 GiB |
+| Qwen2.5-0.5B | bf16 | 9.1 | 14,233 | 7.38 | 135.5 | 2.67 GiB |
+
+A first CPU run recorded 1.3 prefill / 0.75 decode tok/s. It did not reproduce:
+the same binary, rerun on an idle machine, gave the row above. Something else
+was using the CPU during that run. Rerun any number that looks wrong before
+trusting it.
 
 ## What the numbers say
 
@@ -78,10 +83,14 @@ Each observation points at an item in the roadmap:
   Matrix-matrix kernels are the fix.
 - **int4 is not faster than fp16 at 0.5B.** The kernel dequantizes per element.
   Group-dequant kernels are the fix.
-- **Host RAM is 2–5 GiB for models resident on the GPU.** Part of that is a
-  zero-filled host copy of the KV cache the GPU path never reads.
+- **Peak host RAM is 2–7 GiB for models resident on the GPU.** It is peak
+  memory, and it builds up while loading, not while decoding. The mmap'd
+  checkpoint pages, the per-layer host copies made before upload, and the f32
+  embedding table are all resident at once. The host copy of the KV cache is
+  not the cause: it is a few tens of MiB at this context, and removing it left
+  peak RSS unchanged.
 - **Streaming spends most of each step moving bytes.** PinStage + H2D account for
   about 85% of a streamed Qwen 1.5B step, and PinStage alone costs more than the
   PCIe copy. Copying straight from the RAM cache into pinned memory is the fix.
-- **The CPU path is very slow.** It has no SIMD, starts new threads on every
-  matmul, and recomputes RoPE on every layer.
+- **The CPU path starts new OS threads for every large matmul** (the MLP
+  projections and the LM head), and has no SIMD.
