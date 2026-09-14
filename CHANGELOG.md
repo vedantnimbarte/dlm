@@ -42,6 +42,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **GPU decode and prefill are 1.3-1.9x faster.** All on a GTX 1650, prompt
+  512, 64 generated, from four kernel changes:
+
+  | Model | Decode tok/s | Prefill tok/s |
+  |---|---|---|
+  | Qwen2.5-0.5B (bf16) | 38.8 -> 49.3 | 77.7 -> 104.4 |
+  | Qwen2.5-0.5B int4 | 35.6 -> 79.2 | 70.1 -> 130.7 |
+  | Qwen2.5-1.5B int4 | 14.4 -> 33.5 | 22.4 -> 42.9 |
+  | Gemma 3 4B int4 | 6.8 -> 14.8 | 10.2 -> 19.1 |
+
+  At a 2k-token context, Qwen2.5-0.5B int4 decode went from 36.0 to 56.4 tok/s.
+  - **GEMV reduction:** 64 threads per block instead of 256. Every doubling
+    adds a barrier to each row's reduction, and 64 won on every model and width
+    measured.
+  - **Quantized GEMV:** scales and zeros are found once per row instead of once
+    per weight, which removes three integer divisions per weight element.
+    Results are bit-identical.
+  - **Attention softmax:** runs across each head's row instead of walking it
+    serially. At 2k context that took one token's softmax from 10.8 ms to
+    0.7 ms.
+  - **Device lookup:** each kernel call asks for the current device once,
+    instead of about 30 times per layer.
 - **CPU matmuls reuse a persistent thread pool.** Large GEMVs (MLP projections,
   the LM head) used to start a fresh OS thread per chunk on every call. On
   Qwen2.5-0.5B on CPU, measured against the previous binary back to back,
