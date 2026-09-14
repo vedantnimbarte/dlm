@@ -358,7 +358,7 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
 //
 //   1. attn_scores_kernel  — one thread per (head, position): the scaled (and
 //                            softcapped) logit.
-//   2. attn_softmax_kernel — one thread per head: max-subtracted softmax of its
+//   2. attn_softmax_kernel — one block per head: max-subtracted softmax of its
 //                            row, in place.
 //   3. attn_mix_kernel     — one thread per (head, dim): the weighted sum of the
 //                            values.
@@ -387,18 +387,48 @@ __global__ void attn_scores_kernel(const float* q, const float* keys, float* sco
     scores[idx] = dot;
 }
 
+// One block per head (launch <<<num_heads, SOFTMAX_THREADS>>>). Threads stride
+// the row and tree-reduce the max, then the sum of exponentials, as
+// `rmsnorm_kernel` does. The single-thread-per-head version walked every row
+// serially three times: at a 2k-token context on Qwen2.5-0.5B that was 10.8 ms
+// of a token's 20 ms of attention, and it is 0.7 ms this way. (Scores and mix
+// are memory-bound rather than serial-bound. Neither a reduction over positions
+// nor scoring each shared GQA key once made them faster.)
+#define SOFTMAX_THREADS 64
 __global__ void attn_softmax_kernel(float* scores, int num_heads, int span) {
-    int h = blockIdx.x * blockDim.x + threadIdx.x;
-    if (h >= num_heads) return;
-    float* row = scores + (long)h * span;
-    float maxv = -1e30f;
-    for (int i = 0; i < span; ++i) if (row[i] > maxv) maxv = row[i];
-    float denom = 0.0f;
-    for (int i = 0; i < span; ++i) {
-        row[i] = expf(row[i] - maxv);
-        denom += row[i];
+    if (blockIdx.x >= num_heads) return;
+    float* row = scores + (long)blockIdx.x * span;
+    __shared__ float partial[SOFTMAX_THREADS];
+    __shared__ float maxv;
+    __shared__ float denom;
+    int t = threadIdx.x;
+
+    float m = -1e30f;
+    for (int i = t; i < span; i += blockDim.x) if (row[i] > m) m = row[i];
+    partial[t] = m;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (t < stride && partial[t + stride] > partial[t]) partial[t] = partial[t + stride];
+        __syncthreads();
     }
-    for (int i = 0; i < span; ++i) row[i] /= denom;
+    if (t == 0) maxv = partial[0];
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int i = t; i < span; i += blockDim.x) {
+        row[i] = expf(row[i] - maxv);
+        sum += row[i];
+    }
+    partial[t] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (t < stride) partial[t] += partial[t + stride];
+        __syncthreads();
+    }
+    if (t == 0) denom = partial[0];
+    __syncthreads();
+
+    for (int i = t; i < span; i += blockDim.x) row[i] /= denom;
 }
 
 __global__ void attn_mix_kernel(const float* weights, const float* values, float* ctx,
@@ -563,7 +593,7 @@ static cudaError_t launch_attention(const float* q, const float* keys, const flo
     float* scores = g_scratch[ATTN_SCORES];
     attn_scores_kernel<<<grid_for(num_heads * span, B), B>>>(q, keys, scores, num_heads, num_kv_heads,
                                                             head_dim, start, span, scale, softcap);
-    attn_softmax_kernel<<<grid_for(num_heads, B), B>>>(scores, num_heads, span);
+    attn_softmax_kernel<<<num_heads, SOFTMAX_THREADS>>>(scores, num_heads, span);
     attn_mix_kernel<<<grid_for(num_heads * head_dim, B), B>>>(scores, values, ctx, num_heads,
                                                              num_kv_heads, head_dim, start, span);
     return cudaSuccess;
@@ -1410,7 +1440,7 @@ static cudaError_t launch_mla_attention(int dt, const float* q, const float* kv_
     #define DLM_MLA_DT(DT) \
         mla_query_latent_kernel<DT><<<hl, B>>>(q, kv_b, kv_b_group, u, num_heads, nope, rope, vdim, latent); \
         mla_scores_kernel<<<grid_for(num_heads * positions, B), B>>>(q, u, kv_keys, scores, num_heads, nope, rope, latent, positions, scale); \
-        attn_softmax_kernel<<<grid_for(num_heads, B), B>>>(scores, num_heads, positions); \
+        attn_softmax_kernel<<<num_heads, SOFTMAX_THREADS>>>(scores, num_heads, positions); \
         mla_mix_kernel<<<hl, B>>>(scores, kv_keys, m, num_heads, rope, latent, positions); \
         mla_values_kernel<DT><<<grid_for(num_heads * vdim, B), B>>>(m, kv_b, kv_b_group, ctx, num_heads, nope, vdim, latent);
     switch (dt) {
