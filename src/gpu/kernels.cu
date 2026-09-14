@@ -500,13 +500,18 @@ enum { DLM_MAX_DEVICES = 16 };
 static thread_local float* g_scratch_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}};
 static thread_local int g_scratch_cap_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}}; // floats
 
+// The device the current entry point runs on, recorded once by DLM_ENTER. Rust
+// switches devices only between calls, never during one, so it cannot go stale
+// mid-call. Asking the driver on every scratch access instead cost about 30
+// `cudaGetDevice` calls per layer per token. -1 if the query failed.
+static thread_local int g_cur_dev = 0;
+#define DLM_ENTER { int d_ = 0; g_cur_dev = (cudaGetDevice(&d_) == cudaSuccess) ? d_ : -1; }
+
 // The current device's index into the scratch tables. A device id past the table
 // is refused by scratch_ensure, which every entry point calls before it reads a
 // slot, so the clamp here only keeps an unreachable index in bounds.
 static inline int scratch_device() {
-    int d = 0;
-    if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= DLM_MAX_DEVICES) return 0;
-    return d;
+    return (g_cur_dev < 0 || g_cur_dev >= DLM_MAX_DEVICES) ? 0 : g_cur_dev;
 }
 // Every existing `g_scratch[i]` / `g_scratch_cap[i]` reads the current device's row.
 #define g_scratch (g_scratch_by_device[scratch_device()])
@@ -515,10 +520,7 @@ static inline int scratch_device() {
 // Ensure scratch slot `i` holds at least `n` floats on the current device;
 // (re)allocates only on growth.
 static cudaError_t scratch_ensure(int i, int n) {
-    int device = 0;
-    cudaError_t de = cudaGetDevice(&device);
-    if (de != cudaSuccess) return de;
-    if (device < 0 || device >= DLM_MAX_DEVICES) return cudaErrorInvalidDevice;
+    if (g_cur_dev < 0 || g_cur_dev >= DLM_MAX_DEVICES) return cudaErrorInvalidDevice;
     if (g_scratch_cap[i] >= n) return cudaSuccess;
     if (g_scratch[i]) cudaFree(g_scratch[i]);
     g_scratch[i] = 0;
@@ -597,6 +599,7 @@ extern "C" int dlm_decode_block(
     const float* pre_ffn_norm, const float* post_ffn_norm,
     const DlmBlockExt* ext)                // NULL: the Llama block shape
 {
+    DLM_ENTER
     const int B = 256;
     int total_pos = num_positions + 1;
     const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
@@ -849,6 +852,7 @@ extern "C" int dlm_decode_block_batched(
     const float* pre_ffn_norm, const float* post_ffn_norm,
     const DlmBlockExt* ext)
 {
+    DLM_ENTER
     const int B = 256;
     if (batch <= 0) return 0;
     const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
@@ -973,6 +977,7 @@ extern "C" int dlm_moe_attn(
     float attn_scale,                      // <=0: derive 1/sqrt(head_dim) as usual
     float attn_softcap)                    // 0 = off (Gemma2 caps attention logits)
 {
+    DLM_ENTER
     const int B = 256;
     int total_pos = num_positions + 1;
     if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
@@ -1023,6 +1028,7 @@ extern "C" int dlm_moe_attn(
 // `decode_block_streaming_moe` does between attention and `moe_ffn_streaming`.
 extern "C" int dlm_moe_norm(int hidden_size, float rms_eps, const float* post_norm, float* x)
 {
+    DLM_ENTER
     cudaError_t e = scratch_ensure(MOE_NORMED2, hidden_size);
     if (e != cudaSuccess) return (int)e;
     rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, g_scratch[MOE_NORMED2], hidden_size, rms_eps);
@@ -1034,6 +1040,7 @@ extern "C" int dlm_moe_norm(int hidden_size, float rms_eps, const float* post_no
 extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_group_size,
                               const void* w, float* y_host)
 {
+    DLM_ENTER
     cudaError_t e = cudaSuccess;
     if (e == cudaSuccess) e = scratch_ensure(MOE_MATVEC, out_dim);
     if (e == cudaSuccess) {
@@ -1057,6 +1064,7 @@ extern "C" int dlm_moe_matvec(int out_dim, int hidden_size, int w_dtype, int w_g
 extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_size,
                            const void* w, const float* x_host, float* logits_host)
 {
+    DLM_ENTER
     cudaError_t e = scratch_ensure(LM_X, hidden_size);
     if (e == cudaSuccess) e = scratch_ensure(LM_LOGITS, vocab);
     if (e == cudaSuccess)
@@ -1197,6 +1205,7 @@ extern "C" int dlm_apply_experts(int hidden_size, int inter, int n_experts,
                                  const DlmPtrs* gate, const DlmPtrs* up, const DlmPtrs* down,
                                  const DlmWeights* weights, float* x, int activation)
 {
+    DLM_ENTER
     const int B = 256;
     if (n_experts <= 0) return 0;
     if (n_experts > DLM_MAX_TOPK) return (int)cudaErrorInvalidValue;
@@ -1225,6 +1234,7 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
                                 const void* gate, const void* up, const void* down,
                                 float weight, float* x, int activation)
 {
+    DLM_ENTER
     const int B = 256;
     cudaError_t e = cudaSuccess;
     #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
@@ -1253,6 +1263,7 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
 extern "C" int dlm_dense_ffn(int hidden_size, int inter, float rms_eps, int w_dtype, int w_group_size,
                              const void* gate_proj, const void* up_proj, const void* down_proj,
                              const float* post_norm, int activation, float* x) {
+    DLM_ENTER
     const int B = 256;
     cudaError_t e = cudaSuccess;
     #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
@@ -1429,6 +1440,7 @@ extern "C" int dlm_mla_attn(
     const void* o_proj,       // [hidden, num_heads*v_head_dim]
     const float* in_norm, const float* inv_freq, float rope_mscale,
     float* x, float* kv_keys, int num_positions, int position) {
+    DLM_ENTER
     const int B = 256;
     int qk = qk_nope + qk_rope;
     int nhqk = num_heads * qk;
