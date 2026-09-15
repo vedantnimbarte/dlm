@@ -1026,7 +1026,7 @@ fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> Vra
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
-        args.kv_quant != KvQuantArg::None,
+        args.kv_quant != KvQuantArg::F32,
     );
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
@@ -1217,7 +1217,7 @@ fn serve_on_gpu(
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
-        args.kv_quant != KvQuantArg::None,
+        args.kv_quant != KvQuantArg::F32,
     );
     let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
     ensure_batch_kv_fits(
@@ -1481,18 +1481,17 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             args.prefix_cache_size
         );
     }
-    if kv_quant != dlm::forward::KvQuant::None {
-        let on_gpu = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();
-        let note = match kv_quant {
-            // The GPU kernels have one approximate KV format, fp16; the CPU
-            // kernels have int8/int4 but no fp16.
-            _ if on_gpu => "fp16 on the GPU (half the KV memory)",
-            dlm::forward::KvQuant::Int8 => "int8 (≈half memory, approximate)",
-            dlm::forward::KvQuant::Int4 => "int4 (≈quarter memory, approximate)",
-            _ => "f32: the CPU kernels have no fp16 store",
-        };
-        println!("  kv cache   : {note}");
-    }
+    let on_gpu = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();
+    // The GPU kernels have one approximate KV format, fp16; the CPU kernels have
+    // int8/int4 but no fp16.
+    let kv_note = match kv_quant {
+        dlm::forward::KvQuant::None => "f32 (exact)",
+        _ if on_gpu => "fp16 on the GPU (half the memory of f32; --kv-quant f32 for exact)",
+        dlm::forward::KvQuant::Int8 => "int8 (≈half memory, approximate)",
+        dlm::forward::KvQuant::Int4 => "int4 (≈quarter memory, approximate)",
+        dlm::forward::KvQuant::F16 => "f32 (the CPU kernels have no fp16 store)",
+    };
+    println!("  kv cache   : {kv_note}");
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
     }

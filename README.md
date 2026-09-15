@@ -788,12 +788,12 @@ inference engine):
 
   Two orthogonal memory knobs apply to any kernel:
   - `--quant {int4,int8}` — see [weight precision](#weight-precision---quant) below.
-  - `--kv-quant {none,f16,int8,int4}` shrinks the KV cache, trading precision
+  - `--kv-quant {f16,f32,int8,int4}` shrinks the KV cache, trading precision
     for a longer context or a bigger batch in the same memory. It is independent
     of `--quant`: one sizes the weights, the other the KV history.
-    - `none` (the default) is exact `f32`.
-    - **On the GPU**, every other value stores the cache as fp16, half the KV
-      VRAM. On Qwen2.5-0.5B and Gemma 3 1B, greedy output was identical to
+    - `f16` is the default. `f32` is exact (`none` is accepted as an alias).
+    - **On the GPU**, everything except `f32` stores the cache as fp16, half the
+      KV VRAM. On Qwen2.5-0.5B and Gemma 3 1B, greedy output was identical to
       `f32` for 96 of 96 tokens, and decode speed is unchanged. The GPU kernels
       have no int8/int4 format yet, so `int8` and `int4` also give fp16 there.
       MLA models keep `f32`.

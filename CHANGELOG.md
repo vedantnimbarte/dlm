@@ -105,8 +105,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     GiB VRAM in use, with decode speed unchanged.
   - **Output:** greedy output matched f32 KV for 96 of 96 tokens on
     Qwen2.5-0.5B and on Gemma 3 1B.
-  - **Unchanged:** the default is still exact f32, MLA stays f32, and the CPU
-    kernels keep their f32/int8/int4 stores.
+  - **Default:** `f16`. Pass `--kv-quant f32` for the exact cache (`none` still
+    works as an alias). MLA stays f32, and the CPU kernels keep their
+    f32/int8/int4 stores.
 - **`dlm bench`**, a speed harness.
   - **Loading:** it builds the model through `serve`'s own loading path, so
     every `serve` flag that shapes the model applies.
