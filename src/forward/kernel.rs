@@ -107,6 +107,18 @@ pub trait ComputeKernel {
         prefill_token_by_token(self, hiddens, kv_layers, start)
     }
 
+    /// Tokens of KV the kernel's shared pools can still take at the given
+    /// precision, if it pages KV from a fixed pool (the GPU kernels). `None`
+    /// means no fixed limit: the CPU kernels keep KV in growable host memory.
+    fn kv_free_tokens(&self, _fp16: bool) -> Option<usize> {
+        None
+    }
+
+    /// Size the kernel's shared KV pools to `tokens` tokens (per layer), for
+    /// kernels that page KV. Takes effect for pools not yet allocated, so call it
+    /// before the first session. A no-op elsewhere.
+    fn set_kv_pool_tokens(&mut self, _tokens: usize) {}
+
     /// Layer-streaming cache stats, if this kernel streams weights. Resident
     /// kernels (everything held in memory) return `None`; the streaming kernel
     /// overrides it so the server can surface hit rate / prefetch effectiveness.
@@ -161,6 +173,10 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         positions: &[usize],
     ) -> Result<()> {
         (**self).decode_batch(hiddens, kv_layers, positions)
+    }
+
+    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+        (**self).kv_free_tokens(fp16)
     }
 
     fn prefill(

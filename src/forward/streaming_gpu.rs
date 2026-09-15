@@ -43,8 +43,8 @@ use std::thread::JoinHandle;
 use crate::forward::gpu::{
     bias_ptr, dlm_apply_expert, dlm_apply_experts, dlm_decode_block, dlm_decode_block_batched,
     dlm_dense_ffn, dlm_mla_attn, dlm_moe_attn, dlm_moe_matvec, dlm_moe_norm, upload_bias,
-    upload_weight, DlmBlockExt, DlmInts, DlmPtrs, DlmSlots, DlmWeights, GpuBlockBiases, GpuMla,
-    DLM_MAX_BATCH, DLM_MAX_TOPK,
+    upload_weight, DlmBlockExt, DlmPtrs, DlmWeights, GpuBlockBiases, GpuMla, SlotKv, DLM_MAX_BATCH,
+    DLM_MAX_TOPK,
 };
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -721,6 +721,8 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     shared: Arc<GpuShared<S>>,
     num_layers: u32,
     kv_capacity_tokens: usize,
+    /// Paged KV blocks shared by every session, one pool per layer.
+    kv_pools: crate::forward::kv_pool::KvPools,
     /// RoPE inverse frequencies (see [`GpuKernel`](crate::forward::GpuKernel)):
     /// computed once by the shared host function, resident for the kernel's life.
     inv_freq: DeviceBuffer,
@@ -740,6 +742,13 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
 }
 
 impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
+    /// Size the shared KV pools to hold `tokens` tokens across all sessions (per
+    /// layer). Call before the first session runs: the pools are allocated then.
+    pub fn with_kv_pool_tokens(mut self, tokens: usize) -> Self {
+        self.set_kv_pool_tokens(tokens);
+        self
+    }
+
     /// The RoPE inverse frequencies `layer` rotates with.
     fn inv_freq_for(&self, layer: u32) -> *const f32 {
         match &self.local_inv_freq {
@@ -846,6 +855,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         Ok(Self {
+            // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
+            kv_pools: crate::forward::kv_pool::KvPools::new(num_layers as usize, cfg.kv_dim(), cap),
             shared,
             num_layers,
             kv_capacity_tokens: cap,
@@ -880,9 +891,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         &self,
         layer: u32,
         w: &GpuWeights,
-        kv_keys: *mut f32,
-        kv_values: *mut f32,
-        kv_half: bool,
+        dkv: &crate::forward::cpu::DeviceKv,
         d_hidden: &DeviceBuffer,
         num_positions: usize,
         position: usize,
@@ -915,8 +924,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 bias_ptr(&w.k_norm),
                 self.inv_freq_for(layer),
                 d_hidden.as_mut_ptr(),
-                kv_keys,
-                kv_values,
+                dkv.keys,
+                dkv.values,
                 num_positions as i32,
                 position as i32,
                 // Per-layer window: Gemma2's global layers must not be clipped.
@@ -924,7 +933,9 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 crate::forward::cpu::rope_mscale(cfg.rope_scaling),
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
-                kv_half as i32,
+                dkv.half as i32,
+                dkv.table,
+                crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
             )
         };
         if code != 0 {
@@ -959,8 +970,14 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         // Per-session K/V (owned by this sequence's KvLayerCache), so batched
         // requests sharing this kernel keep independent history.
         // MLA reconstructs K and V from one cached latent — no value cache.
-        let (kv_keys, kv_values) =
-            kv.gpu_kv(self.kv_capacity_tokens, self.shared.cfg.mla.is_none())?;
+        let dkv = kv.device_kv(
+            &self.kv_pools,
+            layer as usize,
+            num_positions + 1,
+            self.kv_capacity_tokens,
+            self.shared.cfg.mla.is_none(),
+        )?;
+        let (kv_keys, kv_values) = (dkv.keys, dkv.values);
 
         // MLA (DeepSeek) runs attention as its own device call, then the FFN half —
         // dense or routed — exactly as the standard-attention paths do. This is the
@@ -1099,7 +1116,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             cfg.attn_logit_softcap.unwrap_or(0.0),
                             bias_ptr(&w.pre_ffn_norm),
                             bias_ptr(&w.post_ffn_norm),
-                            &DlmBlockExt::new(cfg, &w.biases, kv.device_half()),
+                            &DlmBlockExt::new(cfg, &w.biases, dkv.half, dkv.table),
                         )
                     };
                     if code != 0 {
@@ -1110,16 +1127,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                     }
                 }
                 GpuFfn::Moe { .. } => {
-                    self.run_moe_block(
-                        layer,
-                        w,
-                        kv_keys,
-                        kv_values,
-                        kv.device_half(),
-                        d_hidden,
-                        num_positions,
-                        position,
-                    )?;
+                    self.run_moe_block(layer, w, &dkv, d_hidden, num_positions, position)?;
                 }
             }
         }
@@ -1311,6 +1319,18 @@ impl<S: LayerSource + 'static> Drop for StreamingGpuKernel<S> {
 }
 
 impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
+    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+        Some(self.kv_pools.free_tokens(fp16))
+    }
+
+    fn set_kv_pool_tokens(&mut self, tokens: usize) {
+        self.kv_pools = crate::forward::kv_pool::KvPools::new(
+            self.num_layers as usize,
+            self.shared.cfg.kv_dim(),
+            tokens,
+        );
+    }
+
     fn num_layers(&self) -> u32 {
         self.num_layers
     }
@@ -1381,19 +1401,17 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
             for (c, chunk) in hiddens.chunks_mut(hidden_size * DLM_MAX_BATCH).enumerate() {
                 let batch = chunk.len() / hidden_size;
                 let history = kv.len();
-                let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
-                let slot_keys = DlmSlots {
-                    p: [keys; DLM_MAX_BATCH],
-                };
-                let slot_values = DlmSlots {
-                    p: [values; DLM_MAX_BATCH],
-                };
-                let num_positions = DlmInts {
-                    v: std::array::from_fn(|b| (history + b) as i32),
-                };
-                let positions = DlmInts {
-                    v: std::array::from_fn(|b| (start + c * DLM_MAX_BATCH + b) as i32),
-                };
+                let dkv = kv.device_kv(
+                    &self.kv_pools,
+                    layer as usize,
+                    history + batch,
+                    self.kv_capacity_tokens,
+                    true,
+                )?;
+                let mut slots = SlotKv::new();
+                for b in 0..batch {
+                    slots.push(&dkv, history + b, start + c * DLM_MAX_BATCH + b);
+                }
                 let d_chunk = DeviceBuffer::from_slice(chunk)?;
                 // SAFETY: live device buffers of the sizes the kernel expects; the
                 // KV has room for `history + batch` rows (checked above).
@@ -1425,10 +1443,11 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         bias_ptr(&w.k_norm),
                         self.inv_freq_for(layer),
                         d_chunk.as_mut_ptr(),
-                        &slot_keys,
-                        &slot_values,
-                        &num_positions,
-                        &positions,
+                        &slots.keys,
+                        &slots.values,
+                        &slots.tables,
+                        &slots.num_positions,
+                        &slots.positions,
                         batch as i32,
                         lcfg.sliding_window.unwrap_or(0) as i32,
                         lcfg.activation.code(),
@@ -1437,7 +1456,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                         lcfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&lcfg, &w.biases, kv.device_half()),
+                        &DlmBlockExt::new(&lcfg, &w.biases, slots.half, std::ptr::null()),
                     )
                 };
                 if code != 0 {

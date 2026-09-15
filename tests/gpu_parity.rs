@@ -2037,7 +2037,10 @@ fn assert_decode_batch_matches_solo<K: ComputeKernel>(
 #[test]
 fn gpu_decode_batch_matches_solo() {
     let cfg = small_cfg();
-    let gpu = GpuKernel::new(cfg, random_layers(&cfg, 3, 0xDECB), 64).unwrap();
+    // 20 sequences of up to 8 tokens: a pool of 64-token sessions would not do.
+    let gpu = GpuKernel::new(cfg, random_layers(&cfg, 3, 0xDECB), 64)
+        .unwrap()
+        .with_kv_pool_tokens(20 * 64);
     for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
         for n in [2, 3, 16, 20] {
             assert_decode_batch_matches_solo(&gpu, cfg, n, quant, &format!("resident {quant:?}"));
@@ -2057,7 +2060,8 @@ fn gpu_decode_batch_matches_solo() {
                 2,
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .with_kv_pool_tokens(5 * 64);
             assert_decode_batch_matches_solo(
                 &streaming,
                 cfg,
@@ -2086,8 +2090,10 @@ fn gpu_decode_batch_matches_solo() {
 fn gpu_run_block_batched_fallback_keeps_sequences_apart() {
     let cfg = small_cfg();
     let num_layers = 2u32;
-    let gpu = GpuKernel::new(cfg, random_layers(&cfg, num_layers, 0xFA11), 64).unwrap();
     let n = 17; // past DLM_MAX_BATCH
+    let gpu = GpuKernel::new(cfg, random_layers(&cfg, num_layers, 0xFA11), 64)
+        .unwrap()
+        .with_kv_pool_tokens(2 * n * 16);
     let start = |b: usize| -> Vec<f32> {
         (0..cfg.hidden_size)
             .map(|i| ((i + 7 * b) % 23) as f32 * 0.03 - 0.3)
@@ -2127,4 +2133,158 @@ fn gpu_run_block_batched_fallback_keeps_sequences_apart() {
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-4, "slot {b}: diverged by {max_diff}");
     }
+}
+
+/// Paged KV: a session reading its history through a scrambled block table
+/// (blocks freed by other sessions, handed out in a different order) decodes
+/// exactly like the same session on a fresh pool, and ending sessions returns
+/// their blocks.
+#[test]
+fn gpu_paged_kv_reuses_freed_blocks_out_of_order() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 2, 0xB10C);
+    let kv_cfg = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let quant = dlm::forward::KvQuant::F16;
+    let decode = |kernel: &GpuKernel, steps: usize| -> Vec<f32> {
+        let mut orch = ForwardOrchestrator::new(kernel, PagedKvCache::new(kv_cfg, 16), quant);
+        let mut h: Vec<f32> = (0..cfg.hidden_size)
+            .map(|i| (i % 11) as f32 * 0.04 - 0.2)
+            .collect();
+        for _ in 0..steps {
+            orch.decode_token(&mut h).unwrap();
+        }
+        h
+    };
+    // 40 tokens: three blocks, so the table has to be followed across blocks.
+    let fresh = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    let want = decode(&fresh, 40);
+
+    let gpu = GpuKernel::new(cfg, layers, 64)
+        .unwrap()
+        .with_kv_pool_tokens(8 * 16);
+    let total = gpu.kv_free_tokens(true).unwrap();
+    assert_eq!(total, 8 * 16);
+    {
+        // Fill blocks in three sessions, then free the middle one's first, so the
+        // next session's table starts on reused blocks and continues on others.
+        let mut orchs: Vec<_> = (0..3)
+            .map(|_| ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant))
+            .collect();
+        let mut h = vec![0.1f32; cfg.hidden_size];
+        for orch in orchs.iter_mut() {
+            for _ in 0..17 {
+                orch.decode_token(&mut h).unwrap();
+            }
+        }
+        assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 3 * 2 * 16);
+        orchs.remove(1);
+        assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 2 * 2 * 16);
+        let got = decode(&gpu, 40);
+        let max_diff = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "scrambled block table diverged by {max_diff}"
+        );
+    }
+    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total, "blocks came back");
+
+    // An exhausted pool refuses the next block, and frees it again once a
+    // session ends.
+    let mut hog = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+    let mut h = vec![0.1f32; cfg.hidden_size];
+    for _ in 0..64 {
+        hog.decode_token(&mut h).unwrap();
+    }
+    let mut late = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+    for _ in 0..64 {
+        late.decode_token(&mut h).unwrap();
+    }
+    let mut third = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+    assert!(matches!(
+        third.decode_token(&mut h),
+        Err(dlm::DlmError::KvCacheExhausted { .. })
+    ));
+    drop(hog);
+    let mut again = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+    again.decode_token(&mut h).unwrap();
+}
+
+/// The scheduler admits a request only when the GPU's KV pool can hold all it
+/// may generate alongside the requests already running. Here the pool holds two
+/// requests' reservations, so four submitted at once run two at a time and
+/// never exhaust it, and each produces what it produces alone.
+#[test]
+fn gpu_scheduler_admits_within_the_kv_pool() {
+    use dlm::batching::BatchScheduler;
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    let cfg = small_cfg();
+    let vocab = 24;
+    let mut rng = Rng::new(0xAD417);
+    let generator = |pool: usize| {
+        let mut rng = Rng::new(0xAD417);
+        Generator::new(
+            GpuKernel::new(cfg, random_layers(&cfg, 2, 0xAD41), 128).unwrap(),
+            rng.vec(vocab * cfg.hidden_size, 0.5),
+            vec![1.0; cfg.hidden_size],
+            rng.vec(vocab * cfg.hidden_size, 0.5),
+            vocab,
+            1e-5,
+            KvCacheConfig {
+                num_layers: 2,
+                num_kv_heads: cfg.num_kv_heads as u32,
+                head_dim: cfg.head_dim as u32,
+                block_size: 16,
+            },
+            8,
+        )
+        .unwrap()
+        .with_kv_quant(dlm::forward::KvQuant::F16)
+        .with_kv_pool_tokens(pool)
+    };
+    let prompts: Vec<Vec<u32>> = (0..4)
+        .map(|_| {
+            (0..5)
+                .map(|_| (rng.next_u64() % vocab as u64) as u32)
+                .collect()
+        })
+        .collect();
+    let max_new = 20; // 5 + 20 = 25 tokens: a 32-token reservation each
+
+    let solo = generator(128);
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: max_new,
+        eos_token: None,
+        sampler: Sampler::Greedy,
+    };
+    let want: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| solo.generate(p, &gen_cfg).unwrap())
+        .collect();
+
+    let shared = generator(64);
+    let mut sched = BatchScheduler::new(&shared, 8);
+    for (id, p) in prompts.iter().enumerate() {
+        sched.submit(id as u64, p.clone(), max_new, vec![]).unwrap();
+    }
+    let mut got = vec![Vec::new(); prompts.len()];
+    let mut peak = 0;
+    while sched.has_work() {
+        let tick = sched.step().unwrap();
+        peak = peak.max(sched.active_len());
+        for (id, token) in tick.produced {
+            got[id as usize].push(token);
+        }
+    }
+    assert_eq!(peak, 2, "two 32-token reservations fill a 64-token pool");
+    assert_eq!(got, want);
+    assert_eq!(shared.kv_free_tokens(), Some(64), "every block came back");
 }

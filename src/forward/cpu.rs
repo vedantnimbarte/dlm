@@ -966,6 +966,17 @@ impl LayerTensors {
     }
 }
 
+/// What a GPU kernel needs to address one session-layer's K/V: the key and value
+/// buffers, the block table (null for MLA's contiguous latent cache), and whether
+/// elements are fp16.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) struct DeviceKv {
+    pub keys: *mut f32,
+    pub values: *mut f32,
+    pub table: *const i32,
+    pub half: bool,
+}
+
 /// Device-resident K/V history for one layer on the GPU path, owned by the
 /// session's [`KvLayerCache`] (not the kernel) so batched sessions never share
 /// KV. Allocated lazily on first GPU use.
@@ -998,6 +1009,9 @@ pub struct KvLayerCache {
     /// this session+layer allocates it.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     gpu: Option<GpuKvHandle>,
+    /// Paged device K/V for standard attention (MLA keeps `gpu`).
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    paged: Option<crate::forward::kv_pool::PagedKv>,
 }
 
 impl Clone for KvLayerCache {
@@ -1011,6 +1025,8 @@ impl Clone for KvLayerCache {
             // prefix cache) starts with none and re-allocates on next GPU use.
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            paged: None,
         }
     }
 }
@@ -1139,6 +1155,8 @@ impl KvLayerCache {
             device_half: quant != KvQuant::None,
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            paged: None,
         }
     }
 
@@ -1232,7 +1250,71 @@ impl KvLayerCache {
     /// Meaningful once [`gpu_kv`](Self::gpu_kv) has allocated it.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn device_half(&self) -> bool {
-        self.gpu.as_ref().is_some_and(|h| h.half)
+        match &self.paged {
+            Some(p) => p.pool().half(),
+            None => self.gpu.as_ref().is_some_and(|h| h.half),
+        }
+    }
+
+    /// The device K/V a kernel reads and writes for this session-layer, with
+    /// rows `0..rows` backed.
+    ///
+    /// Standard attention is paged: blocks from `pools` (layer `layer`) plus a
+    /// block table, with room for up to `capacity_rows` rows. MLA (`standard ==
+    /// false`) keeps one contiguous latent buffer of `capacity_rows` rows and no
+    /// table. A cache that already holds host rows is a resumed prefix, and its
+    /// rows are uploaded first.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn device_kv(
+        &mut self,
+        pools: &crate::forward::kv_pool::KvPools,
+        layer: usize,
+        rows: usize,
+        capacity_rows: usize,
+        standard: bool,
+    ) -> Result<DeviceKv> {
+        if !standard {
+            let (keys, values) = self.gpu_kv(capacity_rows, false)?;
+            return Ok(DeviceKv {
+                keys,
+                values,
+                table: std::ptr::null(),
+                half: false,
+            });
+        }
+        if self.paged.is_none() {
+            if self.device_tokens > 0 {
+                return Err(DlmError::InvalidConfig(
+                    "KV snapshot holds device-only history; take it with snapshot_synced".into(),
+                ));
+            }
+            let pool = pools.get(layer, self.device_half)?;
+            let mut paged = crate::forward::kv_pool::PagedKv::new(pool, capacity_rows)?;
+            let n = self.host_len();
+            if n > 0 {
+                let d = self.kv_dim;
+                let mut keys = vec![0.0f32; n * d];
+                let mut values = vec![0.0f32; n * d];
+                for (i, (k, v)) in keys
+                    .chunks_exact_mut(d)
+                    .zip(values.chunks_exact_mut(d))
+                    .enumerate()
+                {
+                    self.row_f32(i, k, v);
+                }
+                paged.ensure_rows(n)?;
+                paged.upload_rows(&keys, &values)?;
+            }
+            self.paged = Some(paged);
+        }
+        let p = self.paged.as_mut().expect("set above");
+        p.ensure_rows(rows)?;
+        Ok(DeviceKv {
+            keys: p.pool().keys_ptr(),
+            values: p.pool().values_ptr(),
+            table: p.table_ptr(),
+            half: p.pool().half(),
+        })
     }
 
     /// Empty (exact `f32`) history for a layer whose K/V width is `kv_dim`.
@@ -1469,10 +1551,21 @@ impl KvLayerCache {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn sync_from_device(&mut self) -> Result<()> {
         let n = self.len();
-        let Some(h) = &self.gpu else { return Ok(()) };
         if n == 0 {
             return Ok(());
         }
+        if let Some(p) = &self.paged {
+            let d = self.kv_dim;
+            let mut keys = vec![0.0f32; n * d];
+            let mut values = vec![0.0f32; n * d];
+            p.download_rows(&mut keys, &mut values)?;
+            self.truncate(0);
+            for i in 0..n {
+                self.append(&keys[i * d..(i + 1) * d], &values[i * d..(i + 1) * d])?;
+            }
+            return Ok(());
+        }
+        let Some(h) = &self.gpu else { return Ok(()) };
         let d = self.kv_dim;
         let get = |buf: &crate::gpu::device::DeviceBuffer, out: &mut [f32]| {
             if h.half {

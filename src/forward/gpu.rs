@@ -122,6 +122,9 @@ extern "C" {
         attn_softcap: f32,
         // 1: the KV buffers hold fp16.
         kv_half: i32,
+        // The sequence's KV block table, and log2 of rows per block.
+        kv_table: *const i32,
+        kv_block_shift: i32,
     ) -> i32;
 
     /// Post-attention norm for a MoE layer whose attention ran in a separate call
@@ -242,6 +245,7 @@ extern "C" {
         x: *mut f32,
         kv_keys: *const DlmSlots,
         kv_values: *const DlmSlots,
+        kv_tables: *const DlmTables,
         num_positions: *const DlmInts,
         positions: *const DlmInts,
         batch: i32,
@@ -324,6 +328,61 @@ pub(crate) struct DlmSlots {
     pub(crate) p: [*mut f32; DLM_MAX_BATCH],
 }
 
+/// Per-slot KV block tables. Matches `DlmTables` in `src/gpu/kernels.cu`.
+#[repr(C)]
+pub(crate) struct DlmTables {
+    pub(crate) p: [*const i32; DLM_MAX_BATCH],
+}
+
+/// Everything a `dlm_decode_block_batched` call needs to address each slot's KV:
+/// buffers, block table, history length and RoPE position.
+pub(crate) struct SlotKv {
+    pub(crate) keys: DlmSlots,
+    pub(crate) values: DlmSlots,
+    pub(crate) tables: DlmTables,
+    pub(crate) num_positions: DlmInts,
+    pub(crate) positions: DlmInts,
+    pub(crate) half: bool,
+    len: usize,
+}
+
+impl SlotKv {
+    pub(crate) fn new() -> Self {
+        Self {
+            keys: DlmSlots {
+                p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+            },
+            values: DlmSlots {
+                p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+            },
+            tables: DlmTables {
+                p: [std::ptr::null(); DLM_MAX_BATCH],
+            },
+            num_positions: DlmInts {
+                v: [0; DLM_MAX_BATCH],
+            },
+            positions: DlmInts {
+                v: [0; DLM_MAX_BATCH],
+            },
+            half: false,
+            len: 0,
+        }
+    }
+
+    /// Add a slot writing its K/V at logical row `row` (its history length) and
+    /// rotating at `position`.
+    pub(crate) fn push(&mut self, kv: &crate::forward::cpu::DeviceKv, row: usize, position: usize) {
+        let b = self.len;
+        self.keys.p[b] = kv.keys;
+        self.values.p[b] = kv.values;
+        self.tables.p[b] = kv.table;
+        self.num_positions.v[b] = row as i32;
+        self.positions.v[b] = position as i32;
+        self.half = kv.half;
+        self.len += 1;
+    }
+}
+
 /// Block shape beyond the Llama default. Matches `DlmBlockExt` in
 /// `src/gpu/kernels.cu`, field for field.
 #[repr(C)]
@@ -339,13 +398,22 @@ pub(crate) struct DlmBlockExt {
     down_bias: *const f32,
     /// 1: the KV buffers hold fp16 (see [`KvLayerCache::device_half`]).
     kv_half: i32,
+    /// The sequence's KV block table (single-sequence calls; batched calls pass
+    /// one per slot).
+    kv_table: *const i32,
+    kv_block_shift: i32,
 }
 
 impl DlmBlockExt {
     /// The device block options for `cfg`, pointing at the layer's biases. Every
     /// field falls out of the config or a bias's presence, so a Llama-shaped
     /// layer yields exactly the kernel's default.
-    pub(crate) fn new(cfg: &BlockConfig, b: &GpuBlockBiases, kv_half: bool) -> Self {
+    pub(crate) fn new(
+        cfg: &BlockConfig,
+        b: &GpuBlockBiases,
+        kv_half: bool,
+        kv_table: *const i32,
+    ) -> Self {
         use crate::forward::cpu::{FfnKind, NormKind};
         Self {
             layer_norm: (cfg.norm_kind == NormKind::Layer) as i32,
@@ -358,6 +426,8 @@ impl DlmBlockExt {
             up_bias: bias_ptr(&b.up),
             down_bias: bias_ptr(&b.down),
             kv_half: kv_half as i32,
+            kv_table,
+            kv_block_shift: crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
         }
     }
 }
@@ -601,8 +671,10 @@ pub struct GpuKernel {
     inv_freq: DeviceBuffer,
     /// Gemma3's local-layer frequencies; `None` when every layer shares `inv_freq`.
     local_inv_freq: Option<DeviceBuffer>,
-    /// Max tokens the per-layer KV buffers can hold.
+    /// Max tokens one session's KV can hold.
     kv_capacity_tokens: usize,
+    /// Paged KV blocks shared by every session, one pool per layer.
+    kv_pools: crate::forward::kv_pool::KvPools,
     /// Persistent device buffer for the hidden vector, reused across every layer
     /// and token. `run_block` uploads the host hidden into it and downloads the
     /// result back — reusing one allocation instead of cudaMalloc/cudaFree per
@@ -670,8 +742,11 @@ impl GpuKernel {
         };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
+        // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
+        let kv_pools = crate::forward::kv_pool::KvPools::new(gpu_layers.len(), cfg.kv_dim(), cap);
         Ok(Self {
             cfg,
+            kv_pools,
             layers: gpu_layers,
             inv_freq,
             local_inv_freq,
@@ -684,6 +759,13 @@ impl GpuKernel {
 }
 
 impl GpuKernel {
+    /// Size the shared KV pools to hold `tokens` tokens across all sessions (per
+    /// layer). Call before the first session runs: the pools are allocated then.
+    pub fn with_kv_pool_tokens(mut self, tokens: usize) -> Self {
+        self.set_kv_pool_tokens(tokens);
+        self
+    }
+
     /// The RoPE inverse frequencies `layer` rotates with.
     fn inv_freq_for(&self, layer: u32) -> *const f32 {
         match &self.local_inv_freq {
@@ -696,17 +778,7 @@ impl GpuKernel {
     /// at `x`, for dense standard-attention layer `layer`. The caller owns the
     /// slot tables and the host KV length bookkeeping.
     #[allow(clippy::too_many_arguments)]
-    fn launch_block_batched(
-        &self,
-        layer: u32,
-        x: *mut f32,
-        slot_keys: &DlmSlots,
-        slot_values: &DlmSlots,
-        num_positions: &DlmInts,
-        slot_positions: &DlmInts,
-        batch: usize,
-        kv_half: bool,
-    ) -> Result<()> {
+    fn launch_block_batched(&self, layer: u32, x: *mut f32, slots: &SlotKv) -> Result<()> {
         let w = &self.layers[layer as usize];
         let cfg = self.cfg.for_layer(layer);
         let hidden_size = cfg.hidden_size;
@@ -741,11 +813,12 @@ impl GpuKernel {
                 bias_ptr(&w.k_norm),
                 self.inv_freq_for(layer),
                 x,
-                slot_keys,
-                slot_values,
-                num_positions,
-                slot_positions,
-                batch as i32,
+                &slots.keys,
+                &slots.values,
+                &slots.tables,
+                &slots.num_positions,
+                &slots.positions,
+                slots.len as i32,
                 cfg.sliding_window.unwrap_or(0) as i32,
                 cfg.activation.code(),
                 crate::forward::cpu::rope_mscale(cfg.rope_scaling),
@@ -753,7 +826,7 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&cfg, &w.biases, kv_half),
+                &DlmBlockExt::new(&cfg, &w.biases, slots.half, std::ptr::null()),
             )
         };
         if code != 0 {
@@ -767,6 +840,15 @@ impl GpuKernel {
 }
 
 impl ComputeKernel for GpuKernel {
+    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+        Some(self.kv_pools.free_tokens(fp16))
+    }
+
+    fn set_kv_pool_tokens(&mut self, tokens: usize) {
+        self.kv_pools =
+            crate::forward::kv_pool::KvPools::new(self.layers.len(), self.cfg.kv_dim(), tokens);
+    }
+
     fn num_layers(&self) -> u32 {
         self.layers.len() as u32
     }
@@ -808,19 +890,6 @@ impl ComputeKernel for GpuKernel {
         }
         let hidden_size = self.cfg.hidden_size;
 
-        let mut slot_keys = DlmSlots {
-            p: [std::ptr::null_mut(); DLM_MAX_BATCH],
-        };
-        let mut slot_values = DlmSlots {
-            p: [std::ptr::null_mut(); DLM_MAX_BATCH],
-        };
-        let mut num_positions = DlmInts {
-            v: [0; DLM_MAX_BATCH],
-        };
-        let mut slot_positions = DlmInts {
-            v: [0; DLM_MAX_BATCH],
-        };
-
         // Stage every slot's hidden into one contiguous [batch, hidden] block.
         let mut staged = vec![0.0f32; batch * hidden_size];
         for (b, hidden) in hiddens.iter().enumerate() {
@@ -832,32 +901,21 @@ impl ComputeKernel for GpuKernel {
             }
             staged[b * hidden_size..(b + 1) * hidden_size].copy_from_slice(hidden);
         }
+        let mut slots = SlotKv::new();
         for (b, kv) in kvs.iter_mut().enumerate() {
             let n = kv.len();
-            if n >= self.kv_capacity_tokens {
-                return Err(DlmError::InvalidConfig(format!(
-                    "GPU KV capacity {} exceeded at position {}",
-                    self.kv_capacity_tokens, positions[b]
-                )));
-            }
-            let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
-            slot_keys.p[b] = keys;
-            slot_values.p[b] = values;
-            num_positions.v[b] = n as i32;
-            slot_positions.v[b] = positions[b] as i32;
+            let dkv = kv.device_kv(
+                &self.kv_pools,
+                layer as usize,
+                n + 1,
+                self.kv_capacity_tokens,
+                true,
+            )?;
+            slots.push(&dkv, n, positions[b]);
         }
 
         let d_batch = DeviceBuffer::from_slice(&staged)?;
-        self.launch_block_batched(
-            layer,
-            d_batch.as_mut_ptr(),
-            &slot_keys,
-            &slot_values,
-            &num_positions,
-            &slot_positions,
-            batch,
-            kvs.first().is_some_and(|kv| kv.device_half()),
-        )?;
+        self.launch_block_batched(layer, d_batch.as_mut_ptr(), &slots)?;
         d_batch.download(&mut staged)?;
         for (b, hidden) in hiddens.iter_mut().enumerate() {
             hidden.copy_from_slice(&staged[b * hidden_size..(b + 1) * hidden_size]);
@@ -902,32 +960,21 @@ impl ComputeKernel for GpuKernel {
                         start + chunk + batch - 1
                     )));
                 }
-                let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
-                let slot_keys = DlmSlots {
-                    p: [keys; DLM_MAX_BATCH],
-                };
-                let slot_values = DlmSlots {
-                    p: [values; DLM_MAX_BATCH],
-                };
-                let num_positions = DlmInts {
-                    v: std::array::from_fn(|b| (history + b) as i32),
-                };
-                let slot_positions = DlmInts {
-                    v: std::array::from_fn(|b| (start + chunk + b) as i32),
-                };
+                let dkv = kv.device_kv(
+                    &self.kv_pools,
+                    layer as usize,
+                    history + batch,
+                    self.kv_capacity_tokens,
+                    true,
+                )?;
+                let mut slots = SlotKv::new();
+                for b in 0..batch {
+                    slots.push(&dkv, history + b, start + chunk + b);
+                }
                 // SAFETY: `chunk + batch <= n`, so the offset block lies inside
                 // the `n × hidden` device buffer.
                 let x = unsafe { d_hiddens.as_mut_ptr().add(chunk * hidden_size) };
-                self.launch_block_batched(
-                    layer,
-                    x,
-                    &slot_keys,
-                    &slot_values,
-                    &num_positions,
-                    &slot_positions,
-                    batch,
-                    kv.device_half(),
-                )?;
+                self.launch_block_batched(layer, x, &slots)?;
                 kv.advance(batch);
             }
         }
@@ -965,46 +1012,20 @@ impl ComputeKernel for GpuKernel {
             // Upload once; every layer reads and writes the device block in place.
             self.d_batch.upload(&staged[..batch * h])?;
             for layer in 0..self.num_layers() {
-                let mut slot_keys = DlmSlots {
-                    p: [std::ptr::null_mut(); DLM_MAX_BATCH],
-                };
-                let mut slot_values = DlmSlots {
-                    p: [std::ptr::null_mut(); DLM_MAX_BATCH],
-                };
-                let mut num_positions = DlmInts {
-                    v: [0; DLM_MAX_BATCH],
-                };
-                let mut slot_positions = DlmInts {
-                    v: [0; DLM_MAX_BATCH],
-                };
+                let mut slots = SlotKv::new();
                 for (b, seq) in kvs.iter_mut().enumerate() {
                     let kv = &mut seq[layer as usize];
                     let n = kv.len();
-                    if n >= self.kv_capacity_tokens {
-                        return Err(DlmError::InvalidConfig(format!(
-                            "GPU KV capacity {} exceeded at position {}",
-                            self.kv_capacity_tokens, pos[b]
-                        )));
-                    }
-                    let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
-                    slot_keys.p[b] = keys;
-                    slot_values.p[b] = values;
-                    num_positions.v[b] = n as i32;
-                    slot_positions.v[b] = pos[b] as i32;
+                    let dkv = kv.device_kv(
+                        &self.kv_pools,
+                        layer as usize,
+                        n + 1,
+                        self.kv_capacity_tokens,
+                        true,
+                    )?;
+                    slots.push(&dkv, n, pos[b]);
                 }
-                let kv_half = kvs
-                    .first()
-                    .is_some_and(|seq| seq[layer as usize].device_half());
-                self.launch_block_batched(
-                    layer,
-                    self.d_batch.as_mut_ptr(),
-                    &slot_keys,
-                    &slot_values,
-                    &num_positions,
-                    &slot_positions,
-                    batch,
-                    kv_half,
-                )?;
+                self.launch_block_batched(layer, self.d_batch.as_mut_ptr(), &slots)?;
                 for seq in kvs.iter_mut() {
                     seq[layer as usize].advance(1);
                 }
@@ -1072,7 +1093,14 @@ impl GpuKernel {
         // Per-session K/V (owned by this sequence's KvLayerCache, not the shared
         // kernel), so concurrent batched requests keep independent history.
         // MLA reconstructs K and V from one cached latent — no value cache.
-        let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens, self.cfg.mla.is_none())?;
+        let dkv = kv.device_kv(
+            &self.kv_pools,
+            layer as usize,
+            num_positions + 1,
+            self.kv_capacity_tokens,
+            self.cfg.mla.is_none(),
+        )?;
+        let (kv_keys, kv_values) = (dkv.keys, dkv.values);
 
         // SAFETY: all pointers are live device allocations of the sizes the
         // kernel expects; kv buffers have capacity for `num_positions + 1`.
@@ -1182,7 +1210,7 @@ impl GpuKernel {
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&self.cfg, &w.biases, kv.device_half()),
+                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table),
                     )
                 };
                 if code != 0 {
@@ -1259,6 +1287,19 @@ impl MultiGpuKernel {
 impl ComputeKernel for MultiGpuKernel {
     fn num_layers(&self) -> u32 {
         self.layer_map.len() as u32
+    }
+
+    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+        self.stages
+            .iter()
+            .filter_map(|s| s.kv_free_tokens(fp16))
+            .min()
+    }
+
+    fn set_kv_pool_tokens(&mut self, tokens: usize) {
+        for stage in &mut self.stages {
+            stage.set_kv_pool_tokens(tokens);
+        }
     }
 
     fn hidden_size(&self) -> usize {

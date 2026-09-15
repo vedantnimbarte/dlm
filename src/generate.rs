@@ -512,6 +512,21 @@ impl<K: ComputeKernel> Generator<K> {
         self
     }
 
+    /// Size the kernel's shared KV pools (the GPU kernels page KV from them) to
+    /// `tokens` tokens: how many tokens all concurrent sessions can hold at once.
+    /// Call before the first session. No effect on kernels without pools.
+    pub fn with_kv_pool_tokens(mut self, tokens: usize) -> Self {
+        self.kernel.set_kv_pool_tokens(tokens);
+        self
+    }
+
+    /// KV tokens the kernel's pools can still take at this generator's KV
+    /// precision, or `None` if the kernel has no fixed pool (the CPU kernels).
+    pub fn kv_free_tokens(&self) -> Option<usize> {
+        self.kernel
+            .kv_free_tokens(self.kv_quant != crate::forward::KvQuant::None)
+    }
+
     /// A fresh single-sequence orchestrator over this generator's kernel and KV
     /// budget.
     pub(crate) fn orchestrator(&self) -> ForwardOrchestrator<&K> {
@@ -907,6 +922,11 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// [`ForwardOrchestrator::snapshot_synced`](crate::forward::ForwardOrchestrator::snapshot_synced).
     pub fn snapshot_synced(&mut self) -> Result<crate::forward::KvSnapshot> {
         self.orchestrator.snapshot_synced()
+    }
+
+    /// KV rows the session holds: its prompt plus the tokens decoded so far.
+    pub fn kv_rows(&self) -> usize {
+        self.orchestrator.position()
     }
 
     /// Emit the next token and advance the internal state by one step.

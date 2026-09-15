@@ -258,6 +258,12 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
     }
 
     /// Draft tokens proposed so far.
+    /// KV rows the session holds in its larger cache (the draft runs up to
+    /// `gamma` tokens ahead of the target within a round).
+    pub fn kv_rows(&self) -> usize {
+        self.target_kv.position().max(self.draft_kv.position())
+    }
+
     pub fn proposed(&self) -> usize {
         self.proposed
     }
