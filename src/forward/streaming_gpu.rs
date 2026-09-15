@@ -628,6 +628,14 @@ impl<S: LayerSource> GpuShared<S> {
                     .and_then(|t| GpuWeights::upload_sync(&t).map(Arc::new))
             } else {
                 self.source.load_layer(layer).and_then(|t| {
+                    // No compute call holds the victim any more, but the kernels
+                    // its last one launched may still be queued on the default
+                    // stream, reading these buffers. Let them finish before the
+                    // copy stream overwrites the weights. (Freeing the buffers
+                    // used to wait the same way, inside cudaFree.)
+                    if victim.is_some() {
+                        synchronize_default()?;
+                    }
                     let mut staging = self.staging.lock().unwrap();
                     GpuWeights::upload_async_traced(
                         &t,
