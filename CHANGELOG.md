@@ -14,6 +14,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Streamed GPU decode could read weights while they were being overwritten.**
+  A layer evicted from the VRAM window could get the next layer uploaded into
+  its buffers while kernels launched on the evicted layer were still queued.
+  Output was then wrong, and different from run to run. Uploads now wait for
+  the default stream first.
+- **`GpuKernel::run_block_batched` corrupted all but the last sequence** when it
+  fell back to one sequence at a time (more than 16 slots, or MLA).
+  `generate_batch` reached that path.
+- **One failed scheduler tick left the server spinning.** The engine closed every
+  client's stream but kept their requests in the scheduler, which failed again
+  on every tick after. It now aborts them as well.
 - **The VRAM planner sized the KV cache at half its real size.**
   - **Cause:** it assumed 2 bytes per element, as for an fp16 cache, but the
     device KV cache is f32. `--kv-quant` changes only the host-side stores.
@@ -97,6 +108,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Concurrent requests share one batched pass and one paged KV pool.**
+  - **Batched decode:** a scheduler tick advances every in-flight request
+    through `Generator::step_sessions`. On the resident GPU kernel that is one
+    fused block call per layer for the whole batch (in chunks of 16).
+  - **Batched decode speedup, GTX 1650, prompt 128:** Qwen2.5-0.5B int4 at
+    batch 16 went from 62.9 to 79.8 tok/s total. It is bounded because this GPU
+    reads each weight row once per sequence either way.
+  - **Paged device KV:** each layer's K/V is one pool of 16-token blocks shared
+    by every session. A session takes blocks as it grows, reaches them through a
+    block table, and returns them when it ends. It used to allocate a
+    full-context buffer per layer on its first token.
+  - **Pool size:** resident `serve` gives the pool whatever VRAM fits after the
+    weights, up to `--max-batch` full contexts. It refuses to start only if one
+    full-context request cannot fit; before, it refused whenever `--max-batch`
+    full contexts did not.
+  - **Admission control:** a request is admitted only when the pools can hold its
+    prompt plus `max_tokens` next to what running requests have reserved. It
+    waits in the queue otherwise, so the pool never runs dry mid-decode.
 - **`--kv-quant f16`: the GPU keeps the KV cache in fp16.**
   - **Before:** device KV was always f32, and `--kv-quant` had no effect on it.
   - **Now:** `f16`, `int8` and `int4` all store device KV as fp16, halving KV
@@ -105,8 +134,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     GiB VRAM in use, with decode speed unchanged.
   - **Output:** greedy output matched f32 KV for 96 of 96 tokens on
     Qwen2.5-0.5B and on Gemma 3 1B.
-  - **Unchanged:** the default is still exact f32, MLA stays f32, and the CPU
-    kernels keep their f32/int8/int4 stores.
+  - **Default:** `f16`. Pass `--kv-quant f32` for the exact cache (`none` still
+    works as an alias). MLA stays f32, and the CPU kernels keep their
+    f32/int8/int4 stores.
 - **`dlm bench`**, a speed harness.
   - **Loading:** it builds the model through `serve`'s own loading path, so
     every `serve` flag that shapes the model applies.

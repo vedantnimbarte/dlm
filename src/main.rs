@@ -903,7 +903,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                     args.auto_prefetch,
                     ram_cache,
                 )?;
-                return start_batched_server(generator, None, &args, &config, &listen);
+                return start_batched_server(generator, None, &args, &config, &listen, None);
             }
 
             // Non-streaming paths materialize all layers resident.
@@ -954,7 +954,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             } else {
                 let generator = parts.into_cpu_generator()?;
                 let draft = draft_parts.map(|p| p.into_cpu_generator()).transpose()?;
-                start_batched_server(generator, draft, &args, &config, &listen)
+                start_batched_server(generator, draft, &args, &config, &listen, None)
             }
         }
     }
@@ -1026,7 +1026,7 @@ fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> Vra
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
-        args.kv_quant != KvQuantArg::None,
+        args.kv_quant != KvQuantArg::F32,
     );
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
@@ -1158,6 +1158,38 @@ fn ensure_batch_kv_fits(
     Ok(())
 }
 
+/// Tokens of KV to pool for resident GPU serving: everything that fits in `free`
+/// after the safety margin and `weights`, at `per_token_bytes` (all layers), up
+/// to `max_batch` full contexts. Refuses when not even one full-context request
+/// fits, since such a request could never be admitted.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels", test))]
+fn resident_kv_pool_tokens(
+    free: u64,
+    safety: u64,
+    weights: u64,
+    per_token_bytes: u64,
+    max_batch: usize,
+    context: u32,
+) -> Result<usize> {
+    let budget = free.saturating_sub(safety).saturating_sub(weights);
+    let want = max_batch.max(1) as u64 * context as u64;
+    let tokens = want.min(budget / per_token_bytes.max(1));
+    if tokens < context as u64 {
+        let gib = |b: u64| b as f64 / GIB as f64;
+        return Err(DlmError::InvalidConfig(format!(
+            "one {context}-token request needs ~{:.2} GiB of KV, but only {:.2} GiB of VRAM is \
+             left after weights {:.1} + safety {:.1} (of {:.1} free). Lower --context-length, \
+             or use --quant / a smaller model.",
+            gib(context as u64 * per_token_bytes),
+            gib(budget),
+            gib(weights),
+            gib(safety),
+            gib(free),
+        )));
+    }
+    Ok(tokens as usize)
+}
+
 /// Serve a model split across `gpu_ids`. On a `cuda-kernels` build each device
 /// computes its own layer shard ([`MultiGpuKernel`]); otherwise it falls back to
 /// the CPU-backed pipeline (device-affinity plumbing that no-ops off-GPU), so the
@@ -1176,7 +1208,7 @@ fn serve_multi_gpu(
     let draft = draft_parts
         .map(|p| p.into_multi_gpu_generator(&ids[..1]))
         .transpose()?;
-    start_batched_server(generator, draft, args, config, listen)
+    start_batched_server(generator, draft, args, config, listen, None)
 }
 
 #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
@@ -1195,7 +1227,7 @@ fn serve_multi_gpu(
     let draft = draft_parts
         .map(|p| p.into_pipeline_parallel_generator(&ids[..1]))
         .transpose()?;
-    start_batched_server(generator, draft, args, config, listen)
+    start_batched_server(generator, draft, args, config, listen, None)
 }
 
 /// Serve with the GPU kernel (all layers resident in VRAM). Feature-gated on
@@ -1217,21 +1249,25 @@ fn serve_on_gpu(
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
-        args.kv_quant != KvQuantArg::None,
+        args.kv_quant != KvQuantArg::F32,
     );
     let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
-    ensure_batch_kv_fits(
+    // KV is paged from a shared pool, so concurrent requests only need VRAM for
+    // the tokens they actually hold. Give the pool whatever fits after the
+    // weights, up to --max-batch full contexts.
+    let per_token = profiler.kv_bytes_per_layer(config) * config.num_layers as u64
+        / args.context_length.max(1) as u64;
+    let pool = resident_kv_pool_tokens(
         free,
         profiler.safety_margin_bytes,
-        profiler.kv_total_bytes(config),
         weights,
+        per_token,
         args.max_batch,
         args.context_length,
-        "weights",
     )?;
     let generator = parts.into_gpu_generator()?;
     let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
-    start_batched_server(generator, draft, args, config, listen)
+    start_batched_server(generator, draft, args, config, listen, Some(pool))
 }
 
 #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
@@ -1270,7 +1306,7 @@ fn serve_streaming_gpu(
         ram_cache,
         expert_cache,
     )?;
-    start_batched_server(generator, None, args, config, listen)
+    start_batched_server(generator, None, args, config, listen, None)
 }
 
 #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
@@ -1385,13 +1421,20 @@ fn serve_distributed(
 /// Build the batched (optionally speculative) streaming engine over any compute
 /// kernel `K` and serve the OpenAI-compatible API. Generic so the CPU and
 /// multi-GPU pipeline kernels share one server path.
+/// `kv_pool_tokens`: the KV tokens a GPU kernel's shared pools hold across all
+/// concurrent requests; `None` sizes them for `--max-batch` full contexts, which
+/// is what the streaming planner reserves. No effect on the CPU kernels.
 fn start_batched_server<K: ComputeKernel + Send + 'static>(
     generator: Generator<K>,
     draft: Option<Generator<K>>,
     args: &ServeArgs,
     config: &ModelConfig,
     listen: &str,
+    kv_pool_tokens: Option<usize>,
 ) -> Result<()> {
+    let pool = kv_pool_tokens.unwrap_or(args.max_batch.max(1) * args.context_length as usize);
+    let generator = generator.with_kv_pool_tokens(pool);
+    let draft = draft.map(|d| d.with_kv_pool_tokens(pool));
     let tokenizer = serve_tokenizer(&args.model_path)?;
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1418,6 +1461,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     let kv_quant = args.kv_quant.to_kv_quant();
     let generator = generator.with_kv_quant(kv_quant);
     let draft = draft.map(|d| d.with_kv_quant(kv_quant));
+    let kv_pool = generator.kv_free_tokens();
     if let Some(opts) = &args.bench {
         return bench_generator(&generator, &tokenizer, opts, args, config);
     }
@@ -1481,17 +1525,23 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             args.prefix_cache_size
         );
     }
-    if kv_quant != dlm::forward::KvQuant::None {
-        let on_gpu = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();
-        let note = match kv_quant {
-            // The GPU kernels have one approximate KV format, fp16; the CPU
-            // kernels have int8/int4 but no fp16.
-            _ if on_gpu => "fp16 on the GPU (half the KV memory)",
-            dlm::forward::KvQuant::Int8 => "int8 (≈half memory, approximate)",
-            dlm::forward::KvQuant::Int4 => "int4 (≈quarter memory, approximate)",
-            _ => "f32: the CPU kernels have no fp16 store",
-        };
-        println!("  kv cache   : {note}");
+    let on_gpu = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();
+    // The GPU kernels have one approximate KV format, fp16; the CPU kernels have
+    // int8/int4 but no fp16.
+    let kv_note = match kv_quant {
+        dlm::forward::KvQuant::None => "f32 (exact)",
+        _ if on_gpu => "fp16 on the GPU (half the memory of f32; --kv-quant f32 for exact)",
+        dlm::forward::KvQuant::Int8 => "int8 (≈half memory, approximate)",
+        dlm::forward::KvQuant::Int4 => "int4 (≈quarter memory, approximate)",
+        dlm::forward::KvQuant::F16 => "f32 (the CPU kernels have no fp16 store)",
+    };
+    println!("  kv cache   : {kv_note}");
+    if let Some(tokens) = kv_pool {
+        println!(
+            "  kv pool    : {tokens} tokens shared by all requests (≈{:.1} full {}-token contexts; shorter requests fit more)",
+            tokens as f64 / args.context_length.max(1) as f64,
+            args.context_length,
+        );
     }
     if args.api_key.is_some() {
         println!("  auth       : bearer token required on /v1/*");
@@ -1991,6 +2041,20 @@ mod tests {
             Some(1000 * mib)
         );
         assert_eq!(default_ram_cache_bytes(801 * mib, 1, 1000 * mib), None);
+    }
+
+    #[test]
+    fn resident_kv_pool_takes_what_fits_up_to_the_batch() {
+        let mib = 1024 * 1024;
+        // 1 MiB per token, 4 GiB free, 1 GiB weights, 0.5 GiB safety: 2.5 GiB left.
+        let pool = |batch, ctx| resident_kv_pool_tokens(4 * GIB, GIB / 2, GIB, mib, batch, ctx);
+        // The whole batch fits: exactly batch x context.
+        assert_eq!(pool(2, 1024).unwrap(), 2048);
+        // It does not: everything that fits (2560 tokens), not a refusal.
+        assert_eq!(pool(8, 1024).unwrap(), 2560);
+        // Not even one full context fits: refuse, naming the lever.
+        let err = pool(1, 4096).unwrap_err().to_string();
+        assert!(err.contains("--context-length"), "{err}");
     }
 
     #[test]

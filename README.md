@@ -788,12 +788,12 @@ inference engine):
 
   Two orthogonal memory knobs apply to any kernel:
   - `--quant {int4,int8}` — see [weight precision](#weight-precision---quant) below.
-  - `--kv-quant {none,f16,int8,int4}` shrinks the KV cache, trading precision
+  - `--kv-quant {f16,f32,int8,int4}` shrinks the KV cache, trading precision
     for a longer context or a bigger batch in the same memory. It is independent
     of `--quant`: one sizes the weights, the other the KV history.
-    - `none` (the default) is exact `f32`.
-    - **On the GPU**, every other value stores the cache as fp16, half the KV
-      VRAM. On Qwen2.5-0.5B and Gemma 3 1B, greedy output was identical to
+    - `f16` is the default. `f32` is exact (`none` is accepted as an alias).
+    - **On the GPU**, everything except `f32` stores the cache as fp16, half the
+      KV VRAM. On Qwen2.5-0.5B and Gemma 3 1B, greedy output was identical to
       `f32` for 96 of 96 tokens, and decode speed is unchanged. The GPU kernels
       have no int8/int4 format yet, so `int8` and `int4` also give fp16 there.
       MLA models keep `f32`.
@@ -822,10 +822,23 @@ inference engine):
   advance in bulk. With greedy sampling the output is provably **identical** to
   plain target decoding (tested), with acceptance-rate stats. Exposed one-shot
   (`SpeculativeDecoder`) and as a resumable per-round `SpeculativeSession`.
-- **Continuous batching** ([`src/batching.rs`](src/batching.rs)) — a scheduler
-  keeps up to `max_batch` generations in flight, advancing each one token per
-  tick and admitting queued requests as slots free. Each request's output is
-  identical to running it alone (tested), independent of interleaving.
+- **Continuous batching** ([`src/batching.rs`](src/batching.rs)). A scheduler
+  keeps up to `--max-batch` generations in flight and admits queued requests as
+  slots free. Each request's output is identical to running it alone (tested),
+  however requests interleave.
+  - **Batched decode:** each tick advances every request through one batched
+    pass. On the resident GPU kernel that is one fused block call per layer for
+    the whole batch.
+  - **Paged KV on the GPU** ([`src/forward/kv_pool.rs`](src/forward/kv_pool.rs)):
+    each layer's KV lives in one pool of 16-token blocks shared by all requests.
+    A request takes blocks as it grows and returns them when it ends, so it uses
+    VRAM for the tokens it holds, not a full `--context-length`.
+  - **Pool size:** `serve` gives the pool whatever VRAM fits after the weights,
+    up to `--max-batch` full contexts. It refuses to start only if one
+    full-context request would not fit.
+  - **Admission control:** a request starts only once the pool can hold its
+    prompt plus `max_tokens` alongside the running requests. Otherwise it waits
+    in the queue instead of failing mid-decode.
   `BatchScheduler::with_speculative` swaps each slot for a `SpeculativeSession`,
   so **the server engine decodes speculatively** when `dlm serve` is given
   `--draft-model-path` — a tick then advances a request by a whole accept/reject

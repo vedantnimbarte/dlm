@@ -163,11 +163,12 @@ impl QuantArg {
 /// KV cache precision (`--kv-quant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum KvQuantArg {
-    /// Exact f32 (default).
-    None,
-    /// Half precision: half the KV VRAM, near-exact. GPU only; the CPU
+    /// Half precision (default): half the KV VRAM, near-exact. GPU only; the CPU
     /// kernels keep f32.
     F16,
+    /// Exact f32 everywhere. `none` is accepted as an alias.
+    #[value(alias = "none")]
+    F32,
     /// int8 — about half the KV memory. On the GPU, stored as fp16.
     Int8,
     /// int4 — about a quarter of the KV memory, more error. On the GPU, stored as
@@ -179,7 +180,7 @@ impl KvQuantArg {
     /// Map to the engine's [`KvQuant`](crate::forward::KvQuant).
     pub fn to_kv_quant(self) -> crate::forward::KvQuant {
         match self {
-            KvQuantArg::None => crate::forward::KvQuant::None,
+            KvQuantArg::F32 => crate::forward::KvQuant::None,
             KvQuantArg::F16 => crate::forward::KvQuant::F16,
             KvQuantArg::Int8 => crate::forward::KvQuant::Int8,
             KvQuantArg::Int4 => crate::forward::KvQuant::Int4,
@@ -287,10 +288,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub auto_prefetch: bool,
 
-    /// KV cache precision: `none` (exact f32), `int8` (≈half memory), or `int4`
-    /// (≈quarter memory, more error). The KV cache can exceed the weights at long
-    /// context, so quantizing it lets more context fit in a given budget.
-    #[arg(long, value_enum, default_value_t = KvQuantArg::None)]
+    /// KV cache precision. The KV cache can exceed the weights at long context,
+    /// so a smaller one fits more context or a bigger batch in the same budget.
+    /// On the GPU: `f16` (default, half the memory) or `f32` (exact); `int8` and
+    /// `int4` store fp16 there too. On the CPU kernels: `f32`, `int8` (≈half
+    /// memory) or `int4` (≈quarter, more error); `f16` stays f32.
+    #[arg(long, value_enum, default_value_t = KvQuantArg::F16)]
     pub kv_quant: KvQuantArg,
 
     /// Cluster role.
@@ -596,6 +599,14 @@ mod tests {
         assert_eq!(a.draft_gamma, 4);
         assert!(a.multi_gpu_ids.is_empty());
         assert!(a.worker_nodes.is_empty());
+        assert_eq!(a.kv_quant, KvQuantArg::F16);
+        // `none` still means exact, as it did when it was the default.
+        let cli = Cli::try_parse_from(["dlm", "serve", "--model-path", "/m", "--kv-quant", "none"])
+            .unwrap();
+        let Command::Serve(a) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(a.kv_quant, KvQuantArg::F32);
     }
 
     #[test]

@@ -337,7 +337,11 @@ fn engine_loop<K: ComputeKernel>(
                 }
             }
             Err(_) => {
-                for (_, s) in sinks.drain() {
+                // Retire the requests along with their streams: left in the
+                // scheduler, a session that failed (an exhausted KV pool, say)
+                // would fail again on every tick after.
+                for (id, s) in sinks.drain() {
+                    sched.abort(id);
                     let _ = s.send(TokenEvent::Done(None));
                 }
             }

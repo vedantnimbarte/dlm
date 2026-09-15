@@ -97,6 +97,32 @@ impl DeviceBuffer {
         backend::copy_d2h(out.as_mut_ptr() as *mut c_void, self.ptr, out.len())
     }
 
+    /// Copy raw bytes from host into this buffer starting at byte `offset`.
+    pub fn upload_bytes_at(&self, offset: usize, data: &[u8]) -> Result<()> {
+        self.check_range(offset, data.len())?;
+        // SAFETY: `offset + data.len() <= self.bytes`, checked above.
+        let dst = unsafe { (self.ptr as *mut u8).add(offset) } as *mut c_void;
+        backend::copy_h2d(dst, data.as_ptr() as *const c_void, data.len())
+    }
+
+    /// Copy `out.len()` bytes starting at byte `offset` of this buffer to the host.
+    pub fn download_bytes_at(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        self.check_range(offset, out.len())?;
+        // SAFETY: `offset + out.len() <= self.bytes`, checked above.
+        let src = unsafe { (self.ptr as *mut u8).add(offset) } as *mut c_void;
+        backend::copy_d2h(out.as_mut_ptr() as *mut c_void, src, out.len())
+    }
+
+    fn check_range(&self, offset: usize, len: usize) -> Result<()> {
+        if offset.checked_add(len).is_none_or(|end| end > self.bytes) {
+            return Err(crate::error::DlmError::InvalidConfig(format!(
+                "device copy of {len} bytes at {offset} overruns a {}-byte buffer",
+                self.bytes
+            )));
+        }
+        Ok(())
+    }
+
     /// Copy this buffer's contents into `out` on the host.
     pub fn download(&self, out: &mut [f32]) -> Result<()> {
         backend::copy_d2h(

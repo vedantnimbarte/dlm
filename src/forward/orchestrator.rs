@@ -142,6 +142,44 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         Ok(())
     }
 
+    /// Advance several sequences by one token each, like calling
+    /// [`decode_token`](Self::decode_token) on every one, but through a single
+    /// [`ComputeKernel::decode_batch`] so a batching kernel can fuse them. All
+    /// orchestrators must share one kernel; the first one's is used.
+    pub fn decode_batch(orchs: &mut [&mut Self], hiddens: &mut [&mut [f32]]) -> Result<()> {
+        let Some(first) = orchs.first() else {
+            return Ok(());
+        };
+        let hidden_size = first.kernel.hidden_size();
+        if orchs.len() != hiddens.len() {
+            return Err(DlmError::ShapeMismatch {
+                expected: orchs.len(),
+                got: hiddens.len(),
+            });
+        }
+        if let Some(h) = hiddens.iter().find(|h| h.len() != hidden_size) {
+            return Err(DlmError::ShapeMismatch {
+                expected: hidden_size,
+                got: h.len(),
+            });
+        }
+        let mut positions = Vec::with_capacity(orchs.len());
+        for o in orchs.iter_mut() {
+            o.budget.append_tokens(SEQ_ID, 1)?;
+            positions.push(o.position);
+        }
+        let (head, rest) = orchs.split_first_mut().expect("checked non-empty above");
+        let kernel = &head.kernel;
+        let mut kv_layers: Vec<&mut [KvLayerCache]> = Vec::with_capacity(rest.len() + 1);
+        kv_layers.push(&mut head.kv_layers);
+        kv_layers.extend(rest.iter_mut().map(|o| o.kv_layers.as_mut_slice()));
+        kernel.decode_batch(hiddens, &mut kv_layers, &positions)?;
+        for o in orchs.iter_mut() {
+            o.position += 1;
+        }
+        Ok(())
+    }
+
     /// Advance the sequence by `hiddens.len() / hidden_size` tokens at once — a
     /// prompt prefill. Each token's hidden state is updated in place; the result
     /// is identical to calling [`decode_token`](Self::decode_token) on each in

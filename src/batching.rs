@@ -9,9 +9,9 @@
 //!
 //! Each request runs in its own [`GenerationSession`] with independent KV state,
 //! so interleaving is transparent: a request's output is identical to running it
-//! alone. On a batched forward kernel the per-tick step would fuse all active
-//! sequences into one matmul; here it steps them in a loop — same scheduling,
-//! same output, the fused speedup awaiting a batch kernel.
+//! alone. A tick advances every plain slot through one
+//! [`Generator::step_sessions`] call, which a batching kernel (the resident GPU
+//! kernel) runs as one fused pass per layer rather than one pass per request.
 //!
 //! ## Speculative decoding
 //!
@@ -101,6 +101,29 @@ struct Active<'a, K: ComputeKernel> {
     decoder: Decoder<'a, K>,
     remaining: usize,
     eos: Vec<u32>,
+    /// KV tokens set aside for this request at admission (whole blocks).
+    reserved: usize,
+}
+
+impl<K: ComputeKernel> Active<'_, K> {
+    /// Reserved KV tokens not yet backed by blocks. Blocks are taken a whole
+    /// block at a time as rows are written, so a partly filled block counts as
+    /// taken.
+    fn unallocated(&self) -> usize {
+        let rows = match &self.decoder {
+            Decoder::Plain(s) => s.kv_rows(),
+            Decoder::Speculative(s) => s.kv_rows(),
+        };
+        self.reserved.saturating_sub(round_to_block(rows))
+    }
+}
+
+/// Rows per paged KV block. `src/forward/kv_pool.rs` checks that it matches.
+pub(crate) const KV_BLOCK_TOKENS: usize = 16;
+
+/// `tokens` rounded up to whole KV blocks, the unit a GPU kernel's pool hands out.
+fn round_to_block(tokens: usize) -> usize {
+    tokens.div_ceil(KV_BLOCK_TOKENS) * KV_BLOCK_TOKENS
 }
 
 /// A completed request.
@@ -285,14 +308,50 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         self.active.len()
     }
 
+    /// KV tokens a request needs set aside before it starts: its prompt and every
+    /// token it may generate, plus, when speculating, the draft tokens a round can
+    /// write before the target rejects them.
+    fn reservation(&self, p: &Pending) -> usize {
+        let slack = if self.draft.is_some() {
+            self.gamma + 1
+        } else {
+            0
+        };
+        round_to_block(p.prompt.len() + p.max_new_tokens + slack)
+    }
+
+    /// Whether the KV pools can take `need` more tokens on top of what running
+    /// requests have reserved but not yet allocated. Kernels without a fixed pool
+    /// (CPU) always can. With nothing running a request is always admitted: if it
+    /// cannot fit an empty pool, waiting would never make it fit, and it should
+    /// fail with the pool's error rather than stall the queue.
+    fn kv_fits(&self, need: usize) -> bool {
+        if self.active.is_empty() {
+            return true;
+        }
+        let outstanding: usize = self.active.iter().map(Active::unallocated).sum();
+        let fits = |free: Option<usize>| free.is_none_or(|free| free >= outstanding + need);
+        fits(self.generator.kv_free_tokens()) && fits(self.draft.and_then(|d| d.kv_free_tokens()))
+    }
+
     /// Fill free slots from the pending queue (prefilling each new session).
     /// Returns ids of requests that finished immediately (zero max tokens).
+    ///
+    /// A request is admitted only when the KV pools can hold everything it may
+    /// generate alongside the requests already running, so a GPU kernel's pool
+    /// never runs dry mid-decode. Otherwise it waits at the head of the queue,
+    /// keeping arrival order, until finished requests hand their blocks back.
     fn admit(&mut self) -> Result<Vec<u64>> {
         let mut zero_finished = Vec::new();
         while self.active.len() < self.max_batch {
-            let Some(p) = self.pending.pop_front() else {
+            let Some(front) = self.pending.front() else {
                 break;
             };
+            let reserved = self.reservation(front);
+            if front.max_new_tokens > 0 && !self.kv_fits(reserved) {
+                break;
+            }
+            let p = self.pending.pop_front().expect("front exists");
             if p.max_new_tokens == 0 {
                 zero_finished.push(p.id);
                 continue;
@@ -335,6 +394,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 decoder,
                 remaining: p.max_new_tokens,
                 eos: p.eos,
+                reserved,
             });
         }
         Ok(zero_finished)
@@ -350,12 +410,23 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             finished: zero_finished,
             ..Default::default()
         };
+        // Every plain slot advances in one batched pass.
+        let mut plain: Vec<&mut GenerationSession<'a, K>> = self
+            .active
+            .iter_mut()
+            .filter_map(|a| match &mut a.decoder {
+                Decoder::Plain(s) => Some(s),
+                Decoder::Speculative(_) => None,
+            })
+            .collect();
+        let mut plain_tokens = self.generator.step_sessions(&mut plain)?.into_iter();
+
         let mut still_active = Vec::with_capacity(self.active.len());
         for mut a in self.active.drain(..) {
             // Plain slots yield one token; speculative slots yield a whole
             // round's accepted tokens (never more than `remaining`).
             let emitted = match &mut a.decoder {
-                Decoder::Plain(s) => vec![s.step()?],
+                Decoder::Plain(_) => vec![plain_tokens.next().expect("one token per plain slot")],
                 Decoder::Speculative(s) => s.step(a.remaining)?,
             };
 

@@ -59,6 +59,35 @@ pub trait ComputeKernel {
         Ok(())
     }
 
+    /// Advance several sequences by one token each through the **whole stack**:
+    /// `hiddens[i]` is sequence `i`'s input at position `positions[i]`, and
+    /// `kv_layers[i]` is its per-layer history. Afterwards each hidden holds that
+    /// sequence's stack output.
+    ///
+    /// The default runs each sequence through every layer before starting the
+    /// next, which is exactly decoding them one after another. That order matters:
+    /// the GPU kernels keep a sequence's hidden state on the device from its first
+    /// layer to its last, so interleaving sequences layer by layer through
+    /// [`run_block`](Self::run_block) would overwrite one sequence's state with
+    /// another's. The resident GPU kernel overrides this to run one fused block
+    /// call per layer for the whole batch, which is what makes concurrent requests
+    /// cheaper than sequential ones.
+    fn decode_batch(
+        &self,
+        hiddens: &mut [&mut [f32]],
+        kv_layers: &mut [&mut [KvLayerCache]],
+        positions: &[usize],
+    ) -> Result<()> {
+        for ((hidden, kvs), &position) in
+            hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
+        {
+            for layer in 0..self.num_layers() {
+                self.run_block(layer, hidden, &mut kvs[layer as usize], position)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Run the whole stack over `n` consecutive tokens of one sequence — a
     /// prompt prefill. `hiddens` is `n × hidden_size`, token `i` sits at absolute
     /// position `start + i`, and `kv_layers[l]` is layer `l`'s history.
@@ -77,6 +106,18 @@ pub trait ComputeKernel {
     ) -> Result<()> {
         prefill_token_by_token(self, hiddens, kv_layers, start)
     }
+
+    /// Tokens of KV the kernel's shared pools can still take at the given
+    /// precision, if it pages KV from a fixed pool (the GPU kernels). `None`
+    /// means no fixed limit: the CPU kernels keep KV in growable host memory.
+    fn kv_free_tokens(&self, _fp16: bool) -> Option<usize> {
+        None
+    }
+
+    /// Size the kernel's shared KV pools to `tokens` tokens (per layer), for
+    /// kernels that page KV. Takes effect for pools not yet allocated, so call it
+    /// before the first session. A no-op elsewhere.
+    fn set_kv_pool_tokens(&mut self, _tokens: usize) {}
 
     /// Layer-streaming cache stats, if this kernel streams weights. Resident
     /// kernels (everything held in memory) return `None`; the streaming kernel
@@ -123,6 +164,19 @@ impl<K: ComputeKernel> ComputeKernel for &K {
     ) -> Result<()> {
         // Forward to the concrete kernel so a borrowed GPU kernel keeps its fusion.
         (**self).run_block_batched(layer, hiddens, kvs, positions)
+    }
+
+    fn decode_batch(
+        &self,
+        hiddens: &mut [&mut [f32]],
+        kv_layers: &mut [&mut [KvLayerCache]],
+        positions: &[usize],
+    ) -> Result<()> {
+        (**self).decode_batch(hiddens, kv_layers, positions)
+    }
+
+    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+        (**self).kv_free_tokens(fp16)
     }
 
     fn prefill(
