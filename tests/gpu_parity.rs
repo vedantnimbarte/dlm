@@ -1971,3 +1971,160 @@ fn multi_gpu_lm_head_matches_host_head() {
     dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
     assert_eq!(dev.generate(&prompt, &greedy).unwrap(), want);
 }
+
+/// Decode `n` sequences with different history lengths together through
+/// `ForwardOrchestrator::decode_batch`, and each one alone; they must agree. `n`
+/// above 16 makes the resident kernel split the batch into several fused calls.
+fn assert_decode_batch_matches_solo<K: ComputeKernel>(
+    kernel: &K,
+    cfg: BlockConfig,
+    n: usize,
+    quant: dlm::forward::KvQuant,
+    what: &str,
+) {
+    let kv_cfg = KvCacheConfig {
+        num_layers: kernel.num_layers(),
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let start = |b: usize| -> Vec<f32> {
+        (0..cfg.hidden_size)
+            .map(|i| ((i * (b + 3)) % 29) as f32 * 0.02 - 0.3)
+            .collect()
+    };
+    // Sequence `b` first decodes `b % 5 + 1` tokens alone, so the batch mixes
+    // history lengths and every slot attends over a different span.
+    let warm = |b: usize| {
+        let mut orch = ForwardOrchestrator::new(kernel, PagedKvCache::new(kv_cfg, 16), quant);
+        let mut h = start(b);
+        for _ in 0..b % 5 + 1 {
+            orch.decode_token(&mut h).unwrap();
+        }
+        (orch, h)
+    };
+    let steps = 3;
+    let solo: Vec<Vec<f32>> = (0..n)
+        .map(|b| {
+            let (mut orch, mut h) = warm(b);
+            for _ in 0..steps {
+                orch.decode_token(&mut h).unwrap();
+            }
+            h
+        })
+        .collect();
+
+    let (mut orchs, mut hs): (Vec<_>, Vec<_>) = (0..n).map(warm).unzip();
+    for _ in 0..steps {
+        let mut o: Vec<_> = orchs.iter_mut().collect();
+        let mut h: Vec<&mut [f32]> = hs.iter_mut().map(|h| h.as_mut_slice()).collect();
+        ForwardOrchestrator::decode_batch(&mut o, &mut h).unwrap();
+    }
+    for (b, (batched, alone)) in hs.iter().zip(&solo).enumerate() {
+        let max_diff = batched
+            .iter()
+            .zip(alone)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "{what}: sequence {b} of {n}: batched decode diverged from solo by {max_diff}"
+        );
+        assert_eq!(orchs[b].position(), b % 5 + 1 + steps, "{what}");
+    }
+}
+
+#[test]
+fn gpu_decode_batch_matches_solo() {
+    let cfg = small_cfg();
+    let gpu = GpuKernel::new(cfg, random_layers(&cfg, 3, 0xDECB), 64).unwrap();
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+        for n in [2, 3, 16, 20] {
+            assert_decode_batch_matches_solo(&gpu, cfg, n, quant, &format!("resident {quant:?}"));
+        }
+    }
+    // Kernels without a fused batch take the sequence-at-a-time default, which
+    // must not interleave a sequence's layers with another's. A window of 2 of 3
+    // layers makes every token evict. That once let the prefetch worker upload a
+    // layer into an evicted layer's buffers while kernels still queued from the
+    // last compute call were reading them.
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+        for n in [2, 5] {
+            let streaming = StreamingGpuKernel::new(
+                cfg,
+                VecSource(random_layers(&cfg, 3, 0xDECB)),
+                64,
+                2,
+                None,
+            )
+            .unwrap();
+            assert_decode_batch_matches_solo(
+                &streaming,
+                cfg,
+                n,
+                quant,
+                &format!("streaming {quant:?}"),
+            );
+        }
+    }
+    let (mla_cfg, shape) = mla_test_config(None);
+    let mla = GpuKernel::new(
+        mla_cfg,
+        random_mla_layers(&mla_cfg, shape, 2, 0xDECC, None),
+        64,
+    )
+    .unwrap();
+    assert_decode_batch_matches_solo(&mla, mla_cfg, 4, dlm::forward::KvQuant::None, "mla");
+}
+
+/// `run_block_batched` with more slots than one fused call takes (or an MLA
+/// model) runs each sequence through the layer in turn. It used to do that through
+/// `run_block`, which leaves a sequence's hidden on the kernel's one device buffer
+/// between its layers, so the next sequence overwrote it and every slot but the
+/// last came back wrong.
+#[test]
+fn gpu_run_block_batched_fallback_keeps_sequences_apart() {
+    let cfg = small_cfg();
+    let num_layers = 2u32;
+    let gpu = GpuKernel::new(cfg, random_layers(&cfg, num_layers, 0xFA11), 64).unwrap();
+    let n = 17; // past DLM_MAX_BATCH
+    let start = |b: usize| -> Vec<f32> {
+        (0..cfg.hidden_size)
+            .map(|i| ((i + 7 * b) % 23) as f32 * 0.03 - 0.3)
+            .collect()
+    };
+    let solo: Vec<Vec<f32>> = (0..n)
+        .map(|b| {
+            let mut kvs: Vec<KvLayerCache> = (0..num_layers)
+                .map(|_| KvLayerCache::new(cfg.kv_dim()))
+                .collect();
+            let mut h = start(b);
+            for l in 0..num_layers {
+                gpu.run_block(l, &mut h, &mut kvs[l as usize], 0).unwrap();
+            }
+            h
+        })
+        .collect();
+    let mut kvs: Vec<Vec<KvLayerCache>> = (0..n)
+        .map(|_| {
+            (0..num_layers)
+                .map(|_| KvLayerCache::new(cfg.kv_dim()))
+                .collect()
+        })
+        .collect();
+    let mut hs: Vec<Vec<f32>> = (0..n).map(start).collect();
+    for l in 0..num_layers {
+        let mut h: Vec<&mut [f32]> = hs.iter_mut().map(|h| h.as_mut_slice()).collect();
+        let mut k: Vec<&mut KvLayerCache> = kvs.iter_mut().map(|s| &mut s[l as usize]).collect();
+        gpu.run_block_batched(l, &mut h, &mut k, &vec![0; n])
+            .unwrap();
+    }
+    for (b, (got, want)) in hs.iter().zip(&solo).enumerate() {
+        let max_diff = got
+            .iter()
+            .zip(want)
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "slot {b}: diverged by {max_diff}");
+    }
+}

@@ -609,6 +609,9 @@ pub struct GpuKernel {
     /// layer (a synchronizing driver call in the hot path). Sound because a given
     /// kernel instance is driven by a single inference thread, one layer at a time.
     d_hidden: DeviceBuffer,
+    /// `[DLM_MAX_BATCH, hidden]` block that `decode_batch` keeps a batch's
+    /// hidden states in across the layer stack.
+    d_batch: DeviceBuffer,
     /// MLA decoupled-RoPE frequencies (over `qk_rope_head_dim`); `None` for
     /// standard attention.
     mla_inv_freq: Option<DeviceBuffer>,
@@ -666,6 +669,7 @@ impl GpuKernel {
             None => None,
         };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
+        let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
         Ok(Self {
             cfg,
             layers: gpu_layers,
@@ -673,6 +677,7 @@ impl GpuKernel {
             local_inv_freq,
             kv_capacity_tokens: cap,
             d_hidden,
+            d_batch,
             mla_inv_freq,
         })
     }
@@ -791,8 +796,13 @@ impl ComputeKernel for GpuKernel {
     ) -> Result<()> {
         let batch = hiddens.len();
         if batch <= 1 || batch > DLM_MAX_BATCH || self.cfg.mla.is_some() {
+            // One layer for each sequence in turn, so every hidden makes its own
+            // round trip: `run_block` would leave it on the shared device buffer
+            // for its next layer, where the next sequence overwrites it.
             for ((hidden, kv), &position) in hiddens.iter_mut().zip(kvs.iter_mut()).zip(positions) {
-                self.run_block(layer, hidden, kv, position)?;
+                self.d_hidden.upload(hidden)?;
+                self.launch_layer(layer, kv, position, &self.d_hidden)?;
+                self.d_hidden.download(hidden)?;
             }
             return Ok(());
         }
@@ -924,12 +934,125 @@ impl ComputeKernel for GpuKernel {
         d_hiddens.download(hiddens)
     }
 
+    fn decode_batch(
+        &self,
+        hiddens: &mut [&mut [f32]],
+        kv_layers: &mut [&mut [KvLayerCache]],
+        positions: &[usize],
+    ) -> Result<()> {
+        // MLA has no batched block; a single sequence gains nothing from one.
+        if hiddens.len() <= 1 || self.cfg.mla.is_some() {
+            for ((hidden, kvs), &position) in
+                hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
+            {
+                for layer in 0..self.num_layers() {
+                    self.run_block(layer, hidden, &mut kvs[layer as usize], position)?;
+                }
+            }
+            return Ok(());
+        }
+        let h = self.cfg.hidden_size;
+        let mut staged = vec![0.0f32; DLM_MAX_BATCH * h];
+        let chunks = hiddens
+            .chunks_mut(DLM_MAX_BATCH)
+            .zip(kv_layers.chunks_mut(DLM_MAX_BATCH))
+            .zip(positions.chunks(DLM_MAX_BATCH));
+        for ((hs, kvs), pos) in chunks {
+            let batch = hs.len();
+            for (b, hidden) in hs.iter().enumerate() {
+                staged[b * h..(b + 1) * h].copy_from_slice(hidden);
+            }
+            // Upload once; every layer reads and writes the device block in place.
+            self.d_batch.upload(&staged[..batch * h])?;
+            for layer in 0..self.num_layers() {
+                let mut slot_keys = DlmSlots {
+                    p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+                };
+                let mut slot_values = DlmSlots {
+                    p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+                };
+                let mut num_positions = DlmInts {
+                    v: [0; DLM_MAX_BATCH],
+                };
+                let mut slot_positions = DlmInts {
+                    v: [0; DLM_MAX_BATCH],
+                };
+                for (b, seq) in kvs.iter_mut().enumerate() {
+                    let kv = &mut seq[layer as usize];
+                    let n = kv.len();
+                    if n >= self.kv_capacity_tokens {
+                        return Err(DlmError::InvalidConfig(format!(
+                            "GPU KV capacity {} exceeded at position {}",
+                            self.kv_capacity_tokens, pos[b]
+                        )));
+                    }
+                    let (keys, values) = kv.gpu_kv(self.kv_capacity_tokens, true)?;
+                    slot_keys.p[b] = keys;
+                    slot_values.p[b] = values;
+                    num_positions.v[b] = n as i32;
+                    slot_positions.v[b] = pos[b] as i32;
+                }
+                let kv_half = kvs
+                    .first()
+                    .is_some_and(|seq| seq[layer as usize].device_half());
+                self.launch_block_batched(
+                    layer,
+                    self.d_batch.as_mut_ptr(),
+                    &slot_keys,
+                    &slot_values,
+                    &num_positions,
+                    &slot_positions,
+                    batch,
+                    kv_half,
+                )?;
+                for seq in kvs.iter_mut() {
+                    seq[layer as usize].advance(1);
+                }
+            }
+            // A blocking copy, so it also waits for the stack's kernels.
+            self.d_batch.download(&mut staged[..batch * h])?;
+            for (b, hidden) in hs.iter_mut().enumerate() {
+                hidden.copy_from_slice(&staged[b * h..(b + 1) * h]);
+            }
+        }
+        Ok(())
+    }
+
     fn run_block(
         &self,
         layer: u32,
         hidden: &mut [f32],
         kv: &mut KvLayerCache,
         position: usize,
+    ) -> Result<()> {
+        // The hidden state stays resident on the device for the whole layer stack:
+        // upload the host vector once before the first layer, chain every layer
+        // through the same persistent buffer on the (in-order) default stream, and
+        // download once after the last layer. The orchestrator never reads `hidden`
+        // between layers, so the per-layer host round-trip + sync it used to do
+        // was pure overhead — ~2/3 of the per-token GPU time on a 16-layer model.
+        if layer == 0 {
+            self.d_hidden.upload(hidden)?;
+        }
+        self.launch_layer(layer, kv, position, &self.d_hidden)?;
+        // `download` is a blocking cudaMemcpy(D2H), so it already waits for the
+        // stack's kernels — no separate synchronize() needed.
+        if layer as usize == self.layers.len() - 1 {
+            self.d_hidden.download(hidden)?;
+        }
+        Ok(())
+    }
+}
+
+impl GpuKernel {
+    /// Enqueue layer `layer` for one token on the hidden vector in `d_hidden`,
+    /// appending its K/V to `kv`. Nothing is copied to or from the host.
+    fn launch_layer(
+        &self,
+        layer: u32,
+        kv: &mut KvLayerCache,
+        position: usize,
+        d_hidden: &DeviceBuffer,
     ) -> Result<()> {
         let w = &self.layers[layer as usize];
         let kv_dim = self.cfg.kv_dim();
@@ -950,19 +1073,6 @@ impl ComputeKernel for GpuKernel {
         // kernel), so concurrent batched requests keep independent history.
         // MLA reconstructs K and V from one cached latent — no value cache.
         let (kv_keys, kv_values) = kv.gpu_kv(self.kv_capacity_tokens, self.cfg.mla.is_none())?;
-
-        // The hidden state stays resident on the device for the whole layer stack:
-        // upload the host vector once before the first layer, chain every layer
-        // through the same persistent buffer on the (in-order) default stream, and
-        // download once after the last layer. The orchestrator never reads `hidden`
-        // between layers, so the per-layer host round-trip + sync it used to do
-        // was pure overhead — ~2/3 of the per-token GPU time on a 16-layer model.
-        let is_first = layer == 0;
-        let is_last = layer as usize == self.layers.len() - 1;
-        let d_hidden = &self.d_hidden;
-        if is_first {
-            d_hidden.upload(hidden)?;
-        }
 
         // SAFETY: all pointers are live device allocations of the sizes the
         // kernel expects; kv buffers have capacity for `num_positions + 1`.
@@ -1083,13 +1193,6 @@ impl ComputeKernel for GpuKernel {
                 }
             }
         }
-        // `download` is a blocking cudaMemcpy(D2H), so it already waits for the
-        // stack's kernels — no separate synchronize() needed. Only the last layer
-        // brings the result back to the host.
-        if is_last {
-            d_hidden.download(hidden)?;
-        }
-
         // Keep the orchestrator's length bookkeeping in step. The real K/V is in
         // VRAM.
         kv.advance(1);

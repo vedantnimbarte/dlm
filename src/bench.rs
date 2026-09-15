@@ -1,8 +1,8 @@
 //! `dlm bench`: time prefill and decode on a loaded [`Generator`].
 //!
 //! The model is built by `serve`'s own loading path, so a number measured here
-//! is the number a served request would see with the same flags. Sequences in a
-//! batch are stepped in turn, the way the server's scheduler steps them today.
+//! is the number a served request would see with the same flags. A batch decodes
+//! through [`Generator::step_sessions`], as the server's scheduler does.
 
 use crate::cli::BenchOpts;
 use crate::error::{DlmError, Result};
@@ -19,7 +19,7 @@ pub struct RunResult {
     pub batch: usize,
     /// Prompt tokens per second, over every sequence's prefill.
     pub prefill_tok_s: f64,
-    /// First sequence: its prefill plus its first decode step.
+    /// First sequence: its prefill plus the first decode step (of the whole batch).
     pub ttft_ms: f64,
     /// Generated tokens per second, summed over the batch.
     pub decode_tok_s: f64,
@@ -112,12 +112,11 @@ fn run_once<K: ComputeKernel>(
     let decode_start = Instant::now();
     let mut first_step = 0.0;
     for step in 0..gen_len {
-        for (i, s) in sessions.iter_mut().enumerate() {
-            let t = Instant::now();
-            s.step()?;
-            if step == 0 && i == 0 {
-                first_step = t.elapsed().as_secs_f64();
-            }
+        let t = Instant::now();
+        let mut batch_refs: Vec<_> = sessions.iter_mut().collect();
+        generator.step_sessions(&mut batch_refs)?;
+        if step == 0 {
+            first_step = t.elapsed().as_secs_f64();
         }
         // Drain every step so a long run never overflows the ring.
         if breakdown {

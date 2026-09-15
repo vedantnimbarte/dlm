@@ -727,14 +727,11 @@ impl<K: ComputeKernel> Generator<K> {
             if done.iter().all(|&d| d) {
                 break;
             }
-            // Advance every sequence through the stack, one batched call per layer.
-            for l in 0..nl {
-                let mut hs: Vec<&mut [f32]> = hidden.iter_mut().map(|h| h.as_mut_slice()).collect();
-                let mut ks: Vec<&mut KvLayerCache> =
-                    kvs.iter_mut().map(|seq| &mut seq[l]).collect();
-                self.kernel
-                    .run_block_batched(l as u32, &mut hs, &mut ks, &position)?;
-            }
+            // Advance every sequence through the stack in one batched pass.
+            let mut hs: Vec<&mut [f32]> = hidden.iter_mut().map(|h| h.as_mut_slice()).collect();
+            let mut ks: Vec<&mut [KvLayerCache]> =
+                kvs.iter_mut().map(|seq| seq.as_mut_slice()).collect();
+            self.kernel.decode_batch(&mut hs, &mut ks, &position)?;
             for p in &mut position {
                 *p += 1;
             }
@@ -867,6 +864,35 @@ impl<K: ComputeKernel> Generator<K> {
     }
 }
 
+impl<K: ComputeKernel> Generator<K> {
+    /// Advance every session by one token, returning each one's token in order.
+    /// Exactly what calling [`GenerationSession::step`] on each would produce,
+    /// but the sessions go through the model together
+    /// ([`ForwardOrchestrator::decode_batch`]), which is how concurrent requests
+    /// share one pass on a batching kernel. Every session must come from this
+    /// generator.
+    pub fn step_sessions(
+        &self,
+        sessions: &mut [&mut GenerationSession<'_, K>],
+    ) -> Result<Vec<u32>> {
+        let mut tokens = Vec::with_capacity(sessions.len());
+        for s in sessions.iter_mut() {
+            if !std::ptr::eq(s.generator, self) {
+                return Err(DlmError::InvalidConfig(
+                    "step_sessions: a session belongs to another generator".into(),
+                ));
+            }
+            tokens.push(s.sample_next()?);
+        }
+        let (mut orchs, mut hiddens): (Vec<_>, Vec<_>) = sessions
+            .iter_mut()
+            .map(|s| (&mut s.orchestrator, s.last_hidden.as_mut_slice()))
+            .unzip();
+        ForwardOrchestrator::decode_batch(&mut orchs, &mut hiddens)?;
+        Ok(tokens)
+    }
+}
+
 impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// Snapshot this session's KV history (e.g. right after prefilling a prompt)
     /// so a later prompt sharing this prefix can
@@ -885,12 +911,19 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
 
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
+        let next = self.sample_next()?;
+        self.orchestrator.decode_token(&mut self.last_hidden)?;
+        Ok(next)
+    }
+
+    /// Choose the next token and load its embedding into `last_hidden`, ready
+    /// for the pass through the model that `step` (or `step_sessions`) runs.
+    fn sample_next(&mut self) -> Result<u32> {
         let mut logits = self.generator.logits(&self.last_hidden)?;
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
         let next = self.sampler.sample(&logits, &mut self.rng);
         self.seen.insert(next);
         self.last_hidden = self.generator.embed(next, self.orchestrator.position())?;
-        self.orchestrator.decode_token(&mut self.last_hidden)?;
         Ok(next)
     }
 }

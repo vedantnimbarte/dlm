@@ -9,9 +9,9 @@
 //!
 //! Each request runs in its own [`GenerationSession`] with independent KV state,
 //! so interleaving is transparent: a request's output is identical to running it
-//! alone. On a batched forward kernel the per-tick step would fuse all active
-//! sequences into one matmul; here it steps them in a loop — same scheduling,
-//! same output, the fused speedup awaiting a batch kernel.
+//! alone. A tick advances every plain slot through one
+//! [`Generator::step_sessions`] call, which a batching kernel (the resident GPU
+//! kernel) runs as one fused pass per layer rather than one pass per request.
 //!
 //! ## Speculative decoding
 //!
@@ -350,12 +350,23 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             finished: zero_finished,
             ..Default::default()
         };
+        // Every plain slot advances in one batched pass.
+        let mut plain: Vec<&mut GenerationSession<'a, K>> = self
+            .active
+            .iter_mut()
+            .filter_map(|a| match &mut a.decoder {
+                Decoder::Plain(s) => Some(s),
+                Decoder::Speculative(_) => None,
+            })
+            .collect();
+        let mut plain_tokens = self.generator.step_sessions(&mut plain)?.into_iter();
+
         let mut still_active = Vec::with_capacity(self.active.len());
         for mut a in self.active.drain(..) {
             // Plain slots yield one token; speculative slots yield a whole
             // round's accepted tokens (never more than `remaining`).
             let emitted = match &mut a.decoder {
-                Decoder::Plain(s) => vec![s.step()?],
+                Decoder::Plain(_) => vec![plain_tokens.next().expect("one token per plain slot")],
                 Decoder::Speculative(s) => s.step(a.remaining)?,
             };
 
