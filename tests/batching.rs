@@ -198,3 +198,30 @@ fn abort_retires_an_active_request() {
     assert!(!sched.has_work());
     assert!(!sched.abort(1)); // already gone → no-op
 }
+
+/// Feeding a prompt in 16-token pieces (how the scheduler prefills while other
+/// requests decode) gives exactly the tokens of prefilling it whole.
+#[test]
+fn prompt_fed_in_pieces_decodes_like_one_prefill() {
+    let generator = build_generator();
+    let prompt: Vec<u32> = (0..53).map(|i| (i * 7 % 13) as u32).collect();
+    let want = greedy(&generator, &prompt, 6);
+
+    let mut session = generator
+        .start_session_deferred(&prompt, dlm::generate::Sampler::Greedy)
+        .unwrap();
+    assert!(
+        session.step().is_err(),
+        "no decoding before the prompt is in"
+    );
+    let mut pieces = 0;
+    while !session.prefill_some(16).unwrap() {
+        pieces += 1;
+    }
+    assert_eq!(
+        pieces, 3,
+        "53 tokens: three full pieces, then the last five"
+    );
+    let got: Vec<u32> = (0..6).map(|_| session.step().unwrap()).collect();
+    assert_eq!(got, want);
+}

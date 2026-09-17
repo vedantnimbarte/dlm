@@ -28,6 +28,18 @@ use crate::forward::{ComputeKernel, KvSnapshot};
 use crate::generate::{GenerationSession, Generator, Sampler};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+/// How long one tick may spend feeding prompts in while other requests are
+/// decoding. A long prompt used to be prefilled whole on admission, stalling
+/// every running stream for its full duration (14 s for 1,590 tokens of
+/// Qwen2.5-0.5B on a GTX 1650). Now it goes in 16 tokens at a time between
+/// decode steps.
+const PREFILL_TICK_BUDGET: Duration = Duration::from_millis(200);
+
+/// Prompt tokens fed in per piece: the GPU kernels' prefill group size, so
+/// splitting a prompt leaves the arithmetic exactly as one call would.
+const PREFILL_PIECE: usize = 16;
 
 /// A bounded cache of KV snapshots keyed by the prompt tokens that produced
 /// them, so a request whose prompt extends a cached one can resume from the
@@ -126,6 +138,9 @@ struct Active<'a, K: ComputeKernel> {
     eos: Vec<u32>,
     /// KV tokens set aside for this request at admission (whole blocks).
     reserved: usize,
+    /// The prompt, kept while it is still being prefilled so its prefix can be
+    /// cached once it is in. `None` when there is nothing to cache.
+    cache_prompt: Option<Vec<u32>>,
 }
 
 impl<K: ComputeKernel> Active<'_, K> {
@@ -361,6 +376,28 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         fits(self.generator.kv_free_tokens()) && fits(self.draft.and_then(|d| d.kv_free_tokens()))
     }
 
+    /// Whether `prompt` starts with at least one KV block of tokens that a request
+    /// still being prefilled also starts with. Such a request waits: once the
+    /// other prompt is in, its prefix is cached and this one resumes from it,
+    /// instead of both computing the shared part. A burst of requests with one
+    /// system prompt then computes it once.
+    fn shares_a_prompt_in_flight(&self, prompt: &[u32]) -> bool {
+        if self.prefix_cache.is_none() {
+            return false;
+        }
+        let align = if self.generator.kv_free_tokens().is_some() {
+            KV_BLOCK_TOKENS
+        } else {
+            1
+        };
+        self.active.iter().any(|a| {
+            a.cache_prompt.as_ref().is_some_and(|other| {
+                let common = other.iter().zip(prompt).take_while(|(x, y)| x == y).count();
+                common.min(prompt.len() - 1) >= align
+            })
+        })
+    }
+
     /// Fill free slots from the pending queue (prefilling each new session).
     /// Returns ids of requests that finished immediately (zero max tokens).
     ///
@@ -375,6 +412,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 break;
             };
             let reserved = self.reservation(front);
+            if self.shares_a_prompt_in_flight(&front.prompt) {
+                break;
+            }
             if front.max_new_tokens > 0 {
                 // Cached prefixes hold KV blocks too. Give them back, oldest first,
                 // before making a request wait for running ones to finish.
@@ -414,32 +454,25 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         .prefix_cache
                         .as_ref()
                         .and_then(|c| c.longest_prefix(&p.prompt, align));
-                    let mut session = match resume {
+                    // The prompt goes in over the next ticks (see `step`).
+                    let session = match resume {
                         Some(snap) => {
                             self.resume_hits += 1;
                             // Pass the whole prompt so the repetition penalty covers
                             // the cached prefix too (resume derives the suffix).
-                            self.generator.resume_session(snap, &p.prompt, p.sampler)?
+                            self.generator
+                                .resume_session_deferred(snap, &p.prompt, p.sampler)?
                         }
-                        None => self.generator.start_session(&p.prompt, p.sampler)?,
+                        None => self
+                            .generator
+                            .start_session_deferred(&p.prompt, p.sampler)?,
                     };
-                    // On a kernel that pages KV, the cached prefix is the prompt
-                    // cut back to whole blocks, so the snapshot shares those
-                    // blocks instead of copying the prompt's KV back to the host.
-                    // Elsewhere the snapshot is a host copy of the whole prompt.
-                    let aligned = if self.generator.kv_free_tokens().is_some() {
-                        p.prompt.len() / KV_BLOCK_TOKENS * KV_BLOCK_TOKENS
-                    } else {
-                        p.prompt.len()
-                    };
-                    if let (Some(cache), true) = (self.prefix_cache.as_mut(), aligned > 0) {
-                        cache.insert(
-                            p.prompt[..aligned].to_vec(),
-                            session.snapshot_prefix(aligned)?,
-                        );
-                    }
                     Decoder::Plain(session)
                 }
+            };
+            let cache_prompt = match (&decoder, &self.prefix_cache) {
+                (Decoder::Plain(_), Some(_)) => Some(p.prompt),
+                _ => None,
             };
             self.active.push(Active {
                 id: p.id,
@@ -447,9 +480,55 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 remaining: p.max_new_tokens,
                 eos: p.eos,
                 reserved,
+                cache_prompt,
             });
         }
         Ok(zero_finished)
+    }
+
+    /// Feed admitted prompts into the model, oldest request first. While any
+    /// request is decoding, prompts go in [`PREFILL_PIECE`] tokens at a time and
+    /// stop once [`PREFILL_TICK_BUDGET`] is spent, so running streams keep
+    /// moving. With nothing decoding there is nothing to protect, and prompts go
+    /// in whole. A prompt that finishes has its prefix cached.
+    fn feed_prompts(&mut self) -> Result<()> {
+        let decoding = self.active.iter().any(|a| match &a.decoder {
+            Decoder::Plain(s) => !s.is_prefilling(),
+            Decoder::Speculative(_) => true,
+        });
+        let piece = if decoding { PREFILL_PIECE } else { usize::MAX };
+        let deadline = Instant::now() + PREFILL_TICK_BUDGET;
+        let align = if self.generator.kv_free_tokens().is_some() {
+            KV_BLOCK_TOKENS
+        } else {
+            1
+        };
+        for a in &mut self.active {
+            let Decoder::Plain(session) = &mut a.decoder else {
+                continue;
+            };
+            while session.is_prefilling() {
+                if decoding && Instant::now() >= deadline {
+                    return Ok(());
+                }
+                session.prefill_some(piece)?;
+            }
+            // On a kernel that pages KV, the cached prefix is the prompt cut back
+            // to whole blocks, so the snapshot shares those blocks instead of
+            // copying the prompt's KV back to the host. Elsewhere it is a host
+            // copy of the whole prompt.
+            if let (Some(prompt), Some(cache)) = (a.cache_prompt.take(), self.prefix_cache.as_mut())
+            {
+                let aligned = prompt.len() / align * align;
+                if aligned > 0 {
+                    cache.insert(
+                        prompt[..aligned].to_vec(),
+                        session.snapshot_prefix(aligned)?,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One scheduler tick: admit queued requests, advance every active slot (by
@@ -462,13 +541,15 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             finished: zero_finished,
             ..Default::default()
         };
-        // Every plain slot advances in one batched pass.
+        self.feed_prompts()?;
+
+        // Every plain slot with its prompt in advances in one batched pass.
         let mut plain: Vec<&mut GenerationSession<'a, K>> = self
             .active
             .iter_mut()
             .filter_map(|a| match &mut a.decoder {
-                Decoder::Plain(s) => Some(s),
-                Decoder::Speculative(_) => None,
+                Decoder::Plain(s) if !s.is_prefilling() => Some(s),
+                _ => None,
             })
             .collect();
         let mut plain_tokens = self.generator.step_sessions(&mut plain)?.into_iter();
@@ -478,6 +559,10 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             // Plain slots yield one token; speculative slots yield a whole
             // round's accepted tokens (never more than `remaining`).
             let emitted = match &mut a.decoder {
+                Decoder::Plain(s) if s.is_prefilling() => {
+                    still_active.push(a);
+                    continue;
+                }
                 Decoder::Plain(_) => vec![plain_tokens.next().expect("one token per plain slot")],
                 Decoder::Speculative(s) => s.step(a.remaining)?,
             };

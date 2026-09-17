@@ -805,6 +805,9 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     rng: SplitMix64,
     /// Context tokens (prompt + generated) for the repetition penalty.
     seen: std::collections::HashSet<u32>,
+    /// Prompt tokens not yet run through the model (see
+    /// [`prefill_some`](GenerationSession::prefill_some)).
+    pending: Vec<u32>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -815,20 +818,33 @@ impl<K: ComputeKernel> Generator<K> {
         prompt: &[u32],
         sampler: Sampler,
     ) -> Result<GenerationSession<'_, K>> {
+        let mut session = self.start_session_deferred(prompt, sampler)?;
+        session.prefill_some(usize::MAX)?;
+        Ok(session)
+    }
+
+    /// Like [`start_session`](Self::start_session), but with the prompt not yet
+    /// run through the model. [`GenerationSession::prefill_some`] feeds it in
+    /// pieces, which lets a scheduler keep other requests decoding meanwhile.
+    pub fn start_session_deferred(
+        &self,
+        prompt: &[u32],
+        sampler: Sampler,
+    ) -> Result<GenerationSession<'_, K>> {
         if prompt.is_empty() {
             return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         }
         let budget = crate::cache::PagedKvCache::new(self.kv_config, self.kv_total_blocks);
-        let mut orchestrator =
+        let orchestrator =
             crate::forward::ForwardOrchestrator::new(&self.kernel, budget, self.kv_quant);
-        let hidden = self.prefill(&mut orchestrator, prompt)?;
         Ok(GenerationSession {
             generator: self,
             orchestrator,
-            last_hidden: hidden,
+            last_hidden: Vec::new(),
             rng: SplitMix64::new(sampler.seed()),
             sampler,
             seen: prompt.iter().copied().collect(),
+            pending: prompt.to_vec(),
         })
     }
 
@@ -850,6 +866,19 @@ impl<K: ComputeKernel> Generator<K> {
         prompt: &[u32],
         sampler: Sampler,
     ) -> Result<GenerationSession<'_, K>> {
+        let mut session = self.resume_session_deferred(snapshot, prompt, sampler)?;
+        session.prefill_some(usize::MAX)?;
+        Ok(session)
+    }
+
+    /// Like [`resume_session`](Self::resume_session), with the suffix not yet
+    /// run through the model (see [`start_session_deferred`](Self::start_session_deferred)).
+    pub fn resume_session_deferred(
+        &self,
+        snapshot: crate::forward::KvSnapshot,
+        prompt: &[u32],
+        sampler: Sampler,
+    ) -> Result<GenerationSession<'_, K>> {
         let start = snapshot.position();
         if start > prompt.len() {
             return Err(DlmError::InvalidConfig(
@@ -863,18 +892,18 @@ impl<K: ComputeKernel> Generator<K> {
             ));
         }
         let budget = PagedKvCache::new(self.kv_config, self.kv_total_blocks);
-        let mut orchestrator = ForwardOrchestrator::resume(&self.kernel, budget, snapshot)?;
-        let hidden = self.prefill(&mut orchestrator, suffix)?;
+        let orchestrator = ForwardOrchestrator::resume(&self.kernel, budget, snapshot)?;
         Ok(GenerationSession {
             generator: self,
             orchestrator,
-            last_hidden: hidden,
+            last_hidden: Vec::new(),
             rng: SplitMix64::new(sampler.seed()),
             sampler,
             // The full prompt (cached prefix + suffix), so the repetition penalty
             // covers the cached prefix — a resumed request matches the same request
             // run without the prefix cache.
             seen: prompt.iter().copied().collect(),
+            pending: suffix.to_vec(),
         })
     }
 }
@@ -936,6 +965,27 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
         self.orchestrator.position()
     }
 
+    /// Whether prompt tokens are still waiting to go through the model.
+    pub fn is_prefilling(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Run up to `max_tokens` more prompt tokens through the model, returning
+    /// whether the whole prompt is now in.
+    ///
+    /// Pass a multiple of 16 (or `usize::MAX`): the GPU kernels prefill in groups
+    /// of 16, so pieces of that size split the work exactly as one call would,
+    /// and the result is bit-identical however the prompt was divided.
+    pub fn prefill_some(&mut self, max_tokens: usize) -> Result<bool> {
+        if self.pending.is_empty() {
+            return Ok(true);
+        }
+        let rest = self.pending.split_off(max_tokens.min(self.pending.len()));
+        let piece = std::mem::replace(&mut self.pending, rest);
+        self.last_hidden = self.generator.prefill(&mut self.orchestrator, &piece)?;
+        Ok(self.pending.is_empty())
+    }
+
     /// Emit the next token and advance the internal state by one step.
     pub fn step(&mut self) -> Result<u32> {
         let next = self.sample_next()?;
@@ -946,6 +996,11 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// Choose the next token and load its embedding into `last_hidden`, ready
     /// for the pass through the model that `step` (or `step_sessions`) runs.
     fn sample_next(&mut self) -> Result<u32> {
+        if self.is_prefilling() {
+            return Err(DlmError::InvalidConfig(
+                "session has prompt tokens left to prefill".into(),
+            ));
+        }
         let mut logits = self.generator.logits(&self.last_hidden)?;
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
         let next = self.sampler.sample(&logits, &mut self.rng);
