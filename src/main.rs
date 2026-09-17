@@ -1118,10 +1118,14 @@ fn build_profiler(
     let p = VramProfiler::new(context_length)
         .with_max_batch(max_batch)
         .with_half_kv(half_kv);
-    match safety_margin_gb {
-        Some(gb) => p.with_safety_margin_bytes((gb.max(0.0) * GIB as f64) as u64),
-        None => p,
-    }
+    let bytes = match safety_margin_gb {
+        Some(gb) => (gb.max(0.0) * GIB as f64) as u64,
+        // Scaled to the card when there is one; the flat default otherwise.
+        None => gpu::mem_get_info().map_or(dlm::profiler::DEFAULT_SAFETY_MARGIN_BYTES, |m| {
+            dlm::profiler::default_safety_margin_bytes(m.total)
+        }),
+    };
+    p.with_safety_margin_bytes(bytes)
 }
 
 /// Refuse a serve config whose concurrent-batch KV reservation won't fit VRAM,

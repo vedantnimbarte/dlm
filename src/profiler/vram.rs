@@ -27,6 +27,18 @@ use crate::storage::LayerCatalog;
 /// Default safety cushion: 1.5 GiB, per (`M_safety`).
 pub const DEFAULT_SAFETY_MARGIN_BYTES: u64 = 3 * 512 * 1024 * 1024; // 1.5 * 2^30
 
+/// The default cushion for a card with `total_bytes` of VRAM: a tenth of it,
+/// between 256 MiB and [`DEFAULT_SAFETY_MARGIN_BYTES`].
+///
+/// The cushion covers transient device allocations: kernel scratch, attention
+/// scores, prefill staging. Those are tens of MiB, not a fixed 1.5 GiB. On a
+/// 4 GB card the flat 1.5 GiB held back nearly half the free VRAM, which a
+/// streamed model then paid for with layers it could have kept resident. Cards
+/// of 16 GB and up keep the full 1.5 GiB.
+pub fn default_safety_margin_bytes(total_bytes: u64) -> u64 {
+    (total_bytes / 10).clamp(256 * 1024 * 1024, DEFAULT_SAFETY_MARGIN_BYTES)
+}
+
 /// Bytes per KV element. The device KV cache is `f32`, whatever `--kv-quant`
 /// says: that flag shrinks only the host-side stores. Planning at 2 bytes
 /// reserved half the VRAM the cache really takes, so a "fitting" plan could
@@ -301,6 +313,17 @@ mod tests {
         assert_eq!(
             half.with_half_kv(false).kv_total_bytes(&c),
             full.kv_total_bytes(&c)
+        );
+    }
+
+    #[test]
+    fn default_safety_margin_scales_with_the_card() {
+        let gib = 1024 * 1024 * 1024u64;
+        assert_eq!(default_safety_margin_bytes(4 * gib), 4 * gib / 10);
+        assert_eq!(default_safety_margin_bytes(gib), 256 * 1024 * 1024);
+        assert_eq!(
+            default_safety_margin_bytes(24 * gib),
+            DEFAULT_SAFETY_MARGIN_BYTES
         );
     }
 

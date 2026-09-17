@@ -2,4 +2,4 @@
 
 pub mod vram;
 
-pub use vram::{VramPlan, VramProfiler, DEFAULT_SAFETY_MARGIN_BYTES};
+pub use vram::{default_safety_margin_bytes, VramPlan, VramProfiler, DEFAULT_SAFETY_MARGIN_BYTES};

@@ -531,7 +531,9 @@ LayersToLoad  =  ─────────────────────
 
 - **`M_free`** — free VRAM from the GPU runtime at runtime
   (`cudaMemGetInfo` / `hipMemGetInfo`; simulated off-GPU).
-- **`M_safety`** — cushion for activation spikes (default **1.5 GiB**).
+- **`M_safety`**: cushion for transient allocations. The default is a tenth of
+  the card's VRAM, between 256 MiB and **1.5 GiB**: about 0.4 GiB on a 4 GB
+  card, the full 1.5 GiB from 16 GB up.
 - **`M_kv_total`** — KV cache for the whole context, summed across **all** layers
   (their histories stay resident while weights stream):
   `2 × N_kv_heads × D_head × 2 bytes × L_context × N_layers`.
