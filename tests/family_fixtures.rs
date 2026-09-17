@@ -560,3 +560,52 @@ fn gemma3_family_fixtures() {
         assert_eq!(template, Some(ChatTemplate::Gemma), "{family}");
     }
 }
+
+/// Byte-level tokenizers split text with their model's own regex before merging:
+/// runs of spaces become one token, a line break ends its piece, digits split
+/// per the pattern. dlm used to split at spaces alone, and on 411 mixed strings
+/// matched Hugging Face `tokenizers` for only 58% (Qwen2.5), 54% (Llama 3) and
+/// 71% (GPT-2) of them. The expected ids here come from `tokenizers` itself
+/// (`encode(text, add_special_tokens=True)`).
+#[test]
+fn byte_level_tokenizers_split_like_their_regex() {
+    const CODE: &str = "def f(x):\n    return x**2  # square\n";
+    const PROSE: &str = "I don't think it's 12345 dollars.";
+    let cases: [(&str, &[u32], &[u32]); 3] = [
+        (
+            "qwen2.5",
+            &[
+                750, 282, 2075, 982, 262, 470, 856, 334, 17, 220, 671, 9334, 198,
+            ],
+            &[
+                40, 1513, 944, 1744, 432, 594, 220, 16, 17, 18, 19, 20, 11192, 13,
+            ],
+        ),
+        (
+            "llama-3",
+            &[
+                128000, 755, 282, 2120, 997, 262, 471, 865, 334, 17, 220, 674, 9518, 198,
+            ],
+            &[
+                128000, 40, 1541, 956, 1781, 433, 596, 220, 4513, 1774, 11441, 13,
+            ],
+        ),
+        (
+            "gpt2",
+            &[
+                4299, 277, 7, 87, 2599, 198, 220, 220, 220, 1441, 2124, 1174, 17, 220, 1303, 6616,
+                198,
+            ],
+            &[40, 836, 470, 892, 340, 338, 17031, 2231, 5054, 13],
+        ),
+    ];
+    for (family, code, prose) in cases {
+        let Some(dir) = fixture(family) else {
+            eprintln!("skipping {family}: fixture absent");
+            continue;
+        };
+        let tok = BpeTokenizer::from_dir(&dir).unwrap_or_else(|e| panic!("{family}: {e}"));
+        assert_eq!(tok.encode(CODE).unwrap(), code, "{family}: code");
+        assert_eq!(tok.encode(PROSE).unwrap(), prose, "{family}: prose");
+    }
+}
