@@ -2296,3 +2296,139 @@ fn gpu_scheduler_admits_within_the_kv_pool() {
     assert_eq!(got, want);
     assert_eq!(shared.kv_free_tokens(), Some(64), "every block came back");
 }
+
+/// A prefix snapshot of paged device KV shares the prefix's blocks instead of
+/// copying them. A session resumed from it decodes exactly like the original,
+/// and the blocks go back to the pool only when their last holder is gone.
+#[test]
+fn gpu_prefix_snapshot_shares_kv_blocks() {
+    let cfg = small_cfg();
+    let gpu = GpuKernel::new(cfg, random_layers(&cfg, 2, 0x5AE), 64)
+        .unwrap()
+        .with_kv_pool_tokens(16 * 16);
+    let kv_cfg = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let quant = dlm::forward::KvQuant::F16;
+    let mut rng = Rng::new(0x5AE);
+    let inputs: Vec<Vec<f32>> = (0..40).map(|_| rng.vec(cfg.hidden_size, 0.5)).collect();
+    let total = gpu.kv_free_tokens(true).unwrap();
+
+    let mut orch = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+    let mut want = Vec::new();
+    for x in &inputs {
+        let mut h = x.clone();
+        orch.decode_token(&mut h).unwrap();
+        want.push(h);
+    }
+    // 40 rows: three blocks.
+    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 48);
+
+    let snap = orch.snapshot_prefix(32).unwrap();
+    assert_eq!(snap.position(), 32);
+    assert_eq!(
+        gpu.kv_free_tokens(true).unwrap(),
+        total - 48,
+        "sharing the prefix allocates nothing"
+    );
+
+    // Resume from the shared prefix and replay the tail: identical output.
+    let mut resumed =
+        ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap.clone()).unwrap();
+    for (i, x) in inputs.iter().enumerate().skip(32) {
+        let mut h = x.clone();
+        resumed.decode_token(&mut h).unwrap();
+        let max_diff = h
+            .iter()
+            .zip(&want[i])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            max_diff, 0.0,
+            "token {i} after resuming from a shared prefix"
+        );
+    }
+    // The resumed session's tail took one block of its own.
+    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 64);
+
+    // Blocks free only when nobody holds them: the original's third block now,
+    // its private tail; the shared prefix once the snapshot and the resumed
+    // session are gone too.
+    drop(orch);
+    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 48);
+    drop(resumed);
+    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 32);
+    drop(snap);
+    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total);
+}
+
+/// With the prefix cache on, requests sharing an opening resume from shared
+/// blocks and still produce what each produces alone.
+#[test]
+fn gpu_scheduler_prefix_cache_preserves_output() {
+    use dlm::batching::BatchScheduler;
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    let cfg = small_cfg();
+    let vocab = 24;
+    let generator = || {
+        let mut rng = Rng::new(0xCAC4E);
+        Generator::new(
+            GpuKernel::new(cfg, random_layers(&cfg, 2, 0xCAC4), 256).unwrap(),
+            rng.vec(vocab * cfg.hidden_size, 0.5),
+            vec![1.0; cfg.hidden_size],
+            rng.vec(vocab * cfg.hidden_size, 0.5),
+            vocab,
+            1e-5,
+            KvCacheConfig {
+                num_layers: 2,
+                num_kv_heads: cfg.num_kv_heads as u32,
+                head_dim: cfg.head_dim as u32,
+                block_size: 16,
+            },
+            16,
+        )
+        .unwrap()
+        .with_kv_quant(dlm::forward::KvQuant::F16)
+        .with_kv_pool_tokens(1024)
+    };
+    let mut rng = Rng::new(7);
+    let system: Vec<u32> = (0..37)
+        .map(|_| (rng.next_u64() % vocab as u64) as u32)
+        .collect();
+    let prompts: Vec<Vec<u32>> = (0..4)
+        .map(|i| {
+            let mut p = system.clone();
+            p.extend((0..5 + i).map(|_| (rng.next_u64() % vocab as u64) as u32));
+            p
+        })
+        .collect();
+    let gen_cfg = GenerationConfig {
+        max_new_tokens: 12,
+        eos_token: None,
+        sampler: Sampler::Greedy,
+    };
+    let solo = generator();
+    let want: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| solo.generate(p, &gen_cfg).unwrap())
+        .collect();
+
+    let shared = generator();
+    // One at a time, so each request can resume from the one before.
+    let mut sched = BatchScheduler::new(&shared, 1).with_prefix_cache(8);
+    for (id, p) in prompts.iter().enumerate() {
+        sched.submit(id as u64, p.clone(), 12, vec![]).unwrap();
+    }
+    let mut results = sched.run().unwrap();
+    results.sort_by_key(|f| f.id);
+    let got: Vec<Vec<u32>> = results.into_iter().map(|f| f.tokens).collect();
+    assert_eq!(got, want);
+    assert_eq!(
+        sched.resume_hits(),
+        3,
+        "every request after the first resumed"
+    );
+}

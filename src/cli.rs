@@ -338,12 +338,15 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ID")]
     pub eos_token: Option<u32>,
 
-    /// Cache up to this many prompt-prefix KV snapshots so requests sharing a
-    /// prefix (e.g. a common system prompt) skip re-prefilling it. `0` disables
-    /// it. Each entry holds the prefix's KV in RAM, so size it to your memory.
-    /// No effect with a draft model (speculative sessions can't resume).
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    pub prefix_cache_size: usize,
+    /// Cache up to this many prompt prefixes so a request that starts like an
+    /// earlier one (a shared system prompt, a chat's history) skips re-prefilling
+    /// that part. `0` disables it. On the GPU a cached prefix shares the KV
+    /// blocks it already has, and cached prefixes are dropped when a request
+    /// needs the room; the default there is 64. On the CPU each entry is a copy
+    /// of the prefix's KV in RAM, so it is off unless set. No effect with a draft
+    /// model (speculative sessions can't resume).
+    #[arg(long, value_name = "N")]
+    pub prefix_cache_size: Option<usize>,
 
     /// Expose `GET /v1/telemetry`, a Server-Sent Events stream of per-layer flow
     /// events: what each layer cost at each stage of

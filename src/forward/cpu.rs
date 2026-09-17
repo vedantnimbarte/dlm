@@ -1090,12 +1090,24 @@ impl Clone for KvLayerCache {
             store: self.store.clone(),
             device_tokens: self.device_tokens,
             device_half: self.device_half,
-            // GPU KV is per-session device memory; a clone (a KV snapshot for the
-            // prefix cache) starts with none and re-allocates on next GPU use.
+            // Contiguous GPU KV is per-session device memory; a clone starts with
+            // none and re-allocates on next GPU use.
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
+            // Paged KV of whole blocks is shared: the clone holds the same blocks
+            // and writes only past them. A partly filled last block cannot be
+            // shared, so such a clone keeps no device history (and has to be
+            // taken through `sync_from_device` to be usable).
             #[cfg(any(feature = "cuda", feature = "rocm"))]
-            paged: None,
+            paged: self
+                .paged
+                .as_ref()
+                .filter(|p| {
+                    self.host_len() == 0
+                        && self.device_tokens % crate::forward::kv_pool::KV_BLOCK_ROWS == 0
+                        && p.rows() >= self.device_tokens
+                })
+                .map(|p| p.share_prefix(self.device_tokens)),
         }
     }
 }
@@ -1313,6 +1325,55 @@ impl KvLayerCache {
         }
         let h = self.gpu.as_ref().unwrap();
         Ok((h.keys.as_mut_ptr(), h.values.as_mut_ptr()))
+    }
+
+    /// This layer's first `rows` positions as a new cache. Paged device history is
+    /// shared ([`share_device_prefix`](Self::share_device_prefix)); host history
+    /// is copied. Device history that cannot be shared at `rows` (not a whole
+    /// number of blocks) is dropped, so resuming from the result fails cleanly
+    /// rather than writing into a block another session holds.
+    pub(crate) fn prefix_of(&self, rows: usize) -> Self {
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if self.paged.is_some() {
+            if let Some(shared) = self.share_device_prefix(rows) {
+                return shared;
+            }
+            let mut detached = self.clone();
+            detached.paged = None;
+            detached.truncate(rows);
+            return detached;
+        }
+        let mut copy = self.clone();
+        copy.truncate(rows);
+        copy
+    }
+
+    /// This layer's first `rows` positions (a whole number of KV blocks) as a new
+    /// cache that shares their device blocks instead of copying them, or `None`
+    /// when they cannot be shared: host-side history, too few rows, or no paged
+    /// device KV (CPU kernels, MLA).
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn share_device_prefix(&self, rows: usize) -> Option<Self> {
+        let p = self.paged.as_ref()?;
+        if self.host_len() != 0
+            || rows % crate::forward::kv_pool::KV_BLOCK_ROWS != 0
+            || rows > self.device_tokens
+            || rows > p.rows()
+        {
+            return None;
+        }
+        Some(Self {
+            kv_dim: self.kv_dim,
+            store: match &self.store {
+                KvStore::Full { .. } => KvStore::default(),
+                KvStore::Int8 { .. } => Self::new_quant(self.kv_dim, KvQuant::Int8).store,
+                KvStore::Int4 { .. } => Self::new_quant(self.kv_dim, KvQuant::Int4).store,
+            },
+            device_tokens: rows,
+            device_half: self.device_half,
+            gpu: None,
+            paged: Some(p.share_prefix(rows)),
+        })
     }
 
     /// Whether the kernels must read and write this layer's device K/V as fp16.
