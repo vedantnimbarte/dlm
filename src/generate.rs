@@ -924,6 +924,13 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
         self.orchestrator.snapshot_synced()
     }
 
+    /// Snapshot the first `rows` positions for the prefix cache, sharing paged
+    /// device KV blocks where it can
+    /// ([`ForwardOrchestrator::snapshot_prefix`](crate::forward::ForwardOrchestrator::snapshot_prefix)).
+    pub fn snapshot_prefix(&mut self, rows: usize) -> Result<crate::forward::KvSnapshot> {
+        self.orchestrator.snapshot_prefix(rows)
+    }
+
     /// KV rows the session holds: its prompt plus the tokens decoded so far.
     pub fn kv_rows(&self) -> usize {
         self.orchestrator.position()

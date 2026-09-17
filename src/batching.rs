@@ -48,19 +48,42 @@ impl PrefixCache {
         }
     }
 
-    /// The snapshot of the longest cached prompt that is a strict prefix of
-    /// `prompt` (so there is a non-empty suffix left to prefill).
+    /// A snapshot of the longest run of leading tokens `prompt` shares with a
+    /// cached prompt, cut down to a multiple of `align` and short of the whole
+    /// prompt (a non-empty suffix is left to prefill).
+    ///
+    /// Shared, not identical: requests with one system prompt and different
+    /// questions share the system prompt, and a cached prompt that includes its
+    /// own question must still serve the next one. `align` is the KV block size
+    /// on a kernel that shares device blocks (only whole blocks can be shared)
+    /// and 1 elsewhere.
     // Linear scan, deliberately: the cache is hard-bounded by `max_entries` (the
     // --prefix-cache-size flag) in `insert`, so this is O(configured size), not
     // O(traffic). Index by first token only if that bound is ever raised to
     // something large. The bound is enforced by
     // `prefix_cache_never_exceeds_its_bound`.
-    fn longest_prefix(&self, prompt: &[u32]) -> Option<KvSnapshot> {
+    fn longest_prefix(&self, prompt: &[u32], align: usize) -> Option<KvSnapshot> {
+        let usable = |toks: &[u32], snap: &KvSnapshot| {
+            let common = toks.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+            let rows = common.min(prompt.len() - 1).min(snap.position());
+            rows / align * align
+        };
         self.entries
             .iter()
-            .filter(|(toks, _)| toks.len() < prompt.len() && prompt.starts_with(toks))
-            .max_by_key(|(toks, _)| toks.len())
-            .map(|(_, snap)| snap.clone())
+            .map(|(toks, snap)| (usable(toks, snap), snap))
+            .filter(|&(rows, _)| rows > 0)
+            .max_by_key(|&(rows, _)| rows)
+            .map(|(rows, snap)| snap.prefix(rows))
+    }
+
+    /// Drop the oldest entry, releasing whatever KV it holds (on a GPU kernel,
+    /// the blocks no running session shares). False if there was none.
+    fn evict_oldest(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.entries.remove(0);
+        true
     }
 
     /// Cache `prompt`'s post-prefill `snapshot`, evicting the oldest entry when
@@ -326,7 +349,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// cannot fit an empty pool, waiting would never make it fit, and it should
     /// fail with the pool's error rather than stall the queue.
     fn kv_fits(&self, need: usize) -> bool {
-        if self.active.is_empty() {
+        let cached = self
+            .prefix_cache
+            .as_ref()
+            .is_some_and(|c| !c.entries.is_empty());
+        if self.active.is_empty() && !cached {
             return true;
         }
         let outstanding: usize = self.active.iter().map(Active::unallocated).sum();
@@ -348,8 +375,18 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 break;
             };
             let reserved = self.reservation(front);
-            if front.max_new_tokens > 0 && !self.kv_fits(reserved) {
-                break;
+            if front.max_new_tokens > 0 {
+                // Cached prefixes hold KV blocks too. Give them back, oldest first,
+                // before making a request wait for running ones to finish.
+                while !self.kv_fits(reserved)
+                    && self
+                        .prefix_cache
+                        .as_mut()
+                        .is_some_and(PrefixCache::evict_oldest)
+                {}
+                if !self.kv_fits(reserved) {
+                    break;
+                }
             }
             let p = self.pending.pop_front().expect("front exists");
             if p.max_new_tokens == 0 {
@@ -366,12 +403,17 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 )?),
                 None => {
                     // Resume from the longest cached prefix if one exists;
-                    // otherwise prefill from scratch. Either way, cache the
-                    // full-prompt snapshot so later requests can extend it.
+                    // otherwise prefill from scratch. Either way, cache this
+                    // prompt's prefix so later requests can extend it.
+                    let align = if self.generator.kv_free_tokens().is_some() {
+                        KV_BLOCK_TOKENS
+                    } else {
+                        1
+                    };
                     let resume = self
                         .prefix_cache
                         .as_ref()
-                        .and_then(|c| c.longest_prefix(&p.prompt));
+                        .and_then(|c| c.longest_prefix(&p.prompt, align));
                     let mut session = match resume {
                         Some(snap) => {
                             self.resume_hits += 1;
@@ -381,10 +423,20 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         }
                         None => self.generator.start_session(&p.prompt, p.sampler)?,
                     };
-                    if let Some(cache) = self.prefix_cache.as_mut() {
-                        // `_synced`: on the GPU kernels the real K/V is in VRAM,
-                        // so an unsynced snapshot would cache zeros.
-                        cache.insert(p.prompt.clone(), session.snapshot_synced()?);
+                    // On a kernel that pages KV, the cached prefix is the prompt
+                    // cut back to whole blocks, so the snapshot shares those
+                    // blocks instead of copying the prompt's KV back to the host.
+                    // Elsewhere the snapshot is a host copy of the whole prompt.
+                    let aligned = if self.generator.kv_free_tokens().is_some() {
+                        p.prompt.len() / KV_BLOCK_TOKENS * KV_BLOCK_TOKENS
+                    } else {
+                        p.prompt.len()
+                    };
+                    if let (Some(cache), true) = (self.prefix_cache.as_mut(), aligned > 0) {
+                        cache.insert(
+                            p.prompt[..aligned].to_vec(),
+                            session.snapshot_prefix(aligned)?,
+                        );
                     }
                     Decoder::Plain(session)
                 }
@@ -490,21 +542,28 @@ mod prefix_cache_tests {
     use crate::cache::{KvCacheConfig, PagedKvCache};
     use crate::forward::{ForwardOrchestrator, KvSnapshot, StubKernel};
 
-    /// A throwaway snapshot; these tests exercise the cache's bookkeeping, not
-    /// the KV contents.
-    fn snap() -> KvSnapshot {
+    /// A throwaway snapshot of `rows` positions; these tests exercise the cache's
+    /// bookkeeping, not the KV contents.
+    fn snap_of(rows: usize) -> KvSnapshot {
         let kv_cfg = KvCacheConfig {
             num_layers: 1,
             num_kv_heads: 1,
             head_dim: 2,
             block_size: 16,
         };
-        let orch = ForwardOrchestrator::new(
+        let mut orch = ForwardOrchestrator::new(
             StubKernel::new(1, 4, 2),
             PagedKvCache::new(kv_cfg, 4),
             crate::forward::KvQuant::None,
         );
+        for _ in 0..rows {
+            orch.decode_token(&mut [0.0; 4]).unwrap();
+        }
         orch.snapshot()
+    }
+
+    fn snap() -> KvSnapshot {
+        snap_of(0)
     }
 
     /// `longest_prefix` scans linearly, which is only acceptable because the
@@ -546,16 +605,25 @@ mod prefix_cache_tests {
     #[test]
     fn longest_prefix_picks_the_longest_strict_prefix() {
         let mut cache = PrefixCache::new(8);
-        cache.insert(vec![1], snap());
-        cache.insert(vec![1, 2, 3], snap());
-        cache.insert(vec![1, 2], snap());
-        cache.insert(vec![9, 9], snap());
+        cache.insert(vec![1], snap_of(1));
+        cache.insert(vec![1, 2, 3], snap_of(3));
+        cache.insert(vec![1, 2], snap_of(2));
+        cache.insert(vec![9, 9], snap_of(2));
 
-        // Longest strict prefix of [1,2,3,4] is [1,2,3].
-        assert!(cache.longest_prefix(&[1, 2, 3, 4]).is_some());
-        // Exact match is not a *strict* prefix — nothing would be left to prefill.
-        assert!(cache.longest_prefix(&[1]).is_none());
-        // No shared prefix at all.
-        assert!(cache.longest_prefix(&[5, 5, 5]).is_none());
+        let rows =
+            |prompt: &[u32], align| cache.longest_prefix(prompt, align).map(|s| s.position());
+        // Longest shared run with [1,2,3,4] is [1,2,3].
+        assert_eq!(rows(&[1, 2, 3, 4], 1), Some(3));
+        // Shared but diverging: [1,2,7] shares [1,2] with the cached [1,2,3].
+        assert_eq!(rows(&[1, 2, 7], 1), Some(2));
+        // The whole prompt is never reused: one token must be left to prefill.
+        assert_eq!(rows(&[1, 2, 3], 1), Some(2));
+        assert_eq!(rows(&[1], 1), None);
+        // Nothing shared at all.
+        assert_eq!(rows(&[5, 5, 5], 1), None);
+        // Cut down to whole blocks: two shared rows make no whole block of 2...
+        assert_eq!(rows(&[1, 2, 3, 4], 2), Some(2));
+        // ...and none of 4.
+        assert_eq!(rows(&[1, 2, 3, 4], 4), None);
     }
 }

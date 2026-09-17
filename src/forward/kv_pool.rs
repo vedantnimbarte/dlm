@@ -26,7 +26,14 @@ pub struct KvPool {
     half: bool,
     kv_dim: usize,
     total_blocks: u32,
-    free: Mutex<Vec<u32>>,
+    blocks: Mutex<Blocks>,
+}
+
+/// Free blocks, and how many holders each block has. A block is shared when a
+/// cached prompt prefix and the sessions resumed from it hold it at once.
+struct Blocks {
+    free: Vec<u32>,
+    refs: Vec<u32>,
 }
 
 impl KvPool {
@@ -46,8 +53,11 @@ impl KvPool {
             half,
             kv_dim,
             total_blocks: blocks,
-            // Low ids first, so short runs touch the start of the pool.
-            free: Mutex::new((0..blocks).rev().collect()),
+            blocks: Mutex::new(Blocks {
+                // Low ids first, so short runs touch the start of the pool.
+                free: (0..blocks).rev().collect(),
+                refs: vec![0; blocks as usize],
+            }),
         })
     }
 
@@ -57,7 +67,7 @@ impl KvPool {
 
     /// Tokens the free blocks can hold.
     pub fn free_tokens(&self) -> usize {
-        self.free.lock().unwrap().len() * KV_BLOCK_ROWS
+        self.blocks.lock().unwrap().free.len() * KV_BLOCK_ROWS
     }
 
     pub(crate) fn keys_ptr(&self) -> *mut f32 {
@@ -68,22 +78,42 @@ impl KvPool {
         self.values.as_mut_ptr()
     }
 
-    /// Take `n` blocks, all or none.
+    /// Take `n` free blocks, all or none, each with one holder.
     fn take(&self, n: usize) -> Result<Vec<u32>> {
-        let mut free = self.free.lock().unwrap();
-        if free.len() < n {
+        let mut b = self.blocks.lock().unwrap();
+        if b.free.len() < n {
             return Err(DlmError::KvCacheExhausted {
                 requested: n as u32,
-                free: free.len() as u32,
+                free: b.free.len() as u32,
                 total: self.total_blocks,
             });
         }
-        let at = free.len() - n;
-        Ok(free.split_off(at))
+        let at = b.free.len() - n;
+        let taken = b.free.split_off(at);
+        for &id in &taken {
+            b.refs[id as usize] = 1;
+        }
+        Ok(taken)
     }
 
-    fn give(&self, blocks: &[u32]) {
-        self.free.lock().unwrap().extend_from_slice(blocks);
+    /// Add a holder to each of `ids`.
+    fn retain(&self, ids: &[u32]) {
+        let mut b = self.blocks.lock().unwrap();
+        for &id in ids {
+            b.refs[id as usize] += 1;
+        }
+    }
+
+    /// Drop a holder from each of `ids`, freeing the blocks nobody holds.
+    fn give(&self, ids: &[u32]) {
+        let mut b = self.blocks.lock().unwrap();
+        for &id in ids {
+            let r = &mut b.refs[id as usize];
+            *r -= 1;
+            if *r == 0 {
+                b.free.push(id);
+            }
+        }
     }
 
     fn elem_bytes(&self) -> usize {
@@ -129,47 +159,90 @@ impl KvPool {
 pub struct PagedKv {
     pool: Arc<KvPool>,
     blocks: Vec<u32>,
-    /// `i32` block ids, room for every block the session may reach.
-    table: DeviceBuffer,
+    /// Rows the table must have room for.
+    capacity_rows: usize,
+    /// `i32` block ids, room for every block the session may reach. Allocated
+    /// on first use, so sharing a prefix (see [`share_prefix`](Self::share_prefix))
+    /// cannot fail.
+    table: Option<DeviceBuffer>,
+    /// Entries of `blocks` already written to `table`.
+    table_len: usize,
 }
 
 impl PagedKv {
     /// An empty mapping on `pool`, with table room for `capacity_rows` rows.
     pub(crate) fn new(pool: Arc<KvPool>, capacity_rows: usize) -> Result<Self> {
-        let slots = capacity_rows.div_ceil(KV_BLOCK_ROWS).max(1);
         Ok(Self {
             pool,
             blocks: Vec::new(),
-            table: DeviceBuffer::new_bytes(slots * 4, slots)?,
+            capacity_rows,
+            table: None,
+            table_len: 0,
         })
+    }
+
+    /// A mapping of the first `rows` rows onto the same blocks, which gain a
+    /// holder. `rows` must fall on a block boundary: a partly filled block would
+    /// be written by both holders. The new mapping's writes all land past `rows`,
+    /// in blocks of its own.
+    pub(crate) fn share_prefix(&self, rows: usize) -> Self {
+        debug_assert_eq!(rows % KV_BLOCK_ROWS, 0, "shared prefixes are whole blocks");
+        let n = (rows / KV_BLOCK_ROWS).min(self.blocks.len());
+        let blocks = self.blocks[..n].to_vec();
+        self.pool.retain(&blocks);
+        Self {
+            pool: Arc::clone(&self.pool),
+            blocks,
+            capacity_rows: self.capacity_rows,
+            table: None,
+            table_len: 0,
+        }
+    }
+
+    /// Rows backed by blocks.
+    pub(crate) fn rows(&self) -> usize {
+        self.blocks.len() * KV_BLOCK_ROWS
     }
 
     pub(crate) fn pool(&self) -> &KvPool {
         &self.pool
     }
 
+    /// The device block table. Call [`ensure_rows`](Self::ensure_rows) first.
     pub(crate) fn table_ptr(&self) -> *const i32 {
-        self.table.as_ptr() as *const i32
+        self.table
+            .as_ref()
+            .map_or(std::ptr::null(), |t| t.as_ptr() as *const i32)
     }
 
     /// Make sure rows `0..rows` have blocks, taking new ones from the pool and
     /// recording them in the device table.
     pub(crate) fn ensure_rows(&mut self, rows: usize) -> Result<()> {
+        let slots = self.capacity_rows.div_ceil(KV_BLOCK_ROWS).max(1);
         let need = rows.div_ceil(KV_BLOCK_ROWS);
-        if need <= self.blocks.len() {
-            return Ok(());
-        }
-        if need > self.table.len() {
+        if need > slots {
             return Err(DlmError::InvalidConfig(format!(
                 "GPU KV capacity {} exceeded at position {}",
-                self.table.len() * KV_BLOCK_ROWS,
+                slots * KV_BLOCK_ROWS,
                 rows - 1
             )));
         }
-        let new = self.pool.take(need - self.blocks.len())?;
-        let bytes: Vec<u8> = new.iter().flat_map(|&b| (b as i32).to_le_bytes()).collect();
-        self.table.upload_bytes_at(self.blocks.len() * 4, &bytes)?;
-        self.blocks.extend(new);
+        if need > self.blocks.len() {
+            let new = self.pool.take(need - self.blocks.len())?;
+            self.blocks.extend(new);
+        }
+        if self.table.is_none() {
+            self.table = Some(DeviceBuffer::new_bytes(slots * 4, slots)?);
+        }
+        if self.table_len < self.blocks.len() {
+            let bytes: Vec<u8> = self.blocks[self.table_len..]
+                .iter()
+                .flat_map(|&b| (b as i32).to_le_bytes())
+                .collect();
+            let table = self.table.as_ref().expect("allocated above");
+            table.upload_bytes_at(self.table_len * 4, &bytes)?;
+            self.table_len = self.blocks.len();
+        }
         Ok(())
     }
 

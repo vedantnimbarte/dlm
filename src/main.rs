@@ -1466,6 +1466,12 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     let generator = generator.with_kv_quant(kv_quant);
     let draft = draft.map(|d| d.with_kv_quant(kv_quant));
     let kv_pool = generator.kv_free_tokens();
+    // Cached prefixes share paged device KV and give it back under pressure, so
+    // they are on by default where the kernel pages KV. On the CPU each one is a
+    // host copy of its KV, so only when asked for.
+    let prefix_cache = args
+        .prefix_cache_size
+        .unwrap_or(if kv_pool.is_some() { 64 } else { 0 });
     if let Some(opts) = &args.bench {
         return bench_generator(&generator, &tokenizer, opts, args, config);
     }
@@ -1485,7 +1491,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             128,
             created,
             args.max_batch.max(1), // max concurrent batch (--max-batch)
-            args.prefix_cache_size,
+            prefix_cache,
         ),
         None => dlm::server::EngineService::start(
             generator,
@@ -1495,7 +1501,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             128,
             created,
             args.max_batch.max(1), // max concurrent batch (--max-batch)
-            args.prefix_cache_size,
+            prefix_cache,
         ),
     }
     .with_chat_template(template)
@@ -1523,10 +1529,14 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             args.context_length
         );
     }
-    if args.prefix_cache_size > 0 && !speculative {
+    if prefix_cache > 0 && !speculative {
         println!(
-            "  prefix     : KV cache up to {} prompt prefixes",
-            args.prefix_cache_size
+            "  prefix     : up to {prefix_cache} prompt prefixes cached{}",
+            if kv_pool.is_some() {
+                " (sharing KV blocks; dropped when requests need the room)"
+            } else {
+                " (each a host copy of its KV)"
+            }
         );
     }
     let on_gpu = args.device == Device::Gpu || !args.multi_gpu_ids.is_empty();

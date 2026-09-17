@@ -38,6 +38,17 @@ impl KvSnapshot {
     pub fn position(&self) -> usize {
         self.position
     }
+
+    /// The first `rows` positions of this snapshot (at most all of them). Paged
+    /// device KV is shared, so `rows` must be a whole number of KV blocks for a
+    /// snapshot of device history; host history is copied at any length.
+    pub fn prefix(&self, rows: usize) -> KvSnapshot {
+        let rows = rows.min(self.position);
+        KvSnapshot {
+            kv_layers: self.kv_layers.iter().map(|kv| kv.prefix_of(rows)).collect(),
+            position: rows,
+        }
+    }
 }
 
 /// Drives one sequence's autoregressive forward pass over a compute kernel.
@@ -90,6 +101,35 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
             kv.sync_from_device()?;
         }
         Ok(self.snapshot())
+    }
+
+    /// Snapshot the first `rows` positions for the prefix cache. When every
+    /// layer's history is paged on the device and `rows` is a whole number of KV
+    /// blocks, the snapshot shares those blocks and nothing is copied. Otherwise
+    /// it pulls the history back to the host, as
+    /// [`snapshot_synced`](Self::snapshot_synced) does, and keeps `rows`.
+    pub fn snapshot_prefix(&mut self, rows: usize) -> Result<KvSnapshot> {
+        let rows = rows.min(self.position);
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        {
+            let shared: Option<Vec<KvLayerCache>> = self
+                .kv_layers
+                .iter()
+                .map(|kv| kv.share_device_prefix(rows))
+                .collect();
+            if let Some(kv_layers) = shared {
+                return Ok(KvSnapshot {
+                    kv_layers,
+                    position: rows,
+                });
+            }
+        }
+        let mut snap = self.snapshot_synced()?;
+        for kv in &mut snap.kv_layers {
+            kv.truncate(rows);
+        }
+        snap.position = rows;
+        Ok(snap)
     }
 
     /// Build an orchestrator resuming from `snapshot`'s KV history and position,

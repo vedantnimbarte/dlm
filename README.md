@@ -802,11 +802,15 @@ inference engine):
     - **On the CPU kernels**, `int8` gives about half the memory and `int4`
       about a quarter, with more error. The CPU kernels have no fp16 store, so
       `f16` stays `f32` there.
-  - `--prefix-cache-size N` — cache up to `N` prompt-prefix KV snapshots so
-    requests sharing a prefix (e.g. a common system prompt) skip re-prefilling it.
-    Each entry holds its prefix's KV in RAM; `0` disables it. Works on CPU and
-    GPU: snapshots are host-side, so on the GPU path the device K/V is copied back
-    when a snapshot is taken and re-uploaded when one is resumed.
+  - `--prefix-cache-size N` caches up to `N` prompt prefixes. A request that
+    starts like an earlier one (a shared system prompt, a chat's growing history)
+    skips re-prefilling that part. `0` disables it.
+    - **On the GPU** it is on by default (64 entries). A cached prefix is the
+      prompt cut back to whole 16-token KV blocks, and it shares those blocks
+      with the session that computed them: nothing is copied. Cached prefixes
+      are dropped, oldest first, when a new request needs their blocks.
+    - **On the CPU** each entry is a host copy of the prefix's KV, so it is off
+      unless set.
 
   **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a

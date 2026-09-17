@@ -140,6 +140,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Requests that repeat an earlier prompt's opening reuse its KV on the GPU.**
+  This covers a shared system prompt, or a chat whose history grows each turn.
+  - **How:** the prefix cache holds prompts cut back to whole KV blocks, and a
+    snapshot shares those blocks with the session that computed them (the pool
+    counts each block's holders). It used to copy the prompt's whole KV back to
+    the host on every request and upload it again on a hit.
+  - **Matching:** a request reuses the longest run of leading tokens it shares
+    with any cached prompt, not only a cached prompt it fully extends. Requests
+    with one system prompt and different questions therefore hit.
+  - **Measured, GTX 1650:** Qwen2.5-0.5B with a 1,590-token system prompt. The
+    first request took 14.1 s. Later requests with different questions took
+    0.27 s, and their answers were identical to the same question computed
+    fresh.
+  - **Default:** on the GPU the cache is on by default (64 entries), and cached
+    prefixes give their blocks back, oldest first, when a request needs the
+    room. The CPU default stays off, since there each entry is a host copy.
+
 - **Concurrent requests share one batched pass and one paged KV pool.**
   - **Batched decode:** a scheduler tick advances every in-flight request
     through `Generator::step_sessions`. On the resident GPU kernel that is one
