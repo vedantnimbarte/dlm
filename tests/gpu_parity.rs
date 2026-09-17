@@ -2051,24 +2051,32 @@ fn gpu_decode_batch_matches_solo() {
     // layers makes every token evict. That once let the prefetch worker upload a
     // layer into an evicted layer's buffers while kernels still queued from the
     // last compute call were reading them.
-    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
-        for n in [2, 5] {
-            let streaming = StreamingGpuKernel::new(
-                cfg,
-                VecSource(random_layers(&cfg, 3, 0xDECB)),
-                64,
-                2,
-                None,
-            )
-            .unwrap()
-            .with_kv_pool_tokens(5 * 64);
-            assert_decode_batch_matches_solo(
-                &streaming,
-                cfg,
-                n,
-                quant,
-                &format!("streaming {quant:?}"),
-            );
+    //
+    // Each streamed upload comes from the plain staging buffer (no pinned cache),
+    // from a pinned cache with room for one layer (so every miss evicts and
+    // restages into a reused buffer), or from one holding every layer.
+    let one_layer = 40_000;
+    for pinned in [0, one_layer, 1 << 30] {
+        for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+            for n in [2, 5] {
+                let streaming = StreamingGpuKernel::new(
+                    cfg,
+                    VecSource(random_layers(&cfg, 3, 0xDECB)),
+                    64,
+                    2,
+                    None,
+                )
+                .unwrap()
+                .with_kv_pool_tokens(5 * 64)
+                .with_pinned_layer_cache(pinned);
+                assert_decode_batch_matches_solo(
+                    &streaming,
+                    cfg,
+                    n,
+                    quant,
+                    &format!("streaming {quant:?}, pinned cache {pinned}"),
+                );
+            }
         }
     }
     let (mla_cfg, shape) = mla_test_config(None);
