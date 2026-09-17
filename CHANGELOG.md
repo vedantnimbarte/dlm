@@ -53,6 +53,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Long prompts no longer stall other requests' streams.**
+  - **Before:** a request's prompt was prefilled whole when it was admitted,
+    and every running stream waited for it.
+  - **Now:** admitted prompts are fed in 16 tokens at a time, and a tick stops
+    after 200 ms while other requests are decoding. With nothing decoding,
+    prompts still go in whole.
+  - **Identical output:** the GPU kernels prefill in groups of 16, so pieces of
+    that size leave the output bit-identical.
+  - **Prefix sharing in bursts:** a request that shares at least a KV block of
+    its opening with a prompt still being prefilled waits for that prompt to be
+    cached, so a burst with one system prompt computes it once.
+  - **Measured, GTX 1650, Qwen2.5-0.5B:** a stream decoding while a 1,590-token
+    request arrived used to pause for 13.9 s. Now its longest gap is 0.41 s. The
+    long request itself takes 17.7 s instead of 13.9 s.
+
 - **Streamed batches load each layer once, not once per request.** The
   streaming GPU kernel now runs every sequence of a dense model through a
   layer's weights in one fused block call before fetching the next layer. It
