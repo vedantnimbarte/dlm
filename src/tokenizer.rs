@@ -137,6 +137,8 @@ pub struct BpeTokenizer {
     /// present and degenerate without it; Qwen sets `add_bos_token: false` and so
     /// leaves this `None`.
     bos_id: Option<u32>,
+    /// How byte-level BPE splits text before merging (the tokenizer's regex).
+    split: ByteLevelSplit,
 }
 
 /// Knobs for SentencePiece-style BPE, read from the tokenizer's normalizer and
@@ -190,6 +192,7 @@ impl BpeTokenizer {
             unigram: None,
             spm: None,
             bos_id: None,
+            split: ByteLevelSplit::Gpt2,
         }
     }
 
@@ -245,6 +248,7 @@ impl BpeTokenizer {
             unigram: None,
             spm: None,
             bos_id: None,
+            split: ByteLevelSplit::Gpt2,
         }
     }
 
@@ -285,6 +289,7 @@ impl BpeTokenizer {
             }),
             spm: None,
             bos_id: None,
+            split: ByteLevelSplit::Gpt2,
         }
     }
 
@@ -369,7 +374,8 @@ impl BpeTokenizer {
                 }
             })
             .collect();
-        let tok = Self::new(vocab, merges_list).with_special(specials);
+        let mut tok = Self::new(vocab, merges_list).with_special(specials);
+        tok.split = detect_byte_level_split(&hf.pre_tokenizer);
         match detect_spm(&hf.normalizer, &hf.pre_tokenizer, hf.model.byte_fallback) {
             Some(spm) => Ok(tok.with_spm(spm)),
             None => Ok(tok),
@@ -432,7 +438,7 @@ impl BpeTokenizer {
                     (None, Some(spm)) => self.encode_spm_bpe(spm, &chunk_text, &mut ids)?,
                     // Byte-level BPE: pre-tokenize into chunks, merge each.
                     (None, None) => {
-                        for chunk in pretokenize(&chunk_text) {
+                        for chunk in pretokenize(&chunk_text, self.split) {
                             for symbol in self.bpe(chunk.as_bytes()) {
                                 let id = self.encoder.get(&symbol).ok_or_else(|| {
                                     DlmError::Tokenizer(format!(
@@ -917,30 +923,237 @@ fn pretokenize_spm(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Split text so a leading space attaches to the following chunk (GPT-2 style:
-/// " world" tokenizes as a "Ġworld" unit). Decoding is independent of this split.
-fn pretokenize(text: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut cur = String::new();
-    for ch in text.chars() {
-        if ch == ' ' {
-            if !cur.is_empty() {
-                chunks.push(std::mem::take(&mut cur));
+/// Which regex a byte-level BPE tokenizer splits text with before merging.
+///
+/// Merges are learned only within the regex's pieces, so splitting any other
+/// way yields tokens the model never saw in training. Splitting at spaces alone
+/// turned a run of spaces (code indentation) into one token per space, where the
+/// model's tokenizer makes one token of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteLevelSplit {
+    /// GPT-2's built-in `ByteLevel` regex:
+    /// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`.
+    Gpt2,
+    /// Qwen2, Qwen2.5 and Qwen3: [`QWEN2_PATTERN`].
+    Qwen2,
+    /// Llama 3: [`QWEN2_PATTERN`] with numbers in runs of up to three digits.
+    Llama3,
+}
+
+const QWEN2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+const LLAMA3_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The split a `tokenizer.json` pre-tokenizer graph asks for: the Qwen2 or
+/// Llama 3 pattern when a `Split` step carries it verbatim, else GPT-2's. Other
+/// byte-level tokenizers (Falcon, DeepSeek) chain several splits of their own;
+/// GPT-2's regex is the closest of the three to those.
+fn detect_byte_level_split(pre: &serde_json::Value) -> ByteLevelSplit {
+    fn patterns<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                if let Some(p) = map
+                    .get("pattern")
+                    .and_then(|p| p.get("Regex"))
+                    .and_then(|r| r.as_str())
+                {
+                    out.push(p);
+                }
+                for child in map.values() {
+                    patterns(child, out);
+                }
             }
-            cur.push(ch);
-        } else {
-            cur.push(ch);
+            serde_json::Value::Array(items) => items.iter().for_each(|i| patterns(i, out)),
+            _ => {}
         }
     }
-    if !cur.is_empty() {
-        chunks.push(cur);
+    let mut found = Vec::new();
+    patterns(pre, &mut found);
+    if found.contains(&QWEN2_PATTERN) {
+        ByteLevelSplit::Qwen2
+    } else if found.contains(&LLAMA3_PATTERN) {
+        ByteLevelSplit::Llama3
+    } else {
+        ByteLevelSplit::Gpt2
     }
-    chunks
+}
+
+/// Split `text` the way `split`'s regex does, leftmost alternative first, so
+/// each piece is exactly what the model's tokenizer would merge within.
+fn pretokenize(text: &str, split: ByteLevelSplit) -> Vec<&str> {
+    use crate::unicode_class::{is_letter, is_number};
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let n = chars.len();
+    let at = |i: usize| chars.get(i).map(|&(_, c)| c);
+    let letter = |i: usize| at(i).is_some_and(is_letter);
+    let number = |i: usize| at(i).is_some_and(is_number);
+    let space = |i: usize| at(i).is_some_and(char::is_whitespace);
+    let crlf = |i: usize| matches!(at(i), Some('\r' | '\n'));
+    // Other: neither whitespace, letter nor number (`[^\s\p{L}\p{N}]`).
+    let other = |i: usize| i < n && !space(i) && !letter(i) && !number(i);
+    let run = |mut i: usize, f: &dyn Fn(usize) -> bool| {
+        while i < n && f(i) {
+            i += 1;
+        }
+        i
+    };
+    let contraction = |i: usize, fold: bool| -> Option<usize> {
+        if at(i) != Some('\'') {
+            return None;
+        }
+        let low = |j: usize| at(j).map(|c| if fold { c.to_ascii_lowercase() } else { c });
+        match (low(i + 1), low(i + 2)) {
+            (Some('s' | 't' | 'm' | 'd'), _) => Some(i + 2),
+            (Some('r'), Some('e')) | (Some('v'), Some('e')) | (Some('l'), Some('l')) => Some(i + 3),
+            _ => None,
+        }
+    };
+    // `\s+(?!\S)` then `\s+`: a whitespace run, less its last character when a
+    // non-space follows (that character starts the next piece instead).
+    let whitespace = |i: usize| -> usize {
+        let end = run(i, &space);
+        if end < n && end - i >= 2 {
+            end - 1
+        } else {
+            end
+        }
+    };
+
+    let mut pieces = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let end = match split {
+            ByteLevelSplit::Gpt2 => contraction(i, false)
+                .or_else(|| {
+                    let from = if at(i) == Some(' ') && i + 1 < n {
+                        i + 1
+                    } else {
+                        i
+                    };
+                    [&letter as &dyn Fn(usize) -> bool, &number, &other]
+                        .into_iter()
+                        .find(|f| f(from))
+                        .map(|f| run(from, f))
+                })
+                .unwrap_or_else(|| whitespace(i)),
+            ByteLevelSplit::Qwen2 | ByteLevelSplit::Llama3 => {
+                if let Some(end) = contraction(i, true) {
+                    end
+                } else if letter(i) {
+                    run(i, &letter)
+                } else if !crlf(i) && !number(i) && letter(i + 1) {
+                    // `[^\r\n\p{L}\p{N}]?\p{L}+`: one leading non-letter.
+                    run(i + 1, &letter)
+                } else if number(i) {
+                    let max = if split == ByteLevelSplit::Llama3 {
+                        3
+                    } else {
+                        1
+                    };
+                    run(i, &number).min(i + max)
+                } else if other(i) || (at(i) == Some(' ') && other(i + 1)) {
+                    // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+                    let from = if other(i) { i } else { i + 1 };
+                    run(run(from, &other), &crlf)
+                } else {
+                    // `\s*[\r\n]+`: through the last line break of the run.
+                    let end = run(i, &space);
+                    match (i..end).rev().find(|&j| crlf(j)) {
+                        Some(last) => last + 1,
+                        None => whitespace(i),
+                    }
+                }
+            }
+        };
+        // Every character matches some alternative; stepping one is only a guard.
+        let end = end.max(i + 1);
+        let start = chars[i].0;
+        let stop = chars.get(end).map_or(text.len(), |&(b, _)| b);
+        pieces.push(&text[start..stop]);
+        i = end;
+    }
+    pieces
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each flavor splits exactly as Hugging Face `tokenizers` pre-tokenizes the
+    /// same text (the expected pieces are its output, byte-level decoded).
+    #[test]
+    fn byte_level_split_matches_the_tokenizers_regexes() {
+        type Case = (&'static str, &'static [&'static str]);
+        let shared: [Case; 7] = [
+            ("a   b\n\n\tc", &["a", "  ", " b", "\n\n", "\tc"]),
+            (
+                "def f(x):\n    return x**2  # square\n",
+                &[
+                    "def", " f", "(x", "):\n", "   ", " return", " x", "**", "2", " ", " #",
+                    " square", "\n",
+                ],
+            ),
+            (
+                "HELLO'S   world'll  ",
+                &["HELLO", "'S", "  ", " world", "'ll", "  "],
+            ),
+            (
+                "line1\r\nline2 \r\n\n",
+                &["line", "1", "\r\n", "line", "2", " \r\n\n"],
+            ),
+            ("   leading", &["  ", " leading"]),
+            ("नमस्ते दुनिया", &["नमस", "्त", "े", " द", "ुन", "िय", "ा"]),
+            ("'hello 'LL ...\n", &["'hello", " '", "LL", " ...\n"]),
+        ];
+        for (text, want) in shared {
+            for split in [ByteLevelSplit::Qwen2, ByteLevelSplit::Llama3] {
+                assert_eq!(pretokenize(text, split), want, "{split:?} {text:?}");
+            }
+        }
+        // Digits: one at a time for Qwen2, runs of up to three for Llama 3.
+        let digits = "I don't THINK it's 12345!";
+        assert_eq!(
+            pretokenize(digits, ByteLevelSplit::Qwen2),
+            ["I", " don", "'t", " THINK", " it", "'s", " ", "1", "2", "3", "4", "5", "!"]
+        );
+        assert_eq!(
+            pretokenize(digits, ByteLevelSplit::Llama3),
+            ["I", " don", "'t", " THINK", " it", "'s", " ", "123", "45", "!"]
+        );
+
+        let gpt2: [Case; 6] = [
+            ("a   b\n\n\tc", &["a", "  ", " b", "\n\n", "\t", "c"]),
+            (
+                "def f(x):\n    return x**2  # square\n",
+                &[
+                    "def", " f", "(", "x", "):", "\n   ", " return", " x", "**", "2", " ", " #",
+                    " square", "\n",
+                ],
+            ),
+            (
+                digits,
+                &["I", " don", "'t", " THINK", " it", "'s", " 12345", "!"],
+            ),
+            (
+                "HELLO'S   world'll  ",
+                &["HELLO", "'", "S", "  ", " world", "'ll", "  "],
+            ),
+            (
+                "line1\r\nline2 \r\n\n",
+                &["line", "1", "\r", "\n", "line", "2", " \r\n\n"],
+            ),
+            (
+                "'hello 'LL ...\n",
+                &["'", "hello", " '", "LL", " ...", "\n"],
+            ),
+        ];
+        for (text, want) in gpt2 {
+            assert_eq!(
+                pretokenize(text, ByteLevelSplit::Gpt2),
+                want,
+                "GPT-2 {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn byte_map_is_a_bijection() {

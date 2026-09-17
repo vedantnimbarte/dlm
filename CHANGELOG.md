@@ -14,6 +14,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Byte-level tokenizers split text differently from the models' own
+  tokenizers.**
+  - **Cause:** dlm's pre-tokenizer only split before spaces. GPT-2, Llama 3 and
+    Qwen split with a regex: whitespace runs become their own token, line breaks
+    end a piece, contractions and digits split off.
+  - **Effect:** prompts with code indentation, repeated spaces, newlines or
+    digits reached the model as token sequences it was never trained on. On 411
+    mixed strings, dlm matched Hugging Face `tokenizers` for only 58% (Qwen2.5),
+    54% (Llama 3) and 71% (GPT-2) of them.
+  - **Fix:** the pre-tokenizer implements each family's regex exactly (Qwen2 and
+    Qwen3, Llama 3, GPT-2), chosen from `tokenizer.json`. `\p{L}` and `\p{N}`
+    use generated Unicode 16 category tables, not `is_alphabetic`, which counts
+    Indic combining marks as letters.
+  - **Result:** all 411 strings now match for Qwen2.5, Qwen3, Llama 3 and GPT-2.
+  - **Not covered yet:** Falcon and DeepSeek chain splits of their own and get
+    the GPT-2 rule, which is much closer than splitting at spaces but not exact.
+    Unicode NFC normalization (Qwen's normalizer) is not applied.
+
 - **Streamed GPU decode could read weights while they were being overwritten.**
   A layer evicted from the VRAM window could get the next layer uploaded into
   its buffers while kernels launched on the evicted layer were still queued.
