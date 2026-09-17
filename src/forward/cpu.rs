@@ -308,6 +308,35 @@ pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
 }
 
 impl Weights {
+    /// No elements, same dtype and quantization geometry: the dtype tag and group
+    /// size read the same as for `self`.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub(crate) fn empty_like(&self) -> Self {
+        match self {
+            Weights::F32(_) => Weights::F32(Vec::new()),
+            Weights::Bf16(_) => Weights::Bf16(Vec::new()),
+            Weights::F16(_) => Weights::F16(Vec::new()),
+            Weights::Int4 {
+                group_size,
+                num_elements,
+                ..
+            } => Weights::Int4 {
+                blob: Vec::new(),
+                group_size: *group_size,
+                num_elements: *num_elements,
+            },
+            Weights::Int8 {
+                group_size,
+                num_elements,
+                ..
+            } => Weights::Int8 {
+                blob: Vec::new(),
+                group_size: *group_size,
+                num_elements: *num_elements,
+            },
+        }
+    }
+
     /// Element count.
     pub fn len(&self) -> usize {
         match self {
@@ -650,6 +679,46 @@ pub struct MlaWeights {
 }
 
 impl LayerTensors {
+    /// This layer with the seven dense projection weights emptied (dtype and
+    /// quantization geometry kept) and everything else copied: biases, norms,
+    /// Q/K norms. What the streaming GPU kernel needs besides the weight bytes it
+    /// keeps staged in pinned memory. `None` for MoE and MLA layers.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub(crate) fn without_dense_weights(&self) -> Option<Self> {
+        let Ffn::Dense(f) = &self.ffn else {
+            return None;
+        };
+        if self.mla.is_some() {
+            return None;
+        }
+        Some(Self {
+            q_proj: self.q_proj.empty_like(),
+            k_proj: self.k_proj.empty_like(),
+            v_proj: self.v_proj.empty_like(),
+            o_proj: self.o_proj.empty_like(),
+            ffn: Ffn::Dense(ExpertFfn {
+                gate: f.gate.empty_like(),
+                up: f.up.empty_like(),
+                down: f.down.empty_like(),
+                up_bias: f.up_bias.clone(),
+                down_bias: f.down_bias.clone(),
+            }),
+            input_layernorm: self.input_layernorm.clone(),
+            post_attention_layernorm: self.post_attention_layernorm.clone(),
+            o_bias: self.o_bias.clone(),
+            input_layernorm_bias: self.input_layernorm_bias.clone(),
+            post_attention_layernorm_bias: self.post_attention_layernorm_bias.clone(),
+            q_bias: self.q_bias.clone(),
+            k_bias: self.k_bias.clone(),
+            v_bias: self.v_bias.clone(),
+            q_norm: self.q_norm.clone(),
+            k_norm: self.k_norm.clone(),
+            pre_feedforward_layernorm: self.pre_feedforward_layernorm.clone(),
+            post_feedforward_layernorm: self.post_feedforward_layernorm.clone(),
+            mla: None,
+        })
+    }
+
     /// Approximate host bytes this layer occupies — the projection matrices in
     /// their native dtype plus the norms/biases. Used to bound a byte-budgeted
     /// cache; ignores per-`Vec` overhead, which is negligible against tens of MB

@@ -1487,14 +1487,24 @@ pub fn build_streaming_gpu_generator(
     // Bound the routed-expert VRAM cache by the budget, not an unbounded count —
     // a 128-expert model would otherwise OOM the card (see B2). `None` for dense.
     let expert_cap = config.expert_cache_capacity(expert_cache_bytes as u64);
-    let source = CachedLayerSource::new(p.source, ram_cache_bytes);
+    // A dense layer uploads from pinned memory, so its host cache is kept pinned
+    // and staged, and the plain RAM cache would only duplicate it. MoE and MLA
+    // layers take the unstaged upload path and keep the RAM cache.
+    let dense = cfg.moe.is_none() && cfg.mla.is_none();
+    let (ram, pinned) = if dense {
+        (0, ram_cache_bytes)
+    } else {
+        (ram_cache_bytes, 0)
+    };
+    let source = CachedLayerSource::new(p.source, ram);
     let kernel = crate::forward::StreamingGpuKernel::new(
         cfg,
         source,
         max_kv_tokens,
         resident_layers,
         expert_cap,
-    )?;
+    )?
+    .with_pinned_layer_cache(pinned);
     Ok(Generator::new(
         kernel,
         p.embedding,

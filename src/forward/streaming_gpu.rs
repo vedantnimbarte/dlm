@@ -174,8 +174,20 @@ impl GpuWeights {
         stream: &Stream,
         staging: &mut PinnedBuffer,
         layer: Option<u32>,
-        mut spare: Vec<DeviceBuffer>,
+        spare: Vec<DeviceBuffer>,
     ) -> Result<Self> {
+        let layout = Self::stage_into(t, staging.as_mut_slice(), layer)?;
+        Self::upload_staged(t, staging.as_ptr(), &layout, stream, layer, spare)
+    }
+
+    /// Copy the layer's nine staged tensors into `dst` back to back, returning
+    /// each one's `(byte offset, byte length, element count)`. Reports the copy
+    /// as `PinStage` for `layer` when telemetry is on.
+    fn stage_into(
+        t: &LayerTensors,
+        dst: &mut [u8],
+        layer: Option<u32>,
+    ) -> Result<Vec<(usize, usize, usize)>> {
         let tensors = Self::tensors(t)?;
         let trace = layer.filter(|_| crate::telemetry::is_enabled());
 
@@ -184,7 +196,7 @@ impl GpuWeights {
         let stage_timer = crate::telemetry::Timer::start();
         let mut layout: Vec<(usize, usize, usize)> = Vec::with_capacity(9);
         {
-            let dst = staging.as_mut_slice();
+            let dst = &mut *dst;
             let mut byte_off = 0usize;
             for (src, len) in tensors {
                 let bytes = src.len();
@@ -193,8 +205,8 @@ impl GpuWeights {
                 byte_off += bytes;
             }
         }
-        let staged_bytes: u64 = layout.iter().map(|&(_, bytes, _)| bytes as u64).sum();
         if let Some(layer) = trace {
+            let staged_bytes: u64 = layout.iter().map(|&(_, bytes, _)| bytes as u64).sum();
             crate::telemetry::emit(crate::telemetry::FlowEvent::new(
                 layer,
                 crate::telemetry::Stage::PinStage,
@@ -202,6 +214,23 @@ impl GpuWeights {
                 stage_timer.elapsed_us(),
             ));
         }
+        Ok(layout)
+    }
+
+    /// Upload a layer whose nine tensors sit in pinned memory at `base`, laid out
+    /// as `layout` (from [`stage_into`](Self::stage_into)). Everything else, the
+    /// biases, norms and dtype tags, comes from `t`, which may be a
+    /// [`LayerTensors::without_dense_weights`] skeleton.
+    fn upload_staged(
+        t: &LayerTensors,
+        base: *const u8,
+        layout: &[(usize, usize, usize)],
+        stream: &Stream,
+        layer: Option<u32>,
+        mut spare: Vec<DeviceBuffer>,
+    ) -> Result<Self> {
+        let trace = layer.filter(|_| crate::telemetry::is_enabled());
+        let staged_bytes: u64 = layout.iter().map(|&(_, bytes, _)| bytes as u64).sum();
 
         // Phase 2: allocate device buffers and enqueue async copies from staging.
         // Timed with device events rather than wall-clock: an async copy has
@@ -213,9 +242,8 @@ impl GpuWeights {
         if let Some(timer) = &copy_timer {
             timer.begin(stream)?;
         }
-        let base = staging.as_ptr();
         let mut bufs: Vec<DeviceBuffer> = Vec::with_capacity(9);
-        for &(off, bytes, len) in &layout {
+        for &(off, bytes, len) in layout {
             let reuse = spare
                 .iter()
                 .position(|b| b.bytes() == bytes.max(1) && b.len() == len.max(1));
@@ -462,6 +490,39 @@ impl WeightLru {
     }
 }
 
+/// A dense layer staged once into its own pinned buffer, so later uploads copy
+/// to the device straight from it. `skeleton` holds everything else the upload
+/// needs.
+struct PinnedLayer {
+    buf: PinnedBuffer,
+    layout: Vec<(usize, usize, usize)>,
+    skeleton: LayerTensors,
+}
+
+/// Byte-budgeted LRU of [`PinnedLayer`]s: the host tier of GPU streaming for
+/// dense models.
+///
+/// Staging a layer into pinned memory was a full memcpy of its weights on every
+/// upload, the larger half of a streamed step. With the layer kept pinned, a hit
+/// goes to the device without touching the CPU. It stands in for the host RAM
+/// cache on this path rather than sitting beside it, so host memory does not
+/// double.
+#[derive(Default)]
+struct PinnedLru {
+    map: HashMap<u32, Arc<PinnedLayer>>,
+    /// Least recently used first.
+    order: VecDeque<u32>,
+    bytes: usize,
+    budget: usize,
+}
+
+/// A dense layer ready to upload: staged in the pinned cache, or (when it cannot
+/// be cached) as host tensors for the shared staging buffer.
+enum HostLayer {
+    Pinned(Arc<PinnedLayer>),
+    Host(Arc<LayerTensors>),
+}
+
 /// Index in `order` (least-recent first) of the entry to evict when inserting
 /// `inserting`: the most recently used one, skipping `inserting` itself in case a
 /// concurrent load already placed it there. `None` when there is nothing safe to
@@ -580,6 +641,8 @@ struct GpuShared<S: LayerSource> {
     /// Page-locked staging buffer for async H2D. Guarded so concurrent uploaders
     /// (worker + a compute-path miss) don't clobber it mid-transfer.
     staging: Mutex<PinnedBuffer>,
+    /// Dense layers kept staged in pinned memory (budget 0 disables it).
+    pinned: Mutex<PinnedLru>,
     /// VRAM cache of routed MoE experts (empty/unused for dense models).
     experts: Mutex<GpuExpertCache>,
     /// Router-selection history driving expert prefetch (unused for dense models).
@@ -627,7 +690,7 @@ impl<S: LayerSource> GpuShared<S> {
                     .load_layer(layer)
                     .and_then(|t| GpuWeights::upload_sync(&t).map(Arc::new))
             } else {
-                self.source.load_layer(layer).and_then(|t| {
+                self.host_layer(layer).and_then(|host| {
                     // No compute call holds the victim any more, but the kernels
                     // its last one launched may still be queued on the default
                     // stream, reading these buffers. Let them finish before the
@@ -636,14 +699,27 @@ impl<S: LayerSource> GpuShared<S> {
                     if victim.is_some() {
                         synchronize_default()?;
                     }
-                    let mut staging = self.staging.lock().unwrap();
-                    GpuWeights::upload_async_traced(
-                        &t,
-                        &self.copy_stream,
-                        &mut staging,
-                        Some(layer),
-                        victim.map_or_else(Vec::new, GpuWeights::into_staged_buffers),
-                    )
+                    let spare = victim.map_or_else(Vec::new, GpuWeights::into_staged_buffers);
+                    match host {
+                        HostLayer::Pinned(p) => GpuWeights::upload_staged(
+                            &p.skeleton,
+                            p.buf.as_ptr(),
+                            &p.layout,
+                            &self.copy_stream,
+                            Some(layer),
+                            spare,
+                        ),
+                        HostLayer::Host(t) => {
+                            let mut staging = self.staging.lock().unwrap();
+                            GpuWeights::upload_async_traced(
+                                &t,
+                                &self.copy_stream,
+                                &mut staging,
+                                Some(layer),
+                                spare,
+                            )
+                        }
+                    }
                     .map(Arc::new)
                 })
             };
@@ -657,6 +733,79 @@ impl<S: LayerSource> GpuShared<S> {
             }
             return Ok(w);
         }
+    }
+
+    /// Dense layer `layer` for upload: from the pinned cache, staging it there on
+    /// a miss, or as plain host tensors when the cache is off or cannot fit it
+    /// (including when pinning the memory fails).
+    fn host_layer(&self, layer: u32) -> Result<HostLayer> {
+        {
+            let mut lru = self.pinned.lock().unwrap();
+            if let Some(p) = lru.map.get(&layer).cloned() {
+                if let Some(i) = lru.order.iter().position(|&l| l == layer) {
+                    lru.order.remove(i);
+                }
+                lru.order.push_back(layer);
+                if crate::telemetry::is_enabled() {
+                    crate::telemetry::emit(crate::telemetry::FlowEvent::new(
+                        layer,
+                        crate::telemetry::Stage::RamHit,
+                        p.buf.len() as u64,
+                        0,
+                    ));
+                }
+                return Ok(HostLayer::Pinned(p));
+            }
+        }
+        let t = self.source.load_layer(layer)?;
+        let (Some(skeleton), Ok(tensors)) = (t.without_dense_weights(), GpuWeights::tensors(&t))
+        else {
+            return Ok(HostLayer::Host(t));
+        };
+        let bytes: usize = tensors.iter().map(|(b, _)| b.len()).sum();
+
+        // Make room, keeping an evicted buffer big enough to stage into.
+        let mut reuse = None;
+        {
+            let mut lru = self.pinned.lock().unwrap();
+            if bytes > lru.budget {
+                return Ok(HostLayer::Host(t));
+            }
+            while lru.bytes + bytes > lru.budget {
+                let Some(old) = lru.order.pop_front() else {
+                    break;
+                };
+                if let Some(p) = lru.map.remove(&old) {
+                    lru.bytes -= p.buf.len();
+                    // Still uploading elsewhere: it frees when that finishes.
+                    if let Ok(p) = Arc::try_unwrap(p) {
+                        if reuse.is_none() && p.buf.capacity() >= bytes {
+                            reuse = Some(p.buf);
+                        }
+                    }
+                }
+            }
+        }
+        let mut buf = match reuse {
+            Some(b) => b,
+            None => match PinnedBuffer::with_len(bytes) {
+                Ok(b) => b,
+                Err(_) => return Ok(HostLayer::Host(t)),
+            },
+        };
+        let layout = GpuWeights::stage_into(&t, buf.as_mut_slice(), Some(layer))?;
+        let p = Arc::new(PinnedLayer {
+            buf,
+            layout,
+            skeleton,
+        });
+        let mut lru = self.pinned.lock().unwrap();
+        if !lru.map.contains_key(&layer) {
+            lru.bytes += p.buf.len();
+            lru.map.insert(layer, Arc::clone(&p));
+            lru.order.push_back(layer);
+        }
+        Ok(HostLayer::Pinned(p))
     }
 
     /// Compute-path fetch: records hit/miss then ensures residency.
@@ -736,6 +885,9 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     /// only weights (not the hidden vector) cross the bus per layer. Safe because
     /// the scheduler drives one sequence's full stack per step (see `GpuKernel`).
     d_hidden: DeviceBuffer,
+    /// `[DLM_MAX_BATCH, hidden]` block `decode_batch` keeps a batch in across
+    /// the layer stack.
+    d_batch: DeviceBuffer,
     prefetch_tx: Option<Sender<u32>>,
     worker: Option<JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
@@ -746,6 +898,85 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     /// layer). Call before the first session runs: the pools are allocated then.
     pub fn with_kv_pool_tokens(mut self, tokens: usize) -> Self {
         self.set_kv_pool_tokens(tokens);
+        self
+    }
+
+    /// One `dlm_decode_block_batched` call for dense layer `layer` (weights `w`)
+    /// over the `[slots, hidden]` device block at `x`.
+    fn launch_dense_batched(
+        &self,
+        layer: u32,
+        w: &GpuWeights,
+        x: *mut f32,
+        slots: &SlotKv,
+    ) -> Result<()> {
+        let GpuFfn::Dense(f) = &w.ffn else {
+            return Err(DlmError::InvalidConfig(
+                "batched block on a layer without a dense FFN".into(),
+            ));
+        };
+        let lcfg = self.shared.cfg.for_layer(layer);
+        // SAFETY: live device buffers of the sizes the kernel expects; every slot's
+        // KV has a block for the row it writes (`device_kv` ensured it).
+        let code = unsafe {
+            dlm_decode_block_batched(
+                lcfg.hidden_size as i32,
+                lcfg.q_dim() as i32,
+                lcfg.kv_dim() as i32,
+                lcfg.num_heads as i32,
+                lcfg.num_kv_heads as i32,
+                lcfg.head_dim as i32,
+                lcfg.intermediate_size as i32,
+                lcfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const std::ffi::c_void,
+                w.k_proj.as_ptr() as *const std::ffi::c_void,
+                w.v_proj.as_ptr() as *const std::ffi::c_void,
+                w.o_proj.as_ptr() as *const std::ffi::c_void,
+                f.gate.as_ptr() as *const std::ffi::c_void,
+                f.up.as_ptr() as *const std::ffi::c_void,
+                f.down.as_ptr() as *const std::ffi::c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq_for(layer),
+                x,
+                &slots.keys,
+                &slots.values,
+                &slots.tables,
+                &slots.num_positions,
+                &slots.positions,
+                slots.len() as i32,
+                lcfg.sliding_window.unwrap_or(0) as i32,
+                lcfg.activation.code(),
+                crate::forward::cpu::rope_mscale(lcfg.rope_scaling),
+                lcfg.attn_scale(),
+                lcfg.attn_logit_softcap.unwrap_or(0.0),
+                bias_ptr(&w.pre_ffn_norm),
+                bias_ptr(&w.post_ffn_norm),
+                &DlmBlockExt::new(&lcfg, &w.biases, slots.half, std::ptr::null()),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_decode_block_batched",
+                code,
+            });
+        }
+        Ok(())
+    }
+
+    /// Keep up to `bytes` of dense layers staged in pinned host memory, so
+    /// uploading one copies straight to the device instead of first copying its
+    /// weights into the staging buffer. Meant to take the place of a host RAM
+    /// cache on the source. MoE and MLA layers never use it.
+    pub fn with_pinned_layer_cache(self, bytes: usize) -> Self {
+        self.shared.pinned.lock().unwrap().budget = bytes;
         self
     }
 
@@ -805,6 +1036,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             ready: Condvar::new(),
             copy_stream: Stream::new_nonblocking()?,
             staging: Mutex::new(PinnedBuffer::with_len(staging_bytes)?),
+            pinned: Mutex::new(PinnedLru::default()),
             experts: Mutex::new(GpuExpertCache::new(expert_capacity)),
             history: Mutex::new(ExpertHistory::default()),
         });
@@ -854,6 +1086,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             None => None,
         };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
+        let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
         Ok(Self {
             // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
             kv_pools: crate::forward::kv_pool::KvPools::new(num_layers as usize, cfg.kv_dim(), cap),
@@ -864,6 +1097,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             local_inv_freq,
             mla_inv_freq,
             d_hidden,
+            d_batch,
             prefetch_tx: Some(tx),
             worker: Some(worker),
             stopped,
@@ -1360,6 +1594,82 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
     /// ponytail: the hidden states live on the host between layers and cross the
     /// bus per chunk (dense) or per token (MLA/MoE). Small next to a streamed
     /// layer; keep them on the device if a profile ever shows the round trips.
+    /// Streams each layer once for the whole batch: a dense model's sequences all
+    /// run on a layer's weights in one fused block call before the next layer is
+    /// fetched. The default ran each sequence through the whole stack in turn,
+    /// which streamed every non-resident layer once per sequence, so at batch 4 a
+    /// streamed model decoded slower in total than at batch 1.
+    ///
+    /// MoE and MLA models have no batched block and keep the default.
+    fn decode_batch(
+        &self,
+        hiddens: &mut [&mut [f32]],
+        kv_layers: &mut [&mut [KvLayerCache]],
+        positions: &[usize],
+    ) -> Result<()> {
+        let cfg = &self.shared.cfg;
+        if hiddens.len() <= 1 || cfg.mla.is_some() || cfg.moe.is_some() {
+            for ((hidden, kvs), &position) in
+                hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
+            {
+                for layer in 0..self.num_layers {
+                    self.run_block(layer, hidden, &mut kvs[layer as usize], position)?;
+                }
+            }
+            return Ok(());
+        }
+        let h = cfg.hidden_size;
+        let mut staged = vec![0.0f32; DLM_MAX_BATCH * h];
+        let chunks = hiddens
+            .chunks_mut(DLM_MAX_BATCH)
+            .zip(kv_layers.chunks_mut(DLM_MAX_BATCH))
+            .zip(positions.chunks(DLM_MAX_BATCH));
+        for ((hs, kvs), pos) in chunks {
+            let batch = hs.len();
+            for (b, hidden) in hs.iter().enumerate() {
+                staged[b * h..(b + 1) * h].copy_from_slice(hidden);
+            }
+            self.d_batch.upload(&staged[..batch * h])?;
+            for layer in 0..self.num_layers {
+                let w = self.shared.fetch(layer)?;
+                if let Some(tx) = &self.prefetch_tx {
+                    let _ = tx.send((layer + 1) % self.num_layers);
+                }
+                let mut slots = SlotKv::new();
+                for (b, seq) in kvs.iter_mut().enumerate() {
+                    let kv = &mut seq[layer as usize];
+                    let n = kv.len();
+                    if n >= self.kv_capacity_tokens {
+                        return Err(DlmError::InvalidConfig(format!(
+                            "GPU KV capacity {} exceeded at position {}",
+                            self.kv_capacity_tokens, pos[b]
+                        )));
+                    }
+                    let dkv = kv.device_kv(
+                        &self.kv_pools,
+                        layer as usize,
+                        n + 1,
+                        self.kv_capacity_tokens,
+                        true,
+                    )?;
+                    slots.push(&dkv, n, pos[b]);
+                }
+                self.launch_dense_batched(layer, &w, self.d_batch.as_mut_ptr(), &slots)?;
+                for seq in kvs.iter_mut() {
+                    seq[layer as usize].advance(1);
+                }
+            }
+            // Drain the stack before the blocking copy, as `run_block` does, so an
+            // upload still overlapping on the copy stream finishes first.
+            synchronize_default()?;
+            self.d_batch.download(&mut staged[..batch * h])?;
+            for (b, hidden) in hs.iter_mut().enumerate() {
+                hidden.copy_from_slice(&staged[b * h..(b + 1) * h]);
+            }
+        }
+        Ok(())
+    }
+
     fn prefill(
         &self,
         hiddens: &mut [f32],
@@ -1368,7 +1678,6 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
     ) -> Result<()> {
         let cfg = &self.shared.cfg;
         let hidden_size = cfg.hidden_size;
-        let kv_dim = cfg.kv_dim();
         let n = hiddens.len() / hidden_size;
         if kv_layers.first().map_or(0, |kv| kv.len()) + n > self.kv_capacity_tokens {
             return Err(DlmError::InvalidConfig(format!(
@@ -1394,10 +1703,6 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 }
                 continue;
             }
-            let GpuFfn::Dense(f) = &w.ffn else {
-                unreachable!("batched implies a dense FFN")
-            };
-            let lcfg = cfg.for_layer(layer);
             for (c, chunk) in hiddens.chunks_mut(hidden_size * DLM_MAX_BATCH).enumerate() {
                 let batch = chunk.len() / hidden_size;
                 let history = kv.len();
@@ -1413,58 +1718,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                     slots.push(&dkv, history + b, start + c * DLM_MAX_BATCH + b);
                 }
                 let d_chunk = DeviceBuffer::from_slice(chunk)?;
-                // SAFETY: live device buffers of the sizes the kernel expects; the
-                // KV has room for `history + batch` rows (checked above).
-                let code = unsafe {
-                    dlm_decode_block_batched(
-                        hidden_size as i32,
-                        lcfg.q_dim() as i32,
-                        kv_dim as i32,
-                        lcfg.num_heads as i32,
-                        lcfg.num_kv_heads as i32,
-                        lcfg.head_dim as i32,
-                        lcfg.intermediate_size as i32,
-                        lcfg.rms_eps,
-                        w.w_dtype,
-                        w.w_group_size,
-                        w.q_proj.as_ptr() as *const std::ffi::c_void,
-                        w.k_proj.as_ptr() as *const std::ffi::c_void,
-                        w.v_proj.as_ptr() as *const std::ffi::c_void,
-                        w.o_proj.as_ptr() as *const std::ffi::c_void,
-                        f.gate.as_ptr() as *const std::ffi::c_void,
-                        f.up.as_ptr() as *const std::ffi::c_void,
-                        f.down.as_ptr() as *const std::ffi::c_void,
-                        w.input_layernorm.as_ptr(),
-                        w.post_attention_layernorm.as_ptr(),
-                        bias_ptr(&w.q_bias),
-                        bias_ptr(&w.k_bias),
-                        bias_ptr(&w.v_bias),
-                        bias_ptr(&w.q_norm),
-                        bias_ptr(&w.k_norm),
-                        self.inv_freq_for(layer),
-                        d_chunk.as_mut_ptr(),
-                        &slots.keys,
-                        &slots.values,
-                        &slots.tables,
-                        &slots.num_positions,
-                        &slots.positions,
-                        batch as i32,
-                        lcfg.sliding_window.unwrap_or(0) as i32,
-                        lcfg.activation.code(),
-                        crate::forward::cpu::rope_mscale(lcfg.rope_scaling),
-                        lcfg.attn_scale(),
-                        lcfg.attn_logit_softcap.unwrap_or(0.0),
-                        bias_ptr(&w.pre_ffn_norm),
-                        bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&lcfg, &w.biases, slots.half, std::ptr::null()),
-                    )
-                };
-                if code != 0 {
-                    return Err(DlmError::Gpu {
-                        api: "dlm_decode_block_batched",
-                        code,
-                    });
-                }
+                self.launch_dense_batched(layer, &w, d_chunk.as_mut_ptr(), &slots)?;
                 d_chunk.download(chunk)?;
                 kv.advance(batch);
             }

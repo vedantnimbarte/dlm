@@ -53,6 +53,38 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Streamed batches load each layer once, not once per request.** The
+  streaming GPU kernel now runs every sequence of a dense model through a
+  layer's weights in one fused block call before fetching the next layer. It
+  used to run each sequence through the whole stack in turn, streaming every
+  non-resident layer once per sequence, so batch 4 decoded slower in total than
+  batch 1.
+  - **Measured, GTX 1650:** Qwen2.5-1.5B bf16 at a 4k context with 17 of 28
+    layers resident. Total decode at batch 4 went from 6.7 to 24.5 tok/s, and at
+    batch 8 from 6.9 to 34.9 tok/s.
+  - **Unchanged:** MoE and MLA models keep the one-sequence-at-a-time path.
+
+- **Streamed dense layers upload straight from pinned memory.**
+  - **Before:** each upload first copied the layer's weights into a pinned
+    staging buffer, which was the larger half of a streamed step.
+  - **Now:** the GPU streaming kernel keeps dense layers staged in pinned buffers
+    (an LRU, budgeted by the RAM cache size, which it replaces for these models),
+    so a hit copies straight to the device.
+  - **Measured, GTX 1650:** Qwen2.5-1.5B bf16 with 14 of 28 layers resident went
+    from 3.2-3.5 to 7.5-7.6 tok/s. Gemma 3 4B int4 with 9 of 34 resident went
+    from 2.8 to 5.6 tok/s on a quiet machine. Peak RSS is unchanged.
+  - **Unchanged:** MoE and MLA layers keep the RAM cache and staging buffer.
+- **The default VRAM safety margin scales with the card.** It is a tenth of
+  total VRAM, between 256 MiB and 1.5 GiB. It was 1.5 GiB on every card, which
+  held back nearly half of a 4 GB card's free VRAM for transient allocations
+  that take tens of MiB.
+  - **Qwen2.5-1.5B bf16, streamed:** 14 to 27 of 28 layers resident, and decode
+    from 7.5 to 27 tok/s together with the pinned cache.
+  - **Gemma 3 4B int4:** now runs resident at a 2k context without
+    `--safety-margin-gb`, at 13.2 tok/s.
+  - **Unchanged:** cards of 16 GB and up keep 1.5 GiB, and `--safety-margin-gb`
+    still overrides it.
+
 - **GPU decode and prefill are 1.3-1.9x faster.** All on a GTX 1650, prompt
   512, 64 generated, from four kernel changes:
 

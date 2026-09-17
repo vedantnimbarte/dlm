@@ -865,8 +865,12 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let shutdown = Shutdown::new();
 
-        // Handler is slow enough that shutdown lands while it is still running.
-        let handler: Handler = Arc::new(|_: &Request| {
+        // The handler reports that it has started, then takes long enough that
+        // shutdown lands while it is still running.
+        let (started_tx, started) = std::sync::mpsc::channel::<()>();
+        let started_tx = std::sync::Mutex::new(started_tx);
+        let handler: Handler = Arc::new(move |_: &Request| {
+            let _ = started_tx.lock().unwrap().send(());
             std::thread::sleep(Duration::from_millis(300));
             Response::text(200, "finished")
         });
@@ -877,8 +881,10 @@ mod tests {
         let client =
             std::thread::spawn(move || round_trip_once(addr, "GET /slow HTTP/1.1\r\n\r\n"));
 
-        // Trigger while the handler is mid-flight.
-        std::thread::sleep(Duration::from_millis(60));
+        // Trigger once the handler is mid-flight. A fixed sleep here raced the
+        // client's connect on a loaded machine: shutdown could close the listener
+        // before the request arrived, and the connection was refused.
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
         shutdown.trigger();
 
         let resp = client.join().unwrap();

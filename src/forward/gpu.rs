@@ -369,6 +369,11 @@ impl SlotKv {
         }
     }
 
+    /// Slots added so far.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
     /// Add a slot writing its K/V at logical row `row` (its history length) and
     /// rotating at `position`.
     pub(crate) fn push(&mut self, kv: &crate::forward::cpu::DeviceKv, row: usize, position: usize) {
