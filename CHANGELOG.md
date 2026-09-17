@@ -53,6 +53,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Streamed batches load each layer once, not once per request.** The
+  streaming GPU kernel now runs every sequence of a dense model through a
+  layer's weights in one fused block call before fetching the next layer. It
+  used to run each sequence through the whole stack in turn, streaming every
+  non-resident layer once per sequence, so batch 4 decoded slower in total than
+  batch 1.
+  - **Measured, GTX 1650:** Qwen2.5-1.5B bf16 at a 4k context with 17 of 28
+    layers resident. Total decode at batch 4 went from 6.7 to 24.5 tok/s, and at
+    batch 8 from 6.9 to 34.9 tok/s.
+  - **Unchanged:** MoE and MLA models keep the one-sequence-at-a-time path.
+
 - **Streamed dense layers upload straight from pinned memory.**
   - **Before:** each upload first copied the layer's weights into a pinned
     staging buffer, which was the larger half of a streamed step.
