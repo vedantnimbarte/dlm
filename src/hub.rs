@@ -84,6 +84,10 @@ struct ModelInfo {
 #[derive(Debug, Deserialize)]
 struct Sibling {
     rfilename: String,
+    /// Byte size, which the hub reports for LFS files. Shown when listing a
+    /// GGUF repo, where the choice between quantizations is mostly a size.
+    #[serde(default)]
+    size: Option<u64>,
     /// LFS metadata, present for the large files (the weights) and absent for
     /// small ones like `config.json`, which the hub stores inline.
     #[serde(default)]
@@ -101,10 +105,17 @@ struct Lfs {
 /// Search the hub for models carrying safetensors weights, most-downloaded first.
 /// An empty `query` lists the top models overall.
 pub fn search(query: &str, limit: usize) -> Result<Vec<ModelHit>> {
+    search_filtered(query, limit, "safetensors")
+}
+
+/// [`search`], restricted to repos carrying `filter` (a hub tag: `safetensors`
+/// or `gguf`).
+pub fn search_filtered(query: &str, limit: usize, filter: &str) -> Result<Vec<ModelHit>> {
     let url = format!(
-        "{}/api/models?search={}&filter=safetensors&sort=downloads&direction=-1&limit={}",
+        "{}/api/models?search={}&filter={}&sort=downloads&direction=-1&limit={}",
         base(),
         urlencode(query),
+        urlencode(filter),
         limit
     );
     let body = curl_json(&url, None)?;
@@ -185,8 +196,20 @@ pub fn pull_with_progress(
         .collect();
 
     if !wanted.iter().any(|(f, _)| f.ends_with(".safetensors")) {
+        let ggufs = gguf_files(&info);
+        if !ggufs.is_empty() {
+            // The listing goes to stdout rather than into the error: an error
+            // reaching `main` is printed with `Debug`, which would show it as one
+            // line of `\n` escapes.
+            println!("{repo} ships these GGUF files:");
+            println!("{}", listing(&ggufs));
+            return Err(DlmError::Hub(format!(
+                "{repo} has no safetensors weights. Fetch one of the files above with \
+                 --file, which takes the name or any part of it (--file q4_k_m)."
+            )));
+        }
         return Err(DlmError::Hub(format!(
-            "{repo} has no .safetensors weights — dlm cannot load GGUF/PyTorch-only repos"
+            "{repo} has no .safetensors weights — dlm cannot load PyTorch-only repos"
         )));
     }
 
@@ -221,6 +244,113 @@ pub fn pull_with_progress(
     }
     println!("done. run: dlm serve --model-path {}", dir.display());
     Ok(dir)
+}
+
+/// The `.gguf` files a repo holds, in the order the hub lists them.
+fn gguf_files(info: &ModelInfo) -> Vec<&Sibling> {
+    info.siblings
+        .iter()
+        .filter(|s| is_safe_relative_path(&s.rfilename) && s.rfilename.ends_with(".gguf"))
+        .collect()
+}
+
+/// The repo's GGUF files as a numbered list, with sizes where the hub gave them.
+fn listing(files: &[&Sibling]) -> String {
+    files
+        .iter()
+        .map(|s| match s.size {
+            Some(bytes) => format!("  {} ({:.1} GiB)", s.rfilename, bytes as f64 / GIB),
+            None => format!("  {}", s.rfilename),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// Download one `.gguf` file out of `repo`, chosen by `want` — the file's name,
+/// or any part of it (`q4_k_m`). An empty `want` lists what the repo has.
+///
+/// Separate from [`pull`] because a GGUF repo is not a model directory: it is the
+/// same model at a dozen quantizations, differing by several gigabytes and a
+/// noticeable amount of quality, so dlm asks rather than guesses.
+pub fn pull_gguf(
+    repo: &str,
+    want: &str,
+    dest: Option<PathBuf>,
+    token: Option<&str>,
+    on_progress: &mut dyn FnMut(PullProgress),
+) -> Result<PathBuf> {
+    let repo = normalize_repo(repo)?;
+    let info_url = format!("{}/api/models/{}?blobs=true", base(), repo);
+    let body = curl_json(&info_url, token)?;
+    let info: ModelInfo = serde_json::from_slice(&body).map_err(|e| {
+        DlmError::Hub(format!(
+            "could not read model info for {repo}: {e} (private/gated? pass --token)"
+        ))
+    })?;
+    let files = gguf_files(&info);
+    if files.is_empty() {
+        return Err(DlmError::Hub(format!("{repo} has no .gguf files")));
+    }
+    let lower = want.to_ascii_lowercase();
+    let matches: Vec<&&Sibling> = files
+        .iter()
+        .filter(|s| s.rfilename.to_ascii_lowercase().contains(&lower))
+        .collect();
+    let chosen = match (want.is_empty(), matches.len()) {
+        (true, _) => {
+            println!("{}", listing(&files));
+            return Err(DlmError::Hub(format!(
+                "{repo} has {} .gguf files, listed above; name one with --file",
+                files.len()
+            )));
+        }
+        (_, 0) => {
+            println!("{}", listing(&files));
+            return Err(DlmError::Hub(format!(
+                "no .gguf file in {repo} matches {want:?}; it has the files listed above"
+            )));
+        }
+        (_, 1) => matches[0],
+        // A split model (`-00001-of-00002.gguf`) needs every part, and dlm does
+        // not join them yet, so an ambiguous match is refused rather than
+        // half-fetched.
+        (_, n) => {
+            println!(
+                "{}",
+                listing(&matches.iter().map(|s| **s).collect::<Vec<_>>())
+            );
+            return Err(DlmError::Hub(format!(
+                "{want:?} matches {n} files in {repo}, listed above; name one exactly"
+            )));
+        }
+    };
+
+    let name = &chosen.rfilename;
+    let dir = dest.unwrap_or_else(|| Path::new("models").join("gguf"));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| DlmError::Hub(format!("cannot create {}: {e}", dir.display())))?;
+    let out = dir.join(name.rsplit('/').next().unwrap_or(name));
+    println!("pulling {repo}/{name} → {}", out.display());
+
+    let report = |phase| PullProgress {
+        file: name,
+        index: 1,
+        total: 1,
+        phase,
+    };
+    on_progress(report(PullPhase::Downloading));
+    curl_download(
+        &format!("{}/{}/resolve/main/{name}", base(), repo),
+        &out,
+        token,
+    )?;
+    on_progress(report(PullPhase::Verifying));
+    verify_sha256(&out, chosen.lfs.as_ref().and_then(|l| l.oid.as_deref()))?;
+    on_progress(report(PullPhase::Done));
+    println!("done. run: dlm serve --model-path {}", out.display());
+    Ok(out)
 }
 
 fn is_wanted(f: &str) -> bool {
@@ -460,6 +590,51 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sibling(name: &str, size: Option<u64>) -> Sibling {
+        Sibling {
+            rfilename: name.to_string(),
+            size,
+            lfs: None,
+        }
+    }
+
+    /// A GGUF repo holds the same model a dozen times over, differing by several
+    /// gigabytes and a noticeable amount of quality, so `--file` picks one by
+    /// name or by any part of it. Guessing would download the wrong one.
+    #[test]
+    fn a_gguf_repo_is_pulled_one_named_file_at_a_time() {
+        let info = ModelInfo {
+            siblings: vec![
+                sibling("config.json", None),
+                sibling("model-q4_k_m.gguf", Some(1 << 30)),
+                sibling("model-q5_k_m.gguf", Some(2 << 30)),
+                sibling("model-q5_0.gguf", Some(2 << 30)),
+                sibling("../escape.gguf", None),
+            ],
+        };
+        let files = gguf_files(&info);
+        // The traversal attempt is dropped with everything else unsafe to join.
+        assert_eq!(files.len(), 3, "{:?}", files.iter().map(|s| &s.rfilename));
+
+        let matching = |want: &str| {
+            files
+                .iter()
+                .filter(|s| s.rfilename.to_ascii_lowercase().contains(want))
+                .count()
+        };
+        assert_eq!(
+            matching("q4_k_m"),
+            1,
+            "an exact quantization picks one file"
+        );
+        assert_eq!(matching("q5"), 2, "an ambiguous one must not be guessed at");
+        assert_eq!(matching("q2_k"), 0);
+
+        // Sizes are shown, since that is most of what the choice is between.
+        let text = listing(&files);
+        assert!(text.contains("model-q4_k_m.gguf (1.0 GiB)"), "{text}");
+    }
 
     /// `curl_json` must return the body, with and without a token. It once
     /// returned nothing — `spawn` inherits stdout, so the body went to the
