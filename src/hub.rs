@@ -169,10 +169,18 @@ pub fn pull_with_progress(
         ))
     })?;
 
+    // Mistral repos carry every weight twice: sharded with an index, and again
+    // as `consolidated.safetensors`. dlm loads the sharded copy, so pulling the
+    // other one doubles a multi-gigabyte download for a file nothing reads.
+    let has_index = info
+        .siblings
+        .iter()
+        .any(|s| s.rfilename.ends_with(".safetensors.index.json"));
     let wanted: Vec<(&String, Option<&str>)> = info
         .siblings
         .iter()
         .filter(|s| is_wanted(&s.rfilename))
+        .filter(|s| !(has_index && crate::storage::mmap_store::is_consolidated(&s.rfilename)))
         .map(|s| (&s.rfilename, s.lfs.as_ref().and_then(|l| l.oid.as_deref())))
         .collect();
 

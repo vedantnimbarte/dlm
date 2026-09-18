@@ -133,6 +133,25 @@ struct RawConfig {
     /// Qwen exposes it as a flag.
     #[serde(default)]
     norm_topk_prob: Option<bool>,
+    // ── DeepSeek routing variants. dlm's router is softmax + plain top-k, which
+    // is what DeepSeek-V2 declares; V3/R1 change all four keys at once and are
+    // refused rather than routed through the wrong experts. ──
+    /// How gate logits become scores: `softmax` (V2) or `sigmoid` (V3).
+    #[serde(default)]
+    scoring_func: Option<String>,
+    /// How the top-k is taken: `greedy` (V2), or the group-limited methods
+    /// `group_limited_greedy` / `noaux_tc` (V3).
+    #[serde(default)]
+    topk_method: Option<String>,
+    /// Experts are split into `n_group` groups and only `topk_group` of them are
+    /// eligible per token.
+    #[serde(default)]
+    n_group: Option<u32>,
+    #[serde(default)]
+    topk_group: Option<u32>,
+    /// Scales the routed experts' summed output (V3 uses 2.5).
+    #[serde(default)]
+    routed_scaling_factor: Option<f32>,
     // ── Multi-head Latent Attention (MLA, DeepSeek-V2/V3); absent otherwise. ──
     /// Compressed KV latent width (the cache stores this per token, not full K/V).
     #[serde(default)]
@@ -153,6 +172,27 @@ struct RawConfig {
     /// `sliding_window` positions; absent/`null` means full causal attention.
     #[serde(default)]
     sliding_window: Option<u32>,
+    /// Qwen2's switch for the window above. Every Qwen2/2.5 config ships a
+    /// `sliding_window` *and* sets this to `false`, so honoring the span on its
+    /// own would truncate attention the model expects to be full.
+    #[serde(default)]
+    use_sliding_window: Option<bool>,
+    /// Qwen2: layers from this index on use the window, earlier ones are full.
+    /// Refused when it would take effect, since dlm's pattern is "every n-th
+    /// layer global", which cannot express a prefix of full layers.
+    #[serde(default)]
+    max_window_layers: Option<u32>,
+    /// Fraction of each head's dimensions that carry RoPE (Phi, GPT-NeoX, GLM,
+    /// typically 0.4 or 0.5). dlm rotates the whole head, so a smaller factor is
+    /// refused: rotating dimensions the model leaves untouched mis-places every
+    /// token without erroring.
+    #[serde(default)]
+    partial_rotary_factor: Option<f32>,
+    /// The LM head is the embedding matrix, not a tensor of its own. dlm already
+    /// falls back to the embedding when `lm_head.weight` is absent; this makes
+    /// the tie explicit, for exports that ship both.
+    #[serde(default)]
+    tie_word_embeddings: Option<bool>,
     /// Gemma2 applies its window to every `n`-th layer rather than all of them.
     /// HF omits this and hard-codes 2 in the model class, so it is defaulted for
     /// `model_type == "gemma2"`.
@@ -437,6 +477,48 @@ fn build_mla_config(raw: &RawConfig) -> Result<Option<MlaConfig>> {
 /// the tensor naming family. A model that declares experts but omits the top-k
 /// count is refused rather than guessed at — routing every token through the
 /// wrong number of experts is silent garbage, the worst failure mode.
+/// Refuse the DeepSeek-V3 router, whose four keys dlm's softmax top-k does not
+/// implement. Every one of them changes which experts a token is routed to, and
+/// routing to the wrong experts produces fluent nonsense rather than an error —
+/// so each is refused by name instead of ignored.
+///
+/// DeepSeek-V2 leaves all four at the values dlm implements, so it still loads.
+fn check_routing_supported(raw: &RawConfig) -> Result<()> {
+    let refuse = |what: String| -> Result<()> {
+        Err(DlmError::InvalidConfig(format!(
+            "{what} dlm's MoE router scores gate logits with softmax and takes a plain \
+             top-k (DeepSeek-V2's routing). Running this checkpoint under that rule would \
+             route tokens through the wrong experts, which reads as fluent, wrong output \
+             rather than failing."
+        )))
+    };
+    match raw.scoring_func.as_deref().map(str::to_ascii_lowercase) {
+        None => {}
+        Some(ref f) if f == "softmax" => {}
+        Some(other) => return refuse(format!("config declares scoring_func {other:?};")),
+    }
+    match raw.topk_method.as_deref().map(str::to_ascii_lowercase) {
+        None => {}
+        Some(ref m) if m == "greedy" => {}
+        // `noaux_tc` also adds a per-expert `e_score_correction_bias` tensor to
+        // the scores before the top-k, which dlm does not read.
+        Some(other) => return refuse(format!("config declares topk_method {other:?};")),
+    }
+    if let Some(groups) = raw.n_group.filter(|&g| g > 1) {
+        return refuse(format!(
+            "config splits the experts into {groups} groups (n_group) and routes within \
+             {} of them (topk_group);",
+            raw.topk_group.unwrap_or(1)
+        ));
+    }
+    if let Some(scale) = raw.routed_scaling_factor.filter(|s| *s != 1.0) {
+        return refuse(format!(
+            "config scales the routed experts' output by {scale} (routed_scaling_factor);"
+        ));
+    }
+    Ok(())
+}
+
 fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
     let (num_experts, naming) = match (raw.num_local_experts, raw.num_experts, raw.n_routed_experts)
     {
@@ -448,6 +530,7 @@ fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
     if num_experts == 0 {
         return Ok(None); // an expert count of 0 is just a dense model
     }
+    check_routing_supported(raw)?;
     let experts_per_tok = raw.num_experts_per_tok.ok_or_else(|| {
         DlmError::InvalidConfig(
             "config declares experts but no num_experts_per_tok; dlm will not guess the \
@@ -615,8 +698,14 @@ pub struct ModelConfig {
     /// Multi-head Latent Attention geometry (DeepSeek-V2/V3); `None` for standard
     /// GQA/MHA attention.
     pub mla: Option<MlaConfig>,
-    /// Sliding-window attention span (Mistral); `None` is full causal attention.
+    /// Sliding-window attention span (Mistral); `None` is full causal attention,
+    /// which is also what a declared window switched off by Qwen2's
+    /// `use_sliding_window: false` comes to.
     pub sliding_window: Option<u32>,
+    /// The LM head is the embedding matrix. The loader then reads the embedding
+    /// even when the checkpoint also ships an `lm_head.weight`, which is what
+    /// transformers does with a tied config.
+    pub tie_word_embeddings: bool,
     /// Gemma applies RMSNorm as `(1 + weight)` rather than `weight`. When true the
     /// loader bakes the `+1` into the norm weights so the kernels stay unchanged.
     pub norm_add_one: bool,
@@ -819,6 +908,37 @@ impl ModelConfig {
         let moe = build_moe_config(&raw)?;
         let mla = build_mla_config(&raw)?;
 
+        // Qwen2 declares a window and switches it off; Mistral just declares one.
+        // A window kept on when the config turns it off truncates attention the
+        // model was trained to have in full, silently, past `sliding_window`.
+        let sliding_window = raw
+            .sliding_window
+            .filter(|&w| w > 0)
+            .filter(|_| raw.use_sliding_window.unwrap_or(true));
+        // Qwen2 windows only the layers from `max_window_layers` on. dlm's
+        // pattern makes every n-th layer global instead, which cannot express a
+        // prefix of full layers, so a config that means it is refused.
+        if let (Some(_), Some(first)) = (sliding_window, raw.max_window_layers) {
+            if first > 0 && first < raw.num_hidden_layers {
+                return Err(DlmError::InvalidConfig(format!(
+                    "config windows attention from layer {first} of {} on \
+                     (max_window_layers), and dlm applies a window either to every layer or \
+                     to every n-th (Gemma). Windowing the first {first} layers too would run \
+                     quietly wrong past {} tokens.",
+                    raw.num_hidden_layers,
+                    sliding_window.unwrap_or(0),
+                )));
+            }
+        }
+        // RoPE on part of each head (Phi, GPT-NeoX, GLM): dlm rotates all of it.
+        if let Some(factor) = raw.partial_rotary_factor.filter(|f| *f < 1.0) {
+            return Err(DlmError::InvalidConfig(format!(
+                "config sets partial_rotary_factor {factor}, so RoPE covers only that \
+                 fraction of each head's dimensions. dlm rotates the whole head; doing that \
+                 to a model trained this way mis-places every token without erroring."
+            )));
+        }
+
         // Gemma architecture variants: (1+w) RMSNorm, embedding scaling, GeGLU.
         // Gemma2 adds logit softcapping, alternating window layers, a decoupled
         // attention scale, and a second norm pair per layer.
@@ -919,7 +1039,8 @@ impl ModelConfig {
             mla,
             // A window >= the model's own max context is the same as full
             // attention; keep it as declared and let the kernel no-op it.
-            sliding_window: raw.sliding_window.filter(|&w| w > 0),
+            sliding_window,
+            tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
             norm_add_one: is_gemma,
             norm_kind,
             parallel_residual: is_falcon && raw.parallel_attn.unwrap_or(true),
@@ -1211,6 +1332,96 @@ mod tests {
             m.first_k_dense, 1,
             "layer 0 is dense, layers 1.. are routed"
         );
+    }
+
+    /// DeepSeek-V2's routing is the one dlm implements, so it must keep loading
+    /// while V3's is refused (next test).
+    #[test]
+    fn deepseek_v2_routing_is_accepted() {
+        let json = br#"{"model_type":"deepseek_v2","hidden_size":16,
+            "num_attention_heads":4,"num_hidden_layers":4,"vocab_size":32,
+            "intermediate_size":8,"moe_intermediate_size":4,"n_routed_experts":64,
+            "num_experts_per_tok":6,"scoring_func":"softmax","topk_method":"greedy",
+            "n_group":1,"topk_group":1,"routed_scaling_factor":1.0}"#;
+        assert!(ModelConfig::from_json_bytes(json, QuantScheme::Fp16)
+            .unwrap()
+            .is_moe());
+    }
+
+    /// DeepSeek-V3/R1 scores with sigmoid, adds a per-expert bias, and limits the
+    /// top-k to a few expert groups. dlm's router does none of that, and routing
+    /// a token through the wrong experts reads as fluent, wrong output — so each
+    /// key is refused by name rather than ignored.
+    #[test]
+    fn deepseek_v3_routing_is_refused() {
+        let base = r#""model_type":"deepseek_v3","hidden_size":16,
+            "num_attention_heads":4,"num_hidden_layers":4,"vocab_size":32,
+            "intermediate_size":8,"moe_intermediate_size":4,"n_routed_experts":64,
+            "num_experts_per_tok":6"#;
+        for (key, value) in [
+            ("scoring_func", r#""sigmoid""#),
+            ("topk_method", r#""noaux_tc""#),
+            ("n_group", "8"),
+            ("routed_scaling_factor", "2.5"),
+        ] {
+            let json = format!(r#"{{{base},"{key}":{value}}}"#);
+            let err = ModelConfig::from_json_bytes(json.as_bytes(), QuantScheme::Fp16)
+                .expect_err("V3 routing must be refused");
+            assert!(
+                format!("{err}").contains(key),
+                "expected the refusal to name {key}, got: {err}"
+            );
+        }
+    }
+
+    /// Every Qwen2/2.5 config ships a 32k `sliding_window` *and*
+    /// `use_sliding_window: false`. Honoring the span alone windowed attention
+    /// the model expects to be full, which only shows up past 32k tokens — and
+    /// then as wrong output, not an error.
+    #[test]
+    fn a_switched_off_sliding_window_is_full_attention() {
+        // Shape of Qwen/Qwen2.5-0.5B-Instruct's config.json.
+        let qwen = r#""model_type":"qwen2","hidden_size":896,"num_attention_heads":14,
+            "num_key_value_heads":2,"num_hidden_layers":24,"vocab_size":151936,
+            "intermediate_size":4864,"sliding_window":32768,"max_window_layers":21"#;
+        let parse = |extra: &str| {
+            ModelConfig::from_json_bytes(
+                format!(r#"{{{qwen}{extra}}}"#).as_bytes(),
+                QuantScheme::Fp16,
+            )
+        };
+        let off = parse(r#","use_sliding_window":false"#).unwrap();
+        assert_eq!(off.sliding_window, None);
+        // With the switch on, the window would cover only layers 21.. — a shape
+        // dlm cannot express, so it is refused rather than applied to all 24.
+        let err = parse(r#","use_sliding_window":true"#)
+            .expect_err("a partial window layout must be refused");
+        assert!(format!("{err}").contains("max_window_layers"), "{err}");
+        // Mistral declares a window and no switch: it applies.
+        let mistral = ModelConfig::from_json_bytes(
+            br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":4,
+                "vocab_size":32,"intermediate_size":8,"sliding_window":4096}"#,
+            QuantScheme::Fp16,
+        )
+        .unwrap();
+        assert_eq!(mistral.sliding_window, Some(4096));
+    }
+
+    /// Phi/GPT-NeoX/GLM rotate only part of each head. dlm rotates all of it, so
+    /// such a checkpoint is refused: the extra rotation mis-places every token
+    /// without erroring.
+    #[test]
+    fn partial_rope_is_refused() {
+        let json = br#"{"model_type":"phi","hidden_size":16,"num_attention_heads":4,
+            "num_hidden_layers":4,"vocab_size":32,"intermediate_size":8,
+            "partial_rotary_factor":0.4}"#;
+        let err = ModelConfig::from_json_bytes(json, QuantScheme::Fp16)
+            .expect_err("partial RoPE must be refused");
+        assert!(format!("{err}").contains("partial_rotary_factor"), "{err}");
+        // A factor of 1.0 is the whole head, which is what dlm does.
+        let whole = br#"{"hidden_size":16,"num_attention_heads":4,"num_hidden_layers":4,
+            "vocab_size":32,"intermediate_size":8,"partial_rotary_factor":1.0}"#;
+        assert!(ModelConfig::from_json_bytes(whole, QuantScheme::Fp16).is_ok());
     }
 
     /// A sparser MoE period is refused rather than guessed: loading a routed

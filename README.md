@@ -519,6 +519,42 @@ The suite covers the safetensors parser and zero-copy reads, the VRAM math
 the layer catalog, and the double-buffer schedule + execution correctness (that
 the A/B swap never corrupts the window under compute).
 
+### Checking a model against transformers
+
+Those tests check dlm against itself — CPU against GPU, streamed against
+resident — which all pass while the whole model is wrong in the same way. For an
+outside reference, `dlm score` reports the log-probability the model gives each
+token of a text and what it would generate next, and `tools/hf_parity.py`
+compares that against Hugging Face transformers:
+
+```bash
+pip install torch transformers        # dev-only; dlm itself has no Python dependency
+python tools/hf_parity.py --model models/qwen2.5-0.5b
+```
+
+Log-probabilities rather than generated text, because greedy output stays
+readable long after the probabilities have drifted. Verified this way, to within
+0.0001 log-probability of a float32 transformers reference: **Qwen2.5-0.5B**
+(CPU and GPU), **GPT-2**, and **Gemma 3 1B**.
+
+```
+$ dlm score --model-path models/qwen2.5-0.5b --text "The capital of France is Paris." --top 3
+mean nll     : 2.8240
+
+     token     logprob  piece
+      6722    -10.1571  " capital"
+       315     -0.3176  " of"
+      9625     -4.2549  " France"
+       374     -0.3579  " is"
+     12095     -1.1968  " Paris"
+        13     -0.6596  "."
+
+next token, most likely first:
+      1084     -1.7398  " It"
+       576     -2.0015  " The"
+     12095     -2.2036  " Paris"
+```
+
 ## The VRAM budget math
 
 The profiler decides how many transformer blocks fit resident at once:

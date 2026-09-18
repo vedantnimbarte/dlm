@@ -29,6 +29,10 @@ pub enum Command {
     /// Run the end-to-end CPU generation loop on a synthetic model (demo). To run
     /// a real model — including VRAM-streaming on the GPU — use `serve` instead.
     Generate(GenerateArgs),
+    /// Score text against a model: the log-probability it gives each token, and
+    /// what it would generate next. `tools/hf_parity.py` compares the JSON
+    /// against Hugging Face transformers.
+    Score(ScoreArgs),
     /// Tokenize text with a byte-level BPE tokenizer (round-trip check).
     Tokenize(TokenizeArgs),
     /// Run environment diagnostics + a self-check (GPU availability, CPU
@@ -526,6 +530,39 @@ pub struct GenerateArgs {
     /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`);
     /// pass `--device cpu` to force CPU. Falls back to CPU with a warning if no
     /// GPU is usable.
+    #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
+    pub device: Device,
+}
+
+/// Arguments for `dlm score`.
+#[derive(Debug, Args)]
+pub struct ScoreArgs {
+    /// Model directory (`config.json` + safetensors).
+    #[arg(long, value_name = "DIR")]
+    pub model_path: std::path::PathBuf,
+
+    /// Text to score, tokenized with the model's tokenizer.
+    #[arg(long)]
+    pub text: Option<String>,
+
+    /// Text to score as comma-separated token ids, for checking a model whose
+    /// tokenizer dlm does not read.
+    #[arg(long, value_delimiter = ',')]
+    pub prompt: Vec<u32>,
+
+    /// Tokenizer directory. Defaults to the model directory.
+    #[arg(long, value_name = "DIR")]
+    pub tokenizer: Option<std::path::PathBuf>,
+
+    /// How many of the most likely next tokens to report.
+    #[arg(long, default_value_t = 20)]
+    pub top: usize,
+
+    /// Write the scores as JSON to this file instead of a table on stdout.
+    #[arg(long, value_name = "FILE")]
+    pub json: Option<std::path::PathBuf>,
+
+    /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`).
     #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
 }

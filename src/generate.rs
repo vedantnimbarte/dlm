@@ -605,8 +605,35 @@ impl<K: ComputeKernel> Generator<K> {
     /// (a misplaced norm, a wrong RoPE base) from a right one when greedy output
     /// still looks fine.
     pub fn score(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        Ok(self.score_and_next(tokens)?.0)
+    }
+
+    /// [`score`](Self::score), plus the model's log-probability for **every**
+    /// token of the vocabulary as the one after `tokens`.
+    ///
+    /// Both halves in one prefill, because the pair is what a parity check needs:
+    /// the per-token half says whether the model agrees with another runtime on
+    /// text it has seen, and the distribution half says what it would do next,
+    /// which is what generation actually depends on. Log-probabilities rather
+    /// than raw logits, since a constant shift across the vocabulary changes
+    /// every logit and no probability.
+    pub fn score_and_next(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        // log-softmax: `x - logsumexp(x)`, shifted by the max so `exp` cannot
+        // overflow, and summed in f64 because a 150k-wide vocabulary loses real
+        // precision in f32.
+        let log_softmax = |logits: &mut Vec<f32>| {
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let lse = max
+                + logits
+                    .iter()
+                    .map(|&l| ((l - max) as f64).exp())
+                    .sum::<f64>()
+                    .ln() as f32;
+            logits.iter_mut().for_each(|l| *l -= lse);
+        };
         let mut orch = self.orchestrator();
         let mut out = Vec::with_capacity(tokens.len().saturating_sub(1));
+        let mut next = Vec::new();
         for (c, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
             let mut hiddens = Vec::with_capacity(chunk.len() * self.hidden_size);
             for (i, &token) in chunk.iter().enumerate() {
@@ -614,21 +641,17 @@ impl<K: ComputeKernel> Generator<K> {
             }
             orch.prefill(&mut hiddens)?;
             for (i, hidden) in hiddens.chunks(self.hidden_size).enumerate() {
-                let Some(&next) = tokens.get(c * PREFILL_CHUNK + i + 1) else {
-                    break;
-                };
-                let logits = self.logits(hidden)?;
-                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let lse = max
-                    + logits
-                        .iter()
-                        .map(|&l| ((l - max) as f64).exp())
-                        .sum::<f64>()
-                        .ln() as f32;
-                out.push(logits[next as usize] - lse);
+                let mut logprobs = self.logits(hidden)?;
+                log_softmax(&mut logprobs);
+                match tokens.get(c * PREFILL_CHUNK + i + 1) {
+                    Some(&next_token) => out.push(logprobs[next_token as usize]),
+                    // The last token: no next token to score, so this is the
+                    // distribution the model would generate from.
+                    None => next = logprobs,
+                }
             }
         }
-        Ok(out)
+        Ok((out, next))
     }
 
     /// Project a hidden state to vocabulary logits via final norm + LM head.
@@ -1063,6 +1086,34 @@ mod tests {
             kernel, embedding, final_norm, lm_head, vocab, 1e-5, kv_config, 8,
         )
         .unwrap()
+    }
+
+    /// The distribution `score_and_next` returns is the one the next token would
+    /// be drawn from: scoring a token must read the same number out of it.
+    ///
+    /// This is what `dlm score` reports and `tools/hf_parity.py` compares
+    /// against transformers, so the two halves have to be the same forward pass.
+    #[test]
+    fn the_next_distribution_scores_the_token_that_follows() {
+        let g = counting_generator();
+        let tokens = [0u32, 1, 3, 2, 2];
+        let (scored, next) = g.score_and_next(&tokens).unwrap();
+        assert_eq!(scored.len(), tokens.len() - 1);
+        assert_eq!(next.len(), g.vocab_size);
+        // Probabilities, so the vocabulary's mass sums to 1.
+        let mass: f32 = next.iter().map(|lp| lp.exp()).sum();
+        assert!((mass - 1.0).abs() < 1e-5, "log-probs sum to {mass}, not 1");
+
+        // Drop the last token: the distribution after the rest must score it
+        // exactly as the full run did.
+        let (_, next_without) = g.score_and_next(&tokens[..tokens.len() - 1]).unwrap();
+        let last = *tokens.last().unwrap() as usize;
+        let want = scored[scored.len() - 1];
+        assert!(
+            (next_without[last] - want).abs() < 1e-5,
+            "{} vs {want}",
+            next_without[last]
+        );
     }
 
     /// `score` must be the log-softmax of the next token, computed the slow way:

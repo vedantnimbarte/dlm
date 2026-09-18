@@ -12,6 +12,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`dlm score` and `tools/hf_parity.py`: a check against transformers.**
+  `dlm score` reports the log-probability the model gives each token of a text
+  and the distribution it would generate from next, as a table or JSON.
+  `tools/hf_parity.py` runs the same text through Hugging Face transformers and
+  compares.
+  - **Why:** every existing test compares dlm against itself — CPU against GPU,
+    streamed against resident, run against run — and all of them pass while the
+    whole model is wrong in the same way. Log-probabilities, not generated text:
+    greedy output stays readable long after the probabilities have drifted.
+  - **Verified** to within 0.0001 log-probability of a float32 transformers
+    reference: Qwen2.5-0.5B (CPU and GPU), GPT-2, Gemma 3 1B.
+  - Keep the reference in float32. A bfloat16 one rounds more than dlm does:
+    the same Qwen2.5-0.5B that matches float32 to 0.0001 differs from bfloat16
+    by up to 0.49.
+
 ### Fixed
 
 - **Byte-level tokenizers split text differently from the models' own
@@ -32,6 +49,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the GPT-2 rule, which is much closer than splitting at spaces but not exact.
     Unicode NFC normalization (Qwen's normalizer) is not applied.
 
+- **Config keys that change the model's behavior were read past in silence.**
+  Each one now takes effect, or is refused by name when dlm does not implement
+  it — a refusal is the only safe answer, since routing or positioning a model
+  wrongly reads as fluent, wrong output rather than an error.
+  - `use_sliding_window: false` (every Qwen2/2.5 config, next to a 32k
+    `sliding_window`) now means full attention. dlm had been windowing
+    attention the model expects whole, visible only past 32k tokens.
+  - `tie_word_embeddings: true` now reads the LM head from the embedding matrix
+    even when the checkpoint also ships an `lm_head.weight`, as transformers
+    does. Only a *missing* `lm_head.weight` used to tie them.
+  - Refused: `partial_rotary_factor` below 1.0 (Phi, GPT-NeoX, GLM rotate part
+    of each head; dlm rotates all of it), `max_window_layers` when it windows
+    only part of the model, and DeepSeek-V3's router (`scoring_func: sigmoid`,
+    `topk_method: noaux_tc`, `n_group`/`topk_group`, `routed_scaling_factor`).
+    DeepSeek-V2, whose routing dlm does implement, still loads.
+- **`dlm pull` downloaded Mistral weights twice.** Those repos ship the same
+  tensors as sharded files with an index and again as
+  `consolidated.safetensors`. dlm loads the sharded copy, so the second one is
+  now skipped — for multi-gigabyte repos it had doubled the download, the disk
+  use, and the address space mapped at load.
 - **Streamed GPU decode could read weights while they were being overwritten.**
   A layer evicted from the VRAM window could get the next layer uploaded into
   its buffers while kernels launched on the evicted layer were still queued.

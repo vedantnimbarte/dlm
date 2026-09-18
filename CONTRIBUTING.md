@@ -61,7 +61,23 @@ The checklist for a new family:
    vocabulary, so a pass cannot mean the encoder merely agrees with itself.
 4. **Verify by mutation.** Revert the code the fixture guards and confirm the test
    goes red. A test that cannot fail proves nothing.
-5. Update the README table and `RELEASING.md`'s ledger together. A claim nobody
+5. **Check the forward pass against transformers**, on a real checkpoint of the
+   family, before the README calls it supported:
+
+   ```bash
+   pip install torch transformers          # dev-only; dlm has no Python dependency
+   cargo build --release
+   python tools/hf_parity.py --model models/<checkpoint>
+   ```
+
+   It compares log-probabilities, not generated text: greedy output stays
+   readable long after the probabilities have drifted. dlm's other tests check
+   it against itself — CPU against GPU, streamed against resident — and all of
+   them pass while the whole model is wrong in the same way. This is the only
+   outside reference. Keep the reference in `float32`; a `bfloat16` one rounds
+   more than dlm does and tells you nothing (measured: Qwen2.5-0.5B is within
+   0.0001 of a float32 reference and up to 0.49 from a bfloat16 one).
+6. Update the README table and `RELEASING.md`'s ledger together. A claim nobody
    has run belongs in the ledger, not the table.
 
 If dlm refuses a checkpoint, that is working as designed — it fails with a clear
