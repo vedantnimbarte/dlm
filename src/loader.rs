@@ -163,15 +163,29 @@ fn load_native(
     // dlm's group-affine form and used as it is: re-quantizing what a quantizer
     // already chose would only lose what it chose, so `--quant` does not apply
     // (the CLI refuses the combination rather than ignoring it).
-    if info.dtype.is_block_quantized() {
-        let w = crate::storage::ggml_quant::to_weights(info.dtype, bytes, expected_len)?;
-        if w.len() != expected_len {
+    if let Some(kind) = crate::storage::ggml_quant::GgmlKind::from_dtype(info.dtype) {
+        // Kept in ggml's blocks and decoded in the kernel, so a quantized model
+        // costs what the file does. `--quant` is refused for these (there are no
+        // floats left to quantize), so it does not apply here.
+        if info.num_elements() != expected_len {
             return Err(DlmError::InvalidConfig(format!(
                 "tensor {name:?}: expected {expected_len} elements, got {}",
-                w.len()
+                info.num_elements()
             )));
         }
-        return Ok(w);
+        let need = kind.byte_len(expected_len);
+        if bytes.len() < need {
+            return Err(DlmError::InvalidConfig(format!(
+                "tensor {name:?}: {:?} needs {need} bytes for {expected_len} weights, got {}",
+                info.dtype,
+                bytes.len()
+            )));
+        }
+        return Ok(Weights::Ggml {
+            blob: bytes[..need].to_vec(),
+            kind,
+            num_elements: expected_len,
+        });
     }
     // `--quant int4`/`int8`: quantize down from the checkpoint's floats at load.
     // Costs one f32 materialization here (transient, per tensor) and buys 4x/2x
@@ -517,7 +531,17 @@ pub struct ModelParts {
 
 impl ModelParts {
     /// Wrap the CPU kernel around these weights and build a generator.
-    pub fn into_cpu_generator(self) -> Result<Generator<CpuKernel>> {
+    pub fn into_cpu_generator(mut self) -> Result<Generator<CpuKernel>> {
+        // Resident on the host: the same trade as on the GPU, against RAM. A
+        // machine that cannot spare the difference keeps ggml's blocks, which is
+        // also what `--stream` wants, since it re-materializes a layer per miss.
+        let ram = crate::memory::page::total_ram().unwrap_or(0);
+        let resident: u64 = self
+            .layers
+            .iter()
+            .map(|l| l.weights().map(|w| w.as_bytes().len() as u64).sum::<u64>())
+            .sum();
+        self.expand_quantized_weights(ram / 2, resident);
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
@@ -538,9 +562,88 @@ impl ModelParts {
         .with_final_logit_softcap(logit_cap))
     }
 
+    /// Re-pack ggml's blocks into dlm's own quantized layout, where the card has
+    /// room for the larger form.
+    ///
+    /// The two are exactly equal in value; they differ in size and in how fast a
+    /// kernel reads them. ggml packs a K-quant's scale into six bits, which is
+    /// smaller but takes more work to unpack per weight; dlm's layout spends a
+    /// pair of f32s per group and decodes in a couple of instructions. Measured
+    /// on a Qwen2.5 Q4_K_M: 45% more weight memory for a third more decode
+    /// throughput.
+    ///
+    /// So the choice is made on what fits. A model with VRAM to spare is faster
+    /// expanded; one that would stop fitting keeps ggml's blocks, which is also
+    /// what the streaming path wants, since it moves those bytes every layer.
+    fn expand_quantized_weights(&mut self, free_bytes: u64, reserved: u64) {
+        use crate::storage::ggml_quant;
+        let mut native = 0u64;
+        let mut expanded = 0u64;
+        for layer in &self.layers {
+            for w in layer.weights() {
+                if let Weights::Ggml {
+                    blob,
+                    kind,
+                    num_elements,
+                } = w
+                {
+                    native += blob.len() as u64;
+                    // Codes plus a scale and zero per group.
+                    let group = if *kind == crate::storage::ggml_quant::GgmlKind::Q6K {
+                        16
+                    } else {
+                        32
+                    };
+                    let four_bit = matches!(
+                        kind,
+                        ggml_quant::GgmlKind::Q4_0
+                            | ggml_quant::GgmlKind::Q4_1
+                            | ggml_quant::GgmlKind::Q4K
+                    );
+                    let codes = if four_bit {
+                        num_elements.div_ceil(2)
+                    } else {
+                        *num_elements
+                    };
+                    expanded += (codes.div_ceil(4) * 4 + num_elements.div_ceil(group) * 8) as u64;
+                }
+            }
+        }
+        if native == 0 {
+            return; // not a GGUF model
+        }
+        let grows_by = expanded.saturating_sub(native);
+        if reserved.saturating_add(grows_by) > free_bytes {
+            return;
+        }
+        for layer in &mut self.layers {
+            for w in layer.weights_mut() {
+                if let Weights::Ggml {
+                    blob,
+                    kind,
+                    num_elements,
+                } = w
+                {
+                    *w = ggml_quant::expand(*kind, blob, *num_elements);
+                }
+            }
+        }
+    }
+
     /// Upload every layer to VRAM and build a generator over the GPU kernel.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-    pub fn into_gpu_generator(self) -> Result<Generator<crate::forward::GpuKernel>> {
+    pub fn into_gpu_generator(mut self) -> Result<Generator<crate::forward::GpuKernel>> {
+        // Everything here becomes resident, so the weights compete with the KV
+        // cache for what the card has free.
+        let free = crate::gpu::mem_get_info().map(|m| m.free).unwrap_or(0);
+        let resident: u64 = self
+            .layers
+            .iter()
+            .map(|l| l.weights().map(|w| w.as_bytes().len() as u64).sum::<u64>())
+            .sum();
+        let kv =
+            self.kv_blocks as u64 * self.kv_config.block_size as u64 * self.cfg.kv_dim() as u64 * 8;
+        self.expand_quantized_weights(free, resident + kv);
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;

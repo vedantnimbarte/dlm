@@ -96,3 +96,40 @@ fn reads_its_own_tokenizer() {
     assert!(!ids.is_empty());
     assert_eq!(tok.decode(&ids).expect("decode"), text, "round trip");
 }
+
+/// Streaming keeps ggml's blocks where the resident path re-packs them into
+/// dlm's own layout, so the two run different decoders over the same file. They
+/// must still produce the same tokens — otherwise a model that is small enough
+/// to sit in memory answers differently from one that has to stream.
+#[test]
+fn streamed_and_resident_agree() {
+    let Some(path) = env_path("DLM_TEST_GGUF") else {
+        eprintln!("skipping: set DLM_TEST_GGUF");
+        return;
+    };
+    let quant = dlm::model::QuantScheme::Fp16; // ignored: a GGUF carries its own
+    let (config, store) = dlm::loader::open_model(&path, quant).expect("open the model");
+    let prompt = [785u32, 6722, 315, 9625, 374]; // "The capital of France is"
+    let gen = dlm::generate::GenerationConfig {
+        max_new_tokens: 8,
+        eos_token: None,
+        sampler: dlm::generate::Sampler::Greedy,
+    };
+
+    let resident = dlm::loader::load_generator(&store, &config, 64).expect("resident");
+    let want = resident.generate(&prompt, &gen).expect("resident generate");
+
+    // A window of two layers, so most of the model really does stream.
+    let streamed = dlm::loader::build_streaming_generator(
+        MmapStore::open_path(&path).expect("re-open"),
+        &config,
+        64,
+        2,
+        1,
+        false,
+        0,
+    )
+    .expect("streaming generator");
+    let got = streamed.generate(&prompt, &gen).expect("streamed generate");
+    assert_eq!(got, want, "streamed output differs from resident");
+}

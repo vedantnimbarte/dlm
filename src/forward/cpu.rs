@@ -250,6 +250,19 @@ pub enum Weights {
         group_size: usize,
         num_elements: usize,
     },
+    /// Weights in ggml's own blocks, exactly as a GGUF file holds them, decoded
+    /// where they are used.
+    ///
+    /// Kept rather than converted because ggml packs a block's scale into a few
+    /// bits where [`Weights::Int4`] spends a pair of f32s per group: a Q4_K
+    /// tensor is 4.5 bits per weight here and 6 as dlm's own form. On a card
+    /// that fits the model by a few hundred megabytes, that difference is the
+    /// model fitting or not.
+    Ggml {
+        blob: Vec<u8>,
+        kind: crate::storage::ggml_quant::GgmlKind,
+        num_elements: usize,
+    },
 }
 
 /// Byte offsets within a quantized [`Weights`] blob.
@@ -334,6 +347,13 @@ impl Weights {
                 group_size: *group_size,
                 num_elements: *num_elements,
             },
+            Weights::Ggml {
+                kind, num_elements, ..
+            } => Weights::Ggml {
+                blob: Vec::new(),
+                kind: *kind,
+                num_elements: *num_elements,
+            },
         }
     }
 
@@ -342,9 +362,9 @@ impl Weights {
         match self {
             Weights::F32(v) => v.len(),
             Weights::Bf16(v) | Weights::F16(v) => v.len(),
-            Weights::Int4 { num_elements, .. } | Weights::Int8 { num_elements, .. } => {
-                *num_elements
-            }
+            Weights::Int4 { num_elements, .. }
+            | Weights::Int8 { num_elements, .. }
+            | Weights::Ggml { num_elements, .. } => *num_elements,
         }
     }
 
@@ -380,6 +400,7 @@ impl Weights {
                 group_size,
                 num_elements,
             } => int8_get(blob, *group_size, *num_elements, i),
+            Weights::Ggml { blob, kind, .. } => crate::storage::ggml_quant::get(*kind, blob, i),
         }
     }
 
@@ -388,7 +409,9 @@ impl Weights {
         match self {
             Weights::F32(v) => bytemuck_cast(v),
             Weights::Bf16(v) | Weights::F16(v) => bytemuck_cast(v),
-            Weights::Int4 { blob, .. } | Weights::Int8 { blob, .. } => blob,
+            Weights::Int4 { blob, .. }
+            | Weights::Int8 { blob, .. }
+            | Weights::Ggml { blob, .. } => blob,
         }
     }
 
@@ -491,6 +514,7 @@ impl Weights {
             Weights::F16(_) => 2,
             Weights::Int4 { .. } => 3,
             Weights::Int8 { .. } => 4,
+            Weights::Ggml { kind, .. } => kind.dtype_code(),
         }
     }
 }
@@ -614,6 +638,66 @@ pub enum Ffn {
         shared: Option<ExpertFfn>,    // Qwen2-MoE shared expert; None otherwise
         shared_gate: Option<Weights>, // [1, hidden] sigmoid gate for the shared expert
     },
+}
+
+impl Ffn {
+    /// Every weight matrix in this feed-forward block.
+    pub fn weights(&self) -> Box<dyn Iterator<Item = &Weights> + '_> {
+        match self {
+            Ffn::Dense(f) => Box::new([&f.gate, &f.up, &f.down].into_iter()),
+            Ffn::Moe {
+                router,
+                experts,
+                shared,
+                shared_gate,
+            } => Box::new(
+                std::iter::once(router).chain(shared_gate.iter()).chain(
+                    shared
+                        .iter()
+                        .chain(experts)
+                        .flat_map(|e| [&e.gate, &e.up, &e.down].into_iter()),
+                ),
+            ),
+        }
+    }
+
+    /// The same, to modify.
+    pub fn weights_mut(&mut self) -> Box<dyn Iterator<Item = &mut Weights> + '_> {
+        match self {
+            Ffn::Dense(f) => Box::new([&mut f.gate, &mut f.up, &mut f.down].into_iter()),
+            Ffn::Moe {
+                router,
+                experts,
+                shared,
+                shared_gate,
+            } => Box::new(
+                std::iter::once(router).chain(shared_gate.iter_mut()).chain(
+                    shared
+                        .iter_mut()
+                        .chain(experts)
+                        .flat_map(|e| [&mut e.gate, &mut e.up, &mut e.down].into_iter()),
+                ),
+            ),
+        }
+    }
+}
+
+impl MlaWeights {
+    /// Every weight matrix in the compressed-latent attention projections.
+    pub fn weights(&self) -> impl Iterator<Item = &Weights> {
+        self.q_a_proj
+            .iter()
+            .chain([&self.q_b_proj, &self.kv_a_proj, &self.kv_b_proj])
+    }
+
+    /// The same, to modify.
+    pub fn weights_mut(&mut self) -> impl Iterator<Item = &mut Weights> {
+        self.q_a_proj.iter_mut().chain([
+            &mut self.q_b_proj,
+            &mut self.kv_a_proj,
+            &mut self.kv_b_proj,
+        ])
+    }
 }
 
 impl Default for Ffn {
@@ -765,6 +849,28 @@ impl LayerTensors {
         self.pre_feedforward_layernorm
             .as_deref()
             .unwrap_or(&self.post_attention_layernorm)
+    }
+
+    /// Every weight matrix in this layer: the four attention projections, and
+    /// whichever FFN it has — one dense triple, or the router, the shared expert
+    /// and every routed expert.
+    pub fn weights(&self) -> impl Iterator<Item = &Weights> {
+        let attn = [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj].into_iter();
+        let mla = self.mla.iter().flat_map(|m| m.weights());
+        attn.chain(mla).chain(self.ffn.weights())
+    }
+
+    /// The same, to modify: used to re-pack a layer's quantized weights.
+    pub fn weights_mut(&mut self) -> impl Iterator<Item = &mut Weights> {
+        let attn = [
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.o_proj,
+        ]
+        .into_iter();
+        let mla = self.mla.iter_mut().flat_map(|m| m.weights_mut());
+        attn.chain(mla).chain(self.ffn.weights_mut())
     }
 
     /// The dense FFN triple, or an error if this layer is MoE. Both GPU kernels
@@ -1811,6 +1917,12 @@ pub(crate) fn matvec_native(w: &Weights, x: &[f32], out_dim: usize, in_dim: usiz
             (0..in_dim)
                 .map(|j| int8_get(blob, *group_size, *num_elements, base + j) * x[j])
                 .sum()
+        }),
+        // One decode per block rather than per weight: a K-quant block holds 256
+        // weights behind one scale lookup, and re-deriving that lookup for each
+        // of them was most of the work.
+        Weights::Ggml { blob, kind, .. } => matvec_rows(out_dim, in_dim, x, |o, x| {
+            crate::storage::ggml_quant::row_dot(*kind, blob, o * in_dim, x)
         }),
     }
 }

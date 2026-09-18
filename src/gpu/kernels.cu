@@ -195,6 +195,153 @@ __device__ __forceinline__ float load_w<DLM_W_INT8>(const void* W, long i, long 
     return (code - zeros[g]) * scales[g];
 }
 
+// ── ggml's block-quantized weights ────────────────────────────────────────
+//
+// A GGUF file stores weights in blocks: a fixed number of them behind one scale,
+// packed tightly (a Q4_K block is 256 weights in 144 bytes). dlm keeps the blocks
+// as the file has them and decodes a weight here, in the register that is about
+// to multiply it, so a quantized model costs the same in VRAM as on disk.
+//
+// These mirror `decode_block` in src/storage/ggml_quant.rs, which is the
+// definition; the two must agree exactly. Consecutive threads read consecutive
+// weights, so a block's scale bytes are one cache line shared across the warp.
+#define DLM_W_Q4_0 5
+#define DLM_W_Q4_1 6
+#define DLM_W_Q5_0 7
+#define DLM_W_Q5_1 8
+#define DLM_W_Q8_0 9
+#define DLM_W_Q4_K 10
+#define DLM_W_Q5_K 11
+#define DLM_W_Q6_K 12
+
+__device__ __forceinline__ float dlm_half(const unsigned char* p) {
+    unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
+    return __half2float(*(const __half*)&bits);
+}
+
+// A K-quant sub-block's 6-bit scale and minimum, out of the 12 bytes eight of
+// them share (ggml's `get_scale_min_k4`).
+__device__ __forceinline__ void k_scale_min(int sub, const unsigned char* s,
+                                            unsigned char* sc, unsigned char* m) {
+    if (sub < 4) {
+        *sc = s[sub] & 63;
+        *m = s[sub + 4] & 63;
+    } else {
+        *sc = (s[sub + 4] & 0x0F) | ((s[sub - 4] >> 6) << 4);
+        *m = (s[sub + 4] >> 4) | ((s[sub] >> 6) << 4);
+    }
+}
+
+// 32 weights: an f16 scale, then weight j in a low nibble and weight j+16 in the
+// high one, as `d * (q - 8)`.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q4_0>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 5) * 18;
+    int j = (int)(i & 31);
+    unsigned char byte = b[2 + (j & 15)];
+    float q = (float)(j < 16 ? (byte & 0x0F) : (byte >> 4));
+    return dlm_half(b) * (q - 8.0f);
+}
+
+// The same with a minimum in place of the offset: `d * q + m`.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q4_1>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 5) * 20;
+    int j = (int)(i & 31);
+    unsigned char byte = b[4 + (j & 15)];
+    float q = (float)(j < 16 ? (byte & 0x0F) : (byte >> 4));
+    return dlm_half(b) * q + dlm_half(b + 2);
+}
+
+// A fifth bit per weight, held in a 32-bit field: weight j takes bit j.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q5_0>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 5) * 22;
+    int j = (int)(i & 31);
+    unsigned int qh = (unsigned int)b[2] | ((unsigned int)b[3] << 8) |
+                      ((unsigned int)b[4] << 16) | ((unsigned int)b[5] << 24);
+    unsigned char byte = b[6 + (j & 15)];
+    unsigned char q = (j < 16 ? (byte & 0x0F) : (byte >> 4)) | (((qh >> j) & 1u) << 4);
+    return dlm_half(b) * ((float)q - 16.0f);
+}
+
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q5_1>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 5) * 24;
+    int j = (int)(i & 31);
+    unsigned int qh = (unsigned int)b[4] | ((unsigned int)b[5] << 8) |
+                      ((unsigned int)b[6] << 16) | ((unsigned int)b[7] << 24);
+    unsigned char byte = b[8 + (j & 15)];
+    unsigned char q = (j < 16 ? (byte & 0x0F) : (byte >> 4)) | (((qh >> j) & 1u) << 4);
+    return dlm_half(b) * (float)q + dlm_half(b + 2);
+}
+
+// 32 weights: an f16 scale and one signed byte each.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q8_0>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 5) * 34;
+    return dlm_half(b) * (float)(signed char)b[2 + (i & 31)];
+}
+
+// 256 weights in eight 32-weight sub-blocks, `d * sc * q - dmin * m` with sc and
+// m 6-bit. The 4-bit weights run low nibbles first over each 32-byte run.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q4_K>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 8) * 144;
+    int j = (int)(i & 255);
+    int sub = j >> 5, l = j & 31;
+    unsigned char sc, m;
+    k_scale_min(sub, b + 4, &sc, &m);
+    unsigned char byte = b[16 + (sub >> 1) * 32 + l];
+    float q = (float)((sub & 1) ? (byte >> 4) : (byte & 0x0F));
+    return dlm_half(b) * (float)sc * q - dlm_half(b + 2) * (float)m;
+}
+
+// Q4_K with a fifth bit per weight, in `qh`: sub-block `sub` takes bit `sub`.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q5_K>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 8) * 176;
+    int j = (int)(i & 255);
+    int sub = j >> 5, l = j & 31;
+    unsigned char sc, m;
+    k_scale_min(sub, b + 4, &sc, &m);
+    unsigned char byte = b[48 + (sub >> 1) * 32 + l];
+    unsigned char q = (sub & 1) ? (byte >> 4) : (byte & 0x0F);
+    if (b[16 + l] & (1u << sub)) q += 16;
+    return dlm_half(b) * (float)sc * (float)q - dlm_half(b + 2) * (float)m;
+}
+
+// 256 weights in sixteen 16-weight sub-blocks with int8 scales off a shared `d`.
+// A weight's 6 bits are a nibble in `ql` and two bits in `qh`, interleaved in
+// runs of 32 across each half block.
+template <>
+__device__ __forceinline__ float load_w<DLM_W_Q6_K>(const void* W, long i, long, int) {
+    const unsigned char* b = (const unsigned char*)W + (i >> 8) * 210;
+    int j = (int)(i & 255);
+    int half_block = j >> 7, r = j & 127, l = r & 31, k = r >> 5;
+    const unsigned char* ql = b + half_block * 64 + l + ((k & 1) ? 32 : 0);
+    unsigned char lo = (k < 2) ? (*ql & 0x0F) : (*ql >> 4);
+    unsigned char hi = (b[128 + half_block * 32 + l] >> (2 * k)) & 0x03;
+    float q = (float)(lo | (hi << 4));
+    return dlm_half(b + 208) * (float)(signed char)b[192 + (j >> 4)] * (q - 32.0f);
+}
+
+// Every weight dtype a launcher dispatches over. F32 is the default arm, so it
+// is not listed.
+#define DLM_FOR_EACH_DTYPE(X) \
+    X(DLM_W_BF16)             \
+    X(DLM_W_F16)              \
+    X(DLM_W_INT4)             \
+    X(DLM_W_INT8)             \
+    X(DLM_W_Q4_0)             \
+    X(DLM_W_Q4_1)             \
+    X(DLM_W_Q5_0)             \
+    X(DLM_W_Q5_1)             \
+    X(DLM_W_Q8_0)             \
+    X(DLM_W_Q4_K)             \
+    X(DLM_W_Q5_K)             \
+    X(DLM_W_Q6_K)
+
 // One thread's share of a row dot product: the sum over `i = start, start +
 // step, ... < in_dim` of `W[base + i] * x[i]`.
 template <int DT>
@@ -267,6 +414,139 @@ __device__ __forceinline__ float row_dot<DLM_W_INT8>(const void* W, const float*
 // load pulled a full cache line to use one float — ~1/32 of memory bandwidth on a
 // bandwidth-bound GEMV. This is the dominant cost of the decode stack; coalescing
 // it is the single biggest kernel speedup.
+// A K-quant weight costs more to decode than a plain one: its scale is six bits
+// packed across two bytes, under a pair of f16s, and deriving that per weight
+// was a third of decode time. These take a run of consecutive weights at a time,
+// so the scale is derived once for the run.
+//
+// The run is 8 weights, which always lies inside one sub-block (32 weights for
+// Q4_K and Q5_K, 16 for Q6_K) as long as the row starts on a multiple of 8 —
+// true for every real model, since a row is `in_dim` wide and `in_dim` is a
+// multiple of 32. `row_dot` falls back to per-weight decoding when it is not.
+//
+// Consecutive threads take consecutive runs, so a warp still reads one
+// contiguous stretch of the row per step, which is what keeps a GEMV at
+// bandwidth.
+#define DLM_KRUN 8
+
+template <int DT>
+__device__ __forceinline__ float ggml_run_dot(const unsigned char* b, int within, int n,
+                                              const float* x);
+
+// Q4_K: `d * sc * q - dmin * m`, the sub-block's 6-bit sc and m shared by 32
+// weights, the weights themselves 4-bit over a 32-byte run.
+template <>
+__device__ __forceinline__ float ggml_run_dot<DLM_W_Q4_K>(const unsigned char* b, int within,
+                                                          int n, const float* x) {
+    int sub = within >> 5, l = within & 31;
+    unsigned char sc, m;
+    k_scale_min(sub, b + 4, &sc, &m);
+    float scale = dlm_half(b) * (float)sc;
+    float min = dlm_half(b + 2) * (float)m;
+    const unsigned char* qs = b + 16 + (sub >> 1) * 32 + l;
+    float s = 0.0f;
+    if (sub & 1) {
+        for (int k = 0; k < n; ++k) s += (scale * (float)(qs[k] >> 4) - min) * x[k];
+    } else {
+        for (int k = 0; k < n; ++k) s += (scale * (float)(qs[k] & 0x0F) - min) * x[k];
+    }
+    return s;
+}
+
+// Q5_K: Q4_K plus a fifth bit per weight, sub-block `sub` taking bit `sub` of
+// each `qh` byte.
+template <>
+__device__ __forceinline__ float ggml_run_dot<DLM_W_Q5_K>(const unsigned char* b, int within,
+                                                          int n, const float* x) {
+    int sub = within >> 5, l = within & 31;
+    unsigned char sc, m;
+    k_scale_min(sub, b + 4, &sc, &m);
+    float scale = dlm_half(b) * (float)sc;
+    float min = dlm_half(b + 2) * (float)m;
+    const unsigned char* qs = b + 48 + (sub >> 1) * 32 + l;
+    const unsigned char* qh = b + 16 + l;
+    unsigned char bit = (unsigned char)(1u << sub);
+    float s = 0.0f;
+    for (int k = 0; k < n; ++k) {
+        unsigned char q = (sub & 1) ? (qs[k] >> 4) : (qs[k] & 0x0F);
+        if (qh[k] & bit) q += 16;
+        s += (scale * (float)q - min) * x[k];
+    }
+    return s;
+}
+
+// Q6_K: sixteen 16-weight sub-blocks with int8 scales, each weight a nibble in
+// `ql` and two bits in `qh`, in runs of 32 across each half block.
+template <>
+__device__ __forceinline__ float ggml_run_dot<DLM_W_Q6_K>(const unsigned char* b, int within,
+                                                          int n, const float* x) {
+    int half_block = within >> 7, r = within & 127, l = r & 31, k4 = r >> 5;
+    const unsigned char* ql = b + half_block * 64 + l + ((k4 & 1) ? 32 : 0);
+    const unsigned char* qh = b + 128 + half_block * 32 + l;
+    float scale = dlm_half(b + 208) * (float)(signed char)b[192 + (within >> 4)];
+    int shift = 2 * k4;
+    float s = 0.0f;
+    for (int k = 0; k < n; ++k) {
+        unsigned char lo = (k4 < 2) ? (ql[k] & 0x0F) : (ql[k] >> 4);
+        unsigned char hi = (qh[k] >> shift) & 0x03;
+        s += scale * ((float)(lo | (hi << 4)) - 32.0f) * x[k];
+    }
+    return s;
+}
+
+// One thread's share of a row dot product for a K-quant, a run of weights at a
+// time. Mirrors the generic `row_dot`, which the float and int arms use.
+template <int DT>
+__device__ __forceinline__ float row_dot_kquant(const void* W, const float* x, long base,
+                                                int start, int step, int in_dim) {
+    const int BLOCK = 256;
+    const int BYTES = (DT == DLM_W_Q4_K) ? 144 : ((DT == DLM_W_Q5_K) ? 176 : 210);
+    const unsigned char* bytes = (const unsigned char*)W;
+    float s = 0.0f;
+    for (int i = start * DLM_KRUN; i < in_dim; i += step * DLM_KRUN) {
+        long e = base + i;
+        int n = min(DLM_KRUN, in_dim - i);
+        s += ggml_run_dot<DT>(bytes + (e / BLOCK) * BYTES, (int)(e % BLOCK), n, x + i);
+    }
+    return s;
+}
+
+template <>
+__device__ __forceinline__ float row_dot<DLM_W_Q4_K>(const void* W, const float* x, long base,
+                                                     int start, int step, int in_dim, long,
+                                                     int) {
+    if ((base | in_dim) % DLM_KRUN) {
+        float s = 0.0f;
+        for (int i = start; i < in_dim; i += step) s += load_w<DLM_W_Q4_K>(W, base + i, 0, 0) * x[i];
+        return s;
+    }
+    return row_dot_kquant<DLM_W_Q4_K>(W, x, base, start, step, in_dim);
+}
+
+template <>
+__device__ __forceinline__ float row_dot<DLM_W_Q5_K>(const void* W, const float* x, long base,
+                                                     int start, int step, int in_dim, long,
+                                                     int) {
+    if ((base | in_dim) % DLM_KRUN) {
+        float s = 0.0f;
+        for (int i = start; i < in_dim; i += step) s += load_w<DLM_W_Q5_K>(W, base + i, 0, 0) * x[i];
+        return s;
+    }
+    return row_dot_kquant<DLM_W_Q5_K>(W, x, base, start, step, in_dim);
+}
+
+template <>
+__device__ __forceinline__ float row_dot<DLM_W_Q6_K>(const void* W, const float* x, long base,
+                                                     int start, int step, int in_dim, long,
+                                                     int) {
+    if ((base | in_dim) % DLM_KRUN) {
+        float s = 0.0f;
+        for (int i = start; i < in_dim; i += step) s += load_w<DLM_W_Q6_K>(W, base + i, 0, 0) * x[i];
+        return s;
+    }
+    return row_dot_kquant<DLM_W_Q6_K>(W, x, base, start, step, in_dim);
+}
+
 template <int DT>
 __global__ void matvec_kernel(const void* W, const float* x, const float* bias, float* out,
                               int out_dim, int in_dim, int group_size) {
@@ -292,28 +572,15 @@ __global__ void matvec_kernel(const void* W, const float* x, const float* bias, 
 // Dispatch the GEMV on the runtime weight dtype (one block per output row).
 static void launch_matvec(int dt, const void* W, const float* x, const float* bias, float* out,
                           int out_dim, int in_dim, int group_size) {
+#define DLM_CASE(D) case D: matvec_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size); break;
     switch (dt) {
-        case DLM_W_BF16:
-            matvec_kernel<DLM_W_BF16>
-                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
-            break;
-        case DLM_W_F16:
-            matvec_kernel<DLM_W_F16>
-                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
-            break;
-        case DLM_W_INT4:
-            matvec_kernel<DLM_W_INT4>
-                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
-            break;
-        case DLM_W_INT8:
-            matvec_kernel<DLM_W_INT8>
-                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
-            break;
+        DLM_FOR_EACH_DTYPE(DLM_CASE)
         default:
             matvec_kernel<DLM_W_F32>
                 <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
             break;
     }
+#undef DLM_CASE
 }
 
 // In-place rotary embedding over [num_heads * head_dim]. One thread per rotated pair.
@@ -951,23 +1218,15 @@ __global__ void matvec_batched_kernel(const void* W, const float* x, const float
 
 static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
                                   float* out, int out_dim, int in_dim, int group_size, int batch) {
+#define DLM_CASE(D) case D: matvec_batched_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); break;
     switch (dt) {
-        case DLM_W_BF16:
-            matvec_batched_kernel<DLM_W_BF16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-            break;
-        case DLM_W_F16:
-            matvec_batched_kernel<DLM_W_F16><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-            break;
-        case DLM_W_INT4:
-            matvec_batched_kernel<DLM_W_INT4><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-            break;
-        case DLM_W_INT8:
-            matvec_batched_kernel<DLM_W_INT8><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-            break;
+        DLM_FOR_EACH_DTYPE(DLM_CASE)
         default:
-            matvec_batched_kernel<DLM_W_F32><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+            matvec_batched_kernel<DLM_W_F32>
+                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
             break;
     }
+#undef DLM_CASE
 }
 
 // rmsnorm over B rows: one block per row (grid.x = batch).
@@ -1343,23 +1602,14 @@ __global__ void grouped_matvec_kernel(DlmPtrs W, const float* x, float* out,
 static void launch_grouped_matvec(int dt, DlmPtrs W, const float* x, float* out,
                                   int n_experts, int out_dim, int in_dim, int group_size) {
     int blocks = n_experts * out_dim;
+#define DLM_CASE(D) case D: grouped_matvec_kernel<D><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size); break;
     switch (dt) {
-        case DLM_W_BF16:
-            grouped_matvec_kernel<DLM_W_BF16><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
-            break;
-        case DLM_W_F16:
-            grouped_matvec_kernel<DLM_W_F16><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
-            break;
-        case DLM_W_INT4:
-            grouped_matvec_kernel<DLM_W_INT4><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
-            break;
-        case DLM_W_INT8:
-            grouped_matvec_kernel<DLM_W_INT8><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
-            break;
+        DLM_FOR_EACH_DTYPE(DLM_CASE)
         default:
             grouped_matvec_kernel<DLM_W_F32><<<blocks, MATVEC_THREADS>>>(W, x, out, out_dim, in_dim, group_size);
             break;
     }
+#undef DLM_CASE
 }
 
 // x[h] += sum_e weight[e] * dot(down_e[h], inter_buf + e*inter)
@@ -1393,23 +1643,14 @@ __global__ void grouped_down_kernel(DlmPtrs W, DlmWeights weights, const float* 
 
 static void launch_grouped_down(int dt, DlmPtrs W, DlmWeights weights, const float* inter_buf,
                                 float* x, int n_experts, int hidden, int inter, int group_size) {
+#define DLM_CASE(D) case D: grouped_down_kernel<D><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size); break;
     switch (dt) {
-        case DLM_W_BF16:
-            grouped_down_kernel<DLM_W_BF16><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
-            break;
-        case DLM_W_F16:
-            grouped_down_kernel<DLM_W_F16><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
-            break;
-        case DLM_W_INT4:
-            grouped_down_kernel<DLM_W_INT4><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
-            break;
-        case DLM_W_INT8:
-            grouped_down_kernel<DLM_W_INT8><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
-            break;
+        DLM_FOR_EACH_DTYPE(DLM_CASE)
         default:
             grouped_down_kernel<DLM_W_F32><<<hidden, MATVEC_THREADS>>>(W, weights, inter_buf, x, n_experts, hidden, inter, group_size);
             break;
     }
+#undef DLM_CASE
 }
 
 // Apply all `n_experts` selected experts to `normed2`, accumulating each one's
@@ -1630,13 +1871,12 @@ static cudaError_t launch_mla_attention(int dt, const float* q, const float* kv_
         attn_softmax_kernel<<<num_heads, SOFTMAX_THREADS>>>(scores, num_heads, positions); \
         mla_mix_kernel<<<hl, B>>>(scores, kv_keys, m, num_heads, rope, latent, positions); \
         mla_values_kernel<DT><<<grid_for(num_heads * vdim, B), B>>>(m, kv_b, kv_b_group, ctx, num_heads, nope, vdim, latent);
+#define DLM_CASE(D) case D: DLM_MLA_DT(D) break;
     switch (dt) {
-        case DLM_W_BF16: DLM_MLA_DT(DLM_W_BF16) break;
-        case DLM_W_F16: DLM_MLA_DT(DLM_W_F16) break;
-        case DLM_W_INT4: DLM_MLA_DT(DLM_W_INT4) break;
-        case DLM_W_INT8: DLM_MLA_DT(DLM_W_INT8) break;
+        DLM_FOR_EACH_DTYPE(DLM_CASE)
         default: DLM_MLA_DT(DLM_W_F32) break;
     }
+#undef DLM_CASE
     #undef DLM_MLA_DT
     return cudaSuccess;
 }
