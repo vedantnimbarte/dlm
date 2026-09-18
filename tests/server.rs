@@ -1,9 +1,13 @@
 //! End-to-end test of the OpenAI-compatible HTTP server over a real socket.
+//!
+//! Against `EngineService` -- what `dlm serve` runs. It used to drive a second,
+//! older engine that nothing else used, so these checks passed while saying
+//! nothing about the server anyone talks to.
 
 use dlm::cache::KvCacheConfig;
 use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
 use dlm::generate::Generator;
-use dlm::server::{router, Engine, HttpServer};
+use dlm::server::{engine::router, EngineService, HttpServer};
 use dlm::tokenizer::BpeTokenizer;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -11,7 +15,7 @@ use std::sync::Arc;
 
 /// Build a tiny synthetic engine (identity block + small embed/head) so the
 /// server has something to run. Output is meaningless but the pipeline is real.
-fn build_engine() -> Engine<CpuKernel> {
+fn build_engine() -> Arc<EngineService> {
     let vocab = 256usize;
     let hidden = 16usize;
     let cfg = BlockConfig {
@@ -51,11 +55,20 @@ fn build_engine() -> Engine<CpuKernel> {
         64,
     )
     .unwrap();
-    Engine::new(generator, BpeTokenizer::bytes_only(), "dlm-test", 8, 0)
+    EngineService::start(
+        generator,
+        BpeTokenizer::bytes_only(),
+        vocab,
+        "dlm-test",
+        8, // default max tokens, so a request that omits it still ends
+        0, // created
+        1, // max batch
+        0, // prefix cache entries
+    )
 }
 
 fn start_server() -> SocketAddr {
-    let engine = Arc::new(build_engine());
+    let engine = build_engine();
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     let handler = router(engine);
@@ -90,6 +103,20 @@ fn chat_completions_endpoint() {
     assert!(resp.contains(r#""finish_reason":"length""#), "{resp}");
     assert!(resp.contains(r#""completion_tokens":4"#), "{resp}");
     assert!(resp.contains(r#""prompt_tokens":"#), "{resp}");
+}
+
+/// The array form of `content`, over a real socket: the SDKs and anything that
+/// can attach an image send it, and dlm used to answer 400.
+#[test]
+fn chat_accepts_content_as_parts() {
+    let addr = start_server();
+    let body =
+        r#"{"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}],"max_tokens":2}"#;
+    let resp = request(addr, "POST", "/v1/chat/completions", body);
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(resp.contains(r#""object":"chat.completion""#), "{resp}");
+    // The reply names the model it came from, not a fixed string.
+    assert!(resp.contains(r#""model":"dlm-test""#), "{resp}");
 }
 
 #[test]

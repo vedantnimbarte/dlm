@@ -250,6 +250,36 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Answer browser preflights and tag every response for `origin`.
+///
+/// A page served from anywhere but this server cannot read a reply without
+/// these headers, so a browser UI pointed at dlm gets a blank error with
+/// nothing in the log -- the request succeeded and the browser threw the answer
+/// away. `origin` is usually one site; `*` allows any, which is only safe
+/// because a shared dlm should be behind `--api-key`, and `*` and credentials
+/// are mutually exclusive by the standard.
+pub fn with_cors(inner: Handler, origin: String) -> Handler {
+    Arc::new(move |req: &Request| {
+        let tag = |mut resp: Response| {
+            resp.extra_headers
+                .push(("Access-Control-Allow-Origin", origin.clone()));
+            resp.extra_headers.push(("Vary", "Origin".to_string()));
+            resp
+        };
+        if req.method == "OPTIONS" {
+            // The preflight carries no body and must not need auth.
+            return tag(Response::text(204, ""))
+                .with_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                .with_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type, x-api-key, anthropic-version",
+                )
+                .with_header("Access-Control-Max-Age", "86400");
+        }
+        tag(inner(req))
+    })
+}
+
 /// A request handler: maps a request to a response.
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
@@ -669,6 +699,48 @@ mod tests {
                 "{raw:?} -> {resp}"
             );
         }
+    }
+
+    /// A browser will not let a page read a cross-origin reply without these
+    /// headers, and sends an `OPTIONS` preflight first that no dlm route
+    /// answered — so a UI pointed at dlm failed with nothing in the log.
+    #[test]
+    fn cors_answers_the_preflight_and_tags_replies() {
+        let server = HttpServer::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let inner: Handler = Arc::new(|_: &Request| Response::text(200, "hi"));
+        let handler = with_cors(inner, "http://localhost:3000".to_string());
+        std::thread::spawn(move || server.serve(handler).unwrap());
+
+        let pre = round_trip_once(
+            addr,
+            "OPTIONS /v1/chat/completions HTTP/1.1
+
+",
+        );
+        assert!(pre.starts_with("HTTP/1.1 204"), "{pre}");
+        assert!(
+            pre.contains("Access-Control-Allow-Origin: http://localhost:3000"),
+            "{pre}"
+        );
+        assert!(
+            pre.contains("Access-Control-Allow-Headers: Authorization"),
+            "{pre}"
+        );
+
+        // The actual request is tagged too, or the browser discards the answer.
+        let resp = round_trip_once(
+            addr,
+            "GET /v1/models HTTP/1.1
+
+",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: http://localhost:3000"),
+            "{resp}"
+        );
+        assert!(resp.trim_end().ends_with("hi"), "{resp}");
     }
 
     #[test]

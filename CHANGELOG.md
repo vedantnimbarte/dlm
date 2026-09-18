@@ -12,6 +12,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **API compatibility: four things that turned working clients away.**
+  - **Every model was called `dlm`.** The id in each response and in
+    `/v1/models` is now the checkpoint's own name (`qwen2.5-0.5b`, or a GGUF
+    file's). A client picking from the model list, routing between instances, or
+    checking a reply against what it asked for had nothing to go on.
+  - **`content` as an array of parts is accepted**, not only as a string. The
+    OpenAI SDKs and anything that can attach an image send the array form, and
+    dlm answered 400. Parts it cannot serve (an image) are dropped rather than
+    refused, and `content: null` reads as empty.
+  - **A request without `max_tokens` now runs to EOS**, instead of stopping at
+    128 tokens with `finish_reason: length`. It is still clamped to what is left
+    of the context window, which is the cap that matters.
+  - **`--cors-origin`** answers browser preflights and tags replies, so a browser
+    UI can reach the API. Without it the request succeeds and the browser
+    discards the answer, with nothing in the log. Off by default: a server on a
+    shared network should not hand its answers to any page that asks.
+- **The end-to-end server test drove an engine nothing served.**
+  `tests/server.rs` exercised a second, older OpenAI router that only the test
+  referenced, so its checks said nothing about the server `dlm serve` runs. It
+  now drives `EngineService`, and the dead router is gone.
+
 ### Changed
 
 - **The GPU's batched GEMV read every weight once per sequence instead of once

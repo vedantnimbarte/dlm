@@ -342,6 +342,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "KEY")]
     pub api_key: Option<String>,
 
+    /// Allow browsers on this origin to call the API (`--cors-origin
+    /// http://localhost:3000`, or `*` for any). Off by default: a page on
+    /// another origin cannot read dlm's replies without it, and a server on a
+    /// shared network should not hand its answers to any page that asks.
+    #[arg(long, value_name = "ORIGIN")]
+    pub cors_origin: Option<String>,
+
     /// Chat prompt template applied to chat messages. `auto` (default) detects it
     /// from the checkpoint's tokenizer_config.json; or name one: `plain`,
     /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `phi3`, `deepseek`.
