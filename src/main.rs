@@ -227,8 +227,7 @@ fn gpu_parity_probe() -> Result<f32> {
 /// Check that a checkpoint directory loads its config, maps its store, has the
 /// pinned embedding tensor, and (if present) a working tokenizer.
 fn checkpoint_check(dir: &Path) -> Result<String> {
-    let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
-    let store = MmapStore::open_dir(dir)?;
+    let (config, store) = dlm::loader::open_model(dir, QuantScheme::Fp16)?;
     if store.locate("model.embed_tokens.weight").is_none() {
         return Err(DlmError::InvalidConfig(
             "missing model.embed_tokens.weight".into(),
@@ -339,8 +338,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
 
     // Materialize the model (real checkpoint or synthetic) into host weights.
     let (parts, is_synthetic) = if let Some(dir) = &args.model_path {
-        let config = ModelConfig::from_path(dir, QuantScheme::Fp16)?;
-        let store = MmapStore::open_dir(dir)?;
+        let (config, store) = dlm::loader::open_model(dir, QuantScheme::Fp16)?;
         println!("generate     : model {}", dir.display());
         println!(
             "model        : vocab {}, hidden {}, {} layers, {} q-heads / {} kv-heads, head_dim {}",
@@ -430,8 +428,7 @@ fn run_score(args: ScoreArgs) -> Result<()> {
         )));
     }
 
-    let config = ModelConfig::from_path(&args.model_path, QuantScheme::Fp16)?;
-    let store = MmapStore::open_dir(&args.model_path)?;
+    let (config, store) = dlm::loader::open_model(&args.model_path, QuantScheme::Fp16)?;
     let parts = dlm::loader::load_model_parts(&store, &config, tokens.len() as u32)?;
     let device = resolve_device(args.device);
     let (logprobs, next) = score_on_device(parts, device, &tokens)?;
@@ -570,6 +567,10 @@ fn run_generation<K: ComputeKernel>(
 /// Load the tokenizer a served model ships (HF `tokenizer.json` or GPT-2
 /// `vocab.json`+`merges.txt`), falling back to a raw byte tokenizer.
 fn serve_tokenizer(model_path: &Path) -> Result<BpeTokenizer> {
+    // A GGUF file carries its vocabulary in its own metadata.
+    if model_path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        return BpeTokenizer::from_gguf_path(model_path);
+    }
     let has_hf = model_path.join("tokenizer.json").exists();
     let has_gpt2 = model_path.join("vocab.json").exists() && model_path.join("merges.txt").exists();
     if has_hf || has_gpt2 {
@@ -733,13 +734,13 @@ fn run_profile(args: ProfileArgs) -> Result<()> {
         Some(dir) => {
             // Probe the real checkpoint so the plan is sized from the weights it
             // actually has, not an assumed scheme.
-            let quant = match MmapStore::open_dir(dir) {
+            let quant = match MmapStore::open_path(dir) {
                 Ok(store) => resolve_quant(args.quant, &store)?,
                 // No mappable store (config-only dir): fall back to the request.
                 Err(_) => args.quant.map_or(QuantScheme::Fp16, |q| q.to_scheme()),
             };
             (
-                ModelConfig::from_path(dir, quant)?,
+                dlm::loader::open_model(dir, quant)?.0,
                 format!("config.json in {}", dir.display()),
             )
         }
@@ -812,14 +813,22 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 
     // Map the checkpoint first: the weight precision (and every plan derived from
     // it) comes from the dtype the file actually holds.
-    let store = MmapStore::open_dir(&args.model_path)?;
+    let store = MmapStore::open_path(&args.model_path)?;
     let quant = resolve_quant(args.quant, &store)?;
 
     println!("serve config :");
     println!("  model      : {}", args.model_path.display());
     println!("  api        : http://{}:{}", args.host, args.port);
     println!("  context    : {} tokens", args.context_length);
-    println!("  quant      : {quant:?}");
+    // A GGUF file is known by the name it was downloaded under ("Q4_K_M"), not by
+    // the precision dlm computes in, so say both.
+    match store
+        .gguf_metadata()
+        .and_then(dlm::storage::gguf::file_type_name)
+    {
+        Some(name) => println!("  quant      : gguf {name} (read as {quant:?})"),
+        None => println!("  quant      : {quant:?}"),
+    }
     println!("  mode       : {:?}", args.distributed_mode);
     if let Some(draft) = &args.draft_model_path {
         println!(
@@ -836,10 +845,14 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     }
     println!();
 
-    let config = ModelConfig::from_path(&args.model_path, quant)?;
+    let (config, store) = dlm::loader::open_model(&args.model_path, quant)?;
     println!(
-        "model source : config.json in {}",
-        args.model_path.display()
+        "model source : {}",
+        if store.gguf_metadata().is_some() {
+            format!("gguf metadata in {}", args.model_path.display())
+        } else {
+            format!("config.json in {}", args.model_path.display())
+        }
     );
     print_geometry(&config);
     let listen = format!("{}:{}", args.host, args.port);
@@ -1021,14 +1034,14 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // be exact. Loaded as parts so it can take the same kernel as the target.
             let draft_parts = match &args.draft_model_path {
                 Some(dir) => {
-                    let dcfg = ModelConfig::from_path(dir, quant)?;
+                    let dcfg = dlm::loader::open_model(dir, quant)?.0;
                     if dcfg.vocab_size != config.vocab_size {
                         return Err(DlmError::InvalidConfig(format!(
                             "draft vocab {} != target vocab {}",
                             dcfg.vocab_size, config.vocab_size
                         )));
                     }
-                    let dstore = MmapStore::open_dir(dir)?;
+                    let dstore = MmapStore::open_path(dir)?;
                     Some(dlm::loader::load_model_parts(
                         &dstore,
                         &dcfg,
@@ -1187,6 +1200,17 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
     let Some(requested) = requested else {
         return Ok(native);
     };
+    // A GGUF file's weights were quantized by whoever built it, with a calibration
+    // dlm cannot reproduce from the codes. There are no floats left to quantize,
+    // so the flag can only be refused, not honored.
+    if store.gguf_metadata().is_some() {
+        return Err(DlmError::UnsupportedQuant(format!(
+            "--quant {:?} cannot apply to a GGUF file: its weights are already quantized, \
+             and dlm reads them at the precision they were saved in ({native:?} here). \
+             Omit --quant, or download a differently-quantized .gguf.",
+            requested.to_scheme()
+        )));
+    }
     let scheme = requested.to_scheme();
     if scheme == native {
         return Ok(scheme);
@@ -1200,7 +1224,8 @@ fn resolve_quant(requested: Option<QuantArg>, store: &MmapStore) -> Result<Quant
             .is_some()
     {
         return Err(DlmError::UnsupportedQuant(format!(
-            "--quant {scheme:?} cannot apply to an already-quantized 4-bit GPTQ checkpoint;              it is loaded at its own int4 precision. Omit --quant."
+            "--quant {scheme:?} cannot apply to an already-quantized 4-bit GPTQ \
+             checkpoint; it is loaded at its own int4 precision. Omit --quant."
         )));
     }
     match scheme {
@@ -1855,7 +1880,7 @@ fn report_plan(
     // Map shards + measure real weight sizes when a directory is supplied.
     let mut mapped: Option<(MmapStore, LayerCatalog)> = None;
     if let Some(dir) = model_dir {
-        if let Ok(store) = MmapStore::open_dir(dir) {
+        if let Ok(store) = MmapStore::open_path(dir) {
             let cat = LayerCatalog::build(&store);
             println!(
                 "storage      : mapped {} shard(s), {} tensors, {:.2} GiB on disk",

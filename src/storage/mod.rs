@@ -1,6 +1,8 @@
 //! Storage engine: memory-mapped, zero-copy access to safetensors weights.
 
 pub mod catalog;
+pub mod ggml_quant;
+pub mod gguf;
 pub mod mmap_store;
 pub mod safetensors;
 pub mod sha256;

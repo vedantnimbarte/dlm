@@ -623,8 +623,28 @@ typedef struct {
     int kv_half;                  // 1: the KV buffers hold fp16 (DLM_KV_F16)
     const int* kv_table;          // the sequence's block table (single-sequence calls)
     int kv_block_shift;           // rows per KV block = 1 << kv_block_shift
+    // Per-projection weight dtype and group size, in the order q, k, v, o, gate,
+    // up, down. A safetensors checkpoint stores a whole layer in one dtype, but a
+    // GGUF one does not: a Q4_K_M file mixes Q4_K and Q6_K tensors inside the same
+    // layer, and decoding a Q6_K matrix as Q4_K reads plausible, wrong weights.
+    // `dtype[0] < 0` means "the call's own w_dtype/w_group_size for all of them".
+    int w_dtype[7];
+    int w_group[7];
 } DlmBlockExt;
-static const DlmBlockExt DLM_BLOCK_DEFAULT = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+#define DLM_W_Q 0
+#define DLM_W_K 1
+#define DLM_W_V 2
+#define DLM_W_O 3
+#define DLM_W_GATE 4
+#define DLM_W_UP 5
+#define DLM_W_DOWN 6
+static const DlmBlockExt DLM_BLOCK_DEFAULT = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                              {-1, -1, -1, -1, -1, -1, -1},
+                                              {0, 0, 0, 0, 0, 0, 0}};
+// This projection's dtype and group size: the per-tensor pair when the caller
+// filled them in, else the call's single dtype.
+#define DLM_WDT(i) (o->w_dtype[0] < 0 ? w_dtype : o->w_dtype[(i)])
+#define DLM_WGRP(i) (o->w_dtype[0] < 0 ? w_group_size : o->w_group[(i)])
 
 // Launch the three attention kernels for one query over `positions` cached
 // tokens. Scores live in scratch slot ATTN_SCORES.
@@ -736,9 +756,9 @@ extern "C" int dlm_decode_block(
     if (e == cudaSuccess) {
         // Attention sublayer.
         DLM_NORM(x, in_norm, o->in_norm_bias, normed)
-        launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
-        launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
-        launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
+        launch_matvec(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q));
+        launch_matvec(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K));
+        launch_matvec(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V));
         // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
@@ -754,7 +774,7 @@ extern "C" int dlm_decode_block(
         // Attend over history + this token, reading the persistent buffers directly.
         e = launch_attention(q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap, o->kv_half);
         if (e != cudaSuccess) return (int)e;
-        launch_matvec(w_dtype, o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, w_group_size);
+        launch_matvec(DLM_WDT(DLM_W_O), o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O));
         // Gemma2 norms the attention output before the residual add (in place, so
         // the add below is unchanged); elsewhere it goes in raw.
         if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
@@ -769,14 +789,14 @@ extern "C" int dlm_decode_block(
             if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
             else DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
         }
-        launch_matvec(w_dtype, up_proj, normed2, o->up_bias, up, inter, hidden_size, w_group_size);
+        launch_matvec(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, DLM_WGRP(DLM_W_UP));
         if (o->gated) {
-            launch_matvec(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size);
+            launch_matvec(DLM_WDT(DLM_W_GATE), gate_proj, normed2, (const float*)0, gate, inter, hidden_size, DLM_WGRP(DLM_W_GATE));
             swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, inter_buf, inter, activation);
         } else {
             activate_kernel<<<grid_for(inter, B), B>>>(up, inter_buf, (long)inter, activation);
         }
-        launch_matvec(w_dtype, down_proj, inter_buf, o->down_bias, down, hidden_size, inter, w_group_size);
+        launch_matvec(DLM_WDT(DLM_W_DOWN), down_proj, inter_buf, o->down_bias, down, hidden_size, inter, DLM_WGRP(DLM_W_DOWN));
         if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
 
@@ -1078,9 +1098,9 @@ extern "C" int dlm_decode_block_batched(
     // Attention sublayer. Projections are batched (one weight read for all
     // slots); everything downstream of them is per-slot state.
     DLM_NORM_B(x, in_norm, o->in_norm_bias, normed)
-    launch_matvec_batched(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size, batch);
-    launch_matvec_batched(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size, batch);
-    launch_matvec_batched(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size, batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q), batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K), batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V), batch);
 
     for (int b = 0; b < batch; ++b) {
         float* qb = q + (long)b * q_dim;
@@ -1105,7 +1125,7 @@ extern "C" int dlm_decode_block_batched(
         if (e != cudaSuccess) return (int)e;
     }
 
-    launch_matvec_batched(w_dtype, o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, w_group_size, batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_O), o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O), batch);
     if (gemma2) {
         rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
     }
@@ -1117,14 +1137,14 @@ extern "C" int dlm_decode_block_batched(
         if (gemma2) rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
         else DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
     }
-    launch_matvec_batched(w_dtype, up_proj, normed2, o->up_bias, up, inter, hidden_size, w_group_size, batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, DLM_WGRP(DLM_W_UP), batch);
     if (o->gated) {
-        launch_matvec_batched(w_dtype, gate_proj, normed2, (const float*)0, gate, inter, hidden_size, w_group_size, batch);
+        launch_matvec_batched(DLM_WDT(DLM_W_GATE), gate_proj, normed2, (const float*)0, gate, inter, hidden_size, DLM_WGRP(DLM_W_GATE), batch);
         swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
     } else {
         activate_kernel<<<grid_for(batch * inter, B), B>>>(up, inter_buf, (long)batch * inter, activation);
     }
-    launch_matvec_batched(w_dtype, down_proj, inter_buf, o->down_bias, down, hidden_size, inter, w_group_size, batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_DOWN), down_proj, inter_buf, o->down_bias, down, hidden_size, inter, DLM_WGRP(DLM_W_DOWN), batch);
     if (gemma2) {
         rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
     }
@@ -1170,9 +1190,11 @@ extern "C" int dlm_moe_attn(
     float attn_scale,                      // <=0: derive 1/sqrt(head_dim) as usual
     float attn_softcap,                    // 0 = off (Gemma2 caps attention logits)
     int kv_half,                           // 1: the KV buffers hold fp16
-    const int* kv_table, int kv_block_shift)  // the sequence's block table
+    const int* kv_table, int kv_block_shift,  // the sequence's block table
+    const DlmBlockExt* ext)                // per-projection dtypes; may be NULL
 {
     DLM_ENTER
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
     const int B = 256;
     int total_pos = num_positions + 1;
     if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
@@ -1193,9 +1215,9 @@ extern "C" int dlm_moe_attn(
 
     if (e == cudaSuccess) {
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
-        launch_matvec(w_dtype, q_proj, normed, q_bias, q, q_dim, hidden_size, w_group_size);
-        launch_matvec(w_dtype, k_proj, normed, k_bias, k, kv_dim, hidden_size, w_group_size);
-        launch_matvec(w_dtype, v_proj, normed, v_bias, v, kv_dim, hidden_size, w_group_size);
+        launch_matvec(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q));
+        launch_matvec(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K));
+        launch_matvec(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V));
         // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
         if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
         if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
@@ -1205,7 +1227,7 @@ extern "C" int dlm_moe_attn(
                          kv_dim, kv_half);
         e = launch_attention(q, kv_keys, kv_values, kv_table, kv_block_shift, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap, kv_half);
         if (e != cudaSuccess) return (int)e;
-        launch_matvec(w_dtype, o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, w_group_size);
+        launch_matvec(DLM_WDT(DLM_W_O), o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O));
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
         // FFN input, reused by the router matvec and every expert.
         rmsnorm_kernel<<<1, RMS_THREADS>>>(x, post_norm, normed2, hidden_size, rms_eps);

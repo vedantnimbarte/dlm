@@ -304,7 +304,8 @@ fn check_quant_supported(q: &QuantizationConfig) -> Result<Option<PackedQuant>> 
     if let Some(bits) = q.bits {
         if bits != 4 {
             return Err(DlmError::UnsupportedQuant(format!(
-                "{bits}-bit {method} checkpoint; dlm decodes 4-bit only.                  Use an fp16/bf16 or 4-bit GPTQ (desc_act=false) checkpoint."
+                "{bits}-bit {method} checkpoint; dlm decodes 4-bit only. Use an fp16/bf16 \
+                 or 4-bit GPTQ (desc_act=false) checkpoint."
             )));
         }
     }
@@ -816,6 +817,13 @@ fn pattern_from_layer_types(types: &[String]) -> Result<Option<u32>> {
     Ok(Some(n as u32))
 }
 
+/// The per-head width a part-built GGUF config implies: its explicit `head_dim`,
+/// else hidden size over head count.
+fn self_head_dim(cfg: &serde_json::Value) -> Option<u64> {
+    let get = |k: &str| cfg.get(k).and_then(serde_json::Value::as_u64);
+    get("head_dim").or_else(|| Some(get("hidden_size")? / get("num_attention_heads")?.max(1)))
+}
+
 impl ModelConfig {
     /// True when this is a Mixture-of-Experts checkpoint.
     pub fn is_moe(&self) -> bool {
@@ -824,6 +832,163 @@ impl ModelConfig {
 }
 
 impl ModelConfig {
+    /// The model config a GGUF file carries in its metadata.
+    ///
+    /// GGUF keeps what `config.json` would hold under `{architecture}.*` keys, in
+    /// llama.cpp's own spelling. They are translated into that JSON shape and
+    /// parsed by [`from_json_bytes`](Self::from_json_bytes), so a GGUF checkpoint
+    /// meets exactly the same validation — and the same refusals — as a
+    /// safetensors one, rather than a second, laxer path.
+    ///
+    /// `has_lm_head` says whether the file ships an output projection; GGUF omits
+    /// it when it is the embedding matrix, which is what `tie_word_embeddings`
+    /// means in a `config.json`.
+    pub fn from_gguf(
+        metadata: &std::collections::BTreeMap<String, crate::storage::gguf::Value>,
+        has_lm_head: bool,
+        quant: QuantScheme,
+    ) -> Result<Self> {
+        use crate::storage::gguf::Value;
+        use serde_json::json;
+
+        let arch = metadata
+            .get("general.architecture")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DlmError::InvalidConfig("gguf: no general.architecture in the metadata".into())
+            })?;
+        // The architectures whose tensor names and block shape dlm knows. An
+        // unrecognized one is refused rather than run as a Llama: the names would
+        // mostly match, and the parts that did not would load as the wrong thing.
+        let model_type = match arch {
+            "llama" | "mistral" | "qwen2" | "qwen3" | "phi3" | "starcoder2" => arch,
+            "gemma" => "gemma",
+            "gemma2" => "gemma2",
+            "gemma3" | "gemma3_text" => "gemma3_text",
+            other => {
+                return Err(DlmError::InvalidConfig(format!(
+                    "gguf: architecture {other:?} is not one dlm implements. It reads llama,                      mistral, qwen2, qwen3, phi3, starcoder2 and gemma/gemma2/gemma3 files."
+                )))
+            }
+        };
+        let num = |key: &str| {
+            metadata
+                .get(&format!("{arch}.{key}"))
+                .and_then(Value::as_f64)
+        };
+        let int = |key: &str| {
+            metadata
+                .get(&format!("{arch}.{key}"))
+                .and_then(Value::as_u64)
+        };
+        let need = |key: &str| {
+            int(key).ok_or_else(|| {
+                DlmError::InvalidConfig(format!("gguf: metadata has no {arch}.{key}"))
+            })
+        };
+
+        // The vocabulary is the tokenizer's token list; GGUF has no vocab_size key.
+        let vocab = metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(Value::as_strings)
+            .map(|t| t.len() as u64)
+            .ok_or_else(|| {
+                DlmError::InvalidConfig("gguf: metadata has no tokenizer.ggml.tokens".into())
+            })?;
+
+        let mut cfg = json!({
+            "model_type": model_type,
+            "hidden_size": need("embedding_length")?,
+            "num_hidden_layers": need("block_count")?,
+            "num_attention_heads": need("attention.head_count")?,
+            "vocab_size": vocab,
+            "tie_word_embeddings": !has_lm_head,
+        });
+        let obj = cfg.as_object_mut().expect("literal object");
+        let mut put = |key: &str, value: Option<serde_json::Value>| {
+            if let Some(v) = value {
+                obj.insert(key.to_string(), v);
+            }
+        };
+        put(
+            "num_key_value_heads",
+            int("attention.head_count_kv").map(Into::into),
+        );
+        put(
+            "intermediate_size",
+            int("feed_forward_length").map(Into::into),
+        );
+        put(
+            "max_position_embeddings",
+            int("context_length").map(Into::into),
+        );
+        put("head_dim", int("attention.key_length").map(Into::into));
+        put("rope_theta", num("rope.freq_base").map(Into::into));
+        put(
+            "rms_norm_eps",
+            num("attention.layer_norm_rms_epsilon").map(Into::into),
+        );
+        put(
+            "layer_norm_epsilon",
+            num("attention.layer_norm_epsilon").map(Into::into),
+        );
+        put(
+            "sliding_window",
+            int("attention.sliding_window").map(Into::into),
+        );
+        put(
+            "attn_logit_softcapping",
+            num("attn_logit_softcapping").map(Into::into),
+        );
+        put(
+            "final_logit_softcapping",
+            num("final_logit_softcapping").map(Into::into),
+        );
+        put(
+            "query_pre_attn_scalar",
+            num("attention.query_pre_attn_scalar").map(Into::into),
+        );
+        put(
+            "rope_local_base_freq",
+            num("rope.freq_base_swa").map(Into::into),
+        );
+        put(
+            "eos_token_id",
+            metadata
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(Value::as_u64)
+                .map(Into::into),
+        );
+        // llama.cpp spells RoPE scaling as a type plus a factor, the same two
+        // fields `rope_scaling` holds.
+        if let (Some(kind), Some(factor)) = (
+            metadata
+                .get(&format!("{arch}.rope.scaling.type"))
+                .and_then(Value::as_str),
+            num("rope.scaling.factor"),
+        ) {
+            put(
+                "rope_scaling",
+                Some(json!({ "rope_type": kind, "factor": factor })),
+            );
+        }
+        // RoPE over fewer dimensions than the head is wide is the partial rotary
+        // factor under another name, which `from_json_bytes` refuses.
+        if let (Some(rope_dims), Some(head_dim)) =
+            (int("rope.dimension_count"), self_head_dim(&cfg))
+        {
+            if rope_dims < head_dim {
+                cfg.as_object_mut().unwrap().insert(
+                    "partial_rotary_factor".into(),
+                    json!(rope_dims as f64 / head_dim as f64),
+                );
+            }
+        }
+
+        let bytes = serde_json::to_vec(&cfg).expect("config json is serializable");
+        Self::from_json_bytes(&bytes, quant)
+    }
+
     /// Load and validate a `config.json` from a model directory or file path.
     /// If `path` is a directory, `config.json` inside it is used — and any
     /// `generation_config.json` beside it is merged in (see [`merge_generation_config`]).

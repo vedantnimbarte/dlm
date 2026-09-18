@@ -125,6 +125,8 @@ extern "C" {
         // The sequence's KV block table, and log2 of rows per block.
         kv_table: *const i32,
         kv_block_shift: i32,
+        // Per-projection dtypes, as `dlm_decode_block` takes them; may be null.
+        ext: *const DlmBlockExt,
     ) -> i32;
 
     /// Post-attention norm for a MoE layer whose attention ran in a separate call
@@ -407,7 +409,25 @@ pub(crate) struct DlmBlockExt {
     /// one per slot).
     kv_table: *const i32,
     kv_block_shift: i32,
+    /// Each projection's own dtype and group size, in the order q, k, v, o, gate,
+    /// up, down.
+    ///
+    /// A safetensors checkpoint holds a whole layer in one dtype, and the kernel
+    /// took one for the block. A GGUF one does not: a Q4_K_M file mixes Q4_K and
+    /// Q6_K inside a layer, and reading a Q6_K matrix as Q4_K gives weights that
+    /// are wrong and still generate fluent text.
+    w_dtype: [i32; 7],
+    w_group: [i32; 7],
 }
+
+/// Where each projection's dtype sits in [`DlmBlockExt`]'s arrays.
+pub(crate) const W_Q: usize = 0;
+pub(crate) const W_K: usize = 1;
+pub(crate) const W_V: usize = 2;
+pub(crate) const W_O: usize = 3;
+pub(crate) const W_GATE: usize = 4;
+pub(crate) const W_UP: usize = 5;
+pub(crate) const W_DOWN: usize = 6;
 
 impl DlmBlockExt {
     /// The device block options for `cfg`, pointing at the layer's biases. Every
@@ -433,7 +453,51 @@ impl DlmBlockExt {
             kv_half: kv_half as i32,
             kv_table,
             kv_block_shift: crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
+            // Filled by `with_weight_dtypes`; -1 in the first slot tells the
+            // kernel to use the call's single dtype for every projection.
+            w_dtype: [-1; 7],
+            w_group: [0; 7],
         }
+    }
+
+    /// Record each projection's own dtype and group size.
+    pub(crate) fn with_weight_dtypes(mut self, w: &WeightDtypes) -> Self {
+        self.w_dtype = w.dtype;
+        self.w_group = w.group;
+        self
+    }
+}
+
+/// A layer's per-projection weight dtypes, kept beside its device buffers
+/// because the host weights they came from are dropped after the upload.
+#[derive(Clone, Copy)]
+pub(crate) struct WeightDtypes {
+    pub(crate) dtype: [i32; 7],
+    pub(crate) group: [i32; 7],
+}
+
+impl WeightDtypes {
+    pub(crate) fn of(t: &LayerTensors) -> Self {
+        let mut me = Self {
+            dtype: [-1; 7],
+            group: [0; 7],
+        };
+        let mut set = |i: usize, w: &crate::forward::Weights| {
+            me.dtype[i] = w.dtype_code();
+            me.group[i] = w.group_size() as i32;
+        };
+        set(W_Q, &t.q_proj);
+        set(W_K, &t.k_proj);
+        set(W_V, &t.v_proj);
+        set(W_O, &t.o_proj);
+        // A MoE layer has no single FFN triple; its experts carry their own dtypes
+        // through `GpuExpert`, and these three slots go unread.
+        if let crate::forward::Ffn::Dense(f) = &t.ffn {
+            set(W_GATE, &f.gate);
+            set(W_UP, &f.up);
+            set(W_DOWN, &f.down);
+        }
+        me
     }
 }
 
@@ -601,9 +665,12 @@ struct GpuLayer {
     /// not fit in VRAM belongs on the streaming path.
     moe: Option<(GpuMoeCore, Vec<GpuExpert>)>,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
+    /// The whole-layer fallback; `dtypes` is what the kernel actually reads.
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
     w_group_size: i32,
+    /// Each projection's own dtype, which a GGUF layer mixes.
+    dtypes: WeightDtypes,
 }
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -926,6 +993,7 @@ impl GpuLayer {
             biases: GpuBlockBiases::upload(t)?,
             w_dtype,
             w_group_size,
+            dtypes: WeightDtypes::of(t),
         })
     }
 }
@@ -1083,7 +1151,8 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&cfg, &w.biases, slots.half, std::ptr::null()),
+                &DlmBlockExt::new(&cfg, &w.biases, slots.half, std::ptr::null())
+                    .with_weight_dtypes(&w.dtypes),
             )
         };
         if code != 0 {
@@ -1486,6 +1555,8 @@ impl GpuKernel {
                         dkv.half as i32,
                         dkv.table,
                         crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
+                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table)
+                            .with_weight_dtypes(&w.dtypes),
                     )
                 };
                 if code != 0 {
@@ -1540,7 +1611,8 @@ impl GpuKernel {
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table),
+                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table)
+                            .with_weight_dtypes(&w.dtypes),
                     )
                 };
                 if code != 0 {

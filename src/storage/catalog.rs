@@ -37,7 +37,11 @@ impl LayerCatalog {
         let mut pinned_bytes: u64 = 0;
 
         for info in store.iter_tensors() {
-            let bytes = info.byte_len() as u64;
+            // What the tensor costs *resident*, not on disk. A ggml block type
+            // grows when it is decoded into dlm's group-affine form, and the plan
+            // this catalog feeds is a VRAM plan: sizing it from the file would
+            // under-count a GGUF model by a third and overrun the card.
+            let bytes = info.dtype.resident_byte_len(info.num_elements()) as u64;
             match classify(&info.name) {
                 TensorRole::Layer(idx) => {
                     *layer_bytes.entry(idx).or_insert(0) += bytes;
