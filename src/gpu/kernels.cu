@@ -274,14 +274,19 @@ __global__ void matvec_kernel(const void* W, const float* x, const float* bias, 
     if (o >= out_dim) return;
     long base = (long)o * in_dim;
     long n = (long)out_dim * in_dim;   // the tensor's element count (INT4 layout)
-    __shared__ float partial[MATVEC_THREADS];
-    partial[threadIdx.x] = row_dot<DT>(W, x, base, threadIdx.x, blockDim.x, in_dim, n, group_size);
+    // Reduce within each warp by shuffle, then combine the warps through shared
+    // memory: one barrier instead of one per tree level. On a 896-wide projection
+    // a block does 14 rows of work, so six barrier rounds were a third of it.
+    __shared__ float partial[MATVEC_THREADS / 32];
+    float v = row_dot<DT>(W, x, base, threadIdx.x, blockDim.x, in_dim, n, group_size);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = v;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < (blockDim.x + 31) / 32; ++w) total += partial[w];
+        out[o] = total + (bias ? bias[o] : 0.0f);
     }
-    if (threadIdx.x == 0) out[o] = partial[0] + (bias ? bias[o] : 0.0f);
 }
 
 // Dispatch the GEMV on the runtime weight dtype (one block per output row).
@@ -797,8 +802,9 @@ extern "C" int dlm_decode_block(
 // Decoding B sequences by calling `dlm_decode_block` B times reads every weight
 // matrix B times. Decode is memory-bound on exactly those reads, so the win here
 // is not fusing arithmetic but **streaming each weight row once and using it for
-// all B slots**: `matvec_batched_kernel` holds a row in registers across the
-// batch loop, turning B GEMVs into one GEMM-shaped pass.
+// all B slots**: `matvec_batched_kernel` keeps one accumulator per slot in
+// registers and multiplies each weight element into all of them as it is read,
+// turning B GEMVs into one GEMM-shaped pass.
 //
 // Per-slot state that cannot be batched — each sequence has its own KV buffer,
 // history length and position — stays per-slot: the norms, RoPE and attention run
@@ -808,31 +814,118 @@ typedef struct { float* p[DLM_MAX_BATCH]; } DlmSlots;
 typedef struct { const int* p[DLM_MAX_BATCH]; } DlmTables;
 typedef struct { int v[DLM_MAX_BATCH]; } DlmInts;
 
+// A row's dtype-specific decoding, with everything that is constant across the
+// row hoisted out of the element loop: the quantized arms would otherwise redo
+// two offset computations and a division by the group size per element (the same
+// reason `row_dot` has its own quantized specializations).
+template <int DT>
+struct RowReader {
+    const void* W;
+    long n;
+    int group_size;
+    __device__ __forceinline__ RowReader(const void* w, long n_, int gs)
+        : W(w), n(n_), group_size(gs) {}
+    __device__ __forceinline__ float at(long e) const { return load_w<DT>(W, e, n, group_size); }
+};
+
+template <>
+struct RowReader<DLM_W_INT4> {
+    const unsigned char* bytes;
+    const float* scales;
+    const float* zeros;
+    int group_size;
+    int shift;
+    __device__ __forceinline__ RowReader(const void* w, long n, int gs)
+        : bytes((const unsigned char*)w), group_size(gs), shift(group_shift(gs)) {
+        long code_bytes = (n + 1) / 2;
+        scales = (const float*)(bytes + q_scales_off(code_bytes));
+        zeros = (const float*)(bytes + q_zeros_off(code_bytes, n, gs));
+    }
+    __device__ __forceinline__ float at(long e) const {
+        unsigned char byte = bytes[e >> 1];
+        float code = (float)((e & 1) ? (byte >> 4) : (byte & 0x0F));
+        long g = shift >= 0 ? (e >> shift) : e / group_size;
+        return (code - zeros[g]) * scales[g];
+    }
+};
+
+template <>
+struct RowReader<DLM_W_INT8> {
+    const unsigned char* bytes;
+    const float* scales;
+    const float* zeros;
+    int group_size;
+    int shift;
+    __device__ __forceinline__ RowReader(const void* w, long n, int gs)
+        : bytes((const unsigned char*)w), group_size(gs), shift(group_shift(gs)) {
+        scales = (const float*)(bytes + q_scales_off(n));
+        zeros = (const float*)(bytes + q_zeros_off(n, n, gs));
+    }
+    __device__ __forceinline__ float at(long e) const {
+        long g = shift >= 0 ? (e >> shift) : e / group_size;
+        return ((float)bytes[e] - zeros[g]) * scales[g];
+    }
+};
+
 // out[b*out_dim + o] = dot(W[o], x + b*in_dim) (+ bias[o]) for all b.
-// One block per output row; the row is read once and reused across the batch.
+//
+// One block per output row, and **each weight element is read from global memory
+// once** and multiplied into every slot's accumulator. That is the point of
+// batching a memory-bound GEMV: B slots cost one pass over the weights, not B.
+//
+// The accumulators live in registers, one per slot, which is why the batch loop
+// is unrolled over the compile-time maximum with a runtime `b < batch` guard:
+// indexing `acc[]` with a runtime value would put it in local memory and give
+// back the saving. Each slot's activations are re-read per weight element, but
+// `x` is a few KiB and stays in cache — the weight row is the thing too large to
+// revisit.
+//
+// The arithmetic per output is unchanged from the single-slot `row_dot`: the same
+// decode, the same values, accumulated over the same strided order.
 template <int DT>
 __global__ void matvec_batched_kernel(const void* W, const float* x, const float* bias,
                                       float* out, int out_dim, int in_dim, int group_size,
                                       int batch) {
-    __shared__ float partial[MATVEC_THREADS];
+    __shared__ float partial[DLM_MAX_BATCH * (MATVEC_THREADS / 32)];
     int o = blockIdx.x;
     if (o >= out_dim) return;
     long base = (long)o * in_dim;
     long n = (long)out_dim * in_dim;
+    RowReader<DT> row(W, n, group_size);
 
-    for (int b = 0; b < batch; ++b) {
-        const float* xb = x + (long)b * in_dim;
-        partial[threadIdx.x] =
-            row_dot<DT>(W, xb, base, threadIdx.x, blockDim.x, in_dim, n, group_size);
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-            __syncthreads();
+    float acc[DLM_MAX_BATCH];
+    #pragma unroll
+    for (int b = 0; b < DLM_MAX_BATCH; ++b) acc[b] = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float w = row.at(base + i);
+        #pragma unroll
+        for (int b = 0; b < DLM_MAX_BATCH; ++b) {
+            if (b < batch) acc[b] += w * x[(long)b * in_dim + i];
         }
-        if (threadIdx.x == 0) {
-            out[(long)b * out_dim + o] = partial[0] + (bias ? bias[o] : 0.0f);
+    }
+
+    // Reduce every slot's accumulator inside its warp with shuffles, which need no
+    // barrier, then combine the warps once. A shared-memory tree per slot would
+    // cost B barrier rounds per block, and with the weights already read that
+    // dominated: on a 896-wide projection each block does 14 rows of work against
+    // 48 barrier rounds. Summation order differs slightly from the single-slot
+    // kernel's tree, within float rounding.
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) / 32;
+    #pragma unroll
+    for (int b = 0; b < DLM_MAX_BATCH; ++b) {
+        if (b < batch) {
+            float v = acc[b];
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+            if (lane == 0) partial[b * (MATVEC_THREADS / 32) + warp] = v;
         }
-        __syncthreads();
+    }
+    __syncthreads();
+    // One thread per slot sums that slot's per-warp partials.
+    if ((int)threadIdx.x < batch) {
+        float v = 0.0f;
+        for (int w = 0; w < warps; ++w) v += partial[threadIdx.x * (MATVEC_THREADS / 32) + w];
+        out[(long)threadIdx.x * out_dim + o] = v + (bias ? bias[o] : 0.0f);
     }
 }
 

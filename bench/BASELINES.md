@@ -4,6 +4,14 @@ Measured with `dlm bench` so later changes can be compared against the same
 numbers. Each row is the median of 3 runs. Rerun the command shown to reproduce
 a row, and put the before/after in the PR that changes it.
 
+**These tables are the 0.4.0 baseline and have not been re-measured since.**
+Several changes have moved them a long way (the GPU kernel work, paged KV,
+batched serving, the batched GEMV rework), each carrying its own before/after in
+`CHANGELOG.md`. Treat the rows below as the starting point they were, not as
+current speeds, until someone reruns the whole set on one machine in one
+sitting. Clocks on this card drift enough between runs that only back-to-back
+comparisons mean anything.
+
 ## Machine
 
 These numbers come from one machine:
