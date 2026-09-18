@@ -265,6 +265,17 @@ fn load_linear_rows(
 }
 
 /// True if this checkpoint uses Falcon's `transformer.h.{i}` tree.
+/// Whether the LM head is the embedding matrix: the config says the two are
+/// tied, or the checkpoint simply ships no `lm_head.weight`.
+///
+/// The config is asked first, because some exports carry both a tie and an
+/// `lm_head.weight` left over from training. transformers ties regardless and
+/// never reads that tensor, so reading it here would run a different head than
+/// every other runtime.
+fn tied_lm_head(config: &ModelConfig, store: &MmapStore) -> bool {
+    config.tie_word_embeddings || store.locate("lm_head.weight").is_none()
+}
+
 fn is_falcon_tree(store: &MmapStore) -> bool {
     store
         .locate("transformer.h.0.self_attention.query_key_value.weight")
@@ -1392,10 +1403,10 @@ fn load_streaming_pieces(
     } else {
         load_norm(&store, "model.norm.weight", hidden, config.norm_add_one)?
     };
-    let lm_head = if store.locate("lm_head.weight").is_some() {
-        load_tensor(&store, "lm_head.weight", vocab * hidden)?
-    } else {
+    let lm_head = if tied_lm_head(config, &store) {
         embedding.clone()
+    } else {
+        load_tensor(&store, "lm_head.weight", vocab * hidden)?
     };
     let kv_config = KvCacheConfig {
         num_layers: config.num_layers,
@@ -1594,11 +1605,10 @@ pub fn load_model_parts(
     } else {
         load_norm(store, "model.norm.weight", hidden, config.norm_add_one)?
     };
-    // Weight tying: reuse the embedding when there is no separate LM head.
-    let lm_head = if store.locate("lm_head.weight").is_some() {
-        load_tensor(store, "lm_head.weight", vocab * hidden)?
-    } else {
+    let lm_head = if tied_lm_head(config, store) {
         embedding.clone()
+    } else {
+        load_tensor(store, "lm_head.weight", vocab * hidden)?
     };
 
     let kv_config = KvCacheConfig {

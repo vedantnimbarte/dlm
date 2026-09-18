@@ -166,6 +166,13 @@ impl std::fmt::Debug for MmapShard {
     }
 }
 
+/// Mistral's whole-model file, next to the sharded copy of the same weights:
+/// `consolidated.safetensors`, or `consolidated-00001-of-00002.safetensors` on
+/// the repos that split it.
+pub(crate) fn is_consolidated(file_name: &str) -> bool {
+    file_name.starts_with("consolidated") && file_name.ends_with(".safetensors")
+}
+
 /// A collection of mmapped shards presenting one flat tensor namespace, as a
 /// real sharded checkpoint (`model-00001-of-00003.safetensors`, ...) requires.
 #[derive(Debug, Default)]
@@ -189,15 +196,32 @@ impl MmapStore {
         })?;
 
         let mut shard_paths: Vec<PathBuf> = Vec::new();
+        let mut has_index = false;
         for entry in read_dir {
             let entry = entry.map_err(|source| DlmError::Io {
                 path: dir.to_path_buf(),
                 source,
             })?;
             let path = entry.path();
+            has_index |= path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".safetensors.index.json"));
             if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
                 shard_paths.push(path);
             }
+        }
+        // Mistral repos ship the same weights twice: as `model-0000n-of-...`
+        // shards with an index, and again as one `consolidated.safetensors` in
+        // their own format. Mapping both doubles the address space and the page
+        // cache for nothing, since the sharded copy answers every lookup.
+        // Without an index, `consolidated` may be the only copy there is.
+        if has_index {
+            shard_paths.retain(|p| {
+                !p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_consolidated)
+            });
         }
         shard_paths.sort();
 
@@ -273,6 +297,38 @@ mod tests {
                 end: 4,
             },
         )
+    }
+
+    /// A one-tensor safetensors file: `[header length][JSON header][data]`.
+    fn write_shard(path: &Path, tensor: &str) {
+        let header =
+            format!(r#"{{"{tensor}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Mistral repos hold the same weights twice, as sharded files with an index
+    /// and again as `consolidated.safetensors` in a different tensor naming.
+    /// Mapping both mapped every weight twice; the consolidated copy is skipped
+    /// whenever the index is there to say the sharded one is complete.
+    #[test]
+    fn a_consolidated_copy_is_skipped_when_the_shards_have_an_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(&dir.path().join("model-00001-of-00001.safetensors"), "kept");
+        // Not a safetensors file at all: opening it is an error, so the test
+        // fails loudly if the skip ever stops working.
+        std::fs::write(dir.path().join("consolidated.safetensors"), b"junk").unwrap();
+
+        std::fs::write(dir.path().join("model.safetensors.index.json"), b"{}").unwrap();
+        let store = MmapStore::open_dir(dir.path()).expect("the consolidated copy is skipped");
+        assert!(store.locate("kept").is_some());
+
+        // Without an index, `consolidated` may be the only copy of the weights,
+        // so it is still mapped -- here, failing on the junk contents.
+        std::fs::remove_file(dir.path().join("model.safetensors.index.json")).unwrap();
+        assert!(MmapStore::open_dir(dir.path()).is_err());
     }
 
     /// Both multimodal layouts come back as the text-only names, the vision
