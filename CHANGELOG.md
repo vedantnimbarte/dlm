@@ -68,11 +68,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     Latin and CJK.
   - **`--quant` is refused** for a GGUF file rather than ignored: its weights are
     already quantized, and there are no floats left to quantize.
-  - **Not yet:** MoE files (their experts are stacked into one tensor per layer),
-    and dlm holds the decoded weights in its own layout, which costs about a
-    third more VRAM than the file does on disk (a Q4_K tensor is 4.5 bits per
-    weight in the file and 6 as dlm stores it). The VRAM planner accounts for
-    the larger figure, so a plan that says it fits does.
+  - **The kernels read ggml's blocks directly**, so a streamed or tight-on-VRAM
+    model costs exactly what the file does. Where there is room to spare, the
+    loader re-packs the blocks into dlm's own layout instead, which the kernels
+    read faster. Measured on a Qwen2.5-0.5B Q4_K_M:
+
+    | | ggml's blocks | dlm's layout |
+    |---|---|---|
+    | Weights per layer | **10.4 MiB** | 18.8 MiB |
+    | Decode, resident on GPU | 54 tok/s | **82 tok/s** |
+    | Decode, streamed through a 0.6 GiB window | **19 tok/s** | 16 tok/s |
+    | Decode, CPU | 3.6 tok/s | **4.2 tok/s** |
+
+    So the resident paths expand and the streaming paths do not, which is the
+    faster choice in each case. The two are exactly equal weight for weight —
+    same codes, same arithmetic — and a test pins that, as does a second one
+    that generates the same tokens both ways from the same file.
+  - **Not yet:** MoE files, whose experts are stacked into one tensor per layer.
 
 - **A GGUF layer mixes quantization types, and the GPU block read them all as
   one.** A Q4_K_M file stores attention as Q4_K and parts of the FFN as Q6_K

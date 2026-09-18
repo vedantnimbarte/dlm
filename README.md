@@ -704,10 +704,15 @@ tensor of a Qwen2.5-0.5B `Q4_K_M` decodes to within 4.8e-8 of llama.cpp's own
 dequantization, and a `Q8_0` one to the bit. `tools/llamacpp_parity.py` compares
 tokenization and greedy output against a running `llama-server` on the same file.
 
-**Not yet:** MoE `.gguf` files (their experts are stacked into one tensor per
-layer). dlm also holds the decoded weights in its own layout, which costs about
-a third more VRAM than the file does on disk; the VRAM planner accounts for the
-larger figure.
+The kernels decode ggml's blocks directly, so a model that streams — or one that
+only just fits — costs exactly what the file does on disk. When there is VRAM to
+spare, the loader re-packs the blocks into dlm's own quantized layout, which the
+kernels read faster; the two are equal weight for weight. On a Qwen2.5-0.5B
+`Q4_K_M` that is 10.4 MiB per layer against 18.8, and 54 tok/s against 82 when
+resident (the other way round when streaming: 19 against 16).
+
+**Not yet:** MoE `.gguf` files, whose experts are stacked into one tensor per
+layer.
 
 ## Weight precision (`--quant`)
 

@@ -115,35 +115,11 @@ impl Dtype {
         elements / self.block_elems() * self.block_bytes()
     }
 
-    /// Weights per group once dlm has decoded this dtype into its own
-    /// group-affine form, or `None` for a dtype it keeps as it is.
-    pub fn affine_group(self) -> Option<usize> {
-        match self {
-            Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q5_0 | Dtype::Q5_1 | Dtype::Q8_0 => Some(32),
-            Dtype::Q4K | Dtype::Q5K => Some(32),
-            Dtype::Q6K => Some(16),
-            _ => None,
-        }
-    }
-
-    /// Bytes `elements` weights occupy **in dlm**, which is not what they occupy
-    /// on disk for a ggml block type: dlm's per-group scale and zero are a pair of
-    /// f32s where a K-quant packs both into 6 bits, and its codes are whole
-    /// nibbles or bytes. A Q4_K tensor is 4.5 bits per weight in the file and 6
-    /// once decoded. The VRAM plan has to size the second number.
+    /// Bytes `elements` weights occupy in memory, which for a ggml block type is
+    /// what they occupy on disk: the blocks are kept as the file has them and
+    /// decoded in the kernel.
     pub fn resident_byte_len(self, elements: usize) -> usize {
-        let Some(group) = self.affine_group() else {
-            return self.byte_len(elements);
-        };
-        // Four bits per weight where the codes fit in a nibble, eight otherwise,
-        // plus a scale and a zero per group.
-        let four_bit = matches!(self, Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q4K);
-        let codes = if four_bit {
-            elements.div_ceil(2)
-        } else {
-            elements
-        };
-        codes.div_ceil(4) * 4 + elements.div_ceil(group) * 8
+        self.byte_len(elements)
     }
 
     /// Whether this dtype stores weights in quantized blocks.
