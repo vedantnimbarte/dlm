@@ -382,9 +382,125 @@ impl BpeTokenizer {
         }
     }
 
+    /// The tokenizer a GGUF file carries in its metadata.
+    ///
+    /// GGUF holds the whole tokenizer where a Hugging Face repo keeps
+    /// `tokenizer.json`: the vocabulary as an ordered list (a token's index *is*
+    /// its id), the BPE merges as "a b" lines, and a type per token that marks
+    /// the control and user-defined ones. Reading it is what makes a downloaded
+    /// `.gguf` self-contained — without it the file's ids mean nothing.
+    pub fn from_gguf(
+        metadata: &std::collections::BTreeMap<String, crate::storage::gguf::Value>,
+    ) -> Result<Self> {
+        use crate::storage::gguf::Value;
+        let get = |key: &str| metadata.get(&format!("tokenizer.ggml.{key}"));
+        let kind = get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DlmError::InvalidConfig("gguf: no tokenizer.ggml.model".into()))?;
+        let tokens = get("tokens")
+            .and_then(Value::as_strings)
+            .ok_or_else(|| DlmError::InvalidConfig("gguf: no tokenizer.ggml.tokens".into()))?;
+        // Token types: 3 is a control token and 4 a user-defined one. Both must be
+        // matched whole rather than merged into, which is what `with_special`
+        // does; the rest are ordinary pieces.
+        let types = get("token_type").and_then(Value::as_numbers);
+        let is_special =
+            |id: usize| types.is_some_and(|t| matches!(t.get(id).copied(), Some(3.0) | Some(4.0)));
+        let specials: Vec<(String, u32)> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| is_special(*id))
+            .map(|(id, t)| (t.clone(), id as u32))
+            .collect();
+
+        let mut tok = match kind {
+            // Byte-level BPE (GPT-2, Llama 3, Qwen): the vocabulary is already in
+            // the byte-level alphabet, and the merges are the same pairs a
+            // `tokenizer.json` lists.
+            "gpt2" => {
+                let merges = get("merges").and_then(Value::as_strings).ok_or_else(|| {
+                    DlmError::InvalidConfig(
+                        "gguf: a gpt2-style tokenizer with no tokenizer.ggml.merges".into(),
+                    )
+                })?;
+                let vocab: HashMap<String, u32> = tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(id, t)| (t.clone(), id as u32))
+                    .collect();
+                let merges_list: Vec<(String, String)> = merges
+                    .iter()
+                    .filter_map(|m| {
+                        let mut it = m.split_whitespace();
+                        Some((it.next()?.to_string(), it.next()?.to_string()))
+                    })
+                    .collect();
+                let mut tok = Self::new(vocab, merges_list).with_special(specials);
+                // Which regex the model splits with, by the name llama.cpp records
+                // for it. An unknown one gets GPT-2's, the same fallback
+                // `tokenizer.json` gets.
+                tok.split = match get("pre").and_then(Value::as_str).unwrap_or("default") {
+                    "qwen2" => ByteLevelSplit::Qwen2,
+                    "llama-bpe" | "llama3" | "llama-v3" => ByteLevelSplit::Llama3,
+                    _ => ByteLevelSplit::Gpt2,
+                };
+                tok
+            }
+            // SentencePiece (Llama 2, Mistral, Gemma): pieces scored against each
+            // other, with ▁ for a space and byte tokens for anything unknown.
+            "llama" => {
+                let scores = get("scores").and_then(Value::as_numbers).ok_or_else(|| {
+                    DlmError::InvalidConfig(
+                        "gguf: a llama-style tokenizer with no tokenizer.ggml.scores".into(),
+                    )
+                })?;
+                let byte_fallback = types.is_some_and(|t| t.contains(&6.0));
+                let pieces: Vec<(String, f32)> = tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(id, t)| (t.clone(), scores.get(id).copied().unwrap_or(0.0) as f32))
+                    .collect();
+                let unk = get("unknown_token_id")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32);
+                Self::from_unigram(pieces, byte_fallback, unk).with_special(specials)
+            }
+            other => {
+                return Err(DlmError::InvalidConfig(format!(
+                    "gguf: tokenizer {other:?} is not one dlm implements. It reads the \
+                     byte-level BPE (\"gpt2\") and SentencePiece (\"llama\") tokenizers."
+                )))
+            }
+        };
+        // A BOS token is prepended only when the file says to, which is how
+        // llama.cpp decides: Gemma and Llama add one, Qwen does not.
+        if get("add_bos_token").and_then(Value::as_u64).unwrap_or(0) != 0 {
+            tok = tok.with_bos(
+                get("bos_token_id")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+            );
+        }
+        Ok(tok)
+    }
+
+    /// The tokenizer inside a `.gguf` file at `path`.
+    pub fn from_gguf_path(path: &Path) -> Result<Self> {
+        let shard = crate::storage::MmapShard::open(path)?;
+        let metadata = shard.gguf_metadata().ok_or_else(|| {
+            DlmError::InvalidConfig(format!("{} is not a GGUF file", path.display()))
+        })?;
+        Self::from_gguf(metadata)
+    }
+
     /// Load a tokenizer from a model directory: prefer HF `tokenizer.json`, else
     /// fall back to the classic `vocab.json` + `merges.txt` pair.
     pub fn from_dir(dir: &Path) -> Result<Self> {
+        // `--tokenizer` naming a .gguf file: it holds one, and a user pointing at
+        // the model they are running should get it.
+        if dir.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            return Self::from_gguf_path(dir);
+        }
         let hf = dir.join("tokenizer.json");
         let tok = if hf.exists() {
             Self::from_hf_json(&hf)?

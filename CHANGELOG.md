@@ -44,6 +44,44 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **dlm reads GGUF files** — the format local models are actually distributed
+  in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
+  and the file is self-contained: dlm takes the config and the tokenizer out of
+  its metadata, so nothing else needs downloading.
+  - **Quantization:** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K
+    and Q6_K. Each is decoded into dlm's own group-affine form, which every
+    existing kernel already reads, so this needed no new kernels. Anything else
+    (Q2_K, Q3_K, the IQ types) is refused by name, with the message saying a
+    Q4_K_M or Q5_K_M download is the usual choice.
+  - **Verified against llama.cpp on the same file**, which is the only reference
+    that can catch a misread scale: every quantized tensor of a Qwen2.5-0.5B
+    Q4_K_M decodes to within 4.8e-8 of llama.cpp's own dequantization, and a
+    Q8_0 one to the bit. Greedy output matches token for token except where the
+    top two candidates sit closer together than the two runtimes' arithmetic
+    differs — llama.cpp quantizes activations to int8 for its dot products,
+    where dlm dequantizes the weights and computes in f32.
+    `tools/llamacpp_parity.py` runs the comparison and reports which of the two
+    a divergence is.
+  - **Tokenizer:** the vocabulary, merges and token types come out of the
+    metadata, byte-level (GPT-2, Llama 3, Qwen) or SentencePiece (Llama 2,
+    Mistral, Gemma). Tokenization matches llama.cpp on prose, code, accented
+    Latin and CJK.
+  - **`--quant` is refused** for a GGUF file rather than ignored: its weights are
+    already quantized, and there are no floats left to quantize.
+  - **Not yet:** MoE files (their experts are stacked into one tensor per layer),
+    and dlm holds the decoded weights in its own layout, which costs about a
+    third more VRAM than the file does on disk (a Q4_K tensor is 4.5 bits per
+    weight in the file and 6 as dlm stores it). The VRAM planner accounts for
+    the larger figure, so a plan that says it fits does.
+
+- **A GGUF layer mixes quantization types, and the GPU block read them all as
+  one.** A Q4_K_M file stores attention as Q4_K and parts of the FFN as Q6_K
+  inside the same layer, while the device block took a single dtype for all
+  seven projections — decoding six of them as the wrong format. Each projection
+  now carries its own dtype and group size. Safetensors checkpoints are
+  unaffected (a layer there is one dtype), and the 46 GPU parity tests confirm
+  it.
+
 - **Mixture-of-Experts models run on the resident GPU path.** Before, `--device
   gpu` refused any MoE checkpoint — `serve`, `bench` and `score` all failed with
   "use the streaming GPU kernel (serve --stream)". A MoE model whose experts fit

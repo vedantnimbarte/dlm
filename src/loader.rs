@@ -30,6 +30,7 @@ use crate::forward::{
 use crate::generate::Generator;
 use crate::model::{ModelConfig, PackedQuant, QuantScheme};
 use crate::storage::{bytes_to_f32, Dtype, MmapStore};
+use std::path::Path;
 
 /// The [`QuantScheme`] matching a checkpoint's own weight dtype.
 ///
@@ -65,6 +66,10 @@ pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
     match dtype {
         Dtype::F32 => Ok(QuantScheme::F32),
         Dtype::F16 | Dtype::BF16 => Ok(QuantScheme::Fp16),
+        // A GGUF file's weights are already quantized. Its blocks are decoded
+        // into dlm's group-affine form, 4-bit or 8-bit depending on the type.
+        Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q4K => Ok(QuantScheme::Int4),
+        Dtype::Q5_0 | Dtype::Q5_1 | Dtype::Q8_0 | Dtype::Q5K | Dtype::Q6K => Ok(QuantScheme::Int8),
         other => Err(DlmError::UnsupportedQuant(format!(
             "checkpoint weights are {other:?}; dlm handles F32/F16/BF16"
         ))),
@@ -88,7 +93,13 @@ fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
-    bytes_to_f32(shard.tensor_bytes(name)?, info.dtype)
+    let bytes = shard.tensor_bytes(name)?;
+    if info.dtype.is_block_quantized() {
+        // GGUF quantizes the embedding matrix too; dlm keeps it as floats, so it
+        // is decoded here rather than carried in blocks.
+        return crate::storage::ggml_quant::to_f32(info.dtype, bytes, info.num_elements());
+    }
+    bytes_to_f32(bytes, info.dtype)
 }
 
 /// Reinterpret raw little-endian bytes as 16-bit bit patterns (bf16/f16), with no
@@ -148,6 +159,20 @@ fn load_native(
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
     let bytes = shard.tensor_bytes(name)?;
+    // A GGUF weight arrives in ggml's blocks, already quantized. It is decoded to
+    // dlm's group-affine form and used as it is: re-quantizing what a quantizer
+    // already chose would only lose what it chose, so `--quant` does not apply
+    // (the CLI refuses the combination rather than ignoring it).
+    if info.dtype.is_block_quantized() {
+        let w = crate::storage::ggml_quant::to_weights(info.dtype, bytes, expected_len)?;
+        if w.len() != expected_len {
+            return Err(DlmError::InvalidConfig(format!(
+                "tensor {name:?}: expected {expected_len} elements, got {}",
+                w.len()
+            )));
+        }
+        return Ok(w);
+    }
     // `--quant int4`/`int8`: quantize down from the checkpoint's floats at load.
     // Costs one f32 materialization here (transient, per tensor) and buys 4x/2x
     // less VRAM and PCIe per layer for the whole run.
@@ -610,6 +635,24 @@ impl ModelParts {
         .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap))
     }
+}
+
+/// Open a model: a directory holding `config.json` and safetensors shards, or a
+/// single `.gguf` file, which carries both.
+///
+/// `quant` is the precision the engine will compute in, which the caller has
+/// already resolved against the checkpoint's own.
+pub fn open_model(path: &Path, quant: QuantScheme) -> Result<(ModelConfig, MmapStore)> {
+    let store = MmapStore::open_path(path)?;
+    let config = match store.gguf_metadata() {
+        // GGUF omits the output projection when it is the embedding matrix, which
+        // is what a `config.json` calls tied word embeddings.
+        Some(meta) => {
+            ModelConfig::from_gguf(meta, store.locate("lm_head.weight").is_some(), quant)?
+        }
+        None => ModelConfig::from_path(path, quant)?,
+    };
+    Ok((config, store))
 }
 
 /// Build a CPU [`Generator`] from a mapped checkpoint and its config.

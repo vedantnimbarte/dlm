@@ -18,7 +18,13 @@ use std::collections::BTreeMap;
 /// The 8-byte little-endian length prefix that precedes the JSON header.
 pub const HEADER_LEN_PREFIX: usize = 8;
 
-/// Element data types defined by the safetensors spec (subset in common use).
+/// Element data types defined by the safetensors spec (subset in common use),
+/// plus the block-quantized types a GGUF file carries.
+///
+/// The block types do not store one value per element: they pack a fixed number
+/// of weights together with the scale that decodes them, which is why they need
+/// [`block_elems`](Self::block_elems) and [`block_bytes`](Self::block_bytes)
+/// rather than a size per element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     Bool,
@@ -36,17 +42,113 @@ pub enum Dtype {
     I64,
     U64,
     F64,
+    /// ggml `Q4_1`: 32 weights as `d * q + m`, both f16. 20 bytes.
+    Q4_1,
+    /// ggml `Q5_0`: 32 weights as `d * (q - 16)`, the fifth bit of each in a
+    /// 32-bit field. 22 bytes.
+    Q5_0,
+    /// ggml `Q5_1`: `Q5_0` with a minimum instead of a fixed offset. 24 bytes.
+    Q5_1,
+    /// ggml `Q4_0`: 32 weights as `d * (q - 8)`, `d` an f16. 18 bytes.
+    Q4_0,
+    /// ggml `Q8_0`: 32 weights as `d * q`, `q` signed. 34 bytes.
+    Q8_0,
+    /// ggml `Q4_K`: 256 weights in eight 32-weight sub-blocks, each with a 6-bit
+    /// scale and minimum off a shared pair of f16s. 144 bytes.
+    Q4K,
+    /// ggml `Q5_K`: `Q4_K` with a fifth bit per weight. 176 bytes.
+    Q5K,
+    /// ggml `Q6_K`: 256 weights in sixteen 16-weight sub-blocks, 6-bit weights
+    /// with an int8 scale each. 210 bytes.
+    Q6K,
 }
 
 impl Dtype {
-    /// Bytes occupied by a single element of this dtype.
+    /// Bytes occupied by a single element of this dtype. Block types have no
+    /// such number; ask them for [`block_bytes`](Self::block_bytes) instead.
     pub fn size_in_bytes(self) -> usize {
         match self {
             Dtype::Bool | Dtype::U8 | Dtype::I8 | Dtype::F8E4M3 | Dtype::F8E5M2 => 1,
             Dtype::I16 | Dtype::U16 | Dtype::F16 | Dtype::BF16 => 2,
             Dtype::I32 | Dtype::U32 | Dtype::F32 => 4,
             Dtype::I64 | Dtype::U64 | Dtype::F64 => 8,
+            // Not element-addressable. Callers that can meet a block type use
+            // `byte_len`; the safetensors parser, the only caller of this, cannot
+            // see one, since no safetensors dtype tag maps to these.
+            Dtype::Q4_0
+            | Dtype::Q4_1
+            | Dtype::Q5_0
+            | Dtype::Q5_1
+            | Dtype::Q8_0
+            | Dtype::Q4K
+            | Dtype::Q5K
+            | Dtype::Q6K => 0,
         }
+    }
+
+    /// Weights per storage block: 1 for every dtype that stores them one by one.
+    pub fn block_elems(self) -> usize {
+        match self {
+            Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q5_0 | Dtype::Q5_1 | Dtype::Q8_0 => 32,
+            Dtype::Q4K | Dtype::Q5K | Dtype::Q6K => 256,
+            _ => 1,
+        }
+    }
+
+    /// Bytes per storage block.
+    pub fn block_bytes(self) -> usize {
+        match self {
+            Dtype::Q4_0 => 18,
+            Dtype::Q4_1 => 20,
+            Dtype::Q5_0 => 22,
+            Dtype::Q5_1 => 24,
+            Dtype::Q8_0 => 34,
+            Dtype::Q4K => 144,
+            Dtype::Q5K => 176,
+            Dtype::Q6K => 210,
+            other => other.size_in_bytes(),
+        }
+    }
+
+    /// Bytes `elements` weights of this dtype occupy.
+    pub fn byte_len(self, elements: usize) -> usize {
+        elements / self.block_elems() * self.block_bytes()
+    }
+
+    /// Weights per group once dlm has decoded this dtype into its own
+    /// group-affine form, or `None` for a dtype it keeps as it is.
+    pub fn affine_group(self) -> Option<usize> {
+        match self {
+            Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q5_0 | Dtype::Q5_1 | Dtype::Q8_0 => Some(32),
+            Dtype::Q4K | Dtype::Q5K => Some(32),
+            Dtype::Q6K => Some(16),
+            _ => None,
+        }
+    }
+
+    /// Bytes `elements` weights occupy **in dlm**, which is not what they occupy
+    /// on disk for a ggml block type: dlm's per-group scale and zero are a pair of
+    /// f32s where a K-quant packs both into 6 bits, and its codes are whole
+    /// nibbles or bytes. A Q4_K tensor is 4.5 bits per weight in the file and 6
+    /// once decoded. The VRAM plan has to size the second number.
+    pub fn resident_byte_len(self, elements: usize) -> usize {
+        let Some(group) = self.affine_group() else {
+            return self.byte_len(elements);
+        };
+        // Four bits per weight where the codes fit in a nibble, eight otherwise,
+        // plus a scale and a zero per group.
+        let four_bit = matches!(self, Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q4K);
+        let codes = if four_bit {
+            elements.div_ceil(2)
+        } else {
+            elements
+        };
+        codes.div_ceil(4) * 4 + elements.div_ceil(group) * 8
+    }
+
+    /// Whether this dtype stores weights in quantized blocks.
+    pub fn is_block_quantized(self) -> bool {
+        self.block_elems() > 1
     }
 
     fn from_tag(tag: &str) -> Result<Self> {

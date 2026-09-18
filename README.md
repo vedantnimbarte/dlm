@@ -675,6 +675,40 @@ and a mismatch can hang or return garbage rather than error cleanly — verify w
 most integrated APUs, whose iGPUs ROCm can't drive regardless. When in doubt,
 `rocminfo` prints your GPU's actual `gfx` name.
 
+## GGUF files
+
+dlm reads the `.gguf` files llama.cpp models ship as — which is what most local
+models are distributed as. Point `--model-path` at the file:
+
+```bash
+dlm pull Qwen/Qwen2.5-0.5B-Instruct-GGUF     # or download the .gguf yourself
+dlm serve --model-path models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+```
+
+The file is self-contained: the model's shape and its tokenizer both come out of
+the GGUF metadata, so there is no `config.json` or `tokenizer.json` to fetch.
+Everything else works as it does for a safetensors checkpoint — CPU or GPU,
+resident or `--stream`.
+
+**Quantization types read natively:** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
+Q8_0, Q4_K, Q5_K, Q6_K. That covers the usual downloads (`Q4_K_M`, `Q5_K_M`,
+`Q8_0`). Q2_K, Q3_K and the IQ types are **refused by name** rather than
+mis-decoded.
+
+`--quant` is refused for a GGUF file: its weights are already quantized, and
+dlm reads them at the precision they were saved in.
+
+**Verified against llama.cpp**, which is the only reference that catches a
+misread scale — dlm would be consistent with itself either way. Every quantized
+tensor of a Qwen2.5-0.5B `Q4_K_M` decodes to within 4.8e-8 of llama.cpp's own
+dequantization, and a `Q8_0` one to the bit. `tools/llamacpp_parity.py` compares
+tokenization and greedy output against a running `llama-server` on the same file.
+
+**Not yet:** MoE `.gguf` files (their experts are stacked into one tensor per
+layer). dlm also holds the decoded weights in its own layout, which costs about
+a third more VRAM than the file does on disk; the VRAM planner accounts for the
+larger figure.
+
 ## Weight precision (`--quant`)
 
 **Omit it and dlm computes in the checkpoint's own precision** — it reads the

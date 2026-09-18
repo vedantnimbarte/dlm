@@ -84,6 +84,8 @@ struct GpuWeights {
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
     w_group_size: i32,
+    /// Each projection's own dtype, which a GGUF layer mixes.
+    dtypes: crate::forward::gpu::WeightDtypes,
 }
 
 impl GpuWeights {
@@ -283,6 +285,7 @@ impl GpuWeights {
             biases: GpuBlockBiases::upload(t)?,
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
+            dtypes: crate::forward::gpu::WeightDtypes::of(t),
         })
     }
 
@@ -350,6 +353,7 @@ impl GpuWeights {
             biases: GpuBlockBiases::upload(t)?,
             w_dtype,
             w_group_size,
+            dtypes: crate::forward::gpu::WeightDtypes::of(t),
         })
     }
 }
@@ -914,7 +918,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 lcfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&lcfg, &w.biases, slots.half, std::ptr::null()),
+                &DlmBlockExt::new(&lcfg, &w.biases, slots.half, std::ptr::null())
+                    .with_weight_dtypes(&w.dtypes),
             )
         };
         if code != 0 {
@@ -1125,6 +1130,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 dkv.half as i32,
                 dkv.table,
                 crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
+                &DlmBlockExt::new(cfg, &w.biases, dkv.half, dkv.table)
+                    .with_weight_dtypes(&w.dtypes),
             )
         };
         if code != 0 {
@@ -1305,7 +1312,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             cfg.attn_logit_softcap.unwrap_or(0.0),
                             bias_ptr(&w.pre_ffn_norm),
                             bias_ptr(&w.post_ffn_norm),
-                            &DlmBlockExt::new(cfg, &w.biases, dkv.half, dkv.table),
+                            &DlmBlockExt::new(cfg, &w.biases, dkv.half, dkv.table)
+                                .with_weight_dtypes(&w.dtypes),
                         )
                     };
                     if code != 0 {

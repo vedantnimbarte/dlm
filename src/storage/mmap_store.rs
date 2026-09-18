@@ -11,6 +11,7 @@
 use crate::error::{DlmError, Result};
 use crate::storage::safetensors::{SafetensorsHeader, TensorInfo};
 use memmap2::{Mmap, MmapOptions};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,9 @@ pub struct MmapShard {
     path: PathBuf,
     mmap: Mmap,
     header: SafetensorsHeader,
+    /// A GGUF shard's metadata (the model's config and tokenizer); `None` for a
+    /// safetensors shard, which keeps those in files of their own.
+    gguf: Option<BTreeMap<String, crate::storage::gguf::Value>>,
 }
 
 impl MmapShard {
@@ -100,10 +104,30 @@ impl MmapShard {
             let _ = mmap.advise(memmap2::Advice::Random);
         }
 
-        let mut header = SafetensorsHeader::parse(&mmap, file_len)?;
+        // A GGUF file carries its config and tokenizer alongside the weights, so
+        // its header yields metadata the safetensors path has no equivalent for.
+        // Everything below this line treats the two identically: a tensor is a
+        // name, a dtype and a byte range.
+        let (mut header, gguf) = if crate::storage::gguf::is_gguf(&mmap) {
+            let g = crate::storage::gguf::parse(&mmap, file_len)?;
+            let metadata = g.metadata.clone();
+            (g.into_safetensors_header(), Some(metadata))
+        } else {
+            (SafetensorsHeader::parse(&mmap, file_len)?, None)
+        };
         header.tensors = text_model_view(std::mem::take(&mut header.tensors));
 
-        Ok(MmapShard { path, mmap, header })
+        Ok(MmapShard {
+            path,
+            mmap,
+            header,
+            gguf,
+        })
+    }
+
+    /// The GGUF metadata this shard was opened with, or `None` for safetensors.
+    pub fn gguf_metadata(&self) -> Option<&BTreeMap<String, crate::storage::gguf::Value>> {
+        self.gguf.as_ref()
     }
 
     /// Path this shard was mapped from.
@@ -184,6 +208,25 @@ impl MmapStore {
     /// Create an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a model: a directory of safetensors shards, or a single `.gguf` file.
+    ///
+    /// GGUF ships as one file, so `--model-path` naming it directly is how those
+    /// models are used; a directory holding one is opened by naming the file.
+    pub fn open_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if path.is_file() {
+            let mut store = MmapStore::new();
+            store.add_shard(MmapShard::open(path)?);
+            return Ok(store);
+        }
+        Self::open_dir(path)
+    }
+
+    /// The GGUF metadata of the first shard that has any.
+    pub fn gguf_metadata(&self) -> Option<&BTreeMap<String, crate::storage::gguf::Value>> {
+        self.shards.iter().find_map(|s| s.gguf_metadata())
     }
 
     /// Open every `*.safetensors` file in a model directory and map them.
