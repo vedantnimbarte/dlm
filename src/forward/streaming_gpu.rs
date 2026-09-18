@@ -26,7 +26,7 @@
 //! run the `cuda-kernels` suite on a real card before tagging a release.
 
 use crate::error::{DlmError, Result};
-use crate::forward::cpu::{route_topk, BlockConfig, ExpertFfn, KvLayerCache, LayerTensors};
+use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
 use crate::forward::kernel::ComputeKernel;
 use crate::forward::streaming::{LayerSource, StreamStats};
 use crate::gpu::device::{synchronize_default, CopyTimer, DeviceBuffer, Stream};
@@ -41,49 +41,17 @@ use std::thread::JoinHandle;
 // Restating the `extern` block let this path keep calling the old ABI after the
 // kernel signature changed — a silent mismatch the compiler only warns about.
 use crate::forward::gpu::{
-    bias_ptr, dlm_apply_expert, dlm_apply_experts, dlm_decode_block, dlm_decode_block_batched,
-    dlm_dense_ffn, dlm_mla_attn, dlm_moe_attn, dlm_moe_matvec, dlm_moe_norm, upload_bias,
-    upload_weight, DlmBlockExt, DlmPtrs, DlmWeights, GpuBlockBiases, GpuMla, SlotKv, DLM_MAX_BATCH,
-    DLM_MAX_TOPK,
+    bias_ptr, dlm_decode_block, dlm_decode_block_batched, dlm_dense_ffn, dlm_mla_attn,
+    dlm_moe_attn, dlm_moe_norm, upload_bias, upload_weight, DlmBlockExt, GpuBlockBiases, GpuExpert,
+    GpuMla, GpuMoeCore, SlotKv, DLM_MAX_BATCH,
 };
-
-/// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
-struct GpuExpert {
-    gate: DeviceBuffer,
-    up: DeviceBuffer,
-    down: DeviceBuffer,
-    w_dtype: i32,
-    w_group_size: i32,
-}
-
-impl GpuExpert {
-    fn upload(e: &ExpertFfn) -> Result<Self> {
-        Ok(Self {
-            gate: DeviceBuffer::from_bytes(e.gate.as_bytes(), e.gate.len())?,
-            up: DeviceBuffer::from_bytes(e.up.as_bytes(), e.up.len())?,
-            down: DeviceBuffer::from_bytes(e.down.as_bytes(), e.down.len())?,
-            // `up`, not `gate`: an ungated MLP (GPT-2, Falcon) has an empty gate
-            // whose default dtype says nothing about the real projections.
-            w_dtype: e.up.dtype_code(),
-            w_group_size: e.up.group_size() as i32,
-        })
-    }
-}
 
 /// A layer's feed-forward weights in VRAM: a single dense MLP, or the MoE core
 /// (router + shared expert) — the routed experts stream separately into the
 /// per-`(layer, expert)` cache.
 enum GpuFfn {
     Dense(GpuExpert),
-    Moe {
-        router: DeviceBuffer,
-        router_dtype: i32,
-        router_group: i32,
-        shared: Option<GpuExpert>,
-        shared_gate: Option<DeviceBuffer>,
-        shared_gate_dtype: i32,
-        shared_gate_group: i32,
-    },
+    Moe(GpuMoeCore),
 }
 
 /// One layer's weight buffers, resident in VRAM (no KV — that lives in `GpuKv`).
@@ -347,26 +315,13 @@ impl GpuWeights {
     /// up in a profile on real hardware. Trigger: streamed MoE/MLA throughput
     /// materially below the dense path at the same layer size.
     fn upload_sync(t: &LayerTensors) -> Result<Self> {
-        let up = |w: &crate::forward::Weights| DeviceBuffer::from_bytes(w.as_bytes(), w.len());
         let ffn = match &t.ffn {
-            crate::forward::Ffn::Moe { .. } => {
-                let (router, experts, shared, shared_gate) = t.moe()?;
+            crate::forward::Ffn::Moe { experts, .. } => {
                 debug_assert!(
                     experts.is_empty(),
                     "GPU core must be loaded without routed experts"
                 );
-                let (sg_dtype, sg_group) = shared_gate
-                    .map(|g| (g.dtype_code(), g.group_size() as i32))
-                    .unwrap_or((0, 0));
-                GpuFfn::Moe {
-                    router: up(router)?,
-                    router_dtype: router.dtype_code(),
-                    router_group: router.group_size() as i32,
-                    shared: shared.map(GpuExpert::upload).transpose()?,
-                    shared_gate: shared_gate.map(up).transpose()?,
-                    shared_gate_dtype: sg_dtype,
-                    shared_gate_group: sg_group,
-                }
+                GpuFfn::Moe(GpuMoeCore::upload(t)?)
             }
             crate::forward::Ffn::Dense(_) => GpuFfn::Dense(GpuExpert::upload(t.dense_ffn()?)?),
         };
@@ -1368,177 +1323,19 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         Ok(())
     }
 
+    /// The expert half of a MoE layer, with each selected expert pulled through
+    /// the per-`(layer, expert)` VRAM cache. The routing itself lives in
+    /// [`GpuMoeCore::run`], shared with the resident kernel; only where the
+    /// experts come from differs.
     fn run_moe_ffn(&self, layer: u32, w: &GpuWeights, d_hidden: &DeviceBuffer) -> Result<()> {
-        use std::ffi::c_void;
-        let cfg = &self.shared.cfg;
-        let m = cfg.moe.expect("run_moe_ffn on a dense model");
-        let GpuFfn::Moe {
-            router,
-            router_dtype,
-            router_group,
-            shared,
-            shared_gate,
-            shared_gate_dtype,
-            shared_gate_group,
-        } = &w.ffn
-        else {
+        let GpuFfn::Moe(core) = &w.ffn else {
             unreachable!("run_moe_ffn on a dense layer");
         };
-
-        // 2. Router logits → host, then top-k + softmax on the host (matches CPU).
-        let n_exp = m.num_experts as usize;
-        let mut logits = vec![0f32; n_exp];
-        let code = unsafe {
-            dlm_moe_matvec(
-                n_exp as i32,
-                cfg.hidden_size as i32,
-                *router_dtype,
-                *router_group,
-                router.as_ptr() as *const c_void,
-                logits.as_mut_ptr(),
-            )
-        };
-        if code != 0 {
-            return Err(DlmError::Gpu {
-                api: "dlm_moe_matvec",
-                code,
-            });
-        }
-
-        // 3. Stream in the selected experts, then apply them all in one grouped
-        // launch (`dlm_apply_experts`: 3 kernels total rather than 3 per expert,
-        // each with a k-times-larger grid). Same arithmetic as applying them one
-        // at a time — only the summation order over experts differs.
-        let inter = m.moe_intermediate_size as i32;
-        let selected = route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob);
-        let mut experts = Vec::with_capacity(selected.len());
-        for (e, weight) in selected {
+        core.run(&self.shared.cfg, d_hidden, |e| {
             // Feed the prefetch heuristic: next token's hot set predicts this one's.
             self.shared.history.lock().unwrap().record(layer, e as u32);
-            experts.push((self.shared.ensure_expert(layer, e as u32)?, weight));
-        }
-        // The grouped kernel takes one dtype for the whole group and a bounded
-        // expert count; both hold for every real checkpoint (one export, top-k
-        // <= 8). Anything else falls back to the per-expert path rather than
-        // silently applying the wrong decode.
-        let uniform_dtype = experts.windows(2).all(|w| {
-            w[0].0.w_dtype == w[1].0.w_dtype && w[0].0.w_group_size == w[1].0.w_group_size
-        });
-        if !experts.is_empty() && experts.len() <= DLM_MAX_TOPK && uniform_dtype {
-            let mut gate = DlmPtrs {
-                p: [std::ptr::null(); DLM_MAX_TOPK],
-            };
-            let mut up = DlmPtrs {
-                p: [std::ptr::null(); DLM_MAX_TOPK],
-            };
-            let mut down = DlmPtrs {
-                p: [std::ptr::null(); DLM_MAX_TOPK],
-            };
-            let mut weights = DlmWeights {
-                w: [0.0; DLM_MAX_TOPK],
-            };
-            for (i, (expert, weight)) in experts.iter().enumerate() {
-                gate.p[i] = expert.gate.as_ptr() as *const c_void;
-                up.p[i] = expert.up.as_ptr() as *const c_void;
-                down.p[i] = expert.down.as_ptr() as *const c_void;
-                weights.w[i] = *weight;
-            }
-            let code = unsafe {
-                dlm_apply_experts(
-                    cfg.hidden_size as i32,
-                    inter,
-                    experts.len() as i32,
-                    experts[0].0.w_dtype,
-                    experts[0].0.w_group_size,
-                    &gate,
-                    &up,
-                    &down,
-                    &weights,
-                    d_hidden.as_mut_ptr(),
-                    cfg.activation.code(),
-                )
-            };
-            if code != 0 {
-                return Err(DlmError::Gpu {
-                    api: "dlm_apply_experts",
-                    code,
-                });
-            }
-        } else {
-            for (expert, weight) in &experts {
-                let code = unsafe {
-                    dlm_apply_expert(
-                        cfg.hidden_size as i32,
-                        inter,
-                        expert.w_dtype,
-                        expert.w_group_size,
-                        expert.gate.as_ptr() as *const c_void,
-                        expert.up.as_ptr() as *const c_void,
-                        expert.down.as_ptr() as *const c_void,
-                        *weight,
-                        d_hidden.as_mut_ptr(),
-                        cfg.activation.code(),
-                    )
-                };
-                if code != 0 {
-                    return Err(DlmError::Gpu {
-                        api: "dlm_apply_expert",
-                        code,
-                    });
-                }
-            }
-        }
-
-        // 4. Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
-        if let Some(sh) = shared {
-            let weight = match shared_gate {
-                Some(g) => {
-                    let mut logit = [0f32; 1];
-                    let code = unsafe {
-                        dlm_moe_matvec(
-                            1,
-                            cfg.hidden_size as i32,
-                            *shared_gate_dtype,
-                            *shared_gate_group,
-                            g.as_ptr() as *const c_void,
-                            logit.as_mut_ptr(),
-                        )
-                    };
-                    if code != 0 {
-                        return Err(DlmError::Gpu {
-                            api: "dlm_moe_matvec",
-                            code,
-                        });
-                    }
-                    1.0 / (1.0 + (-logit[0]).exp())
-                }
-                None => 1.0,
-            };
-            let sinter = m
-                .shared_intermediate_size
-                .unwrap_or(m.moe_intermediate_size) as i32;
-            let code = unsafe {
-                dlm_apply_expert(
-                    cfg.hidden_size as i32,
-                    sinter,
-                    sh.w_dtype,
-                    sh.w_group_size,
-                    sh.gate.as_ptr() as *const c_void,
-                    sh.up.as_ptr() as *const c_void,
-                    sh.down.as_ptr() as *const c_void,
-                    weight,
-                    d_hidden.as_mut_ptr(),
-                    cfg.activation.code(),
-                )
-            };
-            if code != 0 {
-                return Err(DlmError::Gpu {
-                    api: "dlm_apply_expert",
-                    code,
-                });
-            }
-        }
-        Ok(())
+            self.shared.ensure_expert(layer, e as u32)
+        })
     }
 }
 

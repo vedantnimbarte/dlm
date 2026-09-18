@@ -592,10 +592,244 @@ struct GpuLayer {
     post_ffn_norm: Option<DeviceBuffer>,
     /// LayerNorm, output-projection and MLP biases (GPT-2, Falcon).
     biases: GpuBlockBiases,
+    /// A MoE layer's router, shared expert, and **every** routed expert, all
+    /// resident. `None` on a dense layer, where `gate/up/down_proj` are the FFN.
+    ///
+    /// Resident means resident: unlike the streaming kernel, which holds a bounded
+    /// VRAM cache and uploads an expert on a miss, this holds the whole expert set
+    /// for the life of the kernel. That is the trade — a model whose experts do
+    /// not fit in VRAM belongs on the streaming path.
+    moe: Option<(GpuMoeCore, Vec<GpuExpert>)>,
     /// Native dtype of this layer's projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
     w_group_size: i32,
+}
+
+/// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
+pub(crate) struct GpuExpert {
+    pub(crate) gate: DeviceBuffer,
+    pub(crate) up: DeviceBuffer,
+    pub(crate) down: DeviceBuffer,
+    pub(crate) w_dtype: i32,
+    pub(crate) w_group_size: i32,
+}
+
+impl GpuExpert {
+    pub(crate) fn upload(e: &crate::forward::cpu::ExpertFfn) -> Result<Self> {
+        Ok(Self {
+            gate: DeviceBuffer::from_bytes(e.gate.as_bytes(), e.gate.len())?,
+            up: DeviceBuffer::from_bytes(e.up.as_bytes(), e.up.len())?,
+            down: DeviceBuffer::from_bytes(e.down.as_bytes(), e.down.len())?,
+            // `up`, not `gate`: an ungated MLP (GPT-2, Falcon) has an empty gate
+            // whose default dtype says nothing about the real projections.
+            w_dtype: e.up.dtype_code(),
+            w_group_size: e.up.group_size() as i32,
+        })
+    }
+}
+
+/// A MoE layer's **unrouted** weights in VRAM: the router, and the shared expert
+/// with its gate. The routed experts are not here — where they come from is the
+/// one thing the two GPU kernels do differently, so [`run`](Self::run) takes them
+/// from a closure: the resident kernel indexes its own array, while the streaming
+/// kernel pulls them through its per-`(layer, expert)` VRAM cache.
+pub(crate) struct GpuMoeCore {
+    router: DeviceBuffer,
+    router_dtype: i32,
+    router_group: i32,
+    shared: Option<GpuExpert>,
+    shared_gate: Option<DeviceBuffer>,
+    shared_gate_dtype: i32,
+    shared_gate_group: i32,
+}
+
+impl GpuMoeCore {
+    /// Upload a MoE layer's router and shared expert. The routed experts in `t`
+    /// are ignored (the streaming kernel loads a core with none at all).
+    pub(crate) fn upload(t: &LayerTensors) -> Result<Self> {
+        let (router, _experts, shared, shared_gate) = t.moe()?;
+        let (shared_gate_dtype, shared_gate_group) = shared_gate
+            .map(|g| (g.dtype_code(), g.group_size() as i32))
+            .unwrap_or((0, 0));
+        Ok(Self {
+            router: DeviceBuffer::from_bytes(router.as_bytes(), router.len())?,
+            router_dtype: router.dtype_code(),
+            router_group: router.group_size() as i32,
+            shared: shared.map(GpuExpert::upload).transpose()?,
+            shared_gate: shared_gate
+                .map(|g| DeviceBuffer::from_bytes(g.as_bytes(), g.len()))
+                .transpose()?,
+            shared_gate_dtype,
+            shared_gate_group,
+        })
+    }
+
+    /// The FFN half of a MoE layer, for the token whose post-attention norm is
+    /// already in device scratch: router → top-k → the selected experts → the
+    /// shared expert. Mirrors `moe_ffn` in `src/forward/cpu.rs`.
+    ///
+    /// Runs unchanged after *either* attention path — standard attention (via
+    /// `dlm_moe_attn`) or MLA (via `dlm_mla_attn` + `dlm_moe_norm`) — because
+    /// both leave `normed2` in the same scratch slot, which is the only state
+    /// this consumes.
+    ///
+    /// The top-k is taken on the host, from router logits copied back per layer.
+    /// That is a device round trip per layer per token, and it is what makes both
+    /// GPU paths select the same experts as the CPU oracle, bit for bit: they run
+    /// the same [`route_topk`](crate::forward::cpu::route_topk).
+    pub(crate) fn run<E: std::ops::Deref<Target = GpuExpert>>(
+        &self,
+        cfg: &BlockConfig,
+        d_hidden: &DeviceBuffer,
+        mut expert: impl FnMut(usize) -> Result<E>,
+    ) -> Result<()> {
+        let m = cfg.moe.expect("GpuMoeCore::run on a dense model");
+
+        // 1. Router logits → host, then top-k + softmax there.
+        let n_exp = m.num_experts as usize;
+        let mut logits = vec![0f32; n_exp];
+        let code = unsafe {
+            dlm_moe_matvec(
+                n_exp as i32,
+                cfg.hidden_size as i32,
+                self.router_dtype,
+                self.router_group,
+                self.router.as_ptr() as *const c_void,
+                logits.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_matvec",
+                code,
+            });
+        }
+
+        // 2. Apply the selected experts in one grouped launch (`dlm_apply_experts`:
+        // 3 kernels total rather than 3 per expert, each with a k-times-larger
+        // grid). Same arithmetic as applying them one at a time — only the
+        // summation order over experts differs.
+        let inter = m.moe_intermediate_size as i32;
+        let selected =
+            crate::forward::cpu::route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob);
+        let mut experts = Vec::with_capacity(selected.len());
+        for (e, weight) in selected {
+            experts.push((expert(e)?, weight));
+        }
+        // The grouped kernel takes one dtype for the whole group and a bounded
+        // expert count; both hold for every real checkpoint (one export, top-k
+        // <= 8). Anything else falls back to the per-expert path rather than
+        // silently applying the wrong decode.
+        let uniform_dtype = experts.windows(2).all(|w| {
+            w[0].0.w_dtype == w[1].0.w_dtype && w[0].0.w_group_size == w[1].0.w_group_size
+        });
+        if !experts.is_empty() && experts.len() <= DLM_MAX_TOPK && uniform_dtype {
+            let null = || DlmPtrs {
+                p: [std::ptr::null(); DLM_MAX_TOPK],
+            };
+            let (mut gate, mut up, mut down) = (null(), null(), null());
+            let mut weights = DlmWeights {
+                w: [0.0; DLM_MAX_TOPK],
+            };
+            for (i, (expert, weight)) in experts.iter().enumerate() {
+                gate.p[i] = expert.gate.as_ptr() as *const c_void;
+                up.p[i] = expert.up.as_ptr() as *const c_void;
+                down.p[i] = expert.down.as_ptr() as *const c_void;
+                weights.w[i] = *weight;
+            }
+            let code = unsafe {
+                dlm_apply_experts(
+                    cfg.hidden_size as i32,
+                    inter,
+                    experts.len() as i32,
+                    experts[0].0.w_dtype,
+                    experts[0].0.w_group_size,
+                    &gate,
+                    &up,
+                    &down,
+                    &weights,
+                    d_hidden.as_mut_ptr(),
+                    cfg.activation.code(),
+                )
+            };
+            if code != 0 {
+                return Err(DlmError::Gpu {
+                    api: "dlm_apply_experts",
+                    code,
+                });
+            }
+        } else {
+            for (expert, weight) in &experts {
+                self.apply_one(cfg, expert, inter, *weight, d_hidden)?;
+            }
+        }
+
+        // 3. Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
+        if let Some(sh) = &self.shared {
+            let weight = match &self.shared_gate {
+                Some(g) => {
+                    let mut logit = [0f32; 1];
+                    let code = unsafe {
+                        dlm_moe_matvec(
+                            1,
+                            cfg.hidden_size as i32,
+                            self.shared_gate_dtype,
+                            self.shared_gate_group,
+                            g.as_ptr() as *const c_void,
+                            logit.as_mut_ptr(),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu {
+                            api: "dlm_moe_matvec",
+                            code,
+                        });
+                    }
+                    1.0 / (1.0 + (-logit[0]).exp())
+                }
+                // DeepSeek ships no gate: its shared expert is added whole.
+                None => 1.0,
+            };
+            let sinter = m
+                .shared_intermediate_size
+                .unwrap_or(m.moe_intermediate_size) as i32;
+            self.apply_one(cfg, sh, sinter, weight, d_hidden)?;
+        }
+        Ok(())
+    }
+
+    /// `x += weight * expert(normed2)`, one expert at a time.
+    fn apply_one(
+        &self,
+        cfg: &BlockConfig,
+        expert: &GpuExpert,
+        inter: i32,
+        weight: f32,
+        d_hidden: &DeviceBuffer,
+    ) -> Result<()> {
+        let code = unsafe {
+            dlm_apply_expert(
+                cfg.hidden_size as i32,
+                inter,
+                expert.w_dtype,
+                expert.w_group_size,
+                expert.gate.as_ptr() as *const c_void,
+                expert.up.as_ptr() as *const c_void,
+                expert.down.as_ptr() as *const c_void,
+                weight,
+                d_hidden.as_mut_ptr(),
+                cfg.activation.code(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_apply_expert",
+                code,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// MLA attention projections resident in VRAM. Shared with the streaming kernel,
@@ -635,7 +869,36 @@ pub(crate) fn upload_weight(w: &crate::forward::Weights) -> Result<DeviceBuffer>
 
 impl GpuLayer {
     fn upload(t: &LayerTensors) -> Result<Self> {
-        let ffn = t.dense_ffn()?;
+        // A MoE layer has no single FFN triple; its router, shared expert and
+        // routed experts go to `moe` instead, and the dense buffers stay dummies.
+        let moe = match &t.ffn {
+            crate::forward::Ffn::Moe { experts, .. } => Some((
+                GpuMoeCore::upload(t)?,
+                experts
+                    .iter()
+                    .map(GpuExpert::upload)
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            crate::forward::Ffn::Dense(_) => None,
+        };
+        // Device allocators dislike zero-length buffers, so a MoE layer's unused
+        // dense slots get the same 1-element dummy `upload_weight` gives an empty
+        // matrix. The kernel never reads them.
+        let (gate_proj, up_proj, down_proj) = match &moe {
+            Some(_) => (
+                DeviceBuffer::from_slice(&[0.0])?,
+                DeviceBuffer::from_slice(&[0.0])?,
+                DeviceBuffer::from_slice(&[0.0])?,
+            ),
+            None => {
+                let ffn = t.dense_ffn()?;
+                (
+                    upload_weight(&ffn.gate)?,
+                    upload_weight(&ffn.up)?,
+                    upload_weight(&ffn.down)?,
+                )
+            }
+        };
         // MLA layers carry their attention dtype on the MLA weights, not q_proj.
         let (w_dtype, w_group_size) = match &t.mla {
             Some(mw) => (mw.q_b_proj.dtype_code(), mw.q_b_proj.group_size() as i32),
@@ -646,9 +909,10 @@ impl GpuLayer {
             k_proj: upload_weight(&t.k_proj)?,
             v_proj: upload_weight(&t.v_proj)?,
             o_proj: upload_weight(&t.o_proj)?,
-            gate_proj: upload_weight(&ffn.gate)?,
-            up_proj: upload_weight(&ffn.up)?,
-            down_proj: upload_weight(&ffn.down)?,
+            gate_proj,
+            up_proj,
+            down_proj,
+            moe,
             input_layernorm: DeviceBuffer::from_slice(&t.input_layernorm)?,
             post_attention_layernorm: DeviceBuffer::from_slice(&t.post_attention_layernorm)?,
             q_bias: upload_bias(t.q_bias.as_ref())?,
@@ -698,18 +962,6 @@ impl GpuKernel {
     /// Upload a model's weights to the device and allocate per-layer KV history
     /// buffers sized for up to `max_kv_tokens` positions.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>, max_kv_tokens: usize) -> Result<Self> {
-        // The resident kernel has no routed-expert path at all (a `GpuLayer` holds
-        // one dense FFN), so MoE — with MLA or not — belongs to the streaming
-        // kernel, which caches experts per `(layer, expert)`. That path supports
-        // MLA + MoE, so this is a routing error, not a missing capability.
-        if cfg.mla.is_some() && cfg.moe.is_some() {
-            return Err(DlmError::InvalidConfig(
-                "MLA + MoE (DeepSeek-V2/V3) needs the streaming GPU path, which caches routed \
-                 experts per layer; the resident GPU kernel holds only a dense FFN per layer. \
-                 Run without --no-stream (or on CPU with --device cpu)."
-                    .into(),
-            ));
-        }
         let cap = max_kv_tokens.max(1);
         let mut gpu_layers = Vec::with_capacity(layers.len());
         for (i, layer) in layers.iter().enumerate() {
@@ -882,7 +1134,9 @@ impl ComputeKernel for GpuKernel {
         positions: &[usize],
     ) -> Result<()> {
         let batch = hiddens.len();
-        if batch <= 1 || batch > DLM_MAX_BATCH || self.cfg.mla.is_some() {
+        // MoE joins MLA on the per-sequence path: the batched device block runs
+        // one dense FFN for the whole batch, and routed experts are per token.
+        if batch <= 1 || batch > DLM_MAX_BATCH || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
             // One layer for each sequence in turn, so every hidden makes its own
             // round trip: `run_block` would leave it on the shared device buffer
             // for its next layer, where the next sequence overwrites it.
@@ -949,7 +1203,7 @@ impl ComputeKernel for GpuKernel {
     ) -> Result<()> {
         let hidden_size = self.cfg.hidden_size;
         let n = hiddens.len() / hidden_size;
-        if n <= 1 || self.cfg.mla.is_some() {
+        if n <= 1 || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
             return crate::forward::kernel::prefill_token_by_token(self, hiddens, kv_layers, start);
         }
         let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
@@ -992,8 +1246,9 @@ impl ComputeKernel for GpuKernel {
         kv_layers: &mut [&mut [KvLayerCache]],
         positions: &[usize],
     ) -> Result<()> {
-        // MLA has no batched block; a single sequence gains nothing from one.
-        if hiddens.len() <= 1 || self.cfg.mla.is_some() {
+        // MLA and MoE have no batched block; a single sequence gains nothing
+        // from one either.
+        if hiddens.len() <= 1 || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
             for ((hidden, kvs), &position) in
                 hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
             {
@@ -1149,6 +1404,26 @@ impl GpuKernel {
                         code,
                     });
                 }
+                // DeepSeek's MLA layers are MoE as well; `dlm_moe_norm` puts the
+                // post-attention norm in the scratch slot the expert calls read,
+                // which is what `dlm_dense_ffn` would otherwise have done inline.
+                if let Some((core, experts)) = &w.moe {
+                    let code = unsafe {
+                        dlm_moe_norm(
+                            self.cfg.hidden_size as i32,
+                            self.cfg.rms_eps,
+                            w.post_attention_layernorm.as_ptr(),
+                            d_hidden.as_mut_ptr(),
+                        )
+                    };
+                    if code != 0 {
+                        return Err(DlmError::Gpu {
+                            api: "dlm_moe_norm",
+                            code,
+                        });
+                    }
+                    return self.finish_moe_layer(core, experts, d_hidden, kv);
+                }
                 let code = unsafe {
                     dlm_dense_ffn(
                         self.cfg.hidden_size as i32,
@@ -1170,6 +1445,56 @@ impl GpuKernel {
                         code,
                     });
                 }
+            }
+            // Standard attention on a MoE layer: `dlm_moe_attn` is
+            // `dlm_decode_block`'s attention half, ending at the post-attention
+            // norm instead of running a dense FFN.
+            _ if w.moe.is_some() => {
+                let (core, experts) = w.moe.as_ref().expect("matched on is_some");
+                let code = unsafe {
+                    dlm_moe_attn(
+                        self.cfg.hidden_size as i32,
+                        self.cfg.q_dim() as i32,
+                        kv_dim as i32,
+                        self.cfg.num_heads as i32,
+                        self.cfg.num_kv_heads as i32,
+                        self.cfg.head_dim as i32,
+                        self.cfg.rms_eps,
+                        w.w_dtype,
+                        w.w_group_size,
+                        w.q_proj.as_ptr() as *const c_void,
+                        w.k_proj.as_ptr() as *const c_void,
+                        w.v_proj.as_ptr() as *const c_void,
+                        w.o_proj.as_ptr() as *const c_void,
+                        w.input_layernorm.as_ptr(),
+                        w.post_attention_layernorm.as_ptr(),
+                        bias_ptr(&w.q_bias),
+                        bias_ptr(&w.k_bias),
+                        bias_ptr(&w.v_bias),
+                        bias_ptr(&w.q_norm),
+                        bias_ptr(&w.k_norm),
+                        self.inv_freq_for(layer),
+                        d_hidden.as_mut_ptr(),
+                        kv_keys,
+                        kv_values,
+                        num_positions as i32,
+                        position as i32,
+                        self.cfg.window_for_layer(layer).unwrap_or(0) as i32,
+                        crate::forward::cpu::rope_mscale(self.cfg.for_layer(layer).rope_scaling),
+                        self.cfg.attn_scale(),
+                        self.cfg.attn_logit_softcap.unwrap_or(0.0),
+                        dkv.half as i32,
+                        dkv.table,
+                        crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
+                    )
+                };
+                if code != 0 {
+                    return Err(DlmError::Gpu {
+                        api: "dlm_moe_attn",
+                        code,
+                    });
+                }
+                return self.finish_moe_layer(core, experts, d_hidden, kv);
             }
             _ => {
                 let code = unsafe {
@@ -1228,6 +1553,29 @@ impl GpuKernel {
         }
         // Keep the orchestrator's length bookkeeping in step. The real K/V is in
         // VRAM.
+        kv.advance(1);
+        Ok(())
+    }
+
+    /// The expert half of a MoE layer, plus the same KV bookkeeping every other
+    /// path in `launch_layer` ends with. Every routed expert is already resident,
+    /// so the closure is a plain index — a router that names an expert outside
+    /// the set is a load-time inconsistency, not a cache miss to service.
+    fn finish_moe_layer(
+        &self,
+        core: &GpuMoeCore,
+        experts: &[GpuExpert],
+        d_hidden: &DeviceBuffer,
+        kv: &mut KvLayerCache,
+    ) -> Result<()> {
+        core.run(&self.cfg, d_hidden, |e| {
+            experts.get(e).ok_or_else(|| {
+                DlmError::InvalidConfig(format!(
+                    "router selected expert {e} but only {} are resident",
+                    experts.len()
+                ))
+            })
+        })?;
         kv.advance(1);
         Ok(())
     }
