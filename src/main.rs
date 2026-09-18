@@ -567,6 +567,25 @@ fn run_generation<K: ComputeKernel>(
     Ok(())
 }
 
+/// The name a served model answers to: the checkpoint's directory, or a GGUF
+/// file's own name.
+///
+/// It was the literal "dlm", which every response and `/v1/models` repeated. A
+/// client picking a model from that list, or routing between several dlm
+/// instances, has nothing to go on — and the tools that check the reply's
+/// `model` against what they asked for see a mismatch.
+fn model_id_from_path(path: &Path) -> String {
+    let name = if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        path.file_stem()
+    } else {
+        path.file_name()
+    };
+    name.and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("dlm")
+        .to_string()
+}
+
 /// Load the tokenizer a served model ships (HF `tokenizer.json` or GPT-2
 /// `vocab.json`+`merges.txt`), falling back to a raw byte tokenizer.
 fn serve_tokenizer(model_path: &Path) -> Result<BpeTokenizer> {
@@ -1488,8 +1507,11 @@ fn serve_distributed(
         serve_tokenizer(&args.model_path)?,
         template,
         config.vocab_size as usize,
-        "dlm",
-        128,
+        model_id_from_path(&args.model_path),
+        // No default cap: `fit_max_tokens` clamps a request to what is left of
+        // the context window, so a client that omits `max_tokens` gets an answer
+        // that ends at EOS rather than one cut off at 128 tokens.
+        usize::MAX,
         args.context_length as usize,
         created,
     ));
@@ -1523,10 +1545,12 @@ fn serve_distributed(
     println!("               spanning the model across nodes; a dead worker runs locally.");
     // secured_router honors --api-key here; the batched path already did, this
     // path silently ignored it before.
-    server.serve(dlm::server::distributed::secured_router(
-        engine,
-        args.api_key.clone(),
-    )) // blocks
+    let router = dlm::server::distributed::secured_router(engine, args.api_key.clone());
+    let router = match &args.cors_origin {
+        Some(origin) => dlm::server::http::with_cors(router, origin.clone()),
+        None => router,
+    };
+    server.serve(router) // blocks
 }
 
 /// Build the batched (optionally speculative) streaming engine over any compute
@@ -1594,8 +1618,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             args.draft_gamma,
             tokenizer,
             config.vocab_size as usize,
-            "dlm",
-            128,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
             created,
             args.max_batch.max(1), // max concurrent batch (--max-batch)
             prefix_cache,
@@ -1604,8 +1628,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             generator,
             tokenizer,
             config.vocab_size as usize,
-            "dlm",
-            128,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
             created,
             args.max_batch.max(1), // max concurrent batch (--max-batch)
             prefix_cache,
@@ -1668,6 +1692,10 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         println!("  auth       : bearer token required on /v1/*");
     }
     let router = dlm::server::engine::secured_router(engine, args.api_key.clone());
+    let router = match &args.cors_origin {
+        Some(origin) => dlm::server::http::with_cors(router, origin.clone()),
+        None => router,
+    };
     let shutdown = install_signal_handler();
     server.serve_with_shutdown(router, shutdown) // blocks until signalled
 }
@@ -2143,6 +2171,27 @@ fn sample_70b_config(quant: QuantScheme) -> ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every response carries the model's id, and `/v1/models` lists it. It was
+    /// the literal "dlm" for every checkpoint, which leaves a client routing
+    /// between models — or checking the reply against what it asked for —
+    /// nothing to go on.
+    #[test]
+    fn a_model_answers_to_its_own_name() {
+        let id = |p: &str| model_id_from_path(Path::new(p));
+        assert_eq!(id("models/qwen2.5-0.5b"), "qwen2.5-0.5b");
+        assert_eq!(
+            id("/srv/models/Llama-3.2-3B-Instruct/"),
+            "Llama-3.2-3B-Instruct"
+        );
+        // A GGUF model is one file, and the quantization is part of what it is.
+        assert_eq!(
+            id("models/gguf/qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+            "qwen2.5-0.5b-instruct-q4_k_m"
+        );
+        // Nothing usable in the path: the old name, rather than an empty id.
+        assert_eq!(id("/"), "dlm");
+    }
 
     /// The default cache holds the whole streamed layer set or nothing: a
     /// cache that cannot hold every layer never gets a hit on a cyclic scan.

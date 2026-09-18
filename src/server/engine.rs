@@ -376,7 +376,49 @@ fn enqueue<K: ComputeKernel>(
 #[derive(Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(deserialize_with = "content_text")]
     pub content: String,
+}
+
+/// OpenAI's `content`: a string, or a list of typed parts.
+///
+/// Clients send both. The array form is what anything that can attach an image
+/// uses, and several send it for plain text too -- Open WebUI and the OpenAI
+/// SDKs among them -- so rejecting it turns a working client into a 400.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Content {
+    Text(String),
+    Parts(Vec<ContentPart>),
+    /// `content: null`, which tool-call replies carry.
+    Null,
+}
+
+#[derive(Deserialize)]
+struct ContentPart {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// The text of a `content` field, whichever form it arrived in. Parts that are
+/// not text (an image) are dropped rather than refused: dlm serves text, and a
+/// conversation that mentions a picture is still worth answering.
+fn content_text<'de, D>(d: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Content::deserialize(d)? {
+        Content::Text(s) => s,
+        Content::Null => String::new(),
+        Content::Parts(parts) => parts
+            .iter()
+            .filter(|p| p.kind.as_deref().unwrap_or("text") == "text")
+            .filter_map(|p| p.text.as_deref())
+            .collect::<Vec<_>>()
+            .join(""),
+    })
 }
 
 /// OpenAI `stop`: either a single string or a list of them.
@@ -1884,6 +1926,43 @@ fn stream_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenAI's `content` arrives as a string from some clients and as a list of
+    /// parts from others — the SDKs and anything that can attach an image. Both
+    /// have to reach the model as the same text; refusing the array form turns a
+    /// working client into a 400.
+    #[test]
+    fn content_is_read_as_a_string_or_as_parts() {
+        let parse = |json: &str| -> String {
+            serde_json::from_str::<ChatMessage>(json)
+                .unwrap_or_else(|e| panic!("{json}: {e}"))
+                .content
+        };
+        assert_eq!(parse(r#"{"role":"user","content":"hi"}"#), "hi");
+        assert_eq!(
+            parse(r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#),
+            "hi"
+        );
+        // Several parts join in order, the way the client laid them out.
+        assert_eq!(
+            parse(
+                r#"{"role":"user","content":[{"type":"text","text":"a"},
+                    {"type":"text","text":"b"}]}"#
+            ),
+            "ab"
+        );
+        // A part dlm cannot serve is dropped, not refused: the rest of the
+        // conversation is still worth answering.
+        assert_eq!(
+            parse(
+                r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}},
+                    {"type":"text","text":"what is this"}]}"#
+            ),
+            "what is this"
+        );
+        // `content: null` is what a tool-call reply carries.
+        assert_eq!(parse(r#"{"role":"assistant","content":null}"#), "");
+    }
 
     #[test]
     fn chat_template_parse_and_render() {

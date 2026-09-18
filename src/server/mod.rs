@@ -3,9 +3,7 @@
 pub mod distributed;
 pub mod engine;
 pub mod http;
-pub mod openai;
 
 pub use distributed::DistributedEngine;
 pub use engine::EngineService;
 pub use http::{Body, HttpServer, Request, Response, Shutdown};
-pub use openai::{router, ChatMessage, Completion, Engine};
