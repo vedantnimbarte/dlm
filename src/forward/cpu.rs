@@ -767,15 +767,16 @@ impl LayerTensors {
             .unwrap_or(&self.post_attention_layernorm)
     }
 
-    /// The dense FFN triple, or an error if this layer is MoE. Used by GPU paths
-    /// that do not yet route experts; the streaming GPU kernel handles MoE
-    /// separately via its per-expert cache.
+    /// The dense FFN triple, or an error if this layer is MoE. Both GPU kernels
+    /// run MoE layers through their own path and never ask for it — this is the
+    /// guard for the fixed-layout fast paths (the pinned staging upload, the
+    /// batched device block) that only a dense layer fits.
     pub fn dense_ffn(&self) -> Result<&ExpertFfn> {
         match &self.ffn {
             Ffn::Dense(f) => Ok(f),
             Ffn::Moe { .. } => Err(DlmError::InvalidConfig(
-                "this GPU path does not support Mixture-of-Experts layers; use the \
-                 streaming GPU kernel (serve --stream) for MoE models"
+                "a Mixture-of-Experts layer has no single FFN; this path takes one dense \
+                 gate/up/down triple"
                     .into(),
             )),
         }

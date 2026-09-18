@@ -14,6 +14,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mixture-of-Experts models run on the resident GPU path.** Before, `--device
+  gpu` refused any MoE checkpoint — `serve`, `bench` and `score` all failed with
+  "use the streaming GPU kernel (serve --stream)". A MoE model whose experts fit
+  in VRAM now holds them all there, with no per-expert cache in the way.
+  - Measured on a tiny Qwen2-MoE: **+6% decode** (226 vs 213 tok/s) and **+27%
+    prefill** over the same model streamed.
+  - The routing itself is now written once (`GpuMoeCore::run`) and shared by both
+    GPU kernels; only where the experts come from differs. The device kernels
+    were already there — this was the missing buffers and branch.
+  - MLA + MoE (DeepSeek-V2) is resident-capable too; its refusal is gone.
+  - Verified against Hugging Face transformers on a real MoE checkpoint: exact
+    agreement (0.0000 log-probability difference) on CPU, resident GPU, and
+    streamed GPU. The GPU parity tests now hold both GPU paths to the CPU oracle.
+  - Batched decode still runs MoE one sequence at a time on both GPU paths; the
+    device's batched block runs a single dense FFN for the whole batch, and
+    routed experts are per token.
+
 - **`dlm score` and `tools/hf_parity.py`: a check against transformers.**
   `dlm score` reports the log-probability the model gives each token of a text
   and the distribution it would generate from next, as a table or JSON.

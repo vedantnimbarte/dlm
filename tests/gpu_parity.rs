@@ -884,7 +884,7 @@ fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
     // Resident CPU (all experts inline) vs streaming GPU (core resident window of
     // 2, experts streamed per (layer, expert)).
     let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
-    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers), 64, 2, None).unwrap();
+    let gpu = StreamingGpuKernel::new(cfg, MoeVecSource(layers.clone()), 64, 2, None).unwrap();
 
     let kv_cfg = KvCacheConfig {
         num_layers,
@@ -917,7 +917,40 @@ fn assert_moe_gpu_matches_cpu(m: MoeConfig, what: &str) {
             .fold(0.0f32, f32::max);
         assert!(
             max_diff < 2e-3,
-            "{what}: step {step}: GPU MoE diverged by {max_diff}"
+            "{what}: step {step}: streaming GPU MoE diverged by {max_diff}"
+        );
+    }
+
+    // The same check for the resident GPU kernel, which holds every expert in
+    // VRAM and indexes them directly instead of streaming them through a cache.
+    // Both GPU paths share the routing code, so what this pins is the other half:
+    // that the resident layer uploaded the router and experts the CPU oracle has.
+    let resident = GpuKernel::new(cfg, layers, 64).unwrap();
+    let mut orch_resident = ForwardOrchestrator::new(
+        resident,
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
+    let mut h_cpu: Vec<f32> = (0..cfg.hidden_size)
+        .map(|i| i as f32 * 0.02 - 0.3)
+        .collect();
+    let mut h_res = h_cpu.clone();
+    let mut orch_cpu = ForwardOrchestrator::new(
+        CpuKernel::new(cfg, random_moe_layers(&cfg, num_layers, 0x50FA)).unwrap(),
+        PagedKvCache::new(kv_cfg, 32),
+        dlm::forward::KvQuant::None,
+    );
+    for step in 0..4 {
+        orch_cpu.decode_token(&mut h_cpu).unwrap();
+        orch_resident.decode_token(&mut h_res).unwrap();
+        let max_diff = h_cpu
+            .iter()
+            .zip(&h_res)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "{what}: step {step}: resident GPU MoE diverged by {max_diff}"
         );
     }
 }
