@@ -12,6 +12,36 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The GPU's batched GEMV read every weight once per sequence instead of once
+  per batch, and both GEMVs spent a third of their time in barriers.** Fixing
+  the two, measured on Qwen2.5-0.5B by running the old and new binaries
+  alternately on the same machine:
+
+  | Workload | Before | After |
+  |---|---|---|
+  | Prefill (resident) | 116–152 tok/s | **251–268 tok/s** |
+  | Prefill (streamed int4, 1.5B) | 40–43 tok/s | **95–106 tok/s** |
+  | Decode, batch 8 | 107–109 tok/s | **131–136 tok/s** |
+  | Decode, batch 1 | 74–83 tok/s | **79–87 tok/s** |
+
+  - **One read per batch.** `matvec_batched_kernel`'s comment claimed it held a
+    row across the batch loop; the code re-read the whole row from global memory
+    for every slot. It now keeps one accumulator per slot in registers and
+    multiplies each weight element into all of them as it is read. Prefill feeds
+    a chunk of tokens through this kernel, which is why it gains most.
+  - **Warp-shuffle reductions.** Both GEMVs reduced through shared memory, one
+    barrier per tree level — and the batched one did that per slot, so a 896-wide
+    projection cost 48 barrier rounds against 14 rows of work. They now reduce
+    inside each warp by shuffle and combine the warps once.
+  - Summation order within a row is unchanged; the order the partial sums combine
+    in is not, which moves results within float rounding. Verified against
+    Hugging Face transformers after the change: Qwen2.5-0.5B, Gemma 3 1B and a
+    Qwen2-MoE all still agree to 0.0001, and the 46 GPU parity tests pass.
+  - MoE gains little (~2%): its expert FFN runs per token through the
+    single-slot GEMV, and MoE decode does not use the batched block at all.
+
 ### Added
 
 - **Mixture-of-Experts models run on the resident GPU path.** Before, `--device
