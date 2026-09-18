@@ -64,6 +64,10 @@ pub struct SearchArgs {
     /// Maximum results to show.
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
+
+    /// List repos that ship `.gguf` files instead of safetensors ones.
+    #[arg(long)]
+    pub gguf: bool,
 }
 
 /// Arguments for `dlm pull`.
@@ -79,6 +83,14 @@ pub struct PullArgs {
     /// HF access token for gated/private models (or set `$HF_TOKEN`).
     #[arg(long, value_name = "TOK")]
     pub token: Option<String>,
+
+    /// Fetch one `.gguf` file out of the repo instead of its safetensors.
+    /// A GGUF repo holds the same model at a dozen quantizations, so dlm will
+    /// not guess; pass the name (`--file qwen2.5-0.5b-instruct-q4_k_m.gguf`),
+    /// or a substring of it (`--file q4_k_m`). Listing the repo's `.gguf` files
+    /// is what `dlm pull <repo> --file ""` does.
+    #[arg(long, value_name = "NAME")]
+    pub file: Option<String>,
 }
 
 /// Arguments for `dlm doctor`.

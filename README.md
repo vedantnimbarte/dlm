@@ -274,7 +274,7 @@ cargo run -- serve --model-path ./models/Qwen2.5-0.5B-Instruct
 
 A full HF URL works in place of the `org/model` id. Use `--local-dir` to change
 where it lands, and `--token` (or `$HF_TOKEN`) for gated/private repos. Only
-safetensors checkpoints load — GGUF/PyTorch-only repos are rejected with a clear
+safetensors checkpoints load — PyTorch-only repos are rejected with a clear
 message.
 
 **`profile`** — with no `--model-path` it profiles a representative
@@ -681,9 +681,15 @@ dlm reads the `.gguf` files llama.cpp models ship as — which is what most loca
 models are distributed as. Point `--model-path` at the file:
 
 ```bash
-dlm pull Qwen/Qwen2.5-0.5B-Instruct-GGUF     # or download the .gguf yourself
-dlm serve --model-path models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+dlm search qwen2.5 --gguf                                  # repos that ship .gguf
+dlm pull Qwen/Qwen2.5-0.5B-Instruct-GGUF --file q4_k_m     # one file out of the repo
+dlm serve --model-path models/gguf/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
+
+A GGUF repo holds the same model at a dozen quantizations, differing by several
+gigabytes and a noticeable amount of quality, so `--file` names the one to fetch
+— by its full name or any part of it. Leave it off and dlm lists what the repo
+has, with sizes.
 
 The file is self-contained: the model's shape and its tokenizer both come out of
 the GGUF metadata, so there is no `config.json` or `tokenizer.json` to fetch.

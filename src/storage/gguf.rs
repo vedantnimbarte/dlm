@@ -360,8 +360,10 @@ fn dtype_of(kind: u32, name: &str) -> Result<Dtype> {
             };
             return Err(DlmError::UnsupportedQuant(format!(
                 "tensor {name:?} is {known} (ggml type {other}), which dlm does not decode. \
-                 It reads F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K and Q6_K -- a Q4_K_M or \
-                 Q5_K_M download is the usual choice."
+                 It reads F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and \
+                 Q6_K -- a Q4_K_M, Q5_K_M, Q6_K or Q8_0 download is the usual choice. \
+                 (Q3_K and Q2_K files often store their embedding as an IQ type, so they \
+                 are refused here too.)"
             )));
         }
     })

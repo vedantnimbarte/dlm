@@ -84,7 +84,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     faster choice in each case. The two are exactly equal weight for weight —
     same codes, same arithmetic — and a test pins that, as does a second one
     that generates the same tokens both ways from the same file.
+  - **`dlm search --gguf`** lists repos that ship GGUF, and **`dlm pull <repo>
+    --file q4_k_m`** fetches one file out of one. A GGUF repo holds the same
+    model at a dozen quantizations, so the pull names the file — by its name or
+    any part of it — and listing what a repo has is what leaving `--file` off
+    does. `dlm pull` on a GGUF repo used to fail with "dlm cannot load
+    GGUF/PyTorch-only repos".
   - **Not yet:** MoE files, whose experts are stacked into one tensor per layer.
+    Q2_K and Q3_K files usually store their embedding as an IQ type, so they are
+    refused as well.
 
 - **A GGUF layer mixes quantization types, and the GPU block read them all as
   one.** A Q4_K_M file stores attention as Q4_K and parts of the FFN as Q6_K

@@ -59,7 +59,8 @@ fn run_completions(args: CompletionsArgs) -> Result<()> {
 
 /// `dlm search` — query the Hugging Face hub and print matching models.
 fn run_search(args: SearchArgs) -> Result<()> {
-    let hits = dlm::hub::search(&args.query, args.limit)?;
+    let filter = if args.gguf { "gguf" } else { "safetensors" };
+    let hits = dlm::hub::search_filtered(&args.query, args.limit, filter)?;
     if hits.is_empty() {
         println!("no models found for {:?}", args.query);
         return Ok(());
@@ -71,14 +72,33 @@ fn run_search(args: SearchArgs) -> Result<()> {
             h.id, h.downloads, h.likes, task
         );
     }
-    println!("\npull one with:  dlm pull <id>");
+    if args.gguf {
+        // A GGUF repo holds one model at many quantizations, so a pull has to
+        // name a file; an empty --file lists them.
+        println!("\npull one with:  dlm pull <id> --file q4_k_m");
+    } else {
+        println!("\npull one with:  dlm pull <id>");
+    }
     Ok(())
 }
 
 /// `dlm pull` — download a model's loadable files from the Hugging Face hub.
 fn run_pull(args: PullArgs) -> Result<()> {
     let token = args.token.or_else(|| std::env::var("HF_TOKEN").ok());
-    dlm::hub::pull(&args.repo, args.local_dir, token.as_deref())?;
+    match &args.file {
+        Some(want) => {
+            dlm::hub::pull_gguf(
+                &args.repo,
+                want,
+                args.local_dir,
+                token.as_deref(),
+                &mut |_| {},
+            )?;
+        }
+        None => {
+            dlm::hub::pull(&args.repo, args.local_dir, token.as_deref())?;
+        }
+    }
     Ok(())
 }
 
