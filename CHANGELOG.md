@@ -12,6 +12,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`dlm score` and `tools/hf_parity.py`: a check against transformers.**
+  `dlm score` reports the log-probability the model gives each token of a text
+  and the distribution it would generate from next, as a table or JSON.
+  `tools/hf_parity.py` runs the same text through Hugging Face transformers and
+  compares.
+  - **Why:** every existing test compares dlm against itself — CPU against GPU,
+    streamed against resident, run against run — and all of them pass while the
+    whole model is wrong in the same way. Log-probabilities, not generated text:
+    greedy output stays readable long after the probabilities have drifted.
+  - **Verified** to within 0.0001 log-probability of a float32 transformers
+    reference: Qwen2.5-0.5B (CPU and GPU), GPT-2, Gemma 3 1B.
+  - Keep the reference in float32. A bfloat16 one rounds more than dlm does:
+    the same Qwen2.5-0.5B that matches float32 to 0.0001 differs from bfloat16
+    by up to 0.49.
+
 ### Fixed
 
 - **Byte-level tokenizers split text differently from the models' own

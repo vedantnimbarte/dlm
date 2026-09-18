@@ -11,7 +11,8 @@ use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
-    GenerateArgs, KvQuantArg, ProfileArgs, PullArgs, QuantArg, SearchArgs, ServeArgs, TokenizeArgs,
+    GenerateArgs, KvQuantArg, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs,
+    TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -36,6 +37,7 @@ fn main() -> Result<()> {
         Command::Serve(args) => run_serve(args),
         Command::Bench(args) => run_bench(args),
         Command::Generate(args) => run_generate(args),
+        Command::Score(args) => run_score(args),
         Command::Tokenize(args) => run_tokenize(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Search(args) => run_search(args),
@@ -396,6 +398,111 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         println!("               meaningful text.");
     }
     Ok(())
+}
+
+/// `dlm score`: the log-probability the model gives each token of a text, and
+/// the distribution it would generate from next.
+///
+/// This is the number a parity check needs. Greedy output can look fine while
+/// the forward pass is subtly wrong — a norm applied in the wrong place, a RoPE
+/// base off by a factor — and the first place that shows up is the probability
+/// mass, not the argmax. `tools/hf_parity.py` compares this JSON against
+/// Hugging Face transformers for the same text.
+fn run_score(args: ScoreArgs) -> Result<()> {
+    let tokenizer = match &args.tokenizer {
+        Some(dir) => BpeTokenizer::from_dir(dir)?,
+        None => serve_tokenizer(&args.model_path)?,
+    };
+    let tokens = match &args.text {
+        Some(text) => tokenizer.encode(text)?,
+        None if !args.prompt.is_empty() => args.prompt.clone(),
+        None => {
+            return Err(DlmError::InvalidConfig(
+                "pass --text to score, or --prompt with token ids".into(),
+            ))
+        }
+    };
+    if tokens.len() < 2 {
+        return Err(DlmError::InvalidConfig(format!(
+            "scoring needs at least 2 tokens (got {}): the first is the context \
+             for the second",
+            tokens.len()
+        )));
+    }
+
+    let config = ModelConfig::from_path(&args.model_path, QuantScheme::Fp16)?;
+    let store = MmapStore::open_dir(&args.model_path)?;
+    let parts = dlm::loader::load_model_parts(&store, &config, tokens.len() as u32)?;
+    let device = resolve_device(args.device);
+    let (logprobs, next) = score_on_device(parts, device, &tokens)?;
+
+    // The mean of the negated log-probabilities: the text's cross-entropy.
+    let mean_nll = -logprobs.iter().sum::<f32>() / logprobs.len() as f32;
+    let mut ranked: Vec<u32> = (0..next.len() as u32).collect();
+    ranked.sort_unstable_by(|&a, &b| next[b as usize].total_cmp(&next[a as usize]));
+    ranked.truncate(args.top);
+
+    if let Some(path) = &args.json {
+        let json = serde_json::json!({
+            "model": args.model_path.display().to_string(),
+            "device": format!("{device:?}").to_lowercase(),
+            "tokens": tokens,
+            // `logprobs[i]` scores `tokens[i + 1]`, so it is one shorter.
+            "logprobs": logprobs,
+            "mean_nll": mean_nll,
+            "next": ranked.iter().map(|&id| serde_json::json!({
+                "id": id,
+                "logprob": next[id as usize],
+            })).collect::<Vec<_>>(),
+        });
+        let bytes = serde_json::to_vec_pretty(&json).map_err(|source| DlmError::Json {
+            context: "score output".to_string(),
+            source,
+        })?;
+        std::fs::write(path, bytes).map_err(|source| DlmError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        println!("wrote {}", path.display());
+        return Ok(());
+    }
+
+    // A token decoded on its own can be half a character, so a piece that is not
+    // valid on its own is shown as the empty string rather than failing.
+    let piece = |id: u32| tokenizer.decode(&[id]).unwrap_or_default();
+    println!("device       : {device:?}");
+    println!("tokens       : {}", tokens.len());
+    println!("mean nll     : {mean_nll:.4}");
+    println!();
+    println!("  {:>8}  {:>10}  piece", "token", "logprob");
+    for (i, lp) in logprobs.iter().enumerate() {
+        println!(
+            "  {:>8}  {lp:>10.4}  {:?}",
+            tokens[i + 1],
+            piece(tokens[i + 1])
+        );
+    }
+    println!();
+    println!("next token, most likely first:");
+    for id in ranked {
+        println!("  {id:>8}  {:>10.4}  {:?}", next[id as usize], piece(id));
+    }
+    Ok(())
+}
+
+/// Wrap the model parts in the chosen kernel and score `tokens`.
+fn score_on_device(
+    parts: ModelParts,
+    device: Device,
+    tokens: &[u32],
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    match device {
+        Device::Cpu => parts.into_cpu_generator()?.score_and_next(tokens),
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        Device::Gpu => parts.into_gpu_generator()?.score_and_next(tokens),
+        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+        Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
+    }
 }
 
 /// Wrap the model parts in the chosen kernel and run generation.
