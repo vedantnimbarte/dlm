@@ -39,6 +39,7 @@
 #endif
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 // Threads per block for the reduction kernels. Must be <= 1024 (the CUDA
 // per-block thread cap) and a power of two for the tree reduction below.
@@ -1449,8 +1450,8 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 20-21 are the LM head's input hidden and output logits.
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
 // Slots 24-25 are the int8 activation codes and their block scales (dp4a).
-enum { SCRATCH_N = 26 };
-enum { Q8_XQ = 24, Q8_XDS = 25 };
+enum { SCRATCH_N = 27 };
+enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26 };   // 26: fp16 tensor-core row scales
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
@@ -2462,6 +2463,529 @@ extern "C" int dlm_decode_block_batched(
         rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
     }
     add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, down, (long)batch * hidden_size);
+    #undef DLM_NORM_B
+    return (int)cudaGetLastError();
+}
+
+// ── Prefill: a prompt chunk through a layer as GEMMs ────────────────────────
+//
+// Prefill used to run the decode block 16 tokens at a time, so every weight was
+// read and decoded once per 16 prompt tokens, and attention ran one launch per
+// token. Here a chunk of up to DLM_PREFILL_T tokens of one sequence goes through
+// a layer at once: the projections are tiled GEMMs that decode each weight tile
+// into shared memory once for 64 tokens, and attention is one launch for every
+// query of the chunk.
+//
+// Each output is still a sum over the input dimension in a fixed order (one
+// 32-wide tile after another), whatever the chunk size, so a prompt prefilled
+// in pieces gives exactly the result of prefilling it whole.
+#define GEMM_BM 64      // weight rows per block
+#define GEMM_BT 64      // tokens per block
+#define GEMM_BK 32      // input elements per tile step
+#define DLM_PREFILL_T 512
+
+// Y[t, m] (+)= sum_k W[m, k] * X[t, k] (+ bias[m]), for t < T, m < M.
+// <<<dim3(ceil(M / 64), ceil(T / 64)), 256>>>; `K % 32 == 0` (see gemm_fits).
+template <int DT, int ACC>
+__global__ void __launch_bounds__(256)
+gemm_kernel(const void* __restrict__ W, const float* __restrict__ X, const float* __restrict__ bias,
+            float* __restrict__ Y, int M, int K, int T, int group_size) {
+    const int N = Chunk<DT>::N;
+    __shared__ float Ws[GEMM_BK][GEMM_BM + 4];
+    __shared__ float Xs[GEMM_BK][GEMM_BT + 4];
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int m0 = blockIdx.x * GEMM_BM, t0 = blockIdx.y * GEMM_BT;
+    const long n = (long)M * K;
+    float acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+        // Weight tile: 64 rows x 32 inputs, decoded a chunk per thread.
+        for (int c = tid; c < GEMM_BM * (GEMM_BK / N); c += 256) {
+            int r = c / (GEMM_BK / N), kc = (c % (GEMM_BK / N)) * N;
+            float w[N];
+            if (m0 + r < M) Chunk<DT>::decode(W, (long)(m0 + r) * K + k0 + kc, n, group_size, w);
+            else for (int j = 0; j < N; ++j) w[j] = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < N; ++j) Ws[kc + j][r] = w[j];
+        }
+        // Activation tile: 64 tokens x 32 inputs, eight floats per thread.
+        {
+            int t = tid >> 2, kk = (tid & 3) * 8;
+            float4 a = make_float4(0, 0, 0, 0), b = a;
+            if (t0 + t < T) {
+                const float4* p = (const float4*)(X + (long)(t0 + t) * K + k0 + kk);
+                a = p[0];
+                b = p[1];
+            }
+            Xs[kk][t] = a.x; Xs[kk + 1][t] = a.y; Xs[kk + 2][t] = a.z; Xs[kk + 3][t] = a.w;
+            Xs[kk + 4][t] = b.x; Xs[kk + 5][t] = b.y; Xs[kk + 6][t] = b.z; Xs[kk + 7][t] = b.w;
+        }
+        __syncthreads();
+        #pragma unroll 8
+        for (int kk = 0; kk < GEMM_BK; ++kk) {
+            float a[4], b[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = Ws[kk][ty * 4 + i];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = Xs[kk][tx * 4 + j];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int m = m0 + ty * 4 + i;
+        if (m >= M) continue;
+        float bv = bias ? bias[m] : 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int t = t0 + tx * 4 + j;
+            if (t >= T) continue;
+            float v = acc[i][j] + bv;
+            float* y = Y + (long)t * M + m;
+            if (ACC) *y += v;
+            else *y = v;
+        }
+    }
+}
+
+template <int DT>
+static inline bool gemm_fits(const void* W, const float* X, int K, int group_size) {
+    return K % GEMM_BK == 0 && chunk_fits<DT>(W, X, K, group_size);
+}
+
+// ── The same GEMM on tensor cores ──────────────────────────────────────────
+//
+// Volta and every RTX card multiply 16x16x16 tiles of 16-bit inputs into f32
+// accumulators in one warp instruction (WMMA). The weight tile is decoded
+// exactly as above and rounded to 16 bits in shared memory; the products sum in
+// f32. Ampere and later take bf16 inputs, whose range is f32's. Volta and Turing
+// have only fp16, whose range ends at 65504 -- below what some models' FFN
+// activations reach -- so there each token row is first divided by a power of
+// two that brings its largest value under 2^14, and the output multiplied back.
+//
+// A GTX 16-series card is Turing without tensor cores: there the instructions
+// exist but run on the FP16 units, slower than the f32 kernel, so `gemm_mode`
+// keeps it on the f32 kernel. `DLM_GEMM=simt|tc` overrides the choice.
+#ifndef __HIP_PLATFORM_AMD__
+#include <mma.h>
+#include <cuda_bf16.h>
+#include <type_traits>
+
+// Per token row: the power of two to divide by for fp16 (1 when it fits).
+__global__ void row_scale_kernel(const float* X, int K, float* scale) {
+    const float* row = X + (long)blockIdx.x * K;
+    float m = 0.0f;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) m = fmaxf(m, fabsf(row[i]));
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+    if (threadIdx.x == 0) scale[blockIdx.x] = m > 16384.0f ? exp2f(ceilf(log2f(m / 16384.0f))) : 1.0f;
+}
+
+template <typename H> __device__ __forceinline__ H to_h(float v);
+template <> __device__ __forceinline__ __half to_h<__half>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 to_h<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+
+#define TC_PAD 8
+// <<<dim3(ceil(M / 64), ceil(T / 64)), 128>>>: four warps, each 32 tokens x 32
+// rows (2 x 2 fragments). `scale` is null for bf16.
+template <int DT, int ACC, typename H>
+__device__ __forceinline__ void
+gemm_tc_body(const void* __restrict__ W, const float* __restrict__ X, const float* __restrict__ bias,
+             float* __restrict__ Y, int M, int K, int T, int group_size, const float* scale) {
+    using namespace nvcuda;
+    const int N = Chunk<DT>::N;
+    __shared__ __align__(32) H Xh[GEMM_BT][GEMM_BK + TC_PAD];
+    __shared__ __align__(32) H Wh[GEMM_BM][GEMM_BK + TC_PAD];
+    __shared__ __align__(32) float Cs[GEMM_BT][GEMM_BM + 4];
+    const int tid = threadIdx.x, warp = tid >> 5;
+    const int m0 = blockIdx.x * GEMM_BM, t0 = blockIdx.y * GEMM_BT;
+    const int wt = (warp >> 1) * 32, wm = (warp & 1) * 32;   // the warp's corner
+    const long n = (long)M * K;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) wmma::fill_fragment(c[i][j], 0.0f);
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+        for (int ch = tid; ch < GEMM_BM * (GEMM_BK / N); ch += 128) {
+            int r = ch / (GEMM_BK / N), kc = (ch % (GEMM_BK / N)) * N;
+            float w[N];
+            if (m0 + r < M) Chunk<DT>::decode(W, (long)(m0 + r) * K + k0 + kc, n, group_size, w);
+            else for (int j = 0; j < N; ++j) w[j] = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < N; ++j) Wh[r][kc + j] = to_h<H>(w[j]);
+        }
+        for (int i = tid; i < GEMM_BT * GEMM_BK; i += 128) {
+            int t = i / GEMM_BK, kk = i % GEMM_BK;
+            float v = 0.0f;
+            if (t0 + t < T) {
+                v = X[(long)(t0 + t) * K + k0 + kk];
+                if (scale) v /= scale[t0 + t];
+            }
+            Xh[t][kk] = to_h<H>(v);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < GEMM_BK; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, H, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, H, wmma::col_major> b[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], &Xh[wt + 16 * i][kk], GEMM_BK + TC_PAD);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], &Wh[wm + 16 * j][kk], GEMM_BK + TC_PAD);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < 2; ++i)
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+            wmma::store_matrix_sync(&Cs[wt + 16 * i][wm + 16 * j], c[i][j], GEMM_BM + 4, wmma::mem_row_major);
+    __syncthreads();
+    for (int i = tid; i < GEMM_BT * GEMM_BM; i += 128) {
+        int t = i / GEMM_BM, r = i % GEMM_BM;
+        if (t0 + t >= T || m0 + r >= M) continue;
+        float v = Cs[t][r] * (scale ? scale[t0 + t] : 1.0f) + (bias ? bias[m0 + r] : 0.0f);
+        float* y = Y + (long)(t0 + t) * M + m0 + r;
+        if (ACC) *y += v;
+        else *y = v;
+    }
+}
+
+// bf16 fragments exist from sm_80 and fp16 ones from sm_70; each instantiation
+// is compiled only for the architectures that have it (build.rs builds every
+// tier). `gemm_mode` picks bf16 only on sm_80+, so the trap is reached only by a
+// binary built without that tier -- loudly, instead of returning zeros.
+template <int DT, int ACC, typename H>
+__global__ void __launch_bounds__(128)
+gemm_tc_kernel(const void* __restrict__ W, const float* __restrict__ X, const float* __restrict__ bias,
+               float* __restrict__ Y, int M, int K, int T, int group_size, const float* scale) {
+#if __CUDA_ARCH__ >= 800
+    gemm_tc_body<DT, ACC, H>(W, X, bias, Y, M, K, T, group_size, scale);
+#elif __CUDA_ARCH__ >= 700
+    if constexpr (std::is_same<H, __half>::value)
+        gemm_tc_body<DT, ACC, H>(W, X, bias, Y, M, K, T, group_size, scale);
+    else
+        __trap();
+#elif defined(__CUDA_ARCH__)
+    __trap();
+#endif
+}
+#endif
+
+// 0: the f32 kernel, 1: tensor cores with bf16, 2: tensor cores with fp16.
+static int gemm_mode() {
+#ifdef __HIP_PLATFORM_AMD__
+    return 0;
+#else
+    static int mode_by_device[DLM_MAX_DEVICES];
+    static bool known[DLM_MAX_DEVICES];
+    int dev = scratch_device();
+    if (known[dev]) return mode_by_device[dev];
+    int mode = 0;
+    cudaDeviceProp p;
+    if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+        bool has_tc = p.major >= 8 || (p.major == 7 && !strstr(p.name, "GTX 16"));
+        if (has_tc) mode = p.major >= 8 ? 1 : 2;
+        const char* want = getenv("DLM_GEMM");
+        if (want && !strcmp(want, "simt")) mode = 0;
+        if (want && !strcmp(want, "tc") && p.major >= 7) mode = p.major >= 8 ? 1 : 2;
+    }
+    mode_by_device[dev] = mode;
+    known[dev] = true;
+    return mode;
+#endif
+}
+
+// Which GEMM prefill runs on the current device: 0 the f32 kernel, 1 bf16 and 2
+// fp16 tensor cores. For tests and the startup banner.
+extern "C" int dlm_gemm_mode() {
+    DLM_ENTER
+    return gemm_mode();
+}
+
+// Launch the GEMM, or return false (launching nothing) for a shape it cannot
+// take; `acc` adds into Y instead of storing.
+static bool launch_gemm(int dt, const void* W, const float* X, const float* bias, float* Y, int M,
+                        int K, int T, int group_size, bool acc) {
+    dim3 grid((M + GEMM_BM - 1) / GEMM_BM, (T + GEMM_BT - 1) / GEMM_BT);
+#ifndef __HIP_PLATFORM_AMD__
+    const int mode = gemm_mode();
+    const float* scale = 0;
+    if (mode == 2) {
+        if (scratch_ensure(GEMM_SCALE, T) != cudaSuccess) return false;
+        scale = g_scratch[GEMM_SCALE];
+    }
+#define DLM_GEMM_TC(D)                                                                              \
+        if (mode == 1) {                                                                            \
+            if (acc) gemm_tc_kernel<D, 1, __nv_bfloat16><<<grid, 128>>>(W, X, bias, Y, M, K, T, group_size, 0); \
+            else gemm_tc_kernel<D, 0, __nv_bfloat16><<<grid, 128>>>(W, X, bias, Y, M, K, T, group_size, 0);     \
+            return true;                                                                            \
+        }                                                                                           \
+        if (mode == 2) {                                                                            \
+            row_scale_kernel<<<T, 32>>>(X, K, (float*)scale);                                       \
+            if (acc) gemm_tc_kernel<D, 1, __half><<<grid, 128>>>(W, X, bias, Y, M, K, T, group_size, scale); \
+            else gemm_tc_kernel<D, 0, __half><<<grid, 128>>>(W, X, bias, Y, M, K, T, group_size, scale);     \
+            return true;                                                                            \
+        }
+#else
+#define DLM_GEMM_TC(D)
+#endif
+#define DLM_GEMM(D)                                                                     \
+    case D:                                                                             \
+        if (!gemm_fits<D>(W, X, K, group_size)) return false;                           \
+        DLM_GEMM_TC(D)                                                                  \
+        if (acc) gemm_kernel<D, 1><<<grid, 256>>>(W, X, bias, Y, M, K, T, group_size);  \
+        else gemm_kernel<D, 0><<<grid, 256>>>(W, X, bias, Y, M, K, T, group_size);      \
+        return true;
+    switch (dt) {
+        DLM_GEMM(DLM_W_F32)
+        DLM_FOR_EACH_DTYPE(DLM_GEMM)
+        default:
+            return false;
+    }
+#undef DLM_GEMM
+#undef DLM_GEMM_TC
+}
+
+// Causal attention for a prefill chunk: one block per (KV head, query token),
+// walking the query's history in chunks of C positions with a running softmax
+// (the split kernel's math, merged as it goes instead of across blocks). Query
+// `t` is at KV row `history + t` and sees rows up to and including it.
+// <<<dim3(num_kv_heads, T), C>>>, shared as attn_split_kernel's.
+template <int KT>
+__global__ void attn_prefill_kernel(const float* __restrict__ q, const void* keys,
+                                    const void* values, const int* table, int shift,
+                                    int num_heads, int num_kv_heads, int head_dim, int history,
+                                    int sliding_window, float scale, float softcap, float* ctx) {
+    extern __shared__ float smem[];
+    const int G = num_heads / num_kv_heads, kvh = blockIdx.x, tq = blockIdx.y;
+    const int C = blockDim.x, t = threadIdx.x;
+    const long q_dim = (long)num_heads * head_dim, kv_dim = (long)num_kv_heads * head_dim;
+    float* qs = smem;
+    float* sc = qs + G * head_dim;
+    float* ml = sc + G * C;            // per head: running max, running sum, rescale
+    for (int i = t; i < G * head_dim; i += C) qs[i] = q[tq * q_dim + (long)kvh * G * head_dim + i];
+    if (t < G) {
+        ml[3 * t] = -1e30f;
+        ml[3 * t + 1] = 0.0f;
+    }
+    const int total = history + tq + 1;
+    const int start = (sliding_window > 0 && total > sliding_window) ? total - sliding_window : 0;
+    const int P = C / head_dim, d = t % head_dim, slice = t / head_dim;
+    const int warp = t >> 5, lane = t & 31, warps = C >> 5;
+    float acc[FA_MAX_G];
+    #pragma unroll
+    for (int g = 0; g < FA_MAX_G; ++g) acc[g] = 0.0f;
+    __syncthreads();
+
+    for (int p0 = start; p0 < total; p0 += C) {
+        const int n = min(C, total - p0);
+        if (t < n) {
+            long kh = kv_row(table, shift, p0 + t) * kv_dim + (long)kvh * head_dim;
+            float s[FA_MAX_G];
+            #pragma unroll
+            for (int g = 0; g < FA_MAX_G; ++g) s[g] = 0.0f;
+            for (int dd = 0; dd < head_dim; dd += 8) {
+                float kk[8];
+                load_kv8<KT>(keys, kh + dd, kk);
+                #pragma unroll
+                for (int g = 0; g < FA_MAX_G; ++g) {
+                    if (g < G) {
+                        const float* qg = qs + g * head_dim + dd;
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) s[g] += qg[j] * kk[j];
+                    }
+                }
+            }
+            #pragma unroll
+            for (int g = 0; g < FA_MAX_G; ++g) {
+                if (g < G) {
+                    float v = s[g] * scale;
+                    if (softcap > 0.0f) v = tanhf(v / softcap) * softcap;
+                    sc[g * C + t] = v;
+                }
+            }
+        }
+        __syncthreads();
+        for (int g = warp; g < G; g += warps) {
+            float m = -1e30f;
+            for (int i = lane; i < n; i += 32) m = fmaxf(m, sc[g * C + i]);
+            m = fmaxf(warp_max(m), ml[3 * g]);
+            float l = 0.0f;
+            for (int i = lane; i < n; i += 32) {
+                float e = expf(sc[g * C + i] - m);
+                sc[g * C + i] = e;
+                l += e;
+            }
+            l = warp_sum(l);
+            if (lane == 0) {
+                float r = expf(ml[3 * g] - m);
+                ml[3 * g + 1] = ml[3 * g + 1] * r + l;
+                ml[3 * g + 2] = r;
+                ml[3 * g] = m;
+            }
+        }
+        __syncthreads();
+        if (slice < P) {
+            #pragma unroll
+            for (int g = 0; g < FA_MAX_G; ++g)
+                if (g < G) acc[g] *= ml[3 * g + 2];
+            for (int i = slice; i < n; i += P) {
+                float v = load_kv<KT>(values, kv_row(table, shift, p0 + i) * kv_dim +
+                                                  (long)kvh * head_dim + d);
+                #pragma unroll
+                for (int g = 0; g < FA_MAX_G; ++g)
+                    if (g < G) acc[g] += sc[g * C + i] * v;
+            }
+        }
+        __syncthreads();
+    }
+    if (slice < P) {
+        #pragma unroll
+        for (int g = 0; g < FA_MAX_G; ++g)
+            if (g < G) sc[(slice * G + g) * head_dim + d] = acc[g];
+    }
+    __syncthreads();
+    for (int i = t; i < G * head_dim; i += C) {
+        int g = i / head_dim, dd = i % head_dim;
+        float o = 0.0f;
+        for (int s = 0; s < P; ++s) o += sc[(s * G + g) * head_dim + dd];
+        ctx[tq * q_dim + ((long)kvh * G + g) * head_dim + dd] = o / ml[3 * g + 1];
+    }
+}
+
+// One layer over `T` consecutive tokens of one sequence (rows `x[0..T]`, at
+// positions `position, position + 1, ...`, appending KV rows `history ...`).
+// The same block as `dlm_decode_block`, step for step. Returns
+// cudaErrorNotSupported, having launched nothing, when a projection's shape
+// does not fit the GEMM or the heads the attention kernel: the caller then
+// prefills through `dlm_decode_block_batched`.
+extern "C" int dlm_prefill_block(
+    int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
+    int inter, float rms_eps, int w_dtype, int w_group_size,
+    const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
+    const void* gate_proj, const void* up_proj, const void* down_proj,
+    const float* in_norm, const float* post_norm,
+    const float* q_bias, const float* k_bias, const float* v_bias,
+    const float* q_norm, const float* k_norm,
+    const float* inv_freq,
+    float* x,                               // [T, hidden] in/out
+    void* kv_keys, void* kv_values,         // the sequence's paged KV (table in ext)
+    int history, int position, int T,
+    int sliding_window, int activation, float rope_mscale,
+    float attn_scale, float attn_softcap,
+    const float* pre_ffn_norm, const float* post_ffn_norm,
+    const DlmBlockExt* ext)
+{
+    DLM_ENTER
+    const int B = 256;
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    if (T <= 0) return 0;
+    if (T > DLM_PREFILL_T) return (int)cudaErrorInvalidValue;
+    if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
+    const int gemma2 = (pre_ffn_norm != 0);
+    const int G = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
+    if (G < 1 || G > FA_MAX_G || G * num_kv_heads != num_heads || head_dim % 8 || head_dim > 256)
+        return (int)cudaErrorNotSupported;
+    // Every projection must take the GEMM; check them all before launching any.
+    {
+        const int ins[7] = {hidden_size, hidden_size, hidden_size, q_dim, hidden_size, hidden_size, inter};
+        const void* ws[7] = {q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj};
+        for (int i = 0; i < 7; ++i) {
+            if (i == DLM_W_GATE && !o->gated) continue;
+            // `x` stands in for every activation block: all come from cudaMalloc.
+            bool ok = false;
+            switch (DLM_WDT(i)) {
+#define DLM_FIT(D) case D: ok = gemm_fits<D>(ws[i], x, ins[i], DLM_WGRP(i)); break;
+                DLM_FIT(DLM_W_F32)
+                DLM_FOR_EACH_DTYPE(DLM_FIT)
+#undef DLM_FIT
+                default: ok = false;
+            }
+            if (!ok) return (int)cudaErrorNotSupported;
+        }
+    }
+    #define DLM_NORM_B(src, w, bias, dst) { \
+        if (o->layer_norm) layernorm_batched_kernel<<<T, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
+        else rmsnorm_batched_kernel<<<T, RMS_THREADS>>>((src), (w), (dst), hidden_size, rms_eps); }
+
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(0, T * hidden_size)
+    DLM_ALLOC(1, T * q_dim)
+    DLM_ALLOC(2, T * kv_dim)
+    DLM_ALLOC(3, T * kv_dim)
+    DLM_ALLOC(4, T * q_dim)
+    DLM_ALLOC(5, T * hidden_size)
+    DLM_ALLOC(6, T * hidden_size)
+    DLM_ALLOC(7, T * inter)
+    DLM_ALLOC(8, T * inter)
+    DLM_ALLOC(9, T * inter)
+    DLM_ALLOC(10, T * hidden_size)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+    float *normed = g_scratch[0], *q = g_scratch[1], *k = g_scratch[2];
+    float *v = g_scratch[3], *ctx = g_scratch[4], *attn_out = g_scratch[5];
+    float *normed2 = g_scratch[6], *gate = g_scratch[7], *up = g_scratch[8];
+    float *inter_buf = g_scratch[9], *down = g_scratch[10];
+
+    DLM_NORM_B(x, in_norm, o->in_norm_bias, normed)
+    launch_gemm(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, T, DLM_WGRP(DLM_W_Q), false);
+    launch_gemm(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, T, DLM_WGRP(DLM_W_K), false);
+    launch_gemm(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, T, DLM_WGRP(DLM_W_V), false);
+    launch_qk_post(q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position, inv_freq,
+                   rope_mscale, o->rope, rms_eps, kv_keys, kv_values, o->kv_table,
+                   o->kv_block_shift, history, o->kv_half, T);
+    {
+        const int C = head_dim > 128 ? 256 : 128;
+        size_t shmem = (size_t)(G * head_dim + G * C + 3 * G) * sizeof(float);
+        dim3 grid(num_kv_heads, T);
+        if (o->kv_half)
+            attn_prefill_kernel<DLM_KV_F16><<<grid, C, shmem>>>(q, kv_keys, kv_values, o->kv_table,
+                o->kv_block_shift, num_heads, num_kv_heads, head_dim, history, sliding_window,
+                attn_scale, attn_softcap, ctx);
+        else
+            attn_prefill_kernel<DLM_KV_F32><<<grid, C, shmem>>>(q, kv_keys, kv_values, o->kv_table,
+                o->kv_block_shift, num_heads, num_kv_heads, head_dim, history, sliding_window,
+                attn_scale, attn_softcap, ctx);
+    }
+    const long TH = (long)T * hidden_size;
+    if (gemma2 || o->parallel) {
+        launch_gemm(DLM_WDT(DLM_W_O), o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, T, DLM_WGRP(DLM_W_O), false);
+        if (gemma2) rmsnorm_batched_kernel<<<T, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
+        if (o->parallel) DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
+        add_inplace_batched_kernel<<<grid_for((int)TH, B), B>>>(x, attn_out, TH);
+    } else {
+        // Straight into the residual.
+        launch_gemm(DLM_WDT(DLM_W_O), o_proj, ctx, o->o_bias, x, hidden_size, q_dim, T, DLM_WGRP(DLM_W_O), true);
+    }
+    if (!o->parallel) {
+        if (gemma2) rmsnorm_batched_kernel<<<T, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
+        else DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
+    }
+    const long TI = (long)T * inter;
+    launch_gemm(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, T, DLM_WGRP(DLM_W_UP), false);
+    if (o->gated) {
+        launch_gemm(DLM_WDT(DLM_W_GATE), gate_proj, normed2, (const float*)0, gate, inter, hidden_size, T, DLM_WGRP(DLM_W_GATE), false);
+        swiglu_batched_kernel<<<grid_for((int)TI, B), B>>>(gate, up, inter_buf, TI, activation);
+    } else {
+        activate_kernel<<<grid_for((int)TI, B), B>>>(up, inter_buf, TI, activation);
+    }
+    if (gemma2) {
+        launch_gemm(DLM_WDT(DLM_W_DOWN), down_proj, inter_buf, o->down_bias, down, hidden_size, inter, T, DLM_WGRP(DLM_W_DOWN), false);
+        rmsnorm_batched_kernel<<<T, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
+        add_inplace_batched_kernel<<<grid_for((int)TH, B), B>>>(x, down, TH);
+    } else {
+        launch_gemm(DLM_WDT(DLM_W_DOWN), down_proj, inter_buf, o->down_bias, x, hidden_size, inter, T, DLM_WGRP(DLM_W_DOWN), true);
+    }
     #undef DLM_NORM_B
     return (int)cudaGetLastError();
 }

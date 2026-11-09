@@ -151,6 +151,10 @@ extern "C" {
         logits_host: *mut f32,
     ) -> i32;
 
+    /// Which GEMM prefill runs on the current device: 0 the f32 kernel, 1 bf16
+    /// and 2 fp16 tensor cores.
+    pub(crate) fn dlm_gemm_mode() -> i32;
+
     /// The LM head's argmax: the index of the largest logit (the first, on a
     /// tie), without copying the logits back.
     pub(crate) fn dlm_lm_head_argmax(
@@ -271,6 +275,53 @@ extern "C" {
         pre_ffn_norm: *const f32,
         post_ffn_norm: *const f32,
         // Non-Llama block shape (GPT-2, Falcon); null for the Llama default.
+        ext: *const DlmBlockExt,
+    ) -> i32;
+
+    /// One layer over `t` consecutive tokens of one sequence, as tiled GEMMs:
+    /// `x` is `[t, hidden_size]`, token `i` at `position + i` appending KV row
+    /// `history + i`. Returns [`CUDA_ERROR_NOT_SUPPORTED`], launching nothing,
+    /// for a layer its kernels cannot take.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_prefill_block(
+        hidden_size: i32,
+        q_dim: i32,
+        kv_dim: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        inter: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        q_proj: *const c_void,
+        k_proj: *const c_void,
+        v_proj: *const c_void,
+        o_proj: *const c_void,
+        gate_proj: *const c_void,
+        up_proj: *const c_void,
+        down_proj: *const c_void,
+        in_norm: *const f32,
+        post_norm: *const f32,
+        q_bias: *const f32,
+        k_bias: *const f32,
+        v_bias: *const f32,
+        q_norm: *const f32,
+        k_norm: *const f32,
+        inv_freq: *const f32,
+        x: *mut f32,
+        kv_keys: *mut c_void,
+        kv_values: *mut c_void,
+        history: i32,
+        position: i32,
+        t: i32,
+        sliding_window: i32,
+        activation: i32,
+        rope_mscale: f32,
+        attn_scale: f32,
+        attn_softcap: f32,
+        pre_ffn_norm: *const f32,
+        post_ffn_norm: *const f32,
         ext: *const DlmBlockExt,
     ) -> i32;
 
@@ -1214,6 +1265,107 @@ impl GpuKernel {
     }
 }
 
+/// Whether prompt prefill on the current device runs on tensor cores, whose
+/// 16-bit inputs round the activations (see `gemm_tc_kernel` in kernels.cu).
+/// `DLM_GEMM=simt|tc` overrides the choice; read once per device.
+pub fn gemm_on_tensor_cores() -> bool {
+    // SAFETY: no arguments; queries the current device's properties.
+    unsafe { dlm_gemm_mode() != 0 }
+}
+
+/// Tokens per [`dlm_prefill_block`] call (its `DLM_PREFILL_T`).
+const DLM_PREFILL_T: usize = 512;
+/// `cudaErrorNotSupported`: a kernel entry point declining a shape.
+const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+
+impl GpuKernel {
+    /// Prefill `t` tokens at `x` (a `[t, hidden]` device block) through dense
+    /// layer `layer` in one [`dlm_prefill_block`] call. `Ok(false)` when that
+    /// call declines the layer, having changed nothing.
+    fn launch_prefill_block(
+        &self,
+        layer: u32,
+        x: *mut f32,
+        kv: &mut KvLayerCache,
+        position: usize,
+        t: usize,
+    ) -> Result<bool> {
+        let w = &self.layers[layer as usize];
+        let history = kv.len();
+        if history + t > self.kv_capacity_tokens {
+            return Err(DlmError::InvalidConfig(format!(
+                "GPU KV capacity {} exceeded at position {}",
+                self.kv_capacity_tokens,
+                position + t - 1
+            )));
+        }
+        let dkv = kv.device_kv(
+            &self.kv_pools,
+            layer as usize,
+            history + t,
+            self.kv_capacity_tokens,
+            true,
+        )?;
+        let cfg = self.cfg.for_layer(layer);
+        // SAFETY: `x` is a live `[t, hidden]` device block; the weights are this
+        // layer's; the KV pool holds `history + t` rows for this sequence.
+        let code = unsafe {
+            dlm_prefill_block(
+                cfg.hidden_size as i32,
+                cfg.q_dim() as i32,
+                cfg.kv_dim() as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.intermediate_size as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.gate_proj.as_ptr() as *const c_void,
+                w.up_proj.as_ptr() as *const c_void,
+                w.down_proj.as_ptr() as *const c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq_for(layer),
+                x,
+                dkv.keys as *mut c_void,
+                dkv.values as *mut c_void,
+                history as i32,
+                position as i32,
+                t as i32,
+                self.cfg.window_for_layer(layer).unwrap_or(0) as i32,
+                cfg.activation.code(),
+                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                cfg.attn_scale(),
+                cfg.attn_logit_softcap.unwrap_or(0.0),
+                bias_ptr(&w.pre_ffn_norm),
+                bias_ptr(&w.post_ffn_norm),
+                &DlmBlockExt::new(&cfg, &w.biases, dkv.half, dkv.table).with_weight_dtypes(&w.dtypes),
+            )
+        };
+        match code {
+            0 => {
+                kv.advance(t);
+                Ok(true)
+            }
+            CUDA_ERROR_NOT_SUPPORTED => Ok(false),
+            code => Err(DlmError::Gpu {
+                api: "dlm_prefill_block",
+                code,
+            }),
+        }
+    }
+}
+
 impl ComputeKernel for GpuKernel {
     fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
         Some(self.kv_pools.free_tokens(fp16))
@@ -1327,7 +1479,19 @@ impl ComputeKernel for GpuKernel {
         let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
         for layer in 0..self.num_layers() {
             let kv = &mut kv_layers[layer as usize];
-            for chunk in (0..n).step_by(DLM_MAX_BATCH) {
+            // The GEMM prefill takes the layer a big piece at a time; a layer it
+            // cannot take (its shape, or the heads) goes 16 tokens per call
+            // through the batched decode block below.
+            let mut done = 0;
+            while done < n {
+                let t = (n - done).min(DLM_PREFILL_T);
+                let x = unsafe { d_hiddens.as_mut_ptr().add(done * hidden_size) };
+                if !self.launch_prefill_block(layer, x, kv, start + done, t)? {
+                    break;
+                }
+                done += t;
+            }
+            for chunk in (done..n).step_by(DLM_MAX_BATCH) {
                 let batch = (n - chunk).min(DLM_MAX_BATCH);
                 let history = kv.len();
                 if history + batch > self.kv_capacity_tokens {

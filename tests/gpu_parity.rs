@@ -44,6 +44,19 @@ fn quantized_tol() -> f32 {
     }
 }
 
+/// Tolerance for prefill against the CPU. Prefill's projections are GEMMs; on
+/// tensor cores (the default on RTX cards, or forced with `DLM_GEMM=tc`) their
+/// inputs are rounded to 16 bits, about a part in a thousand -- 6e-3 to 1e-2 on
+/// the Gemma cases here, whose activations run larger. The f32 kernel (a GTX
+/// card, or `DLM_GEMM=simt`) is held to the tight bound.
+fn prefill_tol() -> f32 {
+    if dlm::forward::gpu::gemm_on_tensor_cores() {
+        2e-2
+    } else {
+        2e-3
+    }
+}
+
 /// Deterministic SplitMix64 for reproducible synthetic weights.
 struct Rng(u64);
 
@@ -1647,7 +1660,7 @@ fn assert_prefill_matches_cpu_kv<K: ComputeKernel>(
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            max_diff < 2e-3,
+            max_diff < prefill_tol(),
             "{what}: round {round} ({tokens} tokens) diverged by {max_diff}"
         );
         assert_eq!(orch_cpu.position(), orch_gpu.position(), "{what}");

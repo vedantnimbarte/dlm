@@ -58,6 +58,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=DLM_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
 }
 
@@ -98,6 +99,19 @@ fn compile_cuda_kernels() {
         }
     } else {
         cmd.args(["-Xcompiler", "-fPIC"]);
+    }
+    // Machine code for every NVIDIA tier dlm targets, plus PTX for the newest so
+    // later cards JIT it. Without this nvcc builds its default (sm_75) only, and
+    // an Ampere or newer card runs JIT-compiled Turing code: no bf16 tensor
+    // cores, which `gemm_tc_kernel` then refuses. `DLM_CUDA_ARCHS=75` (comma
+    // separated) narrows it for a quicker local build.
+    let archs = std::env::var("DLM_CUDA_ARCHS").unwrap_or_else(|_| "75,80,86,89".to_string());
+    let archs: Vec<&str> = archs.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+    for a in &archs {
+        cmd.arg(format!("-gencode=arch=compute_{a},code=sm_{a}"));
+    }
+    if let Some(last) = archs.last() {
+        cmd.arg(format!("-gencode=arch=compute_{last},code=compute_{last}"));
     }
     let output = cmd
         .args(["-lib", "src/gpu/kernels.cu", "-o"])
