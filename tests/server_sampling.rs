@@ -121,3 +121,43 @@ fn zero_temperature_matches_greedy() {
         "temp=0 must equal greedy"
     );
 }
+
+/// The assistant text of a non-streamed chat response.
+fn assistant_text(resp: &str) -> String {
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    let json: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {resp}"));
+    json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no content: {resp}"))
+        .to_string()
+}
+
+fn chat(addr: SocketAddr, fields: &str) -> String {
+    request(
+        addr,
+        &format!(r#"{{"messages":[{{"role":"user","content":"Hi"}}],{fields}}}"#),
+    )
+}
+
+#[test]
+fn logit_bias_steers_even_greedy_decoding() {
+    let addr = start_server();
+    // +100 on byte 'A' outweighs anything this model's logits can do.
+    let resp = chat(addr, r#""max_tokens":4,"logit_bias":{"65":100}"#);
+    assert_eq!(assistant_text(&resp), "AAAA", "{resp}");
+}
+
+#[test]
+fn out_of_range_sampling_fields_are_rejected() {
+    let addr = start_server();
+    for (field, why) in [
+        (r#""logit_bias":{"65":101}"#, "between -100 and 100"),
+        (r#""logit_bias":{"abc":1}"#, "not a token id"),
+        (r#""logit_bias":{"256":1}"#, "outside the vocabulary"),
+    ] {
+        let resp = chat(addr, field);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{field}: {resp}");
+        assert!(resp.contains(why), "{field}: {resp}");
+    }
+}

@@ -61,9 +61,10 @@ impl SplitMix64 {
 }
 
 /// Token-selection strategy over a logit vector.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Sampler {
     /// Deterministic argmax.
+    #[default]
     Greedy,
     /// Temperature scaling with optional top-k, nucleus (top-p), and min-p
     /// truncation. `top_k == 0` keeps all tokens; `top_p >= 1.0` disables nucleus
@@ -144,6 +145,42 @@ impl Sampler {
                 }
                 sample_topk_topp(logits, temperature, top_p, top_k as usize, min_p, rng)
             }
+        }
+    }
+}
+
+/// Logit adjustments a request layers on its [`Sampler`]. Unlike the sampler's
+/// own knobs these apply under greedy too: a `-100` bias is how an OpenAI client
+/// bans a token, and a ban that `temperature: 0` ignored would not be one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Penalties {
+    /// OpenAI's `logit_bias`: `(token, bias)` pairs added to the logits.
+    pub logit_bias: Vec<(u32, f32)>,
+}
+
+impl Penalties {
+    /// Adjust `logits` in place, before the sampler sees them.
+    pub fn apply(&self, logits: &mut [f32]) {
+        for &(token, bias) in &self.logit_bias {
+            if let Some(l) = logits.get_mut(token as usize) {
+                *l += bias;
+            }
+        }
+    }
+}
+
+/// How a request chooses its tokens: the [`Sampler`] and what it layers on it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Decoding {
+    pub sampler: Sampler,
+    pub penalties: Penalties,
+}
+
+impl From<Sampler> for Decoding {
+    fn from(sampler: Sampler) -> Self {
+        Decoding {
+            sampler,
+            ..Default::default()
         }
     }
 }
@@ -538,15 +575,18 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// The sampler's next-token distribution after `hidden`, with the repetition
-    /// penalty applied over `seen` -- exactly what a session samples from.
+    /// penalty applied over `seen` and then `penalties` -- exactly what a session
+    /// samples from.
     pub(crate) fn distribution(
         &self,
         hidden: &[f32],
         seen: &std::collections::HashSet<u32>,
         sampler: &Sampler,
+        penalties: &Penalties,
     ) -> Result<Vec<(u32, f32)>> {
         let mut logits = self.logits(hidden)?;
         apply_repetition_penalty(&mut logits, seen, sampler.repetition_penalty());
+        penalties.apply(&mut logits);
         Ok(sampler.distribution(&logits))
     }
 
@@ -828,6 +868,7 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     rng: SplitMix64,
     /// Context tokens (prompt + generated) for the repetition penalty.
     seen: std::collections::HashSet<u32>,
+    penalties: Penalties,
     /// Prompt tokens not yet run through the model (see
     /// [`prefill_some`](GenerationSession::prefill_some)).
     pending: Vec<u32>,
@@ -867,6 +908,7 @@ impl<K: ComputeKernel> Generator<K> {
             rng: SplitMix64::new(sampler.seed()),
             sampler,
             seen: prompt.iter().copied().collect(),
+            penalties: Penalties::default(),
             pending: prompt.to_vec(),
         })
     }
@@ -926,6 +968,7 @@ impl<K: ComputeKernel> Generator<K> {
             // covers the cached prefix — a resumed request matches the same request
             // run without the prefix cache.
             seen: prompt.iter().copied().collect(),
+            penalties: Penalties::default(),
             pending: suffix.to_vec(),
         })
     }
@@ -961,6 +1004,12 @@ impl<K: ComputeKernel> Generator<K> {
 }
 
 impl<K: ComputeKernel> GenerationSession<'_, K> {
+    /// Layer `penalties` on the session's sampler from the next token on.
+    pub fn with_penalties(mut self, penalties: Penalties) -> Self {
+        self.penalties = penalties;
+        self
+    }
+
     /// Snapshot this session's KV history (e.g. right after prefilling a prompt)
     /// so a later prompt sharing this prefix can
     /// [`resume`](Generator::resume_session) from it.
@@ -1026,6 +1075,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
         }
         let mut logits = self.generator.logits(&self.last_hidden)?;
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
+        self.penalties.apply(&mut logits);
         let next = self.sampler.sample(&logits, &mut self.rng);
         self.seen.insert(next);
         self.last_hidden = self.generator.embed(next, self.orchestrator.position())?;
@@ -1270,6 +1320,22 @@ mod tests {
             draws.len() > 1,
             "min_p=0 should not collapse a flat distribution"
         );
+    }
+
+    #[test]
+    fn logit_bias_moves_greedy_sessions() {
+        // The counting model goes 0 → 1 → 2; a +100 bias on 3 overrides it even
+        // though the session is greedy, and out-of-vocabulary ids are ignored.
+        let gen = counting_generator();
+        let penalties = Penalties {
+            logit_bias: vec![(3, 100.0), (999, 1.0)],
+        };
+        let mut s = gen
+            .start_session(&[0], Sampler::Greedy)
+            .unwrap()
+            .with_penalties(penalties);
+        assert_eq!(s.step().unwrap(), 3);
+        assert_eq!(s.step().unwrap(), 3);
     }
 
     #[test]

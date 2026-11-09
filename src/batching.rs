@@ -25,7 +25,7 @@
 
 use crate::error::Result;
 use crate::forward::{ComputeKernel, KvSnapshot};
-use crate::generate::{GenerationSession, Generator, Sampler};
+use crate::generate::{Decoding, GenerationSession, Generator, Sampler};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -120,7 +120,7 @@ struct Pending {
     /// Stop when any of these token ids is produced; empty means run to length.
     eos: Vec<u32>,
     /// How tokens are chosen, on the plain and the speculative path alike.
-    sampler: Sampler,
+    decoding: Decoding,
 }
 
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
@@ -311,6 +311,19 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         eos: Vec<u32>,
         sampler: Sampler,
     ) -> Result<()> {
+        self.submit_decoding(id, prompt, max_new_tokens, eos, sampler.into())
+    }
+
+    /// Queue a request with a sampler and what it layers on it (see
+    /// [`Decoding`]).
+    pub fn submit_decoding(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+    ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::DlmError::InvalidConfig(
                 "prompt is empty".into(),
@@ -321,7 +334,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             prompt,
             max_new_tokens,
             eos,
-            sampler,
+            decoding,
         });
         Ok(())
     }
@@ -433,14 +446,12 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 zero_finished.push(p.id);
                 continue;
             }
+            let Decoding { sampler, penalties } = p.decoding;
             let decoder = match self.draft {
-                Some(draft) => Decoder::Speculative(SpeculativeSession::new(
-                    self.generator,
-                    draft,
-                    self.gamma,
-                    &p.prompt,
-                    p.sampler,
-                )?),
+                Some(draft) => Decoder::Speculative(
+                    SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
+                        .with_penalties(penalties),
+                ),
                 None => {
                     // Resume from the longest cached prefix if one exists;
                     // otherwise prefill from scratch. Either way, cache this
@@ -461,13 +472,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                             // Pass the whole prompt so the repetition penalty covers
                             // the cached prefix too (resume derives the suffix).
                             self.generator
-                                .resume_session_deferred(snap, &p.prompt, p.sampler)?
+                                .resume_session_deferred(snap, &p.prompt, sampler)?
                         }
-                        None => self
-                            .generator
-                            .start_session_deferred(&p.prompt, p.sampler)?,
+                        None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    Decoder::Plain(session)
+                    Decoder::Plain(session.with_penalties(penalties))
                 }
             };
             let cache_prompt = match (&decoder, &self.prefix_cache) {

@@ -67,6 +67,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`logit_bias`** on `/v1/chat/completions` and `/v1/completions`, in OpenAI's
+  shape: token id → a bias in [-100, 100] added to that token's logit. It
+  applies under greedy decoding too, so `-100` bans a token whatever the
+  temperature. A bias out of range, or a key that is not a token in the model's
+  vocabulary, is a 400 that says which.
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of

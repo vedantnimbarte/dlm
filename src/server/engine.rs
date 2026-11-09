@@ -11,7 +11,7 @@
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
-use crate::generate::{Generator, Sampler};
+use crate::generate::{Decoding, Generator, Penalties, Sampler};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ struct Job {
     prompt: Vec<u32>,
     max_new: usize,
     eos: Vec<u32>,
-    sampler: Sampler,
+    decoding: Decoding,
     sink: Sender<TokenEvent>,
 }
 
@@ -245,7 +245,7 @@ impl EngineService {
         prompt: Vec<u32>,
         max_new: usize,
         eos: Vec<u32>,
-        sampler: Sampler,
+        decoding: Decoding,
     ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -258,7 +258,7 @@ impl EngineService {
                 prompt,
                 max_new,
                 eos,
-                sampler,
+                decoding,
                 sink,
             });
         out
@@ -359,7 +359,7 @@ fn enqueue<K: ComputeKernel>(
     sinks: &mut HashMap<u64, Sender<TokenEvent>>,
     job: Job,
 ) {
-    match sched.submit_sampled(job.id, job.prompt, job.max_new, job.eos, job.sampler) {
+    match sched.submit_decoding(job.id, job.prompt, job.max_new, job.eos, job.decoding) {
         Ok(()) => {
             sinks.insert(job.id, job.sink);
         }
@@ -459,6 +459,49 @@ struct ChatRequest {
     /// Stop sequence(s): generation is cut before the first occurrence.
     #[serde(default)]
     stop: Option<Stop>,
+    #[serde(flatten)]
+    extra: ExtraSampling,
+}
+
+/// The OpenAI sampling fields that layer on the sampler, shared by chat and
+/// completions. [`decoding`] validates them before anything is queued.
+#[derive(Deserialize, Default)]
+struct ExtraSampling {
+    /// Token id (as a string, OpenAI's shape) → bias added to its logit.
+    #[serde(default)]
+    logit_bias: Option<HashMap<String, f32>>,
+}
+
+/// Check the request's extra sampling fields and combine them with `sampler`.
+/// An out-of-range value is a client error, not something to clamp quietly: a
+/// client that asked for it would otherwise get output it did not ask for and no
+/// sign why.
+fn decoding(
+    engine: &EngineService,
+    sampler: Sampler,
+    extra: ExtraSampling,
+) -> Result<Decoding, String> {
+    let mut logit_bias = Vec::new();
+    for (key, bias) in extra.logit_bias.unwrap_or_default() {
+        let token: u32 = key
+            .parse()
+            .map_err(|_| format!("logit_bias: '{key}' is not a token id"))?;
+        if token as usize >= engine.vocab_size {
+            return Err(format!(
+                "logit_bias: token {token} is outside the vocabulary"
+            ));
+        }
+        if !(-100.0..=100.0).contains(&bias) {
+            return Err(format!(
+                "logit_bias: the bias for token {token} must be between -100 and 100"
+            ));
+        }
+        logit_bias.push((token, bias));
+    }
+    Ok(Decoding {
+        sampler,
+        penalties: Penalties { logit_bias },
+    })
 }
 
 /// Flatten the `stop` field into a list of non-empty stop strings.
@@ -1102,11 +1145,11 @@ fn collect_completion(
     engine: &Arc<EngineService>,
     ids: Vec<u32>,
     max_tokens: usize,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: &[String],
 ) -> Generated {
     let prompt_tokens = ids.len();
-    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
     let mut tokens = Vec::new();
     let mut spec = None;
     let mut hit_eos = false;
@@ -1176,13 +1219,17 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Err(e) => return Response::json(400, error_json(&e)),
     };
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
+    let decoding = match decoding(engine, sampler, parsed.extra) {
+        Ok(d) => d,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_chat(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
+        stream_chat(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
     } else {
-        let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
         let body = ChatResponse {
             id: format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed)),
             object: "chat.completion",
@@ -1237,6 +1284,8 @@ struct CompletionRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Option<Stop>,
+    #[serde(flatten)]
+    extra: ExtraSampling,
 }
 
 #[derive(Serialize)]
@@ -1302,13 +1351,17 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
         },
         _ => Sampler::Greedy,
     };
+    let decoding = match decoding(engine, sampler, parsed.extra) {
+        Ok(d) => d,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_completion(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
+        stream_completion(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
     } else {
-        let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
         let body = CompletionResponse {
             id: format!("cmpl-{id}"),
             object: "text_completion",
@@ -1341,7 +1394,7 @@ fn stream_completion(
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
@@ -1374,7 +1427,7 @@ fn stream_completion(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
@@ -1633,10 +1686,17 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        return stream_messages(Arc::clone(engine), ids, max_tokens, model, sampler, stops);
+        return stream_messages(
+            Arc::clone(engine),
+            ids,
+            max_tokens,
+            model,
+            sampler.into(),
+            stops,
+        );
     }
 
-    let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+    let g = collect_completion(engine, ids, max_tokens, sampler.into(), &stops);
     let body = MessagesResponse {
         id: format!("msg-{id}"),
         kind: "message",
@@ -1672,7 +1732,7 @@ fn stream_messages(
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
@@ -1722,7 +1782,7 @@ fn stream_messages(
         let mut sent_chars = 0usize;
         let mut stop_reason = "max_tokens";
         let mut stop_sequence: Option<String> = None;
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
@@ -1796,7 +1856,7 @@ fn stream_chat(
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
@@ -1841,7 +1901,7 @@ fn stream_chat(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
