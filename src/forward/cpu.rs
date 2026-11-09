@@ -1236,8 +1236,8 @@ pub enum KvQuant {
     Int4,
 }
 
-/// How a layer's K/V history is stored: exact `f32`, or int8/int4-quantized per
-/// token (each token carries its own scale). See [`KvQuant`].
+/// How a layer's K/V history is stored: exact `f32`, or int8/int4-quantized with
+/// a scale per [`KV_QGROUP`] values of each token. See [`KvQuant`].
 #[derive(Debug, Clone)]
 enum KvStore {
     Full {
@@ -1268,37 +1268,61 @@ impl Default for KvStore {
     }
 }
 
-/// Symmetric per-vector int8 quantization: `scale = max|x| / 127`, `q = round(x /
-/// scale)`. Returns all-zero codes with a zero scale for an all-zero input.
-fn quantize_i8(x: &[f32]) -> (Vec<i8>, f32) {
-    let max = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    let scale = max / 127.0;
-    if scale <= 0.0 {
-        return (vec![0i8; x.len()], 0.0);
-    }
-    let q = x
-        .iter()
-        .map(|&v| (v / scale).round().clamp(-127.0, 127.0) as i8)
-        .collect();
-    (q, scale)
+/// Values per scale in the quantized KV stores.
+///
+/// One scale per token's whole `kv_dim` vector was the first form, and it cost
+/// far more than the bits suggest: every head of every layer shares the range of
+/// the token's single largest value, and a few key channels run much larger than
+/// the rest. Measured on Qwen2.5-0.5B scoring 415 tokens, mean NLL 3.644 exact:
+/// per-token scales gave 3.750 (int8) and 6.266 (int4); per 32 values, see the
+/// CHANGELOG. 32 divides every real head size, so no group spans two heads.
+pub const KV_QGROUP: usize = 32;
+
+/// Scales per token for a `kv_dim`-wide vector.
+fn kv_groups(kv_dim: usize) -> usize {
+    kv_dim.div_ceil(KV_QGROUP)
 }
 
-/// Symmetric per-vector int4 quantization (`scale = max|x| / 7`, codes in
-/// `-7..=7`), packed two 4-bit codes per byte (element `i` in byte `i/2`, low
-/// nibble for even `i`). Zero scale ⇒ all-zero for an all-zero input.
-fn quantize_i4(x: &[f32]) -> (Vec<u8>, f32) {
+/// Symmetric int8 quantization with a scale per [`KV_QGROUP`] values: `scale =
+/// max|x| / 127` over the group, `q = round(x / scale)`. An all-zero group gets
+/// zero codes and a zero scale.
+fn quantize_i8(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let mut q = vec![0i8; x.len()];
+    let mut scales = Vec::with_capacity(kv_groups(x.len()));
+    for (g, group) in x.chunks(KV_QGROUP).enumerate() {
+        let max = group.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = max / 127.0;
+        scales.push(scale);
+        if scale > 0.0 {
+            for (j, &v) in group.iter().enumerate() {
+                q[g * KV_QGROUP + j] = (v / scale).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
+    (q, scales)
+}
+
+/// Symmetric int4 quantization with a scale per [`KV_QGROUP`] values (`scale =
+/// max|x| / 7`, codes in `-7..=7`), packed two 4-bit codes per byte (element `i`
+/// in byte `i/2`, low nibble for even `i`). An all-zero group is all zero.
+fn quantize_i4(x: &[f32]) -> (Vec<u8>, Vec<f32>) {
     let mut packed = vec![0u8; x.len().div_ceil(2)];
-    let max = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    let scale = max / 7.0;
-    if scale <= 0.0 {
-        return (packed, 0.0);
+    let mut scales = Vec::with_capacity(kv_groups(x.len()));
+    for (g, group) in x.chunks(KV_QGROUP).enumerate() {
+        let max = group.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = max / 7.0;
+        scales.push(scale);
+        if scale <= 0.0 {
+            continue;
+        }
+        for (j, &v) in group.iter().enumerate() {
+            let i = g * KV_QGROUP + j;
+            let q = (v / scale).round().clamp(-7.0, 7.0) as i8;
+            let nib = (q & 0x0F) as u8; // 4-bit two's complement
+            packed[i / 2] |= if i % 2 == 0 { nib } else { nib << 4 };
+        }
     }
-    for (i, &v) in x.iter().enumerate() {
-        let q = (v / scale).round().clamp(-7.0, 7.0) as i8;
-        let nib = (q & 0x0F) as u8; // 4-bit two's complement
-        packed[i / 2] |= if i % 2 == 0 { nib } else { nib << 4 };
-    }
-    (packed, scale)
+    (packed, scales)
 }
 
 /// Read element `i`'s int4 code from `packed` (starting at byte `base`),
@@ -1585,8 +1609,8 @@ impl KvLayerCache {
     fn host_len(&self) -> usize {
         match &self.store {
             KvStore::Full { keys, .. } => keys.len() / self.kv_dim.max(1),
-            KvStore::Int8 { key_scales, .. } => key_scales.len(),
-            KvStore::Int4 { key_scales, .. } => key_scales.len(),
+            KvStore::Int8 { key_scales, .. } => key_scales.len() / kv_groups(self.kv_dim),
+            KvStore::Int4 { key_scales, .. } => key_scales.len() / kv_groups(self.kv_dim),
         }
     }
 
@@ -1620,8 +1644,8 @@ impl KvLayerCache {
             } => {
                 keys.truncate(n * kv_dim);
                 values.truncate(n * kv_dim);
-                key_scales.truncate(n);
-                value_scales.truncate(n);
+                key_scales.truncate(n * kv_groups(kv_dim));
+                value_scales.truncate(n * kv_groups(kv_dim));
             }
             KvStore::Int4 {
                 keys,
@@ -1632,8 +1656,8 @@ impl KvLayerCache {
                 let bytes = n * kv_dim.div_ceil(2);
                 keys.truncate(bytes);
                 values.truncate(bytes);
-                key_scales.truncate(n);
-                value_scales.truncate(n);
+                key_scales.truncate(n * kv_groups(kv_dim));
+                value_scales.truncate(n * kv_groups(kv_dim));
             }
         }
     }
@@ -1665,9 +1689,9 @@ impl KvLayerCache {
                 let (qk, ks) = quantize_i8(key);
                 let (qv, vs) = quantize_i8(value);
                 keys.extend_from_slice(&qk);
-                key_scales.push(ks);
+                key_scales.extend_from_slice(&ks);
                 values.extend_from_slice(&qv);
-                value_scales.push(vs);
+                value_scales.extend_from_slice(&vs);
             }
             KvStore::Int4 {
                 keys,
@@ -1678,9 +1702,9 @@ impl KvLayerCache {
                 let (qk, ks) = quantize_i4(key);
                 let (qv, vs) = quantize_i4(value);
                 keys.extend_from_slice(&qk);
-                key_scales.push(ks);
+                key_scales.extend_from_slice(&ks);
                 values.extend_from_slice(&qv);
-                value_scales.push(vs);
+                value_scales.extend_from_slice(&vs);
             }
         }
         Ok(())
@@ -1710,20 +1734,21 @@ impl KvLayerCache {
                 keys, key_scales, ..
             } => {
                 let base = pos * self.kv_dim + off;
-                let s = key_scales[pos];
+                let s = &key_scales[pos * kv_groups(self.kv_dim)..];
                 q.iter()
                     .zip(&keys[base..base + d])
-                    .map(|(&a, &b)| a * (b as f32 * s))
+                    .enumerate()
+                    .map(|(j, (&a, &b))| a * (b as f32 * s[(off + j) / KV_QGROUP]))
                     .sum()
             }
             KvStore::Int4 {
                 keys, key_scales, ..
             } => {
-                let s = key_scales[pos];
+                let s = &key_scales[pos * kv_groups(self.kv_dim)..];
                 let byte_base = pos * self.kv_dim.div_ceil(2);
                 q.iter()
                     .enumerate()
-                    .map(|(j, &a)| a * (read_i4(keys, byte_base, off + j) * s))
+                    .map(|(j, &a)| a * (read_i4(keys, byte_base, off + j) * s[(off + j) / KV_QGROUP]))
                     .sum()
             }
         }
@@ -1751,12 +1776,12 @@ impl KvLayerCache {
                 value_scales,
             } => {
                 let base = pos * d;
-                let (ks, vs) = (key_scales[pos], value_scales[pos]);
+                let g = pos * kv_groups(d);
                 for (j, o) in key_out.iter_mut().enumerate() {
-                    *o = keys[base + j] as f32 * ks;
+                    *o = keys[base + j] as f32 * key_scales[g + j / KV_QGROUP];
                 }
                 for (j, o) in value_out.iter_mut().enumerate() {
-                    *o = values[base + j] as f32 * vs;
+                    *o = values[base + j] as f32 * value_scales[g + j / KV_QGROUP];
                 }
             }
             KvStore::Int4 {
@@ -1766,12 +1791,12 @@ impl KvLayerCache {
                 value_scales,
             } => {
                 let byte_base = pos * d.div_ceil(2);
-                let (ks, vs) = (key_scales[pos], value_scales[pos]);
+                let g = pos * kv_groups(d);
                 for (j, o) in key_out.iter_mut().enumerate() {
-                    *o = read_i4(keys, byte_base, j) * ks;
+                    *o = read_i4(keys, byte_base, j) * key_scales[g + j / KV_QGROUP];
                 }
                 for (j, o) in value_out.iter_mut().enumerate() {
-                    *o = read_i4(values, byte_base, j) * vs;
+                    *o = read_i4(values, byte_base, j) * value_scales[g + j / KV_QGROUP];
                 }
             }
         }
@@ -1846,9 +1871,9 @@ impl KvLayerCache {
                 ..
             } => {
                 let base = pos * self.kv_dim + off;
-                let s = value_scales[pos];
-                for (o, &vv) in out.iter_mut().zip(&values[base..base + d]) {
-                    *o += w * (vv as f32 * s);
+                let s = &value_scales[pos * kv_groups(self.kv_dim)..];
+                for (j, (o, &vv)) in out.iter_mut().zip(&values[base..base + d]).enumerate() {
+                    *o += w * (vv as f32 * s[(off + j) / KV_QGROUP]);
                 }
             }
             KvStore::Int4 {
@@ -1856,10 +1881,10 @@ impl KvLayerCache {
                 value_scales,
                 ..
             } => {
-                let s = value_scales[pos];
+                let s = &value_scales[pos * kv_groups(self.kv_dim)..];
                 let byte_base = pos * self.kv_dim.div_ceil(2);
                 for (j, o) in out.iter_mut().enumerate() {
-                    *o += w * (read_i4(values, byte_base, off + j) * s);
+                    *o += w * (read_i4(values, byte_base, off + j) * s[(off + j) / KV_QGROUP]);
                 }
             }
         }
@@ -3672,14 +3697,30 @@ mod tests {
     fn quantize_i8_round_trips_within_a_quantum() {
         let x = [0.0f32, 0.5, -1.0, 3.0, -2.5, 0.1];
         let (q, s) = quantize_i8(&x);
+        assert_eq!(s.len(), 1);
         for (&orig, &code) in x.iter().zip(&q) {
-            let deq = code as f32 * s;
-            assert!((orig - deq).abs() <= s, "{orig} vs {deq}, scale {s}");
+            let deq = code as f32 * s[0];
+            assert!((orig - deq).abs() <= s[0], "{orig} vs {deq}, scale {s:?}");
         }
         // All-zero input → zero scale, all-zero codes.
         let (qz, sz) = quantize_i8(&[0.0, 0.0]);
-        assert_eq!(sz, 0.0);
+        assert_eq!(sz, vec![0.0]);
         assert!(qz.iter().all(|&c| c == 0));
+    }
+
+    /// A large value costs only its own group precision: the next group's small
+    /// values keep a scale of their own. With one scale per token, an outlier in
+    /// one head's keys left every other head a handful of int4 levels.
+    #[test]
+    fn kv_quant_scales_per_group() {
+        let mut x = vec![0.01f32; 2 * KV_QGROUP];
+        x[0] = 100.0;
+        let (q4, s4) = quantize_i4(&x);
+        let (q8, s8) = quantize_i8(&x);
+        assert_eq!((s4.len(), s8.len()), (2, 2));
+        let j = KV_QGROUP + 3; // in the second group
+        assert!((read_i4(&q4, 0, j) * s4[1] - 0.01).abs() < 1e-3);
+        assert!((q8[j] as f32 * s8[1] - 0.01).abs() < 1e-4);
     }
 
     #[test]
@@ -3726,14 +3767,14 @@ mod tests {
         let x = [0.0f32, 0.4, -1.2, 3.0, -2.7, 0.9, -0.1];
         let (packed, s) = quantize_i4(&x);
         for (i, &orig) in x.iter().enumerate() {
-            let deq = read_i4(&packed, 0, i) * s;
-            assert!((orig - deq).abs() <= s, "{orig} vs {deq}, scale {s}");
+            let deq = read_i4(&packed, 0, i) * s[0];
+            assert!((orig - deq).abs() <= s[0], "{orig} vs {deq}, scale {s:?}");
         }
         // Two codes per byte: 7 elements → 4 bytes.
         assert_eq!(packed.len(), 4);
         // All-zero input → zero scale, all-zero bytes.
         let (pz, sz) = quantize_i4(&[0.0, 0.0, 0.0]);
-        assert_eq!(sz, 0.0);
+        assert_eq!(sz, vec![0.0]);
         assert!(pz.iter().all(|&b| b == 0));
     }
 

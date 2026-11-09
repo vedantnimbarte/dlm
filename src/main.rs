@@ -451,7 +451,7 @@ fn run_score(args: ScoreArgs) -> Result<()> {
     let (config, store) = dlm::loader::open_model(&args.model_path, QuantScheme::Fp16)?;
     let parts = dlm::loader::load_model_parts(&store, &config, tokens.len() as u32)?;
     let device = resolve_device(args.device);
-    let (logprobs, next) = score_on_device(parts, device, &tokens)?;
+    let (logprobs, next) = score_on_device(parts, device, &tokens, args.kv_quant.to_kv_quant())?;
 
     // The mean of the negated log-probabilities: the text's cross-entropy.
     let mean_nll = -logprobs.iter().sum::<f32>() / logprobs.len() as f32;
@@ -512,11 +512,18 @@ fn score_on_device(
     parts: ModelParts,
     device: Device,
     tokens: &[u32],
+    kv_quant: dlm::forward::KvQuant,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     match device {
-        Device::Cpu => parts.into_cpu_generator()?.score_and_next(tokens),
+        Device::Cpu => parts
+            .into_cpu_generator()?
+            .with_kv_quant(kv_quant)
+            .score_and_next(tokens),
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-        Device::Gpu => parts.into_gpu_generator()?.score_and_next(tokens),
+        Device::Gpu => parts
+            .into_gpu_generator()?
+            .with_kv_quant(kv_quant)
+            .score_and_next(tokens),
         #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
     }

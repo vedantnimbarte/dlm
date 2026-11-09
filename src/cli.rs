@@ -584,6 +584,11 @@ pub struct ScoreArgs {
     /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`).
     #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
+
+    /// KV-cache precision to score with, to measure what a cheaper cache costs.
+    /// Exact `f32` by default, so the scores stay a parity reference.
+    #[arg(long, value_enum, default_value_t = KvQuantArg::F32)]
+    pub kv_quant: KvQuantArg,
 }
 
 #[cfg(test)]
