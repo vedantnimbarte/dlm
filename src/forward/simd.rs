@@ -250,9 +250,13 @@ fn f32_at(blob: &[u8], off: usize) -> f32 {
 }
 
 /// A dlm int4/int8 row: `(code - zero) * scale` with a scale and zero per
-/// `group` weights, groups running on across rows. Taken one group at a time,
-/// 32 weights per step, the remainder (a group size that is not a multiple of
-/// 32, an int4 row starting on an odd element) one weight at a time.
+/// `group` weights, groups running on across rows.
+///
+/// Every real layout has groups a multiple of 16 that each row starts on a
+/// multiple of 16 of (dlm's 128, GPTQ's 32 to 128, expanded ggml's 16 and 32),
+/// so every 16 weights share one scale and a 32-weight step needs at most two:
+/// that is the fast loop, which divides once per row. Anything else (a group of
+/// 100) and the last few weights take the general loop, one group at a time.
 #[inline(always)]
 unsafe fn affine_row<S: Simd>(
     s: S,
@@ -263,24 +267,44 @@ unsafe fn affine_row<S: Simd>(
     base: usize,
     x: &[f32],
 ) -> f32 {
+    let at = |g: usize| {
+        let scale = f32_at(blob, layout.scales_off + g * 4);
+        (scale, f32_at(blob, layout.zeros_off + g * 4) * scale)
+    };
     let mut acc = [s.zero(); 4];
-    let mut tail = 0.0f32;
     let mut j = 0;
+    if group % 16 == 0 && base % 16 == 0 {
+        let (mut g, mut left) = (base / group, group - base % group);
+        let mut cur = (g, at(g));
+        while x.len() - j >= 32 {
+            let mut halves = [(0.0f32, 0.0f32); 2];
+            for half in &mut halves {
+                if cur.0 != g {
+                    cur = (g, at(g));
+                }
+                *half = cur.1;
+                left -= 16;
+                if left == 0 {
+                    (g, left) = (g + 1, group);
+                }
+            }
+            let (sc, o) = ([halves[0].0, halves[1].0], [halves[0].1, halves[1].1]);
+            let c = affine_codes(s, blob, four, base + j);
+            s.fma_codes(&mut acc, c, sc, o, x.as_ptr().add(j));
+            j += 32;
+        }
+    }
+    let mut tail = 0.0f32;
     while j < x.len() {
         let g = (base + j) / group;
         let end = ((g + 1) * group - base).min(x.len());
-        let scale = f32_at(blob, layout.scales_off + g * 4);
+        let (scale, offset) = at(g);
         let zero = f32_at(blob, layout.zeros_off + g * 4);
-        let offset = zero * scale;
         while j < end {
             let i = base + j;
             if end - j >= 32 && !(four && i % 2 == 1) {
-                let codes = if four {
-                    s.nibbles_interleaved(blob.as_ptr().add(i / 2))
-                } else {
-                    s.bytes(blob.as_ptr().add(i))
-                };
-                s.fma_codes(&mut acc, codes, [scale; 2], [offset; 2], x.as_ptr().add(j));
+                let c = affine_codes(s, blob, four, i);
+                s.fma_codes(&mut acc, c, [scale; 2], [offset; 2], x.as_ptr().add(j));
                 j += 32;
             } else {
                 let code = if four {
@@ -294,6 +318,16 @@ unsafe fn affine_row<S: Simd>(
         }
     }
     s.hsum(acc) + tail
+}
+
+/// The 32 codes from element `i` of an int4 (even `i`) or int8 blob.
+#[inline(always)]
+unsafe fn affine_codes<S: Simd>(s: S, blob: &[u8], four: bool, i: usize) -> S::B {
+    if four {
+        s.nibbles_interleaved(blob.as_ptr().add(i / 2))
+    } else {
+        s.bytes(blob.as_ptr().add(i))
+    }
 }
 
 fn half_at(b: &[u8], off: usize) -> f32 {
@@ -718,9 +752,17 @@ mod tests {
     fn dlm_int4_and_int8_match_the_scalar_reference() {
         let mut rng = Rng(2);
         // 128: the shipped group, aligned with the rows. 100: groups that
-        // straddle rows and are not a multiple of 32. 97 wide: int4 rows that
-        // start on an odd element, mid-byte.
-        for (in_dim, group) in [(896, 128), (300, 100), (97, 32), (64, 16)] {
+        // straddle rows and are not a multiple of 16. 97 wide: int4 rows that
+        // start on an odd element, mid-byte. 16 and 48: two scales in one
+        // 32-weight step, and groups that cross a step.
+        for (in_dim, group) in [
+            (896, 128),
+            (300, 100),
+            (97, 32),
+            (64, 16),
+            (96, 16),
+            (192, 48),
+        ] {
             let (out_dim, n) = (5, 5 * in_dim);
             let v = rng.vec(n);
             let what = format!("in {in_dim} group {group}");
