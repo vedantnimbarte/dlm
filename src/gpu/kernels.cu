@@ -1585,6 +1585,177 @@ static void launch_kv_append(const float* k, const float* v, void* keys, void* v
     }
 }
 
+// ── Fused single-token decode stages ────────────────────────────────────────
+//
+// A decode step on a small model is launch-bound as much as bandwidth-bound:
+// the block above issues ~18 kernels per layer, most of them touching a few KiB.
+// These fold the elementwise work into the GEMVs on either side of it:
+//
+//   * several matrices in one grid (Q, K and V share their input);
+//   * an epilogue: `out[o] += v`, the residual add.
+//
+// Gate and up stay separate GEMVs with the SwiGLU kernel after them. Fused --
+// one warp computing both rows -- the int8-activation path lost 40% of batch-1
+// decode on Qwen2.5-1.5B int4; with a warp per row and the pair combined in
+// shared memory, bf16 merely broke even. Neither beat the three launches.
+//
+// The norms stay their own (one-block) launch. Folding them into the GEMVs as a
+// prologue -- every warp re-deriving the norm and applying the norm weights as
+// it read `x` -- cost more than the launch it saved: on Qwen2.5-0.5B the gate/up
+// stage then read as many bytes of activations and norm weights from L2 as of
+// weights, and batch-1 decode lost 15%.
+#define FUSE_PLAIN 0   // out[o] = W·x + b
+#define FUSE_RESID 1   // out[o] += W·x + b
+
+typedef struct {
+    const void* W[3];
+    const float* bias[3];
+    float* out[3];
+    int rows[3];
+    int nseg;
+} DlmSegs;
+
+// One row's dot product, reduced across the warp: integer dot products when the
+// caller quantized `x` (`xq` set), else the chunked f32 decode.
+template <int DT>
+__device__ __forceinline__ float fused_row_dot(const void* W, long base, long n, int group_size,
+                                               const float* x, const signed char* xq,
+                                               const float2* xds, int in_dim, int lane) {
+    if (Dp4a<DT>::OK && xq) return q8_row_dot<DT>(W, base, n, group_size, xq, xds, in_dim, lane);
+    const int N = Chunk<DT>::N;
+    float s = 0.0f;
+    for (int i = lane * N; i < in_dim; i += 32 * N) {
+        float w[N];
+        Chunk<DT>::decode(W, base + i, n, group_size, w);
+        s += chunk_dot<N>(w, x + i);
+    }
+    return warp_sum(s);
+}
+
+// Launch <<<ceil(total rows / MV_ROWS), 32 * MV_ROWS>>>; total rows is the sum
+// of the segments'.
+template <int DT, int MODE>
+__global__ void __launch_bounds__(32 * MV_ROWS)
+matvec_fused_kernel(DlmSegs s, const float* __restrict__ x, const signed char* __restrict__ xq,
+                    const float2* __restrict__ xds, int in_dim, int group_size) {
+    int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    int seg = 0;
+    while (seg + 1 < s.nseg && o >= s.rows[seg]) o -= s.rows[seg++];
+    if (o >= s.rows[seg]) return;
+    long base = (long)o * in_dim;
+    long n = (long)s.rows[seg] * in_dim;
+    float v = fused_row_dot<DT>(s.W[seg], base, n, group_size, x, xq, xds, in_dim, lane);
+    if (s.bias[seg]) v += s.bias[seg][o];
+    if (lane == 0) {
+        if (MODE == FUSE_RESID) s.out[seg][o] += v;
+        else s.out[seg][o] = v;
+    }
+}
+
+// Launch a fused stage, or return false (launching nothing) when the chunked
+// GEMV cannot take this shape: the caller then runs the unfused kernels. Every
+// segment must share one dtype and group size.
+static bool launch_fused(int mode, int dt, int group_size, const DlmSegs& s, const float* x,
+                         int in_dim) {
+    int rows = 0;
+    for (int i = 0; i < s.nseg; ++i) rows += s.rows[i];
+    dim3 grid((rows + MV_ROWS - 1) / MV_ROWS), block(32 * MV_ROWS);
+#define DLM_FUSE(D)                                                                     case D: {                                                                               bool q8 = true;                                                                     for (int i = 0; i < s.nseg; ++i) {                                                      if (!chunk_fits<D>(s.W[i], x, in_dim, group_size)) return false;                    q8 = q8 && q8_fits<D>(s.W[i], x, in_dim, group_size);                           }                                                                                   const signed char* xq = 0;                                                          const float2* xds = 0;                                                              if (q8 && !quantize_x(x, in_dim, &xq, &xds)) xq = 0;                                if (mode == FUSE_RESID)                                                                 matvec_fused_kernel<D, FUSE_RESID><<<grid, block>>>(s, x, xq, xds, in_dim, group_size);         else                                                                                    matvec_fused_kernel<D, FUSE_PLAIN><<<grid, block>>>(s, x, xq, xds, in_dim, group_size);         return true;                                                                    }
+    switch (dt) {
+        DLM_FUSE(DLM_W_F32)
+        DLM_FOR_EACH_DTYPE(DLM_FUSE)
+        default:
+            return false;
+    }
+#undef DLM_FUSE
+}
+
+// Per-head work between the QKV projection and attention, one warp per head:
+// Qwen3's per-head RMSNorm, RoPE, and (for the KV heads) the append of this
+// token's K and V into the paged cache. Six launches in the unfused block, two
+// of them one thread per head. A lane owns the rotation pairs `(i, i + half)`
+// it touches, so the norm and the rotation need no exchange between lanes.
+// Launch <<<dim3(num_heads + num_kv_heads, tokens), 32>>>: token `t` (a prefill
+// row) is at `position + t`, appends KV row `row + t`, and its q/k/v rows are
+// `t` rows into the [tokens, q_dim] / [tokens, kv_dim] blocks.
+template <int KT>
+__global__ void qk_post_kernel(float* q, float* k, const float* v, const float* q_norm,
+                               const float* k_norm, int num_heads, int num_kv_heads,
+                               int head_dim, int position, const float* inv_freq, float mscale,
+                               int rope, float eps, void* kv_keys, void* kv_values,
+                               const int* table, int shift, long row) {
+    int h = blockIdx.x, lane = threadIdx.x, t = blockIdx.y;
+    long kv_dim = (long)num_kv_heads * head_dim;
+    q += t * (long)num_heads * head_dim;
+    k += t * kv_dim;
+    v += t * kv_dim;
+    position += t;
+    row += t;
+    bool is_k = h >= num_heads;
+    int head = is_k ? h - num_heads : h;
+    float* vec = (is_k ? k : q) + (long)head * head_dim;
+    const float* nw = is_k ? k_norm : q_norm;
+    int half = head_dim / 2;
+    float inv = 1.0f;
+    if (nw) {
+        float ss = 0.0f;
+        for (int i = lane; i < head_dim; i += 32) ss += vec[i] * vec[i];
+        inv = rsqrtf(warp_sum(ss) / (float)head_dim + eps);
+    }
+    long dst = is_k ? kv_row(table, shift, row) * ((long)num_kv_heads * head_dim) +
+                          (long)head * head_dim
+                    : 0;
+    for (int i = lane; i < half; i += 32) {
+        float a = vec[i], b = vec[i + half];
+        if (nw) {
+            a = a * inv * nw[i];
+            b = b * inv * nw[i + half];
+        }
+        if (rope) {
+            float ang = (float)position * inv_freq[i];
+            float sn = sinf(ang) * mscale, c = cosf(ang) * mscale;
+            float ra = a * c - b * sn, rb = a * sn + b * c;
+            a = ra;
+            b = rb;
+        }
+        vec[i] = a;
+        vec[i + half] = b;
+        if (is_k) {
+            if (KT == DLM_KV_F16) {
+                ((__half*)kv_keys)[dst + i] = __float2half(a);
+                ((__half*)kv_keys)[dst + i + half] = __float2half(b);
+            } else {
+                ((float*)kv_keys)[dst + i] = a;
+                ((float*)kv_keys)[dst + i + half] = b;
+            }
+        }
+    }
+    if (is_k) {
+        const float* vh = v + (long)head * head_dim;
+        for (int i = lane; i < head_dim; i += 32) {
+            if (KT == DLM_KV_F16) ((__half*)kv_values)[dst + i] = __float2half(vh[i]);
+            else ((float*)kv_values)[dst + i] = vh[i];
+        }
+    }
+}
+
+static void launch_qk_post(float* q, float* k, const float* v, const float* q_norm,
+                           const float* k_norm, int num_heads, int num_kv_heads, int head_dim,
+                           int position, const float* inv_freq, float mscale, int rope, float eps,
+                           void* keys, void* values, const int* table, int shift, long row,
+                           int kv_half, int tokens = 1) {
+    dim3 grid(num_heads + num_kv_heads, tokens);
+    if (kv_half)
+        qk_post_kernel<DLM_KV_F16><<<grid, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
+                                                 head_dim, position, inv_freq, mscale, rope, eps,
+                                                 keys, values, table, shift, row);
+    else
+        qk_post_kernel<DLM_KV_F32><<<grid, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
+                                                 head_dim, position, inv_freq, mscale, rope, eps,
+                                                 keys, values, table, shift, row);
+}
+
 // `kv_keys` / `kv_values` are **persistent** device buffers (capacity
 // max_positions * kv_dim) owned by the caller across the whole sequence. This
 // call writes the new token's K/V into slot `num_positions` in place and attends
@@ -1648,34 +1819,49 @@ extern "C" int dlm_decode_block(
     float *inter_buf = g_scratch[9], *down = g_scratch[10];
 
     if (e == cudaSuccess) {
-        // Attention sublayer.
-        DLM_NORM(x, in_norm, o->in_norm_bias, normed)
-        launch_matvec(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q));
-        launch_matvec(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K));
-        launch_matvec(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V));
-        // Qwen3 per-head Q/K RMSNorm (NULL when absent), before RoPE.
-        if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
-        if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
-        if (o->rope) {
-            rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, rope_mscale);
-            rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, rope_mscale);
-        }
+        // Each stage below tries its fused form first (see "Fused single-token
+        // decode stages") and runs the separate kernels when the layer's shape,
+        // dtypes or block family rule it out.
+        const bool same_qkv = DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_K) && DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_V) &&
+                              DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_K) && DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_V);
 
-        // Append this token's K/V into the persistent history at slot num_positions.
-        launch_kv_append(k, v, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_positions,
-                         kv_dim, o->kv_half);
+        // Attention sublayer: Q/K/V in one grid.
+        DLM_NORM(x, in_norm, o->in_norm_bias, normed)
+        DlmSegs qkv = {{q_proj, k_proj, v_proj}, {q_bias, k_bias, v_bias}, {q, k, v},
+                       {q_dim, kv_dim, kv_dim}, 3};
+        bool fused_qkv = same_qkv && launch_fused(FUSE_PLAIN, DLM_WDT(DLM_W_Q), DLM_WGRP(DLM_W_Q),
+                                                  qkv, normed, hidden_size);
+        if (!fused_qkv) {
+            launch_matvec(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q));
+            launch_matvec(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K));
+            launch_matvec(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V));
+        }
+        // Qwen3's per-head Q/K RMSNorm (when present), RoPE, and this token's K/V
+        // appended into the persistent history at slot num_positions.
+        launch_qk_post(q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position, inv_freq,
+                       rope_mscale, o->rope, rms_eps, kv_keys, kv_values, o->kv_table,
+                       o->kv_block_shift, num_positions, o->kv_half);
 
         // Attend over history + this token, reading the persistent buffers directly.
         e = launch_attention(q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap, o->kv_half);
         if (e != cudaSuccess) return (int)e;
-        launch_matvec(DLM_WDT(DLM_W_O), o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O));
-        // Gemma2 norms the attention output before the residual add (in place, so
-        // the add below is unchanged); elsewhere it goes in raw.
-        if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
-        // Falcon's parallel block: the FFN reads the norm of the block *input*,
-        // so take it before the attention output lands in `x`.
-        if (o->parallel) DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
-        add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
+        // Output projection straight into the residual. Gemma2 norms the
+        // attention output first, and Falcon's parallel FFN needs the block input
+        // before it changes, so both keep the separate add.
+        DlmSegs oseg = {{o_proj, 0, 0}, {o->o_bias, 0, 0}, {x, 0, 0}, {hidden_size, 0, 0}, 1};
+        bool fused_o = !gemma2 && !o->parallel &&
+                       launch_fused(FUSE_RESID, DLM_WDT(DLM_W_O), DLM_WGRP(DLM_W_O), oseg, ctx,
+                                    q_dim);
+        if (!fused_o) {
+            launch_matvec(DLM_WDT(DLM_W_O), o_proj, ctx, o->o_bias, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O));
+            // Gemma2 norms the attention output before the residual add (in place, so
+            // the add below is unchanged); elsewhere it goes in raw.
+            if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(attn_out, post_norm, attn_out, hidden_size, rms_eps);
+            // Falcon's parallel block: the FFN reads the norm of the block *input*,
+            // so take it before the attention output lands in `x`.
+            if (o->parallel) DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
+            add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
+        }
 
         // MLP sublayer. Gemma2 uses its dedicated pre-FFN norm here, since
         // `post_norm` was already spent on the attention output.
@@ -1690,9 +1876,17 @@ extern "C" int dlm_decode_block(
         } else {
             activate_kernel<<<grid_for(inter, B), B>>>(up, inter_buf, (long)inter, activation);
         }
-        launch_matvec(DLM_WDT(DLM_W_DOWN), down_proj, inter_buf, o->down_bias, down, hidden_size, inter, DLM_WGRP(DLM_W_DOWN));
-        if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
-        add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
+        // Down projection straight into the residual, except where Gemma2 norms
+        // the FFN output first.
+        DlmSegs dseg = {{down_proj, 0, 0}, {o->down_bias, 0, 0}, {x, 0, 0}, {hidden_size, 0, 0}, 1};
+        bool fused_down = !gemma2 &&
+                          launch_fused(FUSE_RESID, DLM_WDT(DLM_W_DOWN), DLM_WGRP(DLM_W_DOWN), dseg,
+                                       inter_buf, inter);
+        if (!fused_down) {
+            launch_matvec(DLM_WDT(DLM_W_DOWN), down_proj, inter_buf, o->down_bias, down, hidden_size, inter, DLM_WGRP(DLM_W_DOWN));
+            if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(down, post_ffn_norm, down, hidden_size, rms_eps);
+            add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, down, hidden_size);
+        }
 
         // No blocking cudaDeviceSynchronize here: all kernels run on the in-order
         // default stream, so consecutive decode blocks (and the layers within one)
@@ -2048,14 +2242,9 @@ extern "C" int dlm_decode_block_batched(
         int pos = positions->v[b];
         int total_pos = np + 1;
 
-        if (q_norm) head_rmsnorm_kernel<<<num_heads, 1>>>(qb, q_norm, num_heads, head_dim, rms_eps);
-        if (k_norm) head_rmsnorm_kernel<<<num_kv_heads, 1>>>(kb, k_norm, num_kv_heads, head_dim, rms_eps);
-        if (o->rope) {
-            rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(qb, num_heads, head_dim, pos, inv_freq, rope_mscale);
-            rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(kb, num_kv_heads, head_dim, pos, inv_freq, rope_mscale);
-        }
-        launch_kv_append(kb, vb, kv_keys->p[b], kv_values->p[b], kv_tables->p[b],
-                         o->kv_block_shift, np, kv_dim, o->kv_half);
+        launch_qk_post(qb, kb, vb, q_norm, k_norm, num_heads, num_kv_heads, head_dim, pos, inv_freq,
+                       rope_mscale, o->rope, rms_eps, kv_keys->p[b], kv_values->p[b],
+                       kv_tables->p[b], o->kv_block_shift, np, o->kv_half);
         e = launch_attention(qb, kv_keys->p[b], kv_values->p[b], kv_tables->p[b],
                              o->kv_block_shift, ctxb, num_heads, num_kv_heads,
                              head_dim, total_pos, sliding_window, attn_scale, attn_softcap, o->kv_half);
