@@ -25,7 +25,7 @@
 
 use crate::error::Result;
 use crate::forward::{ComputeKernel, KvSnapshot};
-use crate::generate::{GenerationSession, Generator, Sampler};
+use crate::generate::{Decoding, GenerationSession, Generator, Sampler};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -120,7 +120,7 @@ struct Pending {
     /// Stop when any of these token ids is produced; empty means run to length.
     eos: Vec<u32>,
     /// How tokens are chosen, on the plain and the speculative path alike.
-    sampler: Sampler,
+    decoding: Decoding,
 }
 
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
@@ -311,6 +311,19 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         eos: Vec<u32>,
         sampler: Sampler,
     ) -> Result<()> {
+        self.submit_decoding(id, prompt, max_new_tokens, eos, sampler.into())
+    }
+
+    /// Queue a request with a sampler and what it layers on it (see
+    /// [`Decoding`]).
+    pub fn submit_decoding(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+    ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::DlmError::InvalidConfig(
                 "prompt is empty".into(),
@@ -321,7 +334,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             prompt,
             max_new_tokens,
             eos,
-            sampler,
+            decoding,
         });
         Ok(())
     }
@@ -433,15 +446,19 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 zero_finished.push(p.id);
                 continue;
             }
+            let Decoding {
+                sampler,
+                penalties,
+                grammar,
+            } = p.decoding;
             let decoder = match self.draft {
-                Some(draft) => Decoder::Speculative(SpeculativeSession::new(
-                    self.generator,
-                    draft,
-                    self.gamma,
-                    &p.prompt,
-                    p.sampler,
-                )?),
-                None => {
+                // A constrained request decodes plainly even here: see
+                // `Decoding::grammar`.
+                Some(draft) if grammar.is_none() => Decoder::Speculative(
+                    SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
+                        .with_penalties(penalties),
+                ),
+                _ => {
                     // Resume from the longest cached prefix if one exists;
                     // otherwise prefill from scratch. Either way, cache this
                     // prompt's prefix so later requests can extend it.
@@ -461,13 +478,15 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                             // Pass the whole prompt so the repetition penalty covers
                             // the cached prefix too (resume derives the suffix).
                             self.generator
-                                .resume_session_deferred(snap, &p.prompt, p.sampler)?
+                                .resume_session_deferred(snap, &p.prompt, sampler)?
                         }
-                        None => self
-                            .generator
-                            .start_session_deferred(&p.prompt, p.sampler)?,
+                        None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    Decoder::Plain(session)
+                    let session = session.with_penalties(penalties);
+                    Decoder::Plain(match grammar {
+                        Some(g) => session.with_grammar(g),
+                        None => session,
+                    })
                 }
             };
             let cache_prompt = match (&decoder, &self.prefix_cache) {
@@ -578,6 +597,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     done = true;
                     break;
                 }
+            }
+            // A finished grammar with no EOS to end on has nothing left to say.
+            if a.eos.is_empty() && matches!(&a.decoder, Decoder::Plain(s) if s.grammar_exhausted())
+            {
+                done = true;
             }
 
             if done {

@@ -112,6 +112,48 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`logit_bias`** on `/v1/chat/completions` and `/v1/completions`, in OpenAI's
+  shape: token id → a bias in [-100, 100] added to that token's logit. It
+  applies under greedy decoding too, so `-100` bans a token whatever the
+  temperature. A bias out of range, or a key that is not a token in the model's
+  vocabulary, is a 400 that says which.
+- **`frequency_penalty` and `presence_penalty`**, with OpenAI's meaning: each
+  time a token has been generated takes `frequency_penalty` off its logit, and
+  having been generated at all takes `presence_penalty` once. Only generated
+  tokens count, not the prompt's. Range -2 to 2; negative values encourage
+  repetition. Speculative decoding applies them at each proposal's own
+  position, so its output still follows the target exactly.
+- **DRY ("don't repeat yourself") sampling**, with llama.cpp's fields:
+  `dry_multiplier` (0, the default, leaves it off), `dry_base` (1.75),
+  `dry_allowed_length` (2) and `dry_sequence_breakers` (`["\n", ":", "\"",
+  "*"]`). It penalizes the token that would extend a run already seen earlier
+  in the context, by `multiplier · base^(run − allowed_length)` — the verbatim
+  loops a small model falls into, which per-token penalties miss because every
+  token in them is ordinary on its own. A run does not cross a token containing
+  a breaker, so repeating a structure line by line is not counted as a loop.
+- **Constrained output: JSON mode, JSON Schema, and GBNF grammars.**
+  `response_format: {"type": "json_object"}` returns a JSON object;
+  `{"type": "json_schema", "json_schema": {"schema": ...}}` returns JSON of
+  that shape; and `grammar` takes a GBNF grammar, llama.cpp's format, so
+  grammars written for it work unchanged. The output matches every time, not
+  usually: at each step a token the grammar cannot take is never emitted, and
+  EOS only once the grammar is complete.
+  - **How:** the sampler draws as it would anyway, and only when the grammar
+    refuses that token does it drop every refused candidate and draw again from
+    what is left. The grammar is matched against each token's bytes, so a
+    character split across two tokens is handled, and tokenization and grammar
+    never need to line up.
+  - **Schemas:** `type` (object, array, string, number, integer, boolean, null,
+    or a list of them), `properties` with `required` (no other keys), `items`,
+    `enum`, `const`, `anyOf` and `oneOf`. Keywords that would otherwise be
+    silently ignored — `$ref`, `allOf`, `not`, `if`, `patternProperties` — are
+    refused, as are grammars that do not parse, with a 400 naming the problem.
+    Properties come out required first, each group in key order; numbers are
+    capped at 16 digits and whitespace runs at 21 characters, so a model that
+    favours digits or spaces still has to finish.
+  - **Speculative decoding is skipped** for a constrained request, which
+    decodes plainly beside the speculative ones: the rejection rule would need
+    the draft held to the same grammar.
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of

@@ -760,6 +760,28 @@ impl BpeTokenizer {
         out
     }
 
+    /// The raw bytes token `id` contributes to decoded text, before any UTF-8
+    /// repair: a byte-level token may hold half a character. `None` for a
+    /// special token (markup, not text) or an unknown id. SentencePiece's
+    /// leading-space strip is a property of the whole text, not of a token, so
+    /// a `▁` piece reads as a space here.
+    pub fn token_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        if self.special_decoder.contains_key(&id) {
+            return None;
+        }
+        let piece = self.decoder.get(&id)?;
+        if self.unigram.is_some() || self.spm.is_some() {
+            return Some(match parse_byte_piece(piece) {
+                Some(b) => vec![b],
+                None => piece.replace(SPM_SPACE, " ").into_bytes(),
+            });
+        }
+        piece
+            .chars()
+            .map(|c| self.byte_decoder.get(&c).copied())
+            .collect()
+    }
+
     /// Decode token ids back into text (lossy on invalid UTF-8). Special-token
     /// ids render as their literal text; runs of byte tokens are byte-decoded.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
@@ -1375,6 +1397,16 @@ mod tests {
         let ids2 = tok.encode("<|eot|>done").unwrap();
         assert_eq!(ids2[0], 999);
         assert_eq!(tok.decode(&ids2).unwrap(), "<|eot|>done");
+    }
+
+    #[test]
+    fn token_bytes_are_raw_and_skip_specials() {
+        let tok = BpeTokenizer::bytes_only().with_special([("<|eot|>".to_string(), 999u32)]);
+        assert_eq!(tok.token_bytes(b'A' as u32), Some(b"A".to_vec()));
+        // Half of a UTF-8 character stays a byte, not a replacement char.
+        assert_eq!(tok.token_bytes(0xC3), Some(vec![0xC3]));
+        assert_eq!(tok.token_bytes(999), None);
+        assert_eq!(tok.token_bytes(5000), None);
     }
 
     #[test]

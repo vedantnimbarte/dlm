@@ -38,8 +38,7 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
-use crate::generate::{sample_from, Generator, Sampler, SplitMix64};
-use std::collections::HashSet;
+use crate::generate::{sample_from, Generator, Penalties, Sampler, SplitMix64};
 
 /// Outcome of a speculative generation.
 #[derive(Debug, Clone)]
@@ -124,8 +123,10 @@ pub struct SpeculativeSession<'a, T: ComputeKernel, D: ComputeKernel> {
     sampler: Sampler,
     rng: SplitMix64,
     seq: Vec<u32>,
-    /// Tokens in `seq`, for the repetition penalty.
-    seen: HashSet<u32>,
+    /// How much of `seq` is the prompt (penalties count only what follows).
+    prompt_len: usize,
+    /// Applied to both models' logits, like the sampler.
+    penalties: Penalties,
     proposed: usize,
     accepted: usize,
 }
@@ -158,10 +159,18 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
             rng: SplitMix64::new(sampler.seed()),
             sampler,
             seq: prompt.to_vec(),
-            seen: prompt.iter().copied().collect(),
+            prompt_len: prompt.len(),
+            penalties: Penalties::default(),
             proposed: 0,
             accepted: 0,
         })
+    }
+
+    /// Layer `penalties` on the sampler. Both models' distributions get them, so
+    /// the rejection rule still emits what the target alone would have drawn.
+    pub fn with_penalties(mut self, penalties: Penalties) -> Self {
+        self.penalties = penalties;
+        self
     }
 
     /// Run one speculative round, emitting at most `budget` tokens (normally
@@ -179,7 +188,7 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
         let mut hidden = self
             .draft
             .prefill(&mut self.draft_kv, &self.seq[unseen..])?;
-        let mut seen = self.seen.clone();
+        let mut context = self.seq.clone();
         let mut proposals = Vec::with_capacity(gamma);
         let mut draft_dists = Vec::with_capacity(gamma);
         for j in 0..gamma {
@@ -189,9 +198,15 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
                     .embed(proposals[j - 1], self.draft_kv.position())?;
                 self.draft_kv.decode_token(&mut hidden)?;
             }
-            let q = self.draft.distribution(&hidden, &seen, &self.sampler)?;
+            let q = self.draft.distribution(
+                &hidden,
+                &self.sampler,
+                &self.penalties,
+                &context,
+                self.prompt_len,
+            )?;
             let x = sample_from(&q, &mut self.rng);
-            seen.insert(x);
+            context.push(x);
             proposals.push(x);
             draft_dists.push(q);
         }
@@ -219,17 +234,21 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
 
         // 3. Accept each proposal with probability min(1, p/q); on the first
         //    rejection, draw the replacement from the residual and stop.
-        let mut seen = self.seen.clone();
+        let mut context = self.seq.clone();
         let mut emitted = Vec::with_capacity(gamma + 1);
         let accepted_before = self.accepted;
         for (j, (&x, q)) in proposals.iter().zip(&draft_dists).enumerate() {
-            let p = self
-                .target
-                .distribution(target_hidden(j), &seen, &self.sampler)?;
+            let p = self.target.distribution(
+                target_hidden(j),
+                &self.sampler,
+                &self.penalties,
+                &context,
+                self.prompt_len,
+            )?;
             let (px, qx) = (prob_of(&p, x), prob_of(q, x));
             if qx > 0.0 && self.rng.next_f32() < px / qx {
                 emitted.push(x);
-                seen.insert(x);
+                context.push(x);
                 self.accepted += 1;
             } else {
                 emitted.push(sample_from(&residual(&p, q), &mut self.rng));
@@ -240,9 +259,13 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
         // also leaves `gamma` tokens emitted, and must not draw a bonus.
         let all_accepted = self.accepted - accepted_before == gamma;
         if all_accepted && emitted.len() < budget {
-            let p = self
-                .target
-                .distribution(target_hidden(gamma), &seen, &self.sampler)?;
+            let p = self.target.distribution(
+                target_hidden(gamma),
+                &self.sampler,
+                &self.penalties,
+                &context,
+                self.prompt_len,
+            )?;
             emitted.push(sample_from(&p, &mut self.rng));
         }
 
@@ -250,7 +273,6 @@ impl<'a, T: ComputeKernel, D: ComputeKernel> SpeculativeSession<'a, T, D> {
         //    token. What stays is valid: every emitted token but the last is an
         //    accepted proposal, i.e. exactly what both models were fed.
         self.seq.extend(&emitted);
-        self.seen.extend(&emitted);
         let keep = self.seq.len() - 1;
         self.target_kv.truncate(keep);
         self.draft_kv.truncate(keep);

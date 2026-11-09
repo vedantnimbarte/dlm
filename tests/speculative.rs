@@ -156,6 +156,48 @@ fn session_round_by_round_equals_target_greedy() {
     assert!(session.accepted() <= session.proposed());
 }
 
+/// Penalties depend on the tokens so far, so speculation has to apply them at
+/// each proposal's own position. Under greedy that makes its output exactly
+/// what a plain session with the same penalties produces.
+#[test]
+fn speculative_penalties_match_plain_decoding() {
+    let prompt = [1u32, 2, 3];
+    let n = 12;
+    let (target, draft) = (build_generator(1), build_generator(2));
+    let penalties = dlm::generate::Penalties {
+        logit_bias: vec![(5, -100.0)],
+        frequency: 2.0,
+        presence: 1.0,
+        dry: Some(dlm::generate::Dry {
+            multiplier: 1.0,
+            base: 1.75,
+            allowed_length: 2,
+            breakers: [7].into_iter().collect(),
+        }),
+    };
+
+    let mut plain = target
+        .start_session(&prompt, Sampler::Greedy)
+        .unwrap()
+        .with_penalties(penalties.clone());
+    let expected: Vec<u32> = (0..n).map(|_| plain.step().unwrap()).collect();
+
+    let mut session = SpeculativeSession::new(&target, &draft, 4, &prompt, Sampler::Greedy)
+        .unwrap()
+        .with_penalties(penalties);
+    let mut out = Vec::new();
+    while out.len() < n {
+        out.extend(session.step(n - out.len()).unwrap());
+    }
+    assert_eq!(out, expected);
+    assert!(!out.contains(&5), "a -100 bias is a ban");
+    assert_ne!(
+        out,
+        greedy(&build_generator(1), &prompt, n),
+        "penalties had no effect"
+    );
+}
+
 #[test]
 fn speculative_scheduler_matches_greedy_across_requests() {
     let target = build_generator(1);
@@ -183,6 +225,53 @@ fn speculative_scheduler_matches_greedy_across_requests() {
     // Every retired slot contributed to the acceptance stats.
     let (proposed, accepted) = sched.speculative_stats();
     assert!(proposed > 0 && accepted <= proposed);
+}
+
+/// A grammar-constrained request on a speculating scheduler decodes plainly,
+/// so it matches the grammar and a plain scheduler's output, and a speculative
+/// request beside it is unaffected.
+#[test]
+fn constrained_requests_bypass_speculation() {
+    use dlm::generate::Decoding;
+    use dlm::grammar::{Constraint, Grammar};
+    use std::sync::Arc;
+    let (target, draft) = (build_generator(1), build_generator(2));
+    // Token i is the letter 'a' + i (and 26.. are digits).
+    let tokens = Arc::new(
+        (0..32u8)
+            .map(|i| Some(vec![if i < 26 { b'a' + i } else { b'0' + i - 26 }]))
+            .collect(),
+    );
+    let grammar = Arc::new(Grammar::parse(r#"root ::= "abc" [d-f]"#).unwrap());
+    let constrained = || Decoding {
+        grammar: Some(Constraint::new(
+            grammar.clone(),
+            Arc::clone(&tokens),
+            vec![],
+        )),
+        ..Default::default()
+    };
+
+    let mut plain = BatchScheduler::new(&target, 2);
+    plain
+        .submit_decoding(1, vec![1, 2], 10, vec![], constrained())
+        .unwrap();
+    let expected = plain.run().unwrap().remove(0).tokens;
+    assert_eq!(expected[..3], [0, 1, 2]);
+    assert!(
+        (3..=5).contains(&expected[3]) && expected.len() == 4,
+        "{expected:?}"
+    );
+
+    let mut sched = BatchScheduler::with_speculative(&target, &draft, 2, 4);
+    sched
+        .submit_decoding(1, vec![1, 2], 10, vec![], constrained())
+        .unwrap();
+    sched.submit(2, vec![1, 2, 3], 7, vec![]).unwrap();
+    let mut results = sched.run().unwrap();
+    results.sort_by_key(|f| f.id);
+    assert_eq!(results[0].tokens, expected);
+    assert_eq!(results[1].tokens, greedy(&target, &[1, 2, 3], 7));
 }
 
 #[test]
