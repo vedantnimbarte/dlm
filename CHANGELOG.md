@@ -30,12 +30,57 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     UI can reach the API. Without it the request succeeds and the browser
     discards the answer, with nothing in the log. Off by default: a server on a
     shared network should not hand its answers to any page that asks.
+- **A K-quant sub-block with a zero scale decoded to zero on the CPU.** ggml
+  decodes it as `-dmin * m`, and so do the GPU kernels; the CPU reference and
+  the expanded (int4/int8) layout dropped the minimum. Both now keep it.
 - **The end-to-end server test drove an engine nothing served.**
   `tests/server.rs` exercised a second, older OpenAI router that only the test
   referenced, so its checks said nothing about the server `dlm serve` runs. It
   now drives `EngineService`, and the dead router is gone.
 
 ### Changed
+
+- **CPU decode is 2.5x faster on a bf16 model and 4.5x on a GGUF one.** The
+  CPU matvec summed one weight at a time (an f32 `sum()` that LLVM may not
+  reorder) and decoded every quantized weight on its own. Measured on a Ryzen 5
+  5600GT with Qwen2.5-0.5B, `dlm bench --device cpu --prompt-len 128
+  --gen-len 16`, old and new binaries run alternately, two rounds of three runs
+  each (medians per round; the machine was shared with other benchmarks, which
+  the spread shows):
+
+  | Model | Workload | Before | After |
+  |---|---|---|---|
+  | bf16 safetensors | Decode | 3.8–3.9 tok/s (runs 3.7–4.4) | **9.3–11.0 tok/s** (runs 4.4–11.5) |
+  | bf16 safetensors | Prefill | 4.9 tok/s | **6.3–12.9 tok/s** |
+  | Q4_K_M GGUF | Decode | 1.7–2.1 tok/s (runs 1.3–2.2) | **8.9–9.1 tok/s** (runs 8.5–10.0) |
+  | Q4_K_M GGUF | Prefill | 2.0–2.2 tok/s | **16.1–17.8 tok/s** |
+
+  - **SIMD kernels for every weight dtype**: f32, bf16, f16, dlm int4/int8, and
+    ggml's Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and Q6_K. AVX2+FMA+F16C on
+    x86_64, picked at run time so the same binary still runs the scalar code on
+    a CPU without them; NEON on aarch64. Each format's decoding is written once
+    against a small set of vector operations that both instruction sets
+    implement. The scalar code stays as the reference, and a test checks every
+    dtype against it on random data. Activations stay f32: llama.cpp's int8
+    activations would be faster for 4-bit weights, but this path is the oracle
+    the GPU kernels are checked against at 2e-3, and an int8 activation's error
+    is a few times that.
+  - **The thread pool no longer waits for its slowest worker to wake.** Each
+    GEMV dealt one fixed slice per thread and waited for every thread, so on a
+    loaded machine one descheduled worker stalled the whole step. Rows now go
+    out in small chunks claimed by whichever threads are running, and a worker
+    that wakes after the last chunk is taken skips the call. On the shared
+    machine above, a 4864×896 bf16 GEMV went from 1.7 ms to 0.18 ms (median).
+  - The attention projections (896×896) now run on the pool too, and attention
+    dots each query head with its keys eight lanes at a time.
+  - **The CPU's LM head is held in bf16 when that is lossless** (any bf16
+    checkpoint): the vocabulary-wide GEMV reads half the bytes, and steady-state
+    memory drops by 272 MB on Qwen2.5-0.5B. The load-time peak RSS is ~0.2 GB
+    higher (2.86 vs 2.67 GiB), since the bf16 copy is made from the f32 one the
+    loader hands over.
+  - Decode is now bound by memory bandwidth, not arithmetic. A GGUF model's LM
+    head is still decoded to f32 on the CPU, and is over half of each token's
+    bytes there; keeping it in its ggml blocks is the next step.
 
 - **The GPU's batched GEMV read every weight once per sequence instead of once
   per batch, and both GEMVs spent a third of their time in barriers.** Fixing
