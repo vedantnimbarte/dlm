@@ -428,6 +428,17 @@ pub struct BenchOpts {
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
 
+    /// Compare against a baseline written by `--json`: print each metric's
+    /// change, and exit non-zero if prefill or decode tok/s fell by more than
+    /// `--tolerance` at any batch size both runs measured.
+    #[arg(long, value_name = "FILE")]
+    pub compare: Option<PathBuf>,
+
+    /// How far (percent) throughput may fall below the `--compare` baseline
+    /// before it counts as a regression.
+    #[arg(long, value_name = "PCT", default_value_t = 5.0)]
+    pub tolerance: f64,
+
     /// Break decode time down by streaming stage (mmap, H2D, compute, ...).
     /// Streaming paths only. Off by default: timing the stages adds overhead of
     /// its own, so leave it off when the headline numbers matter.
@@ -744,6 +755,8 @@ mod tests {
             "1,4",
             "--gen-len",
             "32",
+            "--compare",
+            "base.json",
         ])
         .unwrap();
         let Command::Bench(a) = cli.command else {
@@ -754,6 +767,8 @@ mod tests {
         assert_eq!(a.opts.batch, vec![1, 4]);
         assert_eq!(a.opts.gen_len, 32);
         assert_eq!(a.opts.prompt_len, 512);
+        assert_eq!(a.opts.compare, Some(PathBuf::from("base.json")));
+        assert_eq!(a.opts.tolerance, 5.0);
         assert!(a.serve.bench.is_none());
     }
 

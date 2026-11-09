@@ -67,6 +67,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`dlm bench --compare base.json`** checks a build for a speed regression:
+  it prints each metric's change against a baseline saved with `--json`, per
+  batch size, and exits non-zero if prefill or decode tok/s fell by more than
+  `--tolerance` percent (default 5). Latency and memory are shown but never fail
+  it. The `--json` file now also records the time, the GPU's name, per-batch
+  peak RSS, and the commit when the build sets `DLM_GIT_COMMIT`; files written
+  before this still read. `bench/BASELINES.md` describes the workflow.
 - **`dlm score --quant int4|int8`** scores a model quantized at load, so what a
   quantization costs in log-likelihood can be measured rather than guessed. It
   also reports the size of the layer weights it scored.
