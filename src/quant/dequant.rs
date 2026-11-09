@@ -176,21 +176,25 @@ pub fn pack_codes(codes: &[u8]) -> Vec<u8> {
 /// Quantize `values` into a [`Quant4Tensor`] using per-group asymmetric affine
 /// quantization: what `--quant int4` does to a float checkpoint at load.
 pub fn quantize_affine(values: &[f32], group_size: usize) -> Result<Quant4Tensor> {
-    let (codes, scales, zeros) = quantize_groups(values, group_size, LEVELS)?;
+    let (codes, scales, zeros) = quantize_groups(values, group_size, LEVELS, true)?;
     Quant4Tensor::new(pack_codes(&codes), scales, zeros, group_size, values.len())
 }
 
 /// Per-group asymmetric affine quantization to 8-bit codes: `(codes, scales,
 /// zeros)`, one code per element (no packing — a byte already holds one).
 ///
-/// Same arithmetic as [`quantize_affine`], one bit-width up. int8's 256 levels
+/// Same layout as [`quantize_affine`], one bit-width up. int8's 256 levels
 /// track a group's range ~17x finer than int4's 16, so it costs half the shrink
 /// for a fraction of the error.
+///
+/// Plain min..max rounding, without int4's search: the search cuts int8's
+/// squared error by ~10%, but Qwen2.5-0.5B and 1.5B score the same either way
+/// (both within 0.002 nats of bf16), and it doubled int8's load time.
 pub fn quantize_affine_int8(
     values: &[f32],
     group_size: usize,
 ) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
-    quantize_groups(values, group_size, LEVELS_INT8)
+    quantize_groups(values, group_size, LEVELS_INT8, false)
 }
 
 /// The shared group-affine core: split `values` into groups, and per group pick
@@ -200,6 +204,7 @@ fn quantize_groups(
     values: &[f32],
     group_size: usize,
     levels: f32,
+    search: bool,
 ) -> Result<(Vec<u8>, Vec<f32>, Vec<f32>)> {
     if group_size == 0 {
         return Err(DlmError::QuantLayout("group_size must be > 0".into()));
@@ -223,7 +228,8 @@ fn quantize_groups(
                 let mut trial = vec![0u8; group_size];
                 let groups = values.chunks(group_size).zip(codes.chunks_mut(group_size));
                 for ((group, out), (scale, zero)) in groups.zip(scales.iter_mut().zip(zeros)) {
-                    (*scale, *zero) = fit_group(group, levels, out, &mut trial[..group.len()]);
+                    let trial = &mut trial[..group.len()];
+                    (*scale, *zero) = fit_group(group, levels, search, out, trial);
                 }
             });
         }
@@ -240,8 +246,15 @@ fn quantize_groups(
 /// no calibration data: try grids slightly finer and coarser than min..max, and
 /// for each one's codes solve the least-squares `scale`/`min` in closed form,
 /// keeping whichever reconstructs the group best. The min..max fit is the first
-/// candidate, so the result is never worse than it.
-fn fit_group(group: &[f32], levels: f32, codes: &mut [u8], trial: &mut [u8]) -> (f32, f32) {
+/// candidate, so the result is never worse than it. Without `search`, the
+/// min..max fit is the answer.
+fn fit_group(
+    group: &[f32],
+    levels: f32,
+    search: bool,
+    codes: &mut [u8],
+    trial: &mut [u8],
+) -> (f32, f32) {
     let min = group.iter().copied().fold(f32::INFINITY, f32::min);
     let max = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     // Degenerate (all equal) → unit scale so code 0 reconstructs the value.
@@ -249,6 +262,16 @@ fn fit_group(group: &[f32], levels: f32, codes: &mut [u8], trial: &mut [u8]) -> 
         codes.fill(0);
         return (1.0, -min);
     }
+    // The min..max fit: dequant(code=0) = (0 - zero) * scale = min.
+    let mut scale = (max - min) / levels;
+    let mut zero = -min / scale;
+    for (c, &x) in codes.iter_mut().zip(group) {
+        *c = ((x - min) / scale).round().clamp(0.0, levels) as u8;
+    }
+    if !search {
+        return (scale, zero);
+    }
+
     // n, Σx and Σx² are the same for every candidate; with each one's Σc, Σc²
     // and Σcx they give its error without a second pass over the group.
     // llama.cpp also weighs each error by `rms + |x|`; on Qwen2.5-0.5B that
@@ -269,22 +292,22 @@ fn fit_group(group: &[f32], levels: f32, codes: &mut [u8], trial: &mut [u8]) -> 
                 (sl + l, sl2 + l * l, sxl + l * x as f64)
             })
     };
-
-    // The min..max fit: dequant(code=0) = (0 - zero) * scale = min.
-    let mut scale = (max - min) / levels;
-    let mut zero = -min / scale;
-    for (c, &x) in codes.iter_mut().zip(group) {
-        *c = ((x - min) / scale).round().clamp(0.0, levels) as u8;
-    }
     let mut best = error(scale as f64, min as f64, sums(codes));
 
     // Grids from `levels - 1` to `levels + 1` steps across min..max.
     for step in 0..=20 {
         let iscale = (levels - 1.0 + 0.1 * step as f32) / (max - min);
+        let (mut sl, mut sl2, mut sxl) = (0u32, 0u32, 0.0f64);
         for (c, &x) in trial.iter_mut().zip(group) {
-            *c = ((x - min) * iscale).round().clamp(0.0, levels) as u8;
+            // `x - min` is never negative, so +0.5 and truncating rounds it:
+            // a plain conversion, where `round()` is a libm call per weight.
+            let l = (((x - min) * iscale + 0.5) as u32).min(levels as u32);
+            *c = l as u8;
+            sl += l;
+            sl2 += l * l;
+            sxl += l as f64 * x as f64;
         }
-        let (sl, sl2, sxl) = sums(trial);
+        let (sl, sl2) = (sl as f64, sl2 as f64);
         // Least squares of x on these codes: x ≈ s * code + m.
         let d = n * sl2 - sl * sl;
         if d <= 0.0 {
@@ -427,7 +450,8 @@ mod tests {
             for outliers in [false, true] {
                 for seed in 1..4 {
                     let values = groups(seed, outliers);
-                    let (codes, scales, zeros) = quantize_groups(&values, 128, levels).unwrap();
+                    let (codes, scales, zeros) =
+                        quantize_groups(&values, 128, levels, true).unwrap();
                     let (mut ours, mut rtn) = (0.0, 0.0);
                     for (g, group) in values.chunks(128).enumerate() {
                         let deq: Vec<f32> = codes[g * 128..][..128]
