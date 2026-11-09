@@ -151,6 +151,18 @@ extern "C" {
         logits_host: *mut f32,
     ) -> i32;
 
+    /// The LM head's argmax: the index of the largest logit (the first, on a
+    /// tie), without copying the logits back.
+    pub(crate) fn dlm_lm_head_argmax(
+        vocab: i32,
+        hidden_size: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        w: *const c_void,
+        x_host: *const f32,
+        token_host: *mut i32,
+    ) -> i32;
+
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
     /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
     pub(crate) fn dlm_moe_matvec(
@@ -627,6 +639,43 @@ impl GpuLmHead {
             });
         }
         Ok(out)
+    }
+
+    /// The token greedy decoding picks for the final-normed hidden state `x`:
+    /// [`argmax`](crate::generate::argmax) of [`logits`](Self::logits), found on
+    /// the device. Four bytes come back instead of `vocab` floats (600 KB a
+    /// token on Qwen2.5). A final logit softcap is `tanh`, which keeps the order,
+    /// so it needs no applying here.
+    pub fn argmax(&self, x: &[f32]) -> Result<u32> {
+        if x.len() != self.hidden {
+            return Err(DlmError::ShapeMismatch {
+                expected: self.hidden,
+                got: x.len(),
+            });
+        }
+        if let Some(id) = self.device {
+            crate::gpu::set_device(id)?;
+        }
+        let mut token = 0i32;
+        // SAFETY: as `logits`; `token` is one host i32.
+        let code = unsafe {
+            dlm_lm_head_argmax(
+                self.vocab as i32,
+                self.hidden as i32,
+                self.w_dtype,
+                self.w_group_size,
+                self.w.as_ptr() as *const c_void,
+                x.as_ptr(),
+                &mut token,
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_lm_head_argmax",
+                code,
+            });
+        }
+        Ok(token as u32)
     }
 }
 

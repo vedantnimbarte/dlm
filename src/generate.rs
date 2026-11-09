@@ -241,6 +241,14 @@ fn z_function(s: &[u32]) -> Vec<usize> {
 }
 
 impl Penalties {
+    /// Whether [`apply`](Self::apply) would leave every logit as it is.
+    pub fn is_noop(&self) -> bool {
+        self.logit_bias.is_empty()
+            && self.frequency == 0.0
+            && self.presence == 0.0
+            && self.dry.as_ref().is_none_or(|d| d.multiplier == 0.0)
+    }
+
     /// Adjust `logits` in place, before the sampler sees them. `context` is the
     /// prompt (its first `prompt_len` tokens) followed by what was generated.
     /// The frequency and presence penalties count generated tokens only, as
@@ -832,6 +840,25 @@ impl<K: ComputeKernel> Generator<K> {
         Ok(out)
     }
 
+    /// The greedy token for `hidden` from the device LM head's argmax, or `None`
+    /// when the head is on the host (the caller then takes the logits' argmax,
+    /// which is the same token).
+    fn greedy_token(&self, hidden: &[f32]) -> Option<Result<u32>> {
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        if let Some(head) = &self.gpu_head {
+            let normed = crate::forward::cpu::norm(
+                hidden,
+                &self.final_norm,
+                self.final_norm_bias.as_deref(),
+                self.rms_eps,
+                self.final_norm_kind,
+            );
+            return Some(head.argmax(&normed));
+        }
+        let _ = hidden;
+        None
+    }
+
     /// Greedy-decode a **batch** of prompts together, advancing all sequences
     /// through each layer in one [`run_block_batched`](ComputeKernel::run_block_batched)
     /// call — so a GPU kernel fuses the per-sequence projections into batched
@@ -955,9 +982,15 @@ impl<K: ComputeKernel> Generator<K> {
         let mut seen: std::collections::HashSet<u32> = prompt.iter().copied().collect();
         let mut generated = Vec::with_capacity(cfg.max_new_tokens);
         for _ in 0..cfg.max_new_tokens {
-            let mut logits = self.logits(&hidden)?;
-            apply_repetition_penalty(&mut logits, &seen, penalty);
-            let next = cfg.sampler.sample(&logits, &mut rng);
+            let greedy = matches!(cfg.sampler, Sampler::Greedy);
+            let next = match greedy.then(|| self.greedy_token(&hidden)) {
+                Some(Some(token)) => token?,
+                _ => {
+                    let mut logits = self.logits(&hidden)?;
+                    apply_repetition_penalty(&mut logits, &seen, penalty);
+                    cfg.sampler.sample(&logits, &mut rng)
+                }
+            };
             generated.push(next);
             seen.insert(next);
             if cfg.eos_token == Some(next) {
@@ -1210,17 +1243,27 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
                 "session has prompt tokens left to prefill".into(),
             ));
         }
-        let mut logits = self.generator.logits(&self.last_hidden)?;
-        apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
-        self.penalties
-            .apply(&mut logits, &self.context, self.prompt_len);
-        let next = match &mut self.grammar {
-            Some(g) => {
-                let next = g.pick(&self.sampler, &logits, &mut self.rng);
-                g.accept(next);
-                next
+        // A plain greedy step needs only the argmax, which the device head finds
+        // without sending the logits back.
+        let plain_greedy = matches!(self.sampler, Sampler::Greedy)
+            && self.penalties.is_noop()
+            && self.grammar.is_none();
+        let next = match plain_greedy.then(|| self.generator.greedy_token(&self.last_hidden)) {
+            Some(Some(token)) => token?,
+            _ => {
+                let mut logits = self.generator.logits(&self.last_hidden)?;
+                apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
+                self.penalties
+                    .apply(&mut logits, &self.context, self.prompt_len);
+                match &mut self.grammar {
+                    Some(g) => {
+                        let next = g.pick(&self.sampler, &logits, &mut self.rng);
+                        g.accept(next);
+                        next
+                    }
+                    None => self.sampler.sample(&logits, &mut self.rng),
+                }
             }
-            None => self.sampler.sample(&logits, &mut self.rng),
         };
         self.seen.insert(next);
         self.context.push(next);

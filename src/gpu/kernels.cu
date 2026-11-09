@@ -2611,6 +2611,58 @@ extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_
     return (int)e;
 }
 
+// Index of the largest logit, the lowest index on ties (the host's greedy
+// sampler keeps the first maximum too). One block: <<<1, 1024>>>.
+__global__ void argmax_kernel(const float* v, int n, int* out) {
+    __shared__ float best_v[32];
+    __shared__ int best_i[32];
+    float bv = -INFINITY;
+    int bi = 0x7FFFFFFF;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float x = v[i];
+        if (x > bv) { bv = x; bi = i; }   // strided ascending: first max per thread
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+        int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) { best_v[warp] = bv; best_i[warp] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (int)(blockDim.x + 31) / 32; ++w)
+            if (best_v[w] > bv || (best_v[w] == bv && best_i[w] < bi)) { bv = best_v[w]; bi = best_i[w]; }
+        *out = bi == 0x7FFFFFFF ? 0 : bi;   // every logit -inf: index 0, as the host
+    }
+}
+
+// The LM head for a greedy step: the largest logit's index, without the logits.
+// A plain step copies `vocab` floats back to the host (600 KB on Qwen2.5) for
+// the host to take one maximum of; this copies four bytes. A final logit softcap
+// is `tanh`, which keeps the order, so the caller can skip it here.
+extern "C" int dlm_lm_head_argmax(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                                  const void* w, const float* x_host, int* token_host)
+{
+    DLM_ENTER
+    cudaError_t e = scratch_ensure(LM_X, hidden_size);
+    if (e == cudaSuccess) e = scratch_ensure(LM_LOGITS, vocab + 1);
+    if (e == cudaSuccess)
+        e = cudaMemcpy(g_scratch[LM_X], x_host, (size_t)hidden_size * sizeof(float),
+                       cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) {
+        float* logits = g_scratch[LM_LOGITS];
+        launch_matvec(w_dtype, w, g_scratch[LM_X], (const float*)0, logits, vocab, hidden_size,
+                      w_group_size);
+        argmax_kernel<<<1, 1024>>>(logits, vocab, (int*)(logits + vocab));
+        e = cudaGetLastError();
+        if (e == cudaSuccess)
+            e = cudaMemcpy(token_host, logits + vocab, sizeof(int), cudaMemcpyDeviceToHost);
+    }
+    return (int)e;
+}
+
 // Apply one expert to the residual: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.
 // Reads normed2 from scratch (left by dlm_moe_attn). `w_dtype`/`w_group_size`
 // describe the expert's weights, which may differ from the core's.
