@@ -1947,14 +1947,13 @@ pub(crate) fn matvec_native_scalar(
 /// Shared driver: compute `out_dim` independent row dot products via `row_dot`,
 /// in parallel for large GEMVs.
 ///
-/// The LM head is [vocab≈128k, hidden] — ~1 GB streamed per token — and
-/// single-threaded it dominates decode latency (the GPU path still computes
-/// logits on the CPU). Output rows are independent, so split them across cores.
-/// Only large GEMVs are parallelized: below the threshold the thread hop costs
-/// more than the work it distributes, so a small per-layer projection is faster
-/// single-threaded. The threshold is expressed in MACs (`out_dim × in_dim`)
+/// Output rows are independent, so they are split across cores. Only large
+/// GEMVs are parallelized: below the threshold waking the pool costs more than
+/// the work it distributes. The threshold is in MACs (`out_dim × in_dim`)
 /// rather than a tuned constant, so it tracks the actual work rather than one
-/// machine's timings. Both paths must produce identical results — pinned by
+/// machine's timings. The rows go out in several chunks per thread, claimed as
+/// threads come free, so one thread the OS runs late or slowly leaves its share
+/// to the rest. Both paths must produce identical results — pinned by
 /// `matvec_rows_agrees_across_the_parallel_threshold`.
 fn matvec_rows<F>(out_dim: usize, in_dim: usize, x: &[f32], row_dot: F) -> Vec<f32>
 where
@@ -1963,8 +1962,8 @@ where
     debug_assert_eq!(x.len(), in_dim);
     let mut y = vec![0.0f32; out_dim];
     let threads = super::pool::threads();
-    if threads > 1 && out_dim.saturating_mul(in_dim) >= (1 << 20) {
-        let rows_per = out_dim.div_ceil(threads);
+    if threads > 1 && out_dim.saturating_mul(in_dim) >= PARALLEL_MACS {
+        let rows_per = out_dim.div_ceil(threads * 4);
         // One lock per chunk, each taken by exactly one pool thread.
         let chunks: Vec<std::sync::Mutex<&mut [f32]>> =
             y.chunks_mut(rows_per).map(std::sync::Mutex::new).collect();
@@ -1981,6 +1980,9 @@ where
     }
     y
 }
+
+/// GEMVs at least this large (in MACs) run on the pool.
+const PARALLEL_MACS: usize = 1 << 20;
 
 /// Root-mean-square layer norm with a learned scale.
 pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
