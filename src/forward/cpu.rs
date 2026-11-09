@@ -1704,10 +1704,7 @@ impl KvLayerCache {
         match &self.store {
             KvStore::Full { keys, .. } => {
                 let base = pos * self.kv_dim + off;
-                q.iter()
-                    .zip(&keys[base..base + d])
-                    .map(|(&a, &b)| a * b)
-                    .sum()
+                super::simd::dot_f32(q, &keys[base..base + d])
             }
             KvStore::Int8 {
                 keys, key_scales, ..
