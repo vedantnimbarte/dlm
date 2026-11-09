@@ -4,6 +4,26 @@ Measured with `dlm bench` so later changes can be compared against the same
 numbers. Each row is the median of 3 runs. Rerun the command shown to reproduce
 a row, and put the before/after in the PR that changes it.
 
+To check a change for a speed regression, save a baseline from the old build
+with `--json` and compare the new build against it with `--compare`, using the
+same flags on the same machine:
+
+```sh
+# on the base commit
+dlm bench --model-path <model> [flags...] --json base.json
+# on the change
+dlm bench --model-path <model> [flags...] --json new.json --compare base.json
+```
+
+`--compare` prints each metric's change per batch size and exits non-zero if
+prefill or decode tok/s fell by more than `--tolerance` percent (default 5).
+Latency and memory are shown but never fail the check. The JSON records the
+model, quant, flags, GPU, time, and per-batch peak RSS and VRAM; it records the
+commit only if the binary was built with `DLM_GIT_COMMIT` set, e.g.
+`DLM_GIT_COMMIT=$(git rev-parse --short HEAD) cargo build --release ...`.
+Clocks drift between runs, so measure both sides back to back, and rerun before
+believing a failure near the tolerance.
+
 **These tables are the 0.4.0 baseline and have not been re-measured since.**
 Several changes have moved them a long way (the GPU kernel work, paged KV,
 batched serving, the batched GEMV rework), each carrying its own before/after in

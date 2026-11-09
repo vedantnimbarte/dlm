@@ -151,6 +151,66 @@ extern "C" {
         logits_host: *mut f32,
     ) -> i32;
 
+    /// Which GEMM prefill runs on the current device: 0 the f32 kernel, 1 bf16
+    /// and 2 fp16 tensor cores.
+    pub(crate) fn dlm_gemm_mode() -> i32;
+
+    /// [`dlm_moe_attn`] for a batch: attention for every slot with each
+    /// projection read once, each slot's FFN input left in a scratch row for
+    /// [`dlm_moe_take_row`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_moe_attn_batched(
+        hidden_size: i32,
+        q_dim: i32,
+        kv_dim: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        q_proj: *const c_void,
+        k_proj: *const c_void,
+        v_proj: *const c_void,
+        o_proj: *const c_void,
+        in_norm: *const f32,
+        post_norm: *const f32,
+        q_bias: *const f32,
+        k_bias: *const f32,
+        v_bias: *const f32,
+        q_norm: *const f32,
+        k_norm: *const f32,
+        inv_freq: *const f32,
+        x: *mut f32,
+        kv_keys: *const DlmSlots,
+        kv_values: *const DlmSlots,
+        kv_tables: *const DlmTables,
+        num_positions: *const DlmInts,
+        positions: *const DlmInts,
+        batch: i32,
+        sliding_window: i32,
+        rope_mscale: f32,
+        attn_scale: f32,
+        attn_softcap: f32,
+        ext: *const DlmBlockExt,
+    ) -> i32;
+
+    /// Make slot `b`'s FFN input from [`dlm_moe_attn_batched`] the one the
+    /// router and expert calls read.
+    pub(crate) fn dlm_moe_take_row(hidden_size: i32, b: i32) -> i32;
+
+    /// The LM head's argmax: the index of the largest logit (the first, on a
+    /// tie), without copying the logits back.
+    pub(crate) fn dlm_lm_head_argmax(
+        vocab: i32,
+        hidden_size: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        w: *const c_void,
+        x_host: *const f32,
+        token_host: *mut i32,
+    ) -> i32;
+
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
     /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
     pub(crate) fn dlm_moe_matvec(
@@ -259,6 +319,53 @@ extern "C" {
         pre_ffn_norm: *const f32,
         post_ffn_norm: *const f32,
         // Non-Llama block shape (GPT-2, Falcon); null for the Llama default.
+        ext: *const DlmBlockExt,
+    ) -> i32;
+
+    /// One layer over `t` consecutive tokens of one sequence, as tiled GEMMs:
+    /// `x` is `[t, hidden_size]`, token `i` at `position + i` appending KV row
+    /// `history + i`. Returns [`CUDA_ERROR_NOT_SUPPORTED`], launching nothing,
+    /// for a layer its kernels cannot take.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_prefill_block(
+        hidden_size: i32,
+        q_dim: i32,
+        kv_dim: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        inter: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        q_proj: *const c_void,
+        k_proj: *const c_void,
+        v_proj: *const c_void,
+        o_proj: *const c_void,
+        gate_proj: *const c_void,
+        up_proj: *const c_void,
+        down_proj: *const c_void,
+        in_norm: *const f32,
+        post_norm: *const f32,
+        q_bias: *const f32,
+        k_bias: *const f32,
+        v_bias: *const f32,
+        q_norm: *const f32,
+        k_norm: *const f32,
+        inv_freq: *const f32,
+        x: *mut f32,
+        kv_keys: *mut c_void,
+        kv_values: *mut c_void,
+        history: i32,
+        position: i32,
+        t: i32,
+        sliding_window: i32,
+        activation: i32,
+        rope_mscale: f32,
+        attn_scale: f32,
+        attn_softcap: f32,
+        pre_ffn_norm: *const f32,
+        post_ffn_norm: *const f32,
         ext: *const DlmBlockExt,
     ) -> i32;
 
@@ -628,6 +735,43 @@ impl GpuLmHead {
         }
         Ok(out)
     }
+
+    /// The token greedy decoding picks for the final-normed hidden state `x`:
+    /// [`argmax`](crate::generate::argmax) of [`logits`](Self::logits), found on
+    /// the device. Four bytes come back instead of `vocab` floats (600 KB a
+    /// token on Qwen2.5). A final logit softcap is `tanh`, which keeps the order,
+    /// so it needs no applying here.
+    pub fn argmax(&self, x: &[f32]) -> Result<u32> {
+        if x.len() != self.hidden {
+            return Err(DlmError::ShapeMismatch {
+                expected: self.hidden,
+                got: x.len(),
+            });
+        }
+        if let Some(id) = self.device {
+            crate::gpu::set_device(id)?;
+        }
+        let mut token = 0i32;
+        // SAFETY: as `logits`; `token` is one host i32.
+        let code = unsafe {
+            dlm_lm_head_argmax(
+                self.vocab as i32,
+                self.hidden as i32,
+                self.w_dtype,
+                self.w_group_size,
+                self.w.as_ptr() as *const c_void,
+                x.as_ptr(),
+                &mut token,
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_lm_head_argmax",
+                code,
+            });
+        }
+        Ok(token as u32)
+    }
 }
 
 /// One layer's weights plus its persistent K/V history, resident in VRAM.
@@ -745,10 +889,13 @@ impl GpuMoeCore {
     /// That is a device round trip per layer per token, and it is what makes both
     /// GPU paths select the same experts as the CPU oracle, bit for bit: they run
     /// the same [`route_topk`](crate::forward::cpu::route_topk).
+    ///
+    /// `hidden` is the device hidden vector the experts add into: a session's
+    /// own buffer, or one row of a batch block.
     pub(crate) fn run<E: std::ops::Deref<Target = GpuExpert>>(
         &self,
         cfg: &BlockConfig,
-        d_hidden: &DeviceBuffer,
+        hidden: *mut f32,
         mut expert: impl FnMut(usize) -> Result<E>,
     ) -> Result<()> {
         let m = cfg.moe.expect("GpuMoeCore::run on a dense model");
@@ -816,7 +963,7 @@ impl GpuMoeCore {
                     &up,
                     &down,
                     &weights,
-                    d_hidden.as_mut_ptr(),
+                    hidden,
                     cfg.activation.code(),
                 )
             };
@@ -828,7 +975,7 @@ impl GpuMoeCore {
             }
         } else {
             for (expert, weight) in &experts {
-                self.apply_one(cfg, expert, inter, *weight, d_hidden)?;
+                self.apply_one(cfg, expert, inter, *weight, hidden)?;
             }
         }
 
@@ -861,7 +1008,7 @@ impl GpuMoeCore {
             let sinter = m
                 .shared_intermediate_size
                 .unwrap_or(m.moe_intermediate_size) as i32;
-            self.apply_one(cfg, sh, sinter, weight, d_hidden)?;
+            self.apply_one(cfg, sh, sinter, weight, hidden)?;
         }
         Ok(())
     }
@@ -873,7 +1020,7 @@ impl GpuMoeCore {
         expert: &GpuExpert,
         inter: i32,
         weight: f32,
-        d_hidden: &DeviceBuffer,
+        hidden: *mut f32,
     ) -> Result<()> {
         let code = unsafe {
             dlm_apply_expert(
@@ -885,7 +1032,7 @@ impl GpuMoeCore {
                 expert.up.as_ptr() as *const c_void,
                 expert.down.as_ptr() as *const c_void,
                 weight,
-                d_hidden.as_mut_ptr(),
+                hidden,
                 cfg.activation.code(),
             )
         };
@@ -1165,6 +1312,186 @@ impl GpuKernel {
     }
 }
 
+/// Whether prompt prefill on the current device runs on tensor cores, whose
+/// 16-bit inputs round the activations (see `gemm_tc_kernel` in kernels.cu).
+/// `DLM_GEMM=simt|tc` overrides the choice; read once per device.
+pub fn gemm_on_tensor_cores() -> bool {
+    // SAFETY: no arguments; queries the current device's properties.
+    unsafe { dlm_gemm_mode() != 0 }
+}
+
+impl GpuKernel {
+    /// MoE layer `layer` for a batch at `x` (`[batch, hidden]` on the device):
+    /// attention with each projection read once for the whole batch, then each
+    /// slot's own routed experts on its row. Before this a batch of MoE
+    /// sequences went through the whole stack one sequence at a time, reading
+    /// every attention matrix (and the shared expert) once per sequence.
+    fn launch_moe_batched(&self, layer: u32, x: *mut f32, slots: &SlotKv) -> Result<()> {
+        let w = &self.layers[layer as usize];
+        let (core, experts) = w.moe.as_ref().expect("launch_moe_batched on a dense layer");
+        let cfg = &self.cfg;
+        // SAFETY: as `launch_block_batched`; `x` holds `slots.len` rows.
+        let code = unsafe {
+            dlm_moe_attn_batched(
+                cfg.hidden_size as i32,
+                cfg.q_dim() as i32,
+                cfg.kv_dim() as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq_for(layer),
+                x,
+                &slots.keys,
+                &slots.values,
+                &slots.tables,
+                &slots.num_positions,
+                &slots.positions,
+                slots.len as i32,
+                cfg.window_for_layer(layer).unwrap_or(0) as i32,
+                crate::forward::cpu::rope_mscale(cfg.for_layer(layer).rope_scaling),
+                cfg.attn_scale(),
+                cfg.attn_logit_softcap.unwrap_or(0.0),
+                &DlmBlockExt::new(cfg, &w.biases, slots.half, std::ptr::null())
+                    .with_weight_dtypes(&w.dtypes),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_attn_batched",
+                code,
+            });
+        }
+        for b in 0..slots.len {
+            // SAFETY: row `b` of the batch block and of the scratch it filled.
+            let code = unsafe { dlm_moe_take_row(cfg.hidden_size as i32, b as i32) };
+            if code != 0 {
+                return Err(DlmError::Gpu {
+                    api: "dlm_moe_take_row",
+                    code,
+                });
+            }
+            let row = unsafe { x.add(b * cfg.hidden_size) };
+            core.run(cfg, row, |e| {
+                experts.get(e).ok_or_else(|| {
+                    DlmError::InvalidConfig(format!(
+                        "router selected expert {e} but only {} are resident",
+                        experts.len()
+                    ))
+                })
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Tokens per [`dlm_prefill_block`] call (its `DLM_PREFILL_T`).
+const DLM_PREFILL_T: usize = 512;
+/// `cudaErrorNotSupported`: a kernel entry point declining a shape.
+const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+
+impl GpuKernel {
+    /// Prefill `t` tokens at `x` (a `[t, hidden]` device block) through dense
+    /// layer `layer` in one [`dlm_prefill_block`] call. `Ok(false)` when that
+    /// call declines the layer, having changed nothing.
+    fn launch_prefill_block(
+        &self,
+        layer: u32,
+        x: *mut f32,
+        kv: &mut KvLayerCache,
+        position: usize,
+        t: usize,
+    ) -> Result<bool> {
+        let w = &self.layers[layer as usize];
+        let history = kv.len();
+        if history + t > self.kv_capacity_tokens {
+            return Err(DlmError::InvalidConfig(format!(
+                "GPU KV capacity {} exceeded at position {}",
+                self.kv_capacity_tokens,
+                position + t - 1
+            )));
+        }
+        let dkv = kv.device_kv(
+            &self.kv_pools,
+            layer as usize,
+            history + t,
+            self.kv_capacity_tokens,
+            true,
+        )?;
+        let cfg = self.cfg.for_layer(layer);
+        // SAFETY: `x` is a live `[t, hidden]` device block; the weights are this
+        // layer's; the KV pool holds `history + t` rows for this sequence.
+        let code = unsafe {
+            dlm_prefill_block(
+                cfg.hidden_size as i32,
+                cfg.q_dim() as i32,
+                cfg.kv_dim() as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.intermediate_size as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.gate_proj.as_ptr() as *const c_void,
+                w.up_proj.as_ptr() as *const c_void,
+                w.down_proj.as_ptr() as *const c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq_for(layer),
+                x,
+                dkv.keys as *mut c_void,
+                dkv.values as *mut c_void,
+                history as i32,
+                position as i32,
+                t as i32,
+                self.cfg.window_for_layer(layer).unwrap_or(0) as i32,
+                cfg.activation.code(),
+                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                cfg.attn_scale(),
+                cfg.attn_logit_softcap.unwrap_or(0.0),
+                bias_ptr(&w.pre_ffn_norm),
+                bias_ptr(&w.post_ffn_norm),
+                &DlmBlockExt::new(&cfg, &w.biases, dkv.half, dkv.table)
+                    .with_weight_dtypes(&w.dtypes),
+            )
+        };
+        match code {
+            0 => {
+                kv.advance(t);
+                Ok(true)
+            }
+            CUDA_ERROR_NOT_SUPPORTED => Ok(false),
+            code => Err(DlmError::Gpu {
+                api: "dlm_prefill_block",
+                code,
+            }),
+        }
+    }
+}
+
 impl ComputeKernel for GpuKernel {
     fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
         Some(self.kv_pools.free_tokens(fp16))
@@ -1278,7 +1605,19 @@ impl ComputeKernel for GpuKernel {
         let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
         for layer in 0..self.num_layers() {
             let kv = &mut kv_layers[layer as usize];
-            for chunk in (0..n).step_by(DLM_MAX_BATCH) {
+            // The GEMM prefill takes the layer a big piece at a time; a layer it
+            // cannot take (its shape, or the heads) goes 16 tokens per call
+            // through the batched decode block below.
+            let mut done = 0;
+            while done < n {
+                let t = (n - done).min(DLM_PREFILL_T);
+                let x = unsafe { d_hiddens.as_mut_ptr().add(done * hidden_size) };
+                if !self.launch_prefill_block(layer, x, kv, start + done, t)? {
+                    break;
+                }
+                done += t;
+            }
+            for chunk in (done..n).step_by(DLM_MAX_BATCH) {
                 let batch = (n - chunk).min(DLM_MAX_BATCH);
                 let history = kv.len();
                 if history + batch > self.kv_capacity_tokens {
@@ -1315,9 +1654,9 @@ impl ComputeKernel for GpuKernel {
         kv_layers: &mut [&mut [KvLayerCache]],
         positions: &[usize],
     ) -> Result<()> {
-        // MLA and MoE have no batched block; a single sequence gains nothing
-        // from one either.
-        if hiddens.len() <= 1 || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
+        // MLA has no batched block; a single sequence gains nothing from one
+        // either. MoE layers batch their attention (`launch_moe_batched`).
+        if hiddens.len() <= 1 || self.cfg.mla.is_some() {
             for ((hidden, kvs), &position) in
                 hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
             {
@@ -1354,7 +1693,11 @@ impl ComputeKernel for GpuKernel {
                     )?;
                     slots.push(&dkv, n, pos[b]);
                 }
-                self.launch_block_batched(layer, self.d_batch.as_mut_ptr(), &slots)?;
+                if self.layers[layer as usize].moe.is_some() {
+                    self.launch_moe_batched(layer, self.d_batch.as_mut_ptr(), &slots)?;
+                } else {
+                    self.launch_block_batched(layer, self.d_batch.as_mut_ptr(), &slots)?;
+                }
                 for seq in kvs.iter_mut() {
                     seq[layer as usize].advance(1);
                 }
@@ -1640,7 +1983,7 @@ impl GpuKernel {
         d_hidden: &DeviceBuffer,
         kv: &mut KvLayerCache,
     ) -> Result<()> {
-        core.run(&self.cfg, d_hidden, |e| {
+        core.run(&self.cfg, d_hidden.as_mut_ptr(), |e| {
             experts.get(e).ok_or_else(|| {
                 DlmError::InvalidConfig(format!(
                     "router selected expert {e} but only {} are resident",

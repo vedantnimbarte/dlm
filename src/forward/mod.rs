@@ -14,6 +14,8 @@ pub mod kv_pool;
 pub mod multigpu;
 pub mod orchestrator;
 pub(crate) mod pool;
+mod simd;
+pub mod split;
 pub mod streaming;
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub mod streaming_gpu;
@@ -27,6 +29,7 @@ pub use gpu::{GpuKernel, GpuLmHead, MultiGpuKernel};
 pub use kernel::{ComputeKernel, StubKernel};
 pub use multigpu::PipelineParallelKernel;
 pub use orchestrator::{ForwardOrchestrator, KvSnapshot};
+pub use split::SplitKernel;
 pub use streaming::{CachedLayerSource, LayerSource, StreamStats, StreamingKernel};
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub use streaming_gpu::StreamingGpuKernel;

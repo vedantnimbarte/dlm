@@ -670,6 +670,46 @@ impl ModelParts {
         .with_lm_head_on_gpu(quantized, None))
     }
 
+    /// Hold the first `gpu_layers` layers in VRAM and run the rest on the CPU,
+    /// where their weights already are ([`SplitKernel`](crate::forward::SplitKernel)):
+    /// for a model too big for the card, an alternative to streaming the rest
+    /// across PCIe on every token.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn into_split_generator(
+        mut self,
+        gpu_layers: usize,
+    ) -> Result<Generator<crate::forward::SplitKernel<crate::forward::GpuKernel, CpuKernel>>> {
+        let gpu_layers = gpu_layers.min(self.layers.len());
+        let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
+        let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
+        let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
+        let head_norm = self.cfg.norm_kind;
+        let quantized = self
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
+        let back = self.layers.split_off(gpu_layers);
+        let kernel = crate::forward::SplitKernel::new(
+            crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?,
+            CpuKernel::for_layers(self.cfg, back, gpu_layers as u32)?,
+        );
+        Ok(Generator::new(
+            kernel,
+            self.embedding,
+            self.final_norm,
+            self.lm_head,
+            self.vocab_size,
+            self.rms_eps,
+            self.kv_config,
+            self.kv_blocks,
+        )?
+        .with_embed_scale(embed_scale)
+        .with_head(wpe, ln_f_bias, head_norm)
+        .with_final_logit_softcap(logit_cap)
+        .with_lm_head_on_gpu(quantized, None))
+    }
+
     /// Split the model's layers across `gpu_ids` and build a generator over a
     /// **GPU** pipeline ([`MultiGpuKernel`]) — each device holds and computes its
     /// own layer shard (real multi-GPU compute, not the CPU-backed
@@ -803,11 +843,35 @@ pub(crate) fn load_layer_tensors(
     store: &MmapStore,
     cfg: &BlockConfig,
     layer: u32,
+    num_layers: u32,
     quant: QuantScheme,
     packed: Option<PackedQuant>,
     norm_add_one: bool,
 ) -> Result<LayerTensors> {
-    load_layer_tensors_opt(store, cfg, layer, quant, packed, true, norm_add_one)
+    load_layer_tensors_opt(
+        store,
+        cfg,
+        layer,
+        num_layers,
+        quant,
+        packed,
+        true,
+        norm_add_one,
+    )
+}
+
+/// Whether `--quant int4` keeps this layer's `v_proj` and `down_proj` at int8.
+///
+/// llama.cpp's Q4_K_M gives the same two tensors more bits in the first and last
+/// eighth of the layers, and in every third layer between. Those two are where
+/// error reaches the residual stream undamped: `v_proj` feeds attention's output
+/// directly, and `down_proj` writes the FFN's result into the residual. dlm keeps
+/// only the two ends: on Qwen2.5-1.5B the middle third bought nothing for its
+/// 5% more size (mean NLL 2.3564 ends only, 2.3576 with it), and on 0.5B it
+/// bought no more per byte than the ends do.
+fn keeps_more_bits(layer: u32, num_layers: u32) -> bool {
+    let eighth = num_layers.div_ceil(8);
+    layer < eighth || layer >= num_layers - eighth
 }
 
 /// Load an RMSNorm weight, baking Gemma's `+1` in when `add_one` so the norm
@@ -841,10 +905,12 @@ fn load_norm_optional(
 /// **core** (attention, norms, router, shared expert) — the routed experts are
 /// left out for the GPU streaming path to fetch per `(layer, expert)`. No effect
 /// on dense models, which have no separate experts.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_layer_tensors_opt(
     store: &MmapStore,
     cfg: &BlockConfig,
     layer: u32,
+    num_layers: u32,
     quant: QuantScheme,
     packed: Option<PackedQuant>,
     include_experts: bool,
@@ -859,6 +925,16 @@ pub(crate) fn load_layer_tensors_opt(
     let kv_dim = cfg.kv_dim();
     let intermediate = cfg.intermediate_size;
     let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
+    // The two projections `--quant int4` hurts most stay at int8 where they
+    // matter most (see `keeps_more_bits`); everything else takes `quant`. Not
+    // on MLA layers: they have no `v_proj`, and the GPU runs their dense FFN at
+    // one dtype for all three projections.
+    let more =
+        if quant == QuantScheme::Int4 && cfg.mla.is_none() && keeps_more_bits(layer, num_layers) {
+            QuantScheme::Int8
+        } else {
+            quant
+        };
     // load_linear takes (in_features, out_features) of the underlying Linear.
     // Falcon: `transformer.h.{i}`, a fused `query_key_value`, an ungated MLP, and
     // -- with `parallel_attn` -- a single `input_layernorm` feeding both
@@ -876,7 +952,7 @@ pub(crate) fn load_layer_tensors_opt(
         return Ok(LayerTensors {
             q_proj: load_linear_rows(store, &qkv, hidden, fused, 0, q_dim, quant)?,
             k_proj: load_linear_rows(store, &qkv, hidden, fused, q_dim, kv_dim, quant)?,
-            v_proj: load_linear_rows(store, &qkv, hidden, fused, q_dim + kv_dim, kv_dim, quant)?,
+            v_proj: load_linear_rows(store, &qkv, hidden, fused, q_dim + kv_dim, kv_dim, more)?,
             o_proj: load_linear(
                 store,
                 &format!("{p}.self_attention.dense"),
@@ -902,7 +978,7 @@ pub(crate) fn load_layer_tensors_opt(
                     &format!("{p}.mlp.dense_4h_to_h"),
                     intermediate,
                     hidden,
-                    quant,
+                    more,
                     packed,
                 )?,
                 up_bias: load_optional(
@@ -938,7 +1014,7 @@ pub(crate) fn load_layer_tensors_opt(
                 fused,
                 q_dim + kv_dim,
                 kv_dim,
-                quant,
+                more,
             )?,
             o_proj: load_conv1d_transposed(
                 store,
@@ -973,7 +1049,7 @@ pub(crate) fn load_layer_tensors_opt(
                     hidden,
                     0,
                     hidden,
-                    quant,
+                    more,
                 )?,
                 up_bias: load_optional(store, &format!("{p}.mlp.c_fc.bias"), intermediate)?,
                 down_bias: load_optional(store, &format!("{p}.mlp.c_proj.bias"), hidden)?,
@@ -1020,7 +1096,7 @@ pub(crate) fn load_layer_tensors_opt(
                 &name("mlp.down_proj"),
                 intermediate,
                 hidden,
-                quant,
+                more,
                 packed,
             )?,
             up_bias: None,
@@ -1048,7 +1124,7 @@ pub(crate) fn load_layer_tensors_opt(
                 &name("mlp.down_proj"),
                 intermediate,
                 hidden,
-                quant,
+                more,
                 packed,
             )?,
             up_bias: None,
@@ -1094,15 +1170,7 @@ pub(crate) fn load_layer_tensors_opt(
         LayerTensors {
             q_proj: load_linear_rows(store, &qkv, hidden, fused_out, 0, q_dim, quant)?,
             k_proj: load_linear_rows(store, &qkv, hidden, fused_out, q_dim, kv_dim, quant)?,
-            v_proj: load_linear_rows(
-                store,
-                &qkv,
-                hidden,
-                fused_out,
-                q_dim + kv_dim,
-                kv_dim,
-                quant,
-            )?,
+            v_proj: load_linear_rows(store, &qkv, hidden, fused_out, q_dim + kv_dim, kv_dim, more)?,
             o_proj: load_linear(
                 store,
                 &name("self_attn.o_proj"),
@@ -1139,7 +1207,7 @@ pub(crate) fn load_layer_tensors_opt(
                 &name("self_attn.v_proj"),
                 hidden,
                 kv_dim,
-                quant,
+                more,
                 packed,
             )?,
             o_proj: load_linear(
@@ -1466,6 +1534,7 @@ impl LayerSource for MmapLayerSource {
             &self.store,
             &self.cfg,
             layer,
+            self.num_layers,
             self.quant,
             self.packed,
             self.norm_add_one,
@@ -1478,6 +1547,7 @@ impl LayerSource for MmapLayerSource {
             &self.store,
             &self.cfg,
             layer,
+            self.num_layers,
             self.quant,
             self.packed,
             false,
@@ -1729,6 +1799,7 @@ pub fn load_model_parts(
             store,
             &cfg,
             i,
+            config.num_layers,
             config.quant,
             config.packed_quant,
             config.norm_add_one,
@@ -1782,4 +1853,22 @@ pub fn load_model_parts(
         embed_scale: config.embed_scale,
         final_logit_softcap: config.final_logit_softcap,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int4_keeps_the_first_and_last_eighth_at_int8() {
+        let kept = |n: u32| {
+            (0..n)
+                .filter(|&l| keeps_more_bits(l, n))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(24), [0, 1, 2, 21, 22, 23]); // Qwen2.5-0.5B
+        assert_eq!(kept(28), [0, 1, 2, 3, 24, 25, 26, 27]); // Qwen2.5-1.5B
+        assert_eq!(kept(4), [0, 3]);
+        assert_eq!(kept(1), [0]);
+    }
 }

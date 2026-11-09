@@ -27,6 +27,36 @@ impl LayerSource for VecSource {
     }
 }
 
+/// Tolerance for the parity cases with quantized weights. By default their GEMVs
+/// quantize the activations to int8 for `dp4a` (see `Dp4a` in kernels.cu), which
+/// the f32 CPU oracle does not: about a part in a thousand, 3e-3 to 1e-2 here.
+/// That is far below what a decoding bug produces (a misread nibble or high bit
+/// is off by 1 or more), so it still catches one. Run the suite a second time
+/// with `DLM_GEMV_EXACT=1` to hold the f32 decode paths to the tight bound:
+///
+/// ```sh
+/// DLM_GEMV_EXACT=1 cargo test --release --features cuda-kernels --test gpu_parity
+/// ```
+fn quantized_tol() -> f32 {
+    match std::env::var("DLM_GEMV_EXACT") {
+        Ok(v) if !v.is_empty() && v != "0" => 2e-3,
+        _ => 2e-2,
+    }
+}
+
+/// Tolerance for prefill against the CPU. Prefill's projections are GEMMs; on
+/// tensor cores (the default on RTX cards, or forced with `DLM_GEMM=tc`) their
+/// inputs are rounded to 16 bits, about a part in a thousand -- 6e-3 to 1e-2 on
+/// the Gemma cases here, whose activations run larger. The f32 kernel (a GTX
+/// card, or `DLM_GEMM=simt`) is held to the tight bound.
+fn prefill_tol() -> f32 {
+    if dlm::forward::gpu::gemm_on_tensor_cores() {
+        2e-2
+    } else {
+        2e-3
+    }
+}
+
 /// Deterministic SplitMix64 for reproducible synthetic weights.
 struct Rng(u64);
 
@@ -233,6 +263,19 @@ fn gpu_batched_sessions_keep_independent_kv() {
 /// Decode a few tokens on both kernels from the same start state and assert the
 /// GPU tracks the CPU oracle.
 fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32, what: &str) {
+    assert_gpu_close(cfg, layers, tol, false, what)
+}
+
+/// [`assert_gpu_matches_cpu`], optionally measuring the error against the
+/// hidden state's largest magnitude (at least 1): the right yardstick for an
+/// error that is relative, as the int8-activation GEMVs' is.
+fn assert_gpu_close(
+    cfg: BlockConfig,
+    layers: Vec<LayerTensors>,
+    tol: f32,
+    relative: bool,
+    what: &str,
+) {
     let num_layers = layers.len() as u32;
     let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
     let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
@@ -267,9 +310,14 @@ fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32,
             .zip(&h_gpu)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
+        let scale = if relative {
+            h_cpu.iter().fold(1.0f32, |m, v| m.max(v.abs()))
+        } else {
+            1.0
+        };
         assert!(
-            max_diff < tol,
-            "{what}: step {step}: GPU diverged from CPU by {max_diff}"
+            max_diff < tol * scale,
+            "{what}: step {step}: GPU diverged from CPU by {max_diff} (scale {scale})"
         );
     }
 }
@@ -556,10 +604,11 @@ fn gpu_matches_cpu_with_int4_weights() {
                 l
             })
             .collect();
-        assert_gpu_matches_cpu(
+        assert_gpu_close(
             cfg,
             quantized,
-            2e-3,
+            quantized_tol(),
+            true,
             &format!("int4 weights, group {group}"),
         );
     }
@@ -608,11 +657,85 @@ fn gpu_matches_cpu_with_int8_weights() {
                 l
             })
             .collect();
-        assert_gpu_matches_cpu(
+        assert_gpu_close(
             cfg,
             quantized,
-            2e-3,
+            quantized_tol(),
+            true,
             &format!("int8 weights, group {group}"),
+        );
+    }
+}
+
+/// Every ggml block format through the device GEMVs. GGUF weights are decoded
+/// on the GPU straight from the file's blocks by code that shares nothing with
+/// the CPU's `ggml_quant::decode_block`, so a misread nibble or high bit on one
+/// side shows up here and nowhere else. Random bytes make valid blocks once each
+/// f16 scale field is pinned to a small finite value.
+#[test]
+fn gpu_matches_cpu_with_ggml_weights() {
+    use dlm::storage::ggml_quant::GgmlKind;
+    let cfg = BlockConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 64,
+        intermediate_size: 512,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        ..Default::default()
+    };
+    // Each kind's f16 header fields, and the f16 to pin them to: the K-quants
+    // multiply theirs by a 6-bit (Q6_K: 8-bit) sub-block scale as well, so they
+    // take a smaller one to land weights in the same range as the others.
+    let kinds = [
+        (GgmlKind::Q4_0, &[0usize][..], 0x1C00u16), // 0.0039
+        (GgmlKind::Q4_1, &[0, 2], 0x1C00),
+        (GgmlKind::Q5_0, &[0], 0x1C00),
+        (GgmlKind::Q5_1, &[0, 2], 0x1C00),
+        (GgmlKind::Q8_0, &[0], 0x1400), // 0.00098: its codes reach 127, not 15
+        (GgmlKind::Q4K, &[0, 2], 0x0800), // 0.00012
+        (GgmlKind::Q5K, &[0, 2], 0x0800),
+        (GgmlKind::Q6K, &[208], 0x0400), // 0.00006
+    ];
+    for (kind, f16_fields, scale) in kinds {
+        let mut rng = Rng::new(0x6611 + kind.dtype_code() as u64);
+        let mut ggml = |elements: usize| {
+            let mut blob: Vec<u8> = (0..kind.byte_len(elements))
+                .map(|_| rng.next_u64() as u8)
+                .collect();
+            for block in blob.chunks_mut(kind.block_bytes()) {
+                for &f in f16_fields {
+                    block[f..f + 2].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+            Weights::Ggml {
+                blob,
+                kind,
+                num_elements: elements,
+            }
+        };
+        let layers: Vec<LayerTensors> = random_layers(&cfg, 2, 0x6612)
+            .into_iter()
+            .map(|mut l| {
+                l.q_proj = ggml(cfg.q_dim() * cfg.hidden_size);
+                l.k_proj = ggml(cfg.kv_dim() * cfg.hidden_size);
+                l.v_proj = ggml(cfg.kv_dim() * cfg.hidden_size);
+                l.o_proj = ggml(cfg.hidden_size * cfg.q_dim());
+                if let Ffn::Dense(f) = &mut l.ffn {
+                    f.gate = ggml(cfg.intermediate_size * cfg.hidden_size);
+                    f.up = ggml(cfg.intermediate_size * cfg.hidden_size);
+                    f.down = ggml(cfg.hidden_size * cfg.intermediate_size);
+                }
+                l
+            })
+            .collect();
+        assert_gpu_close(
+            cfg,
+            layers,
+            quantized_tol(),
+            true,
+            &format!("{kind:?} weights"),
         );
     }
 }
@@ -1544,7 +1667,7 @@ fn assert_prefill_matches_cpu_kv<K: ComputeKernel>(
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            max_diff < 2e-3,
+            max_diff < prefill_tol(),
             "{what}: round {round} ({tokens} tokens) diverged by {max_diff}"
         );
         assert_eq!(orch_cpu.position(), orch_gpu.position(), "{what}");
@@ -1557,6 +1680,22 @@ fn gpu_prefill_matches_cpu_decode() {
     let layers = random_layers(&cfg, 3, 0xBA7C4);
     let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
     assert_prefill_matches_cpu(cfg, layers, gpu, "dense");
+}
+
+/// `--gpu-layers`: the front of the model on the GPU and the tail on the CPU
+/// computes what the whole model does. The GPU kernel must hand its hidden
+/// state back after its own last layer, not the model's.
+#[test]
+fn split_gpu_cpu_matches_cpu() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 4, 0x5B17);
+    for k in [1, 3] {
+        let split = dlm::forward::SplitKernel::new(
+            GpuKernel::new(cfg, layers[..k].to_vec(), 64).unwrap(),
+            CpuKernel::for_layers(cfg, layers[k..].to_vec(), k as u32).unwrap(),
+        );
+        assert_prefill_matches_cpu(cfg, layers.clone(), split, &format!("split at {k}"));
+    }
 }
 
 /// fp16 device KV (`--kv-quant f16`) through prefill and decode, on the resident
@@ -1712,6 +1851,75 @@ fn gpu_long_context_attention_matches_cpu() {
             d < 2e-3,
             "decode step {step} at 1100+ positions diverged by {d}"
         );
+    }
+}
+
+/// The split-K attention at real head geometries: Qwen2.5's 7 query heads per
+/// KV head at `head_dim` 64 (128 positions per chunk), and `head_dim` 256 (256
+/// per chunk), each long enough to need several chunks and their merge.
+#[test]
+fn gpu_split_attention_matches_cpu_at_real_head_shapes() {
+    for (num_heads, num_kv_heads, head_dim, tokens) in [(14, 2, 64, 300), (4, 2, 256, 600)] {
+        let cfg = BlockConfig {
+            hidden_size: 128,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_size: 256,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            ..Default::default()
+        };
+        let layers = random_layers(&cfg, 1, 0x5A17);
+        let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+        let gpu = GpuKernel::new(cfg, layers, tokens + 8).unwrap();
+        let kv_cfg = KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            block_size: 16,
+        };
+        let blocks = (tokens + 8).div_ceil(16) as u32;
+        let mut orch_cpu = ForwardOrchestrator::new(
+            cpu,
+            PagedKvCache::new(kv_cfg, blocks),
+            dlm::forward::KvQuant::None,
+        );
+        let mut orch_gpu = ForwardOrchestrator::new(
+            gpu,
+            PagedKvCache::new(kv_cfg, blocks),
+            dlm::forward::KvQuant::None,
+        );
+        let mut rng = Rng::new(0x5A18);
+        let h = cfg.hidden_size;
+        let mut want = rng.vec(tokens * h, 0.5);
+        let mut got = want.clone();
+        for hidden in want.chunks_mut(h) {
+            orch_cpu.decode_token(hidden).unwrap();
+        }
+        orch_gpu.prefill(&mut got).unwrap();
+        let mut a = rng.vec(h, 0.5);
+        let mut b = a.clone();
+        orch_cpu.decode_token(&mut a).unwrap();
+        orch_gpu.decode_token(&mut b).unwrap();
+        for (what, x, y) in [
+            (
+                "prefill tail",
+                &want[want.len() - 4 * h..],
+                &got[got.len() - 4 * h..],
+            ),
+            ("decode", &a[..], &b[..]),
+        ] {
+            let d = x
+                .iter()
+                .zip(y)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                d < 2e-3,
+                "heads {num_heads}/{num_kv_heads} dim {head_dim}: {what} diverged by {d}"
+            );
+        }
     }
 }
 
@@ -2120,6 +2328,27 @@ fn gpu_decode_batch_matches_solo() {
     )
     .unwrap();
     assert_decode_batch_matches_solo(&mla, mla_cfg, 4, dlm::forward::KvQuant::None, "mla");
+
+    // MoE batches its attention and routes each slot on its own row.
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 64,
+        shared_intermediate_size: Some(64),
+        norm_topk_prob: true,
+        naming: MoeNaming::Qwen,
+        first_k_dense: 0,
+    };
+    let moe_cfg = BlockConfig {
+        moe: Some(m),
+        ..small_cfg()
+    };
+    let moe = GpuKernel::new(moe_cfg, random_moe_layers(&moe_cfg, 3, 0xDECD), 64)
+        .unwrap()
+        .with_kv_pool_tokens(5 * 64);
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+        assert_decode_batch_matches_solo(&moe, moe_cfg, 5, quant, &format!("moe {quant:?}"));
+    }
 }
 
 /// `run_block_batched` with more slots than one fused call takes (or an MLA

@@ -32,7 +32,7 @@
 
 use crate::error::Result;
 use crate::forward::{ComputeKernel, KvSnapshot};
-use crate::generate::{GenerationSession, Generator, Sampler};
+use crate::generate::{Decoding, GenerationSession, Generator, Sampler};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -127,7 +127,7 @@ struct Pending {
     /// Stop when any of these token ids is produced; empty means run to length.
     eos: Vec<u32>,
     /// How tokens are chosen, on the plain and the speculative path alike.
-    sampler: Sampler,
+    decoding: Decoding,
 }
 
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
@@ -148,9 +148,8 @@ struct Active<'a, K: ComputeKernel> {
     /// The prompt, kept while it is still being prefilled so its prefix can be
     /// cached once it is in. `None` when there is nothing to cache.
     cache_prompt: Option<Vec<u32>>,
-    /// The prompt of a slot that will speculate by lookup once its prompt is in,
-    /// for the lookup to search. `None` otherwise.
-    ngram_prompt: Option<Vec<u32>>,
+    /// Whether the slot turns speculative, by lookup, once its prompt is in.
+    ngram: bool,
 }
 
 impl<K: ComputeKernel> Active<'_, K> {
@@ -325,6 +324,19 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         eos: Vec<u32>,
         sampler: Sampler,
     ) -> Result<()> {
+        self.submit_decoding(id, prompt, max_new_tokens, eos, sampler.into())
+    }
+
+    /// Queue a request with a sampler and what it layers on it (see
+    /// [`Decoding`]).
+    pub fn submit_decoding(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+    ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::DlmError::InvalidConfig(
                 "prompt is empty".into(),
@@ -335,7 +347,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             prompt,
             max_new_tokens,
             eos,
-            sampler,
+            decoding,
         });
         Ok(())
     }
@@ -443,15 +455,20 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 zero_finished.push(p.id);
                 continue;
             }
+            let Decoding {
+                sampler,
+                penalties,
+                grammar,
+            } = p.decoding;
+            // A constrained request decodes plainly even when speculating: see
+            // `Decoding::grammar`.
+            let ngram = self.draft.is_none() && self.gamma > 0 && grammar.is_none();
             let decoder = match self.draft {
-                Some(draft) => Decoder::Speculative(SpeculativeSession::new(
-                    self.generator,
-                    draft,
-                    self.gamma,
-                    &p.prompt,
-                    p.sampler,
-                )?),
-                None => {
+                Some(draft) if grammar.is_none() => Decoder::Speculative(
+                    SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
+                        .with_penalties(penalties),
+                ),
+                _ => {
                     // Resume from the longest cached prefix if one exists;
                     // otherwise prefill from scratch. Either way, cache this
                     // prompt's prefix so later requests can extend it.
@@ -471,20 +488,20 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                             // Pass the whole prompt so the repetition penalty covers
                             // the cached prefix too (resume derives the suffix).
                             self.generator
-                                .resume_session_deferred(snap, &p.prompt, p.sampler)?
+                                .resume_session_deferred(snap, &p.prompt, sampler)?
                         }
-                        None => self
-                            .generator
-                            .start_session_deferred(&p.prompt, p.sampler)?,
+                        None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    Decoder::Plain(session)
+                    let session = session.with_penalties(penalties);
+                    Decoder::Plain(match grammar {
+                        Some(g) => session.with_grammar(g),
+                        None => session,
+                    })
                 }
             };
             // A lookup slot starts plain, so its prompt goes in piecewise and
             // through the prefix cache like any other, and turns speculative
             // once it is in (see `step`).
-            let ngram_prompt =
-                (self.gamma > 0 && matches!(decoder, Decoder::Plain(_))).then(|| p.prompt.clone());
             let cache_prompt = match (&decoder, &self.prefix_cache) {
                 (Decoder::Plain(_), Some(_)) => Some(p.prompt),
                 _ => None,
@@ -496,7 +513,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 eos: p.eos,
                 reserved,
                 cache_prompt,
-                ngram_prompt,
+                ngram,
             });
         }
         Ok(zero_finished)
@@ -564,7 +581,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             .active
             .iter_mut()
             .filter_map(|a| match &mut a.decoder {
-                Decoder::Plain(s) if !s.is_prefilling() && a.ngram_prompt.is_none() => Some(s),
+                Decoder::Plain(s) if !s.is_prefilling() && !a.ngram => Some(s),
                 _ => None,
             })
             .collect();
@@ -603,19 +620,17 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     still_active.push(a);
                     continue;
                 }
-                Decoder::Plain(s) => match a.ngram_prompt.take() {
-                    // Its prompt is in: a lookup slot carries on speculatively,
-                    // its first token chosen without a pass.
-                    Some(prompt) => {
-                        let (s, first) = SpeculativeSession::ngram_from(s, prompt, self.gamma)?;
-                        a.decoder = Decoder::Speculative(s);
-                        vec![first]
-                    }
-                    None => {
-                        a.decoder = Decoder::Plain(s);
-                        vec![plain_tokens.next().expect("one token per plain slot")]
-                    }
-                },
+                // Its prompt is in: a lookup slot carries on speculatively, its
+                // first token chosen without a pass.
+                Decoder::Plain(s) if a.ngram => {
+                    let (s, first) = SpeculativeSession::ngram_from(s, self.gamma)?;
+                    a.decoder = Decoder::Speculative(s);
+                    vec![first]
+                }
+                Decoder::Plain(s) => {
+                    a.decoder = Decoder::Plain(s);
+                    vec![plain_tokens.next().expect("one token per plain slot")]
+                }
                 Decoder::Speculative(mut s) => {
                     let emitted = if fuse {
                         vec![fused_tokens.next().expect("one token per fused slot")]
@@ -638,6 +653,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     done = true;
                     break;
                 }
+            }
+            // A finished grammar with no EOS to end on has nothing left to say.
+            if a.eos.is_empty() && matches!(&a.decoder, Decoder::Plain(s) if s.grammar_exhausted())
+            {
+                done = true;
             }
 
             if done {

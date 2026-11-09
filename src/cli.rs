@@ -332,6 +332,15 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     pub multi_gpu_ids: Vec<u32>,
 
+    /// Hold only the first N layers in VRAM and run the rest on the CPU, where
+    /// their weights already sit (llama.cpp's `-ngl`). An alternative to
+    /// `--stream` for a model too big for the card: streaming moves every
+    /// non-resident layer over PCIe each token, and a desktop's RAM can be
+    /// faster to compute from than to copy out of. Measure both with
+    /// `dlm bench`. GPU only; not with `--stream` or `--multi-gpu-ids`.
+    #[arg(long, value_name = "N")]
+    pub gpu_layers: Option<u32>,
+
     /// Compute device for the serving engine. Defaults to `gpu` on a
     /// `cuda-kernels` build (else `cpu`); pass `--device cpu` to force CPU.
     /// Ignored when `--multi-gpu-ids` is set. If `gpu` is chosen but no device is
@@ -486,6 +495,17 @@ pub struct BenchOpts {
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
 
+    /// Compare against a baseline written by `--json`: print each metric's
+    /// change, and exit non-zero if prefill or decode tok/s fell by more than
+    /// `--tolerance` at any batch size both runs measured.
+    #[arg(long, value_name = "FILE")]
+    pub compare: Option<PathBuf>,
+
+    /// How far (percent) throughput may fall below the `--compare` baseline
+    /// before it counts as a regression.
+    #[arg(long, value_name = "PCT", default_value_t = 5.0)]
+    pub tolerance: f64,
+
     /// Break decode time down by streaming stage (mmap, H2D, compute, ...).
     /// Streaming paths only. Off by default: timing the stages adds overhead of
     /// its own, so leave it off when the headline numbers matter.
@@ -639,9 +659,20 @@ pub struct ScoreArgs {
     #[arg(long, value_name = "FILE")]
     pub json: Option<std::path::PathBuf>,
 
+    /// Weight precision, as for `dlm run`: the checkpoint's own by default, or
+    /// `int4`/`int8` to score the model quantized at load (what that costs in
+    /// log-likelihood is the point of scoring it).
+    #[arg(long, value_enum)]
+    pub quant: Option<QuantArg>,
+
     /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`).
     #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
+
+    /// KV-cache precision to score with, to measure what a cheaper cache costs.
+    /// Exact `f32` by default, so the scores stay a parity reference.
+    #[arg(long, value_enum, default_value_t = KvQuantArg::F32)]
+    pub kv_quant: KvQuantArg,
 }
 
 #[cfg(test)]
@@ -818,6 +849,8 @@ mod tests {
             "1,4",
             "--gen-len",
             "32",
+            "--compare",
+            "base.json",
         ])
         .unwrap();
         let Command::Bench(a) = cli.command else {
@@ -828,6 +861,8 @@ mod tests {
         assert_eq!(a.opts.batch, vec![1, 4]);
         assert_eq!(a.opts.gen_len, 32);
         assert_eq!(a.opts.prompt_len, 512);
+        assert_eq!(a.opts.compare, Some(PathBuf::from("base.json")));
+        assert_eq!(a.opts.tolerance, 5.0);
         assert!(a.serve.bench.is_none());
     }
 

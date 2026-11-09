@@ -1339,7 +1339,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         let GpuFfn::Moe(core) = &w.ffn else {
             unreachable!("run_moe_ffn on a dense layer");
         };
-        core.run(&self.shared.cfg, d_hidden, |e| {
+        core.run(&self.shared.cfg, d_hidden.as_mut_ptr(), |e| {
             // Feed the prefetch heuristic: next token's hot set predicts this one's.
             self.shared.history.lock().unwrap().record(layer, e as u32);
             self.shared.ensure_expert(layer, e as u32)

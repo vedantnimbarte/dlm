@@ -826,7 +826,14 @@ inference engine):
   be **streamed** to the client token by token. Started by `dlm serve`.
   Per-request **sampling** is honored on both dialects: `temperature`, `top_p`,
   `top_k`, `min_p`, `repetition_penalty` and `seed` select the sampler
-  (temperature `0` → deterministic greedy); `stop` (OpenAI) / `stop_sequences`
+  (temperature `0` → deterministic greedy), and OpenAI's `logit_bias`,
+  `frequency_penalty` and `presence_penalty`, and llama.cpp's DRY
+  (`dry_multiplier`, `dry_base`, `dry_allowed_length`,
+  `dry_sequence_breakers`) adjust the logits under any sampler. **Constrained
+  output** (OpenAI endpoints): `response_format` `json_object` or `json_schema`
+  holds the output to JSON (of that schema), and `grammar` to a GBNF grammar,
+  llama.cpp's format ([`src/grammar.rs`](src/grammar.rs) lists the supported
+  schema subset). `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,

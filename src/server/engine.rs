@@ -11,14 +11,15 @@
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
-use crate::generate::{Generator, Sampler};
+use crate::generate::{Decoding, Dry, Generator, Penalties, Sampler};
+use crate::grammar::{Constraint, Grammar, TokenBytes};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A token event streamed back for one request. `Done` carries the request's
 /// speculative acceptance stats when it was decoded speculatively (`None` on the
@@ -33,7 +34,7 @@ struct Job {
     prompt: Vec<u32>,
     max_new: usize,
     eos: Vec<u32>,
-    sampler: Sampler,
+    decoding: Decoding,
     sink: Sender<TokenEvent>,
 }
 
@@ -96,6 +97,8 @@ pub struct EngineService {
     metrics: Metrics,
     /// Layer-streaming stats, shared with the engine loop that publishes them.
     stream: Arc<StreamMetrics>,
+    /// Each token id's bytes, built on first use (see [`token_bytes`](Self::token_bytes)).
+    token_bytes: OnceLock<TokenBytes>,
 }
 
 impl EngineService {
@@ -226,7 +229,19 @@ impl EngineService {
             max_context: usize::MAX,
             metrics: Metrics::default(),
             stream,
+            token_bytes: OnceLock::new(),
         })
+    }
+
+    /// Each token id's bytes (`None` for special tokens). Requests that look at
+    /// token text need them, and decoding the whole vocabulary per request
+    /// would cost more than the request, so it happens once.
+    fn token_bytes(&self) -> TokenBytes {
+        let table = self.token_bytes.get_or_init(|| {
+            let ids = 0..self.vocab_size as u32;
+            Arc::new(ids.map(|id| self.tokenizer.token_bytes(id)).collect())
+        });
+        Arc::clone(table)
     }
 
     /// Record a completed generation into the `/metrics` counters.
@@ -275,7 +290,7 @@ impl EngineService {
         prompt: Vec<u32>,
         max_new: usize,
         eos: Vec<u32>,
-        sampler: Sampler,
+        decoding: Decoding,
     ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -288,7 +303,7 @@ impl EngineService {
                 prompt,
                 max_new,
                 eos,
-                sampler,
+                decoding,
                 sink,
             });
         out
@@ -391,7 +406,7 @@ fn enqueue<K: ComputeKernel>(
     sinks: &mut HashMap<u64, Sender<TokenEvent>>,
     job: Job,
 ) {
-    match sched.submit_sampled(job.id, job.prompt, job.max_new, job.eos, job.sampler) {
+    match sched.submit_decoding(job.id, job.prompt, job.max_new, job.eos, job.decoding) {
         Ok(()) => {
             sinks.insert(job.id, job.sink);
         }
@@ -491,6 +506,172 @@ struct ChatRequest {
     /// Stop sequence(s): generation is cut before the first occurrence.
     #[serde(default)]
     stop: Option<Stop>,
+    #[serde(flatten)]
+    extra: ExtraSampling,
+}
+
+/// The OpenAI sampling fields that layer on the sampler, shared by chat and
+/// completions. [`decoding`] validates them before anything is queued.
+#[derive(Deserialize, Default)]
+struct ExtraSampling {
+    /// Token id (as a string, OpenAI's shape) → bias added to its logit.
+    #[serde(default)]
+    logit_bias: Option<HashMap<String, f32>>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    /// DRY (non-standard, llama.cpp's names): off unless `dry_multiplier > 0`.
+    #[serde(default)]
+    dry_multiplier: Option<f32>,
+    #[serde(default)]
+    dry_base: Option<f32>,
+    #[serde(default)]
+    dry_allowed_length: Option<usize>,
+    #[serde(default)]
+    dry_sequence_breakers: Option<Vec<String>>,
+    /// `json_object` or `json_schema` constrains the output to JSON.
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+    /// A GBNF grammar the output must match (non-standard, llama.cpp's field).
+    #[serde(default)]
+    grammar: Option<String>,
+}
+
+/// OpenAI's `response_format`.
+#[derive(Deserialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    json_schema: Option<JsonSchemaFormat>,
+}
+
+/// `response_format.json_schema`. Its `name` and `strict` are accepted and
+/// ignored: the output is always held to the schema.
+#[derive(Deserialize)]
+struct JsonSchemaFormat {
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
+}
+
+/// DRY's sequence breakers when a request names none (llama.cpp's defaults).
+const DRY_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
+
+/// Check the request's extra sampling fields and combine them with `sampler`.
+/// An out-of-range value is a client error, not something to clamp quietly: a
+/// client that asked for it would otherwise get output it did not ask for and no
+/// sign why.
+fn decoding(
+    engine: &EngineService,
+    sampler: Sampler,
+    extra: ExtraSampling,
+) -> Result<Decoding, String> {
+    let mut logit_bias = Vec::new();
+    for (key, &bias) in extra.logit_bias.iter().flatten() {
+        let token: u32 = key
+            .parse()
+            .map_err(|_| format!("logit_bias: '{key}' is not a token id"))?;
+        if token as usize >= engine.vocab_size {
+            return Err(format!(
+                "logit_bias: token {token} is outside the vocabulary"
+            ));
+        }
+        if !(-100.0..=100.0).contains(&bias) {
+            return Err(format!(
+                "logit_bias: the bias for token {token} must be between -100 and 100"
+            ));
+        }
+        logit_bias.push((token, bias));
+    }
+    let penalty = |name: &str, value: Option<f32>| match value.unwrap_or(0.0) {
+        v if (-2.0..=2.0).contains(&v) => Ok(v),
+        _ => Err(format!("{name} must be between -2 and 2")),
+    };
+    Ok(Decoding {
+        sampler,
+        penalties: Penalties {
+            logit_bias,
+            frequency: penalty("frequency_penalty", extra.frequency_penalty)?,
+            presence: penalty("presence_penalty", extra.presence_penalty)?,
+            dry: dry(engine, &extra)?,
+        },
+        grammar: constraint(engine, &extra)?,
+    })
+}
+
+/// The grammar the request's output must match, if it asked for one. A
+/// grammar or schema that does not parse is the client's error to fix, so it
+/// is refused here rather than failing the request mid-generation.
+fn constraint(engine: &EngineService, extra: &ExtraSampling) -> Result<Option<Constraint>, String> {
+    let format = extra.response_format.as_ref();
+    let grammar = match (format.map(|f| f.kind.as_str()), &extra.grammar) {
+        (Some("json_object" | "json_schema"), Some(_)) => {
+            return Err("set grammar or a JSON response_format, not both".into())
+        }
+        (None | Some("text"), None) => return Ok(None),
+        (None | Some("text"), Some(gbnf)) => Grammar::parse(gbnf)?,
+        (Some("json_object"), None) => Grammar::json_object(),
+        (Some("json_schema"), None) => {
+            let schema = format
+                .and_then(|f| f.json_schema.as_ref())
+                .and_then(|j| j.schema.as_ref())
+                .ok_or("response_format: json_schema needs json_schema.schema")?;
+            Grammar::from_json_schema(schema)?
+        }
+        (Some(other), _) => {
+            return Err(format!(
+                "response_format: type '{other}' is not text, json_object or json_schema"
+            ))
+        }
+    };
+    Ok(Some(Constraint::new(
+        Arc::new(grammar),
+        engine.token_bytes(),
+        engine.eos_tokens.clone(),
+    )))
+}
+
+/// The request's DRY settings, or `None` when its multiplier leaves it off.
+fn dry(engine: &EngineService, extra: &ExtraSampling) -> Result<Option<Dry>, String> {
+    let multiplier = extra.dry_multiplier.unwrap_or(0.0);
+    let base = extra.dry_base.unwrap_or(1.75);
+    let allowed_length = extra.dry_allowed_length.unwrap_or(2);
+    if !(0.0..=f32::MAX).contains(&multiplier) {
+        return Err("dry_multiplier must be 0 or more".into());
+    }
+    if !(1.0..=f32::MAX).contains(&base) {
+        return Err("dry_base must be at least 1".into());
+    }
+    if allowed_length == 0 {
+        return Err("dry_allowed_length must be at least 1".into());
+    }
+    let breakers: Vec<&[u8]> = match &extra.dry_sequence_breakers {
+        Some(b) => b.iter().map(|s| s.as_bytes()).collect(),
+        None => DRY_BREAKERS.iter().map(|s| s.as_bytes()).collect(),
+    };
+    if breakers.iter().any(|b| b.is_empty()) {
+        return Err("dry_sequence_breakers must not contain an empty string".into());
+    }
+    if multiplier == 0.0 {
+        return Ok(None);
+    }
+    // ponytail: a breaker counts only inside one token; one that a tokenizer
+    // splits across two (a multi-character breaker) is not seen. llama.cpp
+    // tracks those; the default single-character breakers never need it.
+    let tokens = engine.token_bytes();
+    let breaks = |t: &[u8]| breakers.iter().any(|b| t.windows(b.len()).any(|w| w == *b));
+    let breakers = (0u32..)
+        .zip(tokens.iter())
+        .filter(|(_, bytes)| bytes.as_deref().is_some_and(breaks))
+        .map(|(id, _)| id)
+        .collect();
+    Ok(Some(Dry {
+        multiplier,
+        base,
+        allowed_length,
+        breakers,
+    }))
 }
 
 /// Flatten the `stop` field into a list of non-empty stop strings.
@@ -1134,11 +1315,11 @@ fn collect_completion(
     engine: &Arc<EngineService>,
     ids: Vec<u32>,
     max_tokens: usize,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: &[String],
 ) -> Generated {
     let prompt_tokens = ids.len();
-    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
     let mut tokens = Vec::new();
     let mut spec = None;
     let mut hit_eos = false;
@@ -1208,13 +1389,17 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Err(e) => return Response::json(400, error_json(&e)),
     };
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
+    let decoding = match decoding(engine, sampler, parsed.extra) {
+        Ok(d) => d,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_chat(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
+        stream_chat(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
     } else {
-        let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
         let body = ChatResponse {
             id: format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed)),
             object: "chat.completion",
@@ -1269,6 +1454,8 @@ struct CompletionRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Option<Stop>,
+    #[serde(flatten)]
+    extra: ExtraSampling,
 }
 
 #[derive(Serialize)]
@@ -1334,13 +1521,17 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
         },
         _ => Sampler::Greedy,
     };
+    let decoding = match decoding(engine, sampler, parsed.extra) {
+        Ok(d) => d,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let stops = normalize_stop(parsed.stop);
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_completion(Arc::clone(engine), ids, max_tokens, model, sampler, stops)
+        stream_completion(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
     } else {
-        let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
         let body = CompletionResponse {
             id: format!("cmpl-{id}"),
             object: "text_completion",
@@ -1373,7 +1564,7 @@ fn stream_completion(
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
@@ -1406,7 +1597,7 @@ fn stream_completion(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
@@ -1665,10 +1856,17 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        return stream_messages(Arc::clone(engine), ids, max_tokens, model, sampler, stops);
+        return stream_messages(
+            Arc::clone(engine),
+            ids,
+            max_tokens,
+            model,
+            sampler.into(),
+            stops,
+        );
     }
 
-    let g = collect_completion(engine, ids, max_tokens, sampler, &stops);
+    let g = collect_completion(engine, ids, max_tokens, sampler.into(), &stops);
     let body = MessagesResponse {
         id: format!("msg-{id}"),
         kind: "message",
@@ -1704,7 +1902,7 @@ fn stream_messages(
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
@@ -1754,7 +1952,7 @@ fn stream_messages(
         let mut sent_chars = 0usize;
         let mut stop_reason = "max_tokens";
         let mut stop_sequence: Option<String> = None;
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {
@@ -1828,7 +2026,7 @@ fn stream_chat(
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    sampler: Sampler,
+    decoding: Decoding,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
@@ -1873,7 +2071,7 @@ fn stream_chat(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), sampler);
+        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
                 TokenEvent::Next(t) => {

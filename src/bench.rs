@@ -9,12 +9,12 @@ use crate::error::{DlmError, Result};
 use crate::forward::ComputeKernel;
 use crate::generate::{Generator, Sampler};
 use crate::telemetry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// One measured run at one batch size.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     pub batch: usize,
     /// Prompt tokens per second, over every sequence's prefill.
@@ -27,13 +27,121 @@ pub struct RunResult {
     pub ms_per_step: f64,
     /// `--breakdown`: milliseconds per generated token spent in each streaming
     /// stage. Empty when off, or on paths that emit no stage events.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stage_ms_per_token: BTreeMap<String, f64>,
     /// Device memory in use at the end of decode, with every sequence's KV cache
     /// still allocated. Whole device, so other processes count. `None` without
     /// a GPU.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vram_used_bytes: Option<u64>,
+    /// This process's peak resident memory at the end of the run (a high-water
+    /// mark, so it covers every run before it too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
+}
+
+/// What `--json` writes and `--compare` reads back: the runs, plus what was run
+/// and where, so two files can be told apart later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Report {
+    pub version: String,
+    /// The commit the binary was built from, when the build recorded one
+    /// (`DLM_GIT_COMMIT` at build time).
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// Seconds since the Unix epoch.
+    #[serde(default)]
+    pub timestamp: u64,
+    pub model: String,
+    pub device: String,
+    pub gpu_backend: String,
+    #[serde(default)]
+    pub gpu_name: Option<String>,
+    pub quant: String,
+    pub stream: bool,
+    pub kv_quant: String,
+    pub context_length: u32,
+    pub prompt_len: usize,
+    pub gen_len: usize,
+    pub runs: Vec<RunResult>,
+    /// The median of each metric per batch size: what `--compare` compares.
+    pub summary: Vec<RunResult>,
+    pub peak_rss_bytes: Option<u64>,
+    pub vram_used_bytes: Option<u64>,
+}
+
+/// One metric of one batch size, baseline against this run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delta {
+    pub batch: usize,
+    pub metric: &'static str,
+    pub before: f64,
+    pub after: f64,
+    /// `(after - before) / before`, in percent.
+    pub change_pct: f64,
+    /// A throughput metric that fell by more than the tolerance.
+    pub regressed: bool,
+}
+
+/// Compare two summaries batch by batch. Every metric is listed, but only
+/// prefill and decode tok/s can regress: latency follows from them, and memory
+/// moves for reasons (other processes on the GPU) a speed check should not fail
+/// on. Batch sizes measured on only one side are skipped.
+pub fn compare(base: &[RunResult], new: &[RunResult], tolerance_pct: f64) -> Vec<Delta> {
+    let mut out = Vec::new();
+    for n in new {
+        let Some(b) = base.iter().find(|b| b.batch == n.batch) else {
+            continue;
+        };
+        let mb = |x: Option<u64>| x.map(|v| v as f64 / (1u64 << 20) as f64);
+        let metrics = [
+            (
+                "prefill tok/s",
+                Some(b.prefill_tok_s),
+                Some(n.prefill_tok_s),
+                true,
+            ),
+            ("ttft ms", Some(b.ttft_ms), Some(n.ttft_ms), false),
+            (
+                "decode tok/s",
+                Some(b.decode_tok_s),
+                Some(n.decode_tok_s),
+                true,
+            ),
+            ("ms/step", Some(b.ms_per_step), Some(n.ms_per_step), false),
+            (
+                "peak rss MiB",
+                mb(b.peak_rss_bytes),
+                mb(n.peak_rss_bytes),
+                false,
+            ),
+            (
+                "vram MiB",
+                mb(b.vram_used_bytes),
+                mb(n.vram_used_bytes),
+                false,
+            ),
+        ];
+        for (metric, before, after, gated) in metrics {
+            let (Some(before), Some(after)) = (before, after) else {
+                continue;
+            };
+            let change_pct = if before == 0.0 {
+                0.0
+            } else {
+                (after - before) / before * 100.0
+            };
+            out.push(Delta {
+                batch: n.batch,
+                metric,
+                before,
+                after,
+                change_pct,
+                regressed: gated && change_pct < -tolerance_pct,
+            });
+        }
+    }
+    out
 }
 
 /// A prompt of exactly `len` tokens: `seed` repeated, folded into the vocab.
@@ -141,6 +249,7 @@ fn run_once<K: ComputeKernel>(
             .map(|(k, us)| (k, us as f64 / 1e3 / tokens))
             .collect(),
         vram_used_bytes,
+        peak_rss_bytes: peak_rss_bytes(),
     })
 }
 
@@ -175,6 +284,7 @@ pub fn summarize(results: &[RunResult]) -> Vec<RunResult> {
                 ms_per_step: med(&|r| r.ms_per_step),
                 stage_ms_per_token: stages,
                 vram_used_bytes: runs.iter().filter_map(|r| r.vram_used_bytes).max(),
+                peak_rss_bytes: runs.iter().filter_map(|r| r.peak_rss_bytes).max(),
             }
         })
         .collect()
@@ -246,7 +356,84 @@ mod tests {
             ms_per_step: 1e3 / decode,
             stage_ms_per_token: BTreeMap::new(),
             vram_used_bytes: None,
+            peak_rss_bytes: Some(1 << 30),
         }
+    }
+
+    fn report(summary: Vec<RunResult>) -> Report {
+        Report {
+            version: "0.4.0".into(),
+            commit: Some("abc1234".into()),
+            timestamp: 1_762_700_000,
+            model: "models/Qwen2.5-0.5B-Instruct".into(),
+            device: "gpu".into(),
+            gpu_backend: "CUDA".into(),
+            gpu_name: Some("NVIDIA GeForce GTX 1650".into()),
+            quant: "Int4".into(),
+            stream: false,
+            kv_quant: "f16".into(),
+            context_length: 1024,
+            prompt_len: 512,
+            gen_len: 64,
+            runs: summary.clone(),
+            summary,
+            peak_rss_bytes: Some(1 << 30),
+            vram_used_bytes: None,
+        }
+    }
+
+    #[test]
+    fn report_round_trips_through_json() {
+        let mut r = row(4, 35.1);
+        r.stage_ms_per_token.insert("H2D".into(), 1.5);
+        r.vram_used_bytes = Some(1 << 31);
+        let before = report(vec![row(1, 38.8), r]);
+        let text = serde_json::to_string_pretty(&before).unwrap();
+        let after: Report = serde_json::from_str(&text).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&after).unwrap(), text);
+        assert_eq!(after.summary[1].stage_ms_per_token["H2D"], 1.5);
+    }
+
+    #[test]
+    fn reads_a_report_written_before_the_new_fields() {
+        // What `--json` wrote before it recorded commit, time, GPU and per-row RSS.
+        let old = r#"{"version":"0.4.0","model":"m","device":"cpu","gpu_backend":"none",
+            "quant":"Fp16","stream":false,"kv_quant":"f16","context_length":512,
+            "prompt_len":128,"gen_len":16,"runs":[],"summary":[{"batch":1,
+            "prefill_tok_s":9.1,"ttft_ms":14233.0,"decode_tok_s":7.38,"ms_per_step":135.5}],
+            "peak_rss_bytes":2867000000,"vram_used_bytes":null}"#;
+        let r: Report = serde_json::from_str(old).unwrap();
+        assert_eq!((r.commit, r.summary[0].peak_rss_bytes), (None, None));
+        assert_eq!(r.summary[0].decode_tok_s, 7.38);
+    }
+
+    #[test]
+    fn compare_flags_only_throughput_beyond_tolerance() {
+        let base = [row(1, 40.0), row(4, 100.0)];
+        let mut slow = row(1, 37.0); // -7.5% decode, -7.5% prefill
+        slow.ttft_ms = 10.0; // 10x worse latency, but latency never fails the check
+        let new = [slow, row(4, 98.0), row(8, 1.0)]; // -2%; batch 8 has no baseline
+        let d = compare(&base, &new, 5.0);
+        let regressed: Vec<_> = d
+            .iter()
+            .filter(|d| d.regressed)
+            .map(|d| (d.batch, d.metric))
+            .collect();
+        assert_eq!(regressed, [(1, "prefill tok/s"), (1, "decode tok/s")]);
+        let decode = d
+            .iter()
+            .find(|d| d.batch == 1 && d.metric == "decode tok/s")
+            .unwrap();
+        assert!((decode.change_pct + 7.5).abs() < 1e-9);
+        assert!(d.iter().all(|d| d.batch != 8));
+        // A looser tolerance lets the same run pass, and a faster one always does.
+        assert!(compare(&base, &new, 10.0).iter().all(|d| !d.regressed));
+        assert!(compare(&base, &[row(1, 80.0)], 0.0)
+            .iter()
+            .all(|d| !d.regressed));
+        // Memory only shows when both sides measured it.
+        assert!(d.iter().any(|d| d.metric == "peak rss MiB"));
+        assert!(d.iter().all(|d| d.metric != "vram MiB"));
     }
 
     #[test]
