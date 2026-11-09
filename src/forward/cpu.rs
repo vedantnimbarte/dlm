@@ -1981,8 +1981,10 @@ where
     y
 }
 
-/// GEMVs at least this large (in MACs) run on the pool.
-const PARALLEL_MACS: usize = 1 << 20;
+/// GEMVs at least this large (in MACs) run on the pool. With the SIMD kernels a
+/// Qwen2.5-0.5B `q_proj` (896×896, 0.8M) took 50 µs on one core and 30 µs on
+/// the pool; its 128-row `k_proj` (0.1M) is faster where it is.
+const PARALLEL_MACS: usize = 1 << 18;
 
 /// Root-mean-square layer norm with a learned scale.
 pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
@@ -3047,7 +3049,7 @@ mod tests {
     /// the kind of bug that only shows up on one layer of one model.
     #[test]
     fn matvec_rows_agrees_across_the_parallel_threshold() {
-        // Straddle the 1<<20 MAC threshold: `small` stays serial, `large` splits.
+        // Straddle `PARALLEL_MACS`: `small` stays serial, `large` splits.
         for (out_dim, in_dim) in [(4usize, 8usize), (2048usize, 1024usize)] {
             let x: Vec<f32> = (0..in_dim)
                 .map(|i| ((i % 13) as f32) * 0.031 - 0.2)
