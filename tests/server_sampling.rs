@@ -163,6 +163,21 @@ fn presence_penalty_stops_a_token_repeating() {
 }
 
 #[test]
+fn dry_breaks_a_loop_once_it_is_long_enough() {
+    let addr = start_server();
+    // Biased into "AAAAAA". DRY lets a run reach dry_allowed_length (2), then
+    // charges the token that would extend it: after "AAA", A would make the
+    // repeat "AA" → "AA" one longer, and costs 5 against the bias's 3.
+    let biased = r#""max_tokens":6,"logit_bias":{"65":3}"#;
+    assert_eq!(assistant_text(&chat(addr, biased)), "AAAAAA");
+    let text = assistant_text(&chat(addr, &format!(r#"{biased},"dry_multiplier":5"#)));
+    assert!(
+        text.starts_with("AAA") && !text.starts_with("AAAA"),
+        "{text:?}"
+    );
+}
+
+#[test]
 fn out_of_range_sampling_fields_are_rejected() {
     let addr = start_server();
     for (field, why) in [
@@ -177,6 +192,13 @@ fn out_of_range_sampling_fields_are_rejected() {
             r#""presence_penalty":-3"#,
             "presence_penalty must be between -2 and 2",
         ),
+        (r#""dry_multiplier":-1"#, "dry_multiplier must be 0 or more"),
+        (r#""dry_base":0.5"#, "dry_base must be at least 1"),
+        (
+            r#""dry_allowed_length":0"#,
+            "dry_allowed_length must be at least 1",
+        ),
+        (r#""dry_sequence_breakers":["\n",""]"#, "empty string"),
     ] {
         let resp = chat(addr, field);
         assert!(resp.starts_with("HTTP/1.1 400"), "{field}: {resp}");

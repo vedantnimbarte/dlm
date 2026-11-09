@@ -165,6 +165,77 @@ pub struct Penalties {
     /// OpenAI's `presence_penalty`: subtracted once from any token generated
     /// at all.
     pub presence: f32,
+    pub dry: Option<Dry>,
+}
+
+/// DRY ("don't repeat yourself"), as in llama.cpp and KoboldCpp: penalize the
+/// token that would extend a run already seen earlier in the context, by
+/// `multiplier * base^(run - allowed_length)`. It catches the loops that
+/// per-token penalties miss — every token in a repeated sentence is ordinary on
+/// its own; it is the sequence that is the problem — and the exponent makes a
+/// long verbatim loop very expensive while leaving short common phrases alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dry {
+    pub multiplier: f32,
+    pub base: f32,
+    /// Runs shorter than this are not penalized.
+    pub allowed_length: usize,
+    /// Tokens a run cannot span: those whose text contains a sequence breaker
+    /// (a newline, say), so repeating a structure line by line is not a loop.
+    pub breakers: std::collections::HashSet<u32>,
+}
+
+impl Dry {
+    fn apply(&self, logits: &mut [f32], context: &[u32]) {
+        // Only the stretch after the last breaker can hold a run, read
+        // backwards so a run ending at the newest token is a common prefix.
+        let start = context
+            .iter()
+            .rposition(|t| self.breakers.contains(t))
+            .map_or(0, |i| i + 1);
+        let rev: Vec<u32> = context[start..].iter().rev().copied().collect();
+        // z[i] is how far the tokens before rev[i] repeat the newest ones, so
+        // the token after that earlier occurrence (rev[i - 1]) would extend a
+        // run of z[i]. Keep the longest run each token would extend.
+        let z = z_function(&rev);
+        let mut longest = std::collections::HashMap::new();
+        for i in 1..rev.len() {
+            if z[i] >= self.allowed_length {
+                let run = longest.entry(rev[i - 1]).or_insert(0);
+                *run = z[i].max(*run);
+            }
+        }
+        for (token, run) in longest {
+            if let Some(l) = logits.get_mut(token as usize) {
+                let exp = (run - self.allowed_length) as f32;
+                *l -= (self.multiplier * self.base.powf(exp)).min(f32::MAX);
+            }
+        }
+    }
+}
+
+/// The Z-array: `z[i]` is the length of the longest common prefix of `s` and
+/// `s[i..]` (with `z[0] = s.len()`). Linear time, so DRY costs O(context) a
+/// token rather than O(context²).
+fn z_function(s: &[u32]) -> Vec<usize> {
+    let n = s.len();
+    let mut z = vec![0; n];
+    if n > 0 {
+        z[0] = n;
+    }
+    let (mut l, mut r) = (0, 0);
+    for i in 1..n {
+        if i < r {
+            z[i] = (r - i).min(z[i - l]);
+        }
+        while i + z[i] < n && s[z[i]] == s[i + z[i]] {
+            z[i] += 1;
+        }
+        if i + z[i] > r {
+            (l, r) = (i, i + z[i]);
+        }
+    }
+    z
 }
 
 impl Penalties {
@@ -172,7 +243,12 @@ impl Penalties {
     /// prompt (its first `prompt_len` tokens) followed by what was generated.
     /// The frequency and presence penalties count generated tokens only, as
     /// OpenAI's do: a prompt that quotes a word should not make it unsayable.
+    /// DRY reads the whole context, as llama.cpp's does: repeating the prompt
+    /// back verbatim is a loop too.
     pub fn apply(&self, logits: &mut [f32], context: &[u32], prompt_len: usize) {
+        if let Some(dry) = &self.dry {
+            dry.apply(logits, context);
+        }
         for &(token, bias) in &self.logit_bias {
             if let Some(l) = logits.get_mut(token as usize) {
                 *l += bias;
@@ -1375,6 +1451,44 @@ mod tests {
             .with_penalties(penalties);
         assert_eq!(s.step().unwrap(), 3);
         assert_eq!(s.step().unwrap(), 3);
+    }
+
+    #[test]
+    fn dry_penalizes_the_token_that_would_extend_a_repeat() {
+        let dry = Dry {
+            multiplier: 1.0,
+            base: 2.0,
+            allowed_length: 2,
+            breakers: [9].into_iter().collect(),
+        };
+        let run = |context: &[u32]| {
+            let mut logits = vec![0.0f32; 10];
+            dry.apply(&mut logits, context);
+            logits
+        };
+        // "1 2 3" has come round again, and 4 followed it last time: emitting
+        // 4 would make a run of four. Run 3 → 1 · 2^(3 - 2).
+        let mut want = vec![0.0f32; 10];
+        want[4] = -2.0;
+        assert_eq!(run(&[1, 2, 3, 4, 1, 2, 3]), want);
+        // Longer runs cost exponentially more; the newest occurrence of a
+        // self-overlapping run counts too ("1 1 1" then 1).
+        want[4] = 0.0;
+        want[1] = -4.0;
+        assert_eq!(run(&[1, 1, 1, 1, 1]), want, "run of 4 → 2^2");
+        // Shorter than allowed_length: free.
+        assert_eq!(run(&[3, 4, 3]), vec![0.0; 10]);
+        // A breaker between the occurrences cuts the run.
+        assert_eq!(run(&[1, 2, 3, 4, 9, 1, 2, 3]), vec![0.0; 10]);
+    }
+
+    #[test]
+    fn z_function_matches_its_definition() {
+        let s = [1u32, 1, 2, 1, 1, 2, 1];
+        let naive: Vec<usize> = (0..s.len())
+            .map(|i| s[i..].iter().zip(&s).take_while(|(a, b)| a == b).count())
+            .collect();
+        assert_eq!(z_function(&s), naive);
     }
 
     #[test]

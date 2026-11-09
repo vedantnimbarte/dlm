@@ -168,6 +168,12 @@ fn speculative_penalties_match_plain_decoding() {
         logit_bias: vec![(5, -100.0)],
         frequency: 2.0,
         presence: 1.0,
+        dry: Some(dlm::generate::Dry {
+            multiplier: 1.0,
+            base: 1.75,
+            allowed_length: 2,
+            breakers: [7].into_iter().collect(),
+        }),
     };
 
     let mut plain = target

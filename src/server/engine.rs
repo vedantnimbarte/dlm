@@ -11,14 +11,14 @@
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
-use crate::generate::{Decoding, Generator, Penalties, Sampler};
+use crate::generate::{Decoding, Dry, Generator, Penalties, Sampler};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A token event streamed back for one request. `Done` carries the request's
 /// speculative acceptance stats when it was decoded speculatively (`None` on the
@@ -96,6 +96,8 @@ pub struct EngineService {
     metrics: Metrics,
     /// Layer-streaming stats, shared with the engine loop that publishes them.
     stream: Arc<StreamMetrics>,
+    /// Each token id's bytes, built on first use (see [`token_bytes`](Self::token_bytes)).
+    token_bytes: OnceLock<Arc<Vec<Option<Vec<u8>>>>>,
 }
 
 impl EngineService {
@@ -196,7 +198,19 @@ impl EngineService {
             max_context: usize::MAX,
             metrics: Metrics::default(),
             stream,
+            token_bytes: OnceLock::new(),
         })
+    }
+
+    /// Each token id's bytes (`None` for special tokens). Requests that look at
+    /// token text need them, and decoding the whole vocabulary per request
+    /// would cost more than the request, so it happens once.
+    fn token_bytes(&self) -> Arc<Vec<Option<Vec<u8>>>> {
+        let table = self.token_bytes.get_or_init(|| {
+            let ids = 0..self.vocab_size as u32;
+            Arc::new(ids.map(|id| self.tokenizer.token_bytes(id)).collect())
+        });
+        Arc::clone(table)
     }
 
     /// Record a completed generation into the `/metrics` counters.
@@ -474,7 +488,19 @@ struct ExtraSampling {
     frequency_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
+    /// DRY (non-standard, llama.cpp's names): off unless `dry_multiplier > 0`.
+    #[serde(default)]
+    dry_multiplier: Option<f32>,
+    #[serde(default)]
+    dry_base: Option<f32>,
+    #[serde(default)]
+    dry_allowed_length: Option<usize>,
+    #[serde(default)]
+    dry_sequence_breakers: Option<Vec<String>>,
 }
+
+/// DRY's sequence breakers when a request names none (llama.cpp's defaults).
+const DRY_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
 
 /// Check the request's extra sampling fields and combine them with `sampler`.
 /// An out-of-range value is a client error, not something to clamp quietly: a
@@ -486,7 +512,7 @@ fn decoding(
     extra: ExtraSampling,
 ) -> Result<Decoding, String> {
     let mut logit_bias = Vec::new();
-    for (key, bias) in extra.logit_bias.unwrap_or_default() {
+    for (key, &bias) in extra.logit_bias.iter().flatten() {
         let token: u32 = key
             .parse()
             .map_err(|_| format!("logit_bias: '{key}' is not a token id"))?;
@@ -512,8 +538,51 @@ fn decoding(
             logit_bias,
             frequency: penalty("frequency_penalty", extra.frequency_penalty)?,
             presence: penalty("presence_penalty", extra.presence_penalty)?,
+            dry: dry(engine, &extra)?,
         },
     })
+}
+
+/// The request's DRY settings, or `None` when its multiplier leaves it off.
+fn dry(engine: &EngineService, extra: &ExtraSampling) -> Result<Option<Dry>, String> {
+    let multiplier = extra.dry_multiplier.unwrap_or(0.0);
+    let base = extra.dry_base.unwrap_or(1.75);
+    let allowed_length = extra.dry_allowed_length.unwrap_or(2);
+    if !(0.0..=f32::MAX).contains(&multiplier) {
+        return Err("dry_multiplier must be 0 or more".into());
+    }
+    if !(1.0..=f32::MAX).contains(&base) {
+        return Err("dry_base must be at least 1".into());
+    }
+    if allowed_length == 0 {
+        return Err("dry_allowed_length must be at least 1".into());
+    }
+    let breakers: Vec<&[u8]> = match &extra.dry_sequence_breakers {
+        Some(b) => b.iter().map(|s| s.as_bytes()).collect(),
+        None => DRY_BREAKERS.iter().map(|s| s.as_bytes()).collect(),
+    };
+    if breakers.iter().any(|b| b.is_empty()) {
+        return Err("dry_sequence_breakers must not contain an empty string".into());
+    }
+    if multiplier == 0.0 {
+        return Ok(None);
+    }
+    // ponytail: a breaker counts only inside one token; one that a tokenizer
+    // splits across two (a multi-character breaker) is not seen. llama.cpp
+    // tracks those; the default single-character breakers never need it.
+    let tokens = engine.token_bytes();
+    let breaks = |t: &[u8]| breakers.iter().any(|b| t.windows(b.len()).any(|w| w == *b));
+    let breakers = (0u32..)
+        .zip(tokens.iter())
+        .filter(|(_, bytes)| bytes.as_deref().is_some_and(breaks))
+        .map(|(id, _)| id)
+        .collect();
+    Ok(Some(Dry {
+        multiplier,
+        base,
+        allowed_length,
+        breakers,
+    }))
 }
 
 /// Flatten the `stop` field into a list of non-empty stop strings.

@@ -78,6 +78,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tokens count, not the prompt's. Range -2 to 2; negative values encourage
   repetition. Speculative decoding applies them at each proposal's own
   position, so its output still follows the target exactly.
+- **DRY ("don't repeat yourself") sampling**, with llama.cpp's fields:
+  `dry_multiplier` (0, the default, leaves it off), `dry_base` (1.75),
+  `dry_allowed_length` (2) and `dry_sequence_breakers` (`["\n", ":", "\"",
+  "*"]`). It penalizes the token that would extend a run already seen earlier
+  in the context, by `multiplier · base^(run − allowed_length)` — the verbatim
+  loops a small model falls into, which per-token penalties miss because every
+  token in them is ordinary on its own. A run does not cross a token containing
+  a breaker, so repeating a structure line by line is not counted as a loop.
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of
