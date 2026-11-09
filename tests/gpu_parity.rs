@@ -2328,6 +2328,27 @@ fn gpu_decode_batch_matches_solo() {
     )
     .unwrap();
     assert_decode_batch_matches_solo(&mla, mla_cfg, 4, dlm::forward::KvQuant::None, "mla");
+
+    // MoE batches its attention and routes each slot on its own row.
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 64,
+        shared_intermediate_size: Some(64),
+        norm_topk_prob: true,
+        naming: MoeNaming::Qwen,
+        first_k_dense: 0,
+    };
+    let moe_cfg = BlockConfig {
+        moe: Some(m),
+        ..small_cfg()
+    };
+    let moe = GpuKernel::new(moe_cfg, random_moe_layers(&moe_cfg, 3, 0xDECD), 64)
+        .unwrap()
+        .with_kv_pool_tokens(5 * 64);
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+        assert_decode_batch_matches_solo(&moe, moe_cfg, 5, quant, &format!("moe {quant:?}"));
+    }
 }
 
 /// `run_block_batched` with more slots than one fused call takes (or an MLA

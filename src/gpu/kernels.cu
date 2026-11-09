@@ -1450,10 +1450,10 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 20-21 are the LM head's input hidden and output logits.
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
 // Slots 24-25 are the int8 activation codes and their block scales (dp4a).
-enum { SCRATCH_N = 27 };
+enum { SCRATCH_N = 28 };
 enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26 };   // 26: fp16 tensor-core row scales
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
-enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
+enum { MOE_NORMED2 = 11, MOE_MATVEC = 12, MOE_NORMED2B = 27 };   // 27: a batch's FFN inputs
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
 enum { DLM_MAX_DEVICES = 16 };
 static thread_local float* g_scratch_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}};
@@ -3071,6 +3071,79 @@ extern "C" int dlm_moe_attn(
         e = cudaGetLastError();
     }
     return (int)e;
+}
+
+// `dlm_moe_attn` for a batch of sequences: the attention half of
+// `dlm_decode_block_batched` (its projections read once for every slot), then
+// each slot's FFN input normed into rows of scratch slot MOE_NORMED2B. The
+// routed experts differ per token, so the caller then routes each slot on its
+// own, moving its row into MOE_NORMED2 with `dlm_moe_take_row` first.
+extern "C" int dlm_moe_attn_batched(
+    int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
+    float rms_eps, int w_dtype, int w_group_size,
+    const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
+    const float* in_norm, const float* post_norm,
+    const float* q_bias, const float* k_bias, const float* v_bias,
+    const float* q_norm, const float* k_norm,
+    const float* inv_freq,
+    float* x,                              // [batch, hidden] in/out
+    const DlmSlots* kv_keys, const DlmSlots* kv_values, const DlmTables* kv_tables,
+    const DlmInts* num_positions, const DlmInts* positions,
+    int batch, int sliding_window, float rope_mscale, float attn_scale, float attn_softcap,
+    const DlmBlockExt* ext)
+{
+    DLM_ENTER
+    const int B = 256;
+    if (batch <= 0) return 0;
+    if (batch > DLM_MAX_BATCH) return (int)cudaErrorInvalidValue;
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(0, batch * hidden_size)
+    DLM_ALLOC(1, batch * q_dim)
+    DLM_ALLOC(2, batch * kv_dim)
+    DLM_ALLOC(3, batch * kv_dim)
+    DLM_ALLOC(4, batch * q_dim)
+    DLM_ALLOC(5, batch * hidden_size)
+    DLM_ALLOC(MOE_NORMED2B, batch * hidden_size)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+    float *normed = g_scratch[0], *q = g_scratch[1], *k = g_scratch[2];
+    float *v = g_scratch[3], *ctx = g_scratch[4], *attn_out = g_scratch[5];
+
+    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    launch_matvec_batched(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q), batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K), batch);
+    launch_matvec_batched(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V), batch);
+    for (int b = 0; b < batch; ++b) {
+        float* qb = q + (long)b * q_dim;
+        launch_qk_post(qb, k + (long)b * kv_dim, v + (long)b * kv_dim, q_norm, k_norm, num_heads,
+                       num_kv_heads, head_dim, positions->v[b], inv_freq, rope_mscale, 1, rms_eps,
+                       kv_keys->p[b], kv_values->p[b], kv_tables->p[b], o->kv_block_shift,
+                       num_positions->v[b], o->kv_half);
+        e = launch_attention(qb, kv_keys->p[b], kv_values->p[b], kv_tables->p[b], o->kv_block_shift,
+                             ctx + (long)b * q_dim, num_heads, num_kv_heads, head_dim,
+                             num_positions->v[b] + 1, sliding_window, attn_scale, attn_softcap,
+                             o->kv_half);
+        if (e != cudaSuccess) return (int)e;
+    }
+    launch_matvec_batched(DLM_WDT(DLM_W_O), o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O), batch);
+    add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, attn_out, (long)batch * hidden_size);
+    rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, post_norm, g_scratch[MOE_NORMED2B], hidden_size, rms_eps);
+    return (int)cudaGetLastError();
+}
+
+// Make slot `b`'s FFN input (left by `dlm_moe_attn_batched`) the one the router
+// and expert calls read.
+extern "C" int dlm_moe_take_row(int hidden_size, int b)
+{
+    DLM_ENTER
+    cudaError_t e = scratch_ensure(MOE_NORMED2, hidden_size);
+    if (e != cudaSuccess) return (int)e;
+    copy_kernel<<<grid_for(hidden_size, 256), 256>>>(g_scratch[MOE_NORMED2B] + (long)b * hidden_size,
+                                                      g_scratch[MOE_NORMED2], hidden_size);
+    return (int)cudaGetLastError();
 }
 
 // Post-attention norm for a MoE layer whose attention ran in a *separate* call —
