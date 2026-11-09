@@ -37,6 +37,25 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--quant int4|int8` chooses each group's scale and zero to fit the group,
+  not just to span it.** Spanning min..max gives the two extreme weights exact
+  codes and rounds the other 126 on a coarser grid than they need. Each group of
+  128 now tries 21 grids around min..max and solves the least-squares scale and
+  zero for each one's codes (llama.cpp's `make_qkx2_quants`, the search behind
+  its K-quants, without calibration data), keeping the best. The min..max fit is
+  one of the candidates, so no group gets worse; synthetic groups lose 12–15% of
+  their squared error, and 35% when a few weights are outliers. The storage
+  layout and kernels are unchanged. `dlm score --device cpu` on a 404-token
+  text, mean NLL in nats (bf16 is the floor):
+
+  | Model | bf16 | int4 before | int4 after | int8 before | int8 after |
+  |---|---|---|---|---|---|
+  | Qwen2.5-0.5B | 2.8421 | 3.0509 | **2.9932** | 2.8426 | 2.8434 |
+  | Qwen2.5-1.5B | 2.2849 | 2.4217 | **2.3847** | | |
+
+  That is 27–28% of int4's loss gone. int8 was already within noise of bf16 and
+  stays there. The groups are fitted in parallel across cores to keep load time
+  in check.
 - **The GPU's batched GEMV read every weight once per sequence instead of once
   per batch, and both GEMVs spent a third of their time in barriers.** Fixing
   the two, measured on Qwen2.5-0.5B by running the old and new binaries
