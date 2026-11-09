@@ -227,6 +227,53 @@ fn speculative_scheduler_matches_greedy_across_requests() {
     assert!(proposed > 0 && accepted <= proposed);
 }
 
+/// A grammar-constrained request on a speculating scheduler decodes plainly,
+/// so it matches the grammar and a plain scheduler's output, and a speculative
+/// request beside it is unaffected.
+#[test]
+fn constrained_requests_bypass_speculation() {
+    use dlm::generate::Decoding;
+    use dlm::grammar::{Constraint, Grammar};
+    use std::sync::Arc;
+    let (target, draft) = (build_generator(1), build_generator(2));
+    // Token i is the letter 'a' + i (and 26.. are digits).
+    let tokens = Arc::new(
+        (0..32u8)
+            .map(|i| Some(vec![if i < 26 { b'a' + i } else { b'0' + i - 26 }]))
+            .collect(),
+    );
+    let grammar = Arc::new(Grammar::parse(r#"root ::= "abc" [d-f]"#).unwrap());
+    let constrained = || Decoding {
+        grammar: Some(Constraint::new(
+            grammar.clone(),
+            Arc::clone(&tokens),
+            vec![],
+        )),
+        ..Default::default()
+    };
+
+    let mut plain = BatchScheduler::new(&target, 2);
+    plain
+        .submit_decoding(1, vec![1, 2], 10, vec![], constrained())
+        .unwrap();
+    let expected = plain.run().unwrap().remove(0).tokens;
+    assert_eq!(expected[..3], [0, 1, 2]);
+    assert!(
+        (3..=5).contains(&expected[3]) && expected.len() == 4,
+        "{expected:?}"
+    );
+
+    let mut sched = BatchScheduler::with_speculative(&target, &draft, 2, 4);
+    sched
+        .submit_decoding(1, vec![1, 2], 10, vec![], constrained())
+        .unwrap();
+    sched.submit(2, vec![1, 2, 3], 7, vec![]).unwrap();
+    let mut results = sched.run().unwrap();
+    results.sort_by_key(|f| f.id);
+    assert_eq!(results[0].tokens, expected);
+    assert_eq!(results[1].tokens, greedy(&target, &[1, 2, 3], 7));
+}
+
 #[test]
 fn speculative_scheduler_respects_eos() {
     let target = build_generator(1);

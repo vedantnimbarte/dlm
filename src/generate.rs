@@ -17,6 +17,7 @@ use crate::cache::{KvCacheConfig, PagedKvCache};
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{matvec, KvLayerCache};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
+use crate::grammar::Constraint;
 
 /// Prompt tokens staged per prefill call. Bounds the `tokens × hidden` buffer on
 /// a long prompt; a streaming kernel loads each layer once per chunk.
@@ -269,10 +270,14 @@ impl Penalties {
 }
 
 /// How a request chooses its tokens: the [`Sampler`] and what it layers on it.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Decoding {
     pub sampler: Sampler,
     pub penalties: Penalties,
+    /// A grammar the output must match. Decoded on the plain path only: the
+    /// speculative rejection rule would need the draft constrained the same
+    /// way, which it is not.
+    pub grammar: Option<Constraint>,
 }
 
 impl From<Sampler> for Decoding {
@@ -977,6 +982,7 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     /// The prompt then every generated token, which `penalties` read.
     context: Vec<u32>,
     prompt_len: usize,
+    grammar: Option<Constraint>,
     /// Prompt tokens not yet run through the model (see
     /// [`prefill_some`](GenerationSession::prefill_some)).
     pending: Vec<u32>,
@@ -1019,6 +1025,7 @@ impl<K: ComputeKernel> Generator<K> {
             penalties: Penalties::default(),
             context: prompt.to_vec(),
             prompt_len: prompt.len(),
+            grammar: None,
             pending: prompt.to_vec(),
         })
     }
@@ -1081,6 +1088,7 @@ impl<K: ComputeKernel> Generator<K> {
             penalties: Penalties::default(),
             context: prompt.to_vec(),
             prompt_len: prompt.len(),
+            grammar: None,
             pending: suffix.to_vec(),
         })
     }
@@ -1120,6 +1128,19 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     pub fn with_penalties(mut self, penalties: Penalties) -> Self {
         self.penalties = penalties;
         self
+    }
+
+    /// Only emit tokens that keep the output inside `grammar`.
+    pub fn with_grammar(mut self, grammar: Constraint) -> Self {
+        self.grammar = Some(grammar);
+        self
+    }
+
+    /// The grammar is complete and admits nothing more. With an EOS token the
+    /// grammar leaves that as the only choice, so this matters to a caller that
+    /// has none: it has to end the request itself.
+    pub fn grammar_exhausted(&self) -> bool {
+        self.grammar.as_ref().is_some_and(Constraint::is_exhausted)
     }
 
     /// Snapshot this session's KV history (e.g. right after prefilling a prompt)
@@ -1189,7 +1210,14 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
         self.penalties
             .apply(&mut logits, &self.context, self.prompt_len);
-        let next = self.sampler.sample(&logits, &mut self.rng);
+        let next = match &mut self.grammar {
+            Some(g) => {
+                let next = g.pick(&self.sampler, &logits, &mut self.rng);
+                g.accept(next);
+                next
+            }
+            None => self.sampler.sample(&logits, &mut self.rng),
+        };
         self.seen.insert(next);
         self.context.push(next);
         self.last_hidden = self.generator.embed(next, self.orchestrator.position())?;

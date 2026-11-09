@@ -12,6 +12,7 @@
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
 use crate::generate::{Decoding, Dry, Generator, Penalties, Sampler};
+use crate::grammar::{Constraint, Grammar, TokenBytes};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
 use serde::{Deserialize, Serialize};
@@ -97,7 +98,7 @@ pub struct EngineService {
     /// Layer-streaming stats, shared with the engine loop that publishes them.
     stream: Arc<StreamMetrics>,
     /// Each token id's bytes, built on first use (see [`token_bytes`](Self::token_bytes)).
-    token_bytes: OnceLock<Arc<Vec<Option<Vec<u8>>>>>,
+    token_bytes: OnceLock<TokenBytes>,
 }
 
 impl EngineService {
@@ -205,7 +206,7 @@ impl EngineService {
     /// Each token id's bytes (`None` for special tokens). Requests that look at
     /// token text need them, and decoding the whole vocabulary per request
     /// would cost more than the request, so it happens once.
-    fn token_bytes(&self) -> Arc<Vec<Option<Vec<u8>>>> {
+    fn token_bytes(&self) -> TokenBytes {
         let table = self.token_bytes.get_or_init(|| {
             let ids = 0..self.vocab_size as u32;
             Arc::new(ids.map(|id| self.tokenizer.token_bytes(id)).collect())
@@ -497,6 +498,29 @@ struct ExtraSampling {
     dry_allowed_length: Option<usize>,
     #[serde(default)]
     dry_sequence_breakers: Option<Vec<String>>,
+    /// `json_object` or `json_schema` constrains the output to JSON.
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+    /// A GBNF grammar the output must match (non-standard, llama.cpp's field).
+    #[serde(default)]
+    grammar: Option<String>,
+}
+
+/// OpenAI's `response_format`.
+#[derive(Deserialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    json_schema: Option<JsonSchemaFormat>,
+}
+
+/// `response_format.json_schema`. Its `name` and `strict` are accepted and
+/// ignored: the output is always held to the schema.
+#[derive(Deserialize)]
+struct JsonSchemaFormat {
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
 }
 
 /// DRY's sequence breakers when a request names none (llama.cpp's defaults).
@@ -540,7 +564,40 @@ fn decoding(
             presence: penalty("presence_penalty", extra.presence_penalty)?,
             dry: dry(engine, &extra)?,
         },
+        grammar: constraint(engine, &extra)?,
     })
+}
+
+/// The grammar the request's output must match, if it asked for one. A
+/// grammar or schema that does not parse is the client's error to fix, so it
+/// is refused here rather than failing the request mid-generation.
+fn constraint(engine: &EngineService, extra: &ExtraSampling) -> Result<Option<Constraint>, String> {
+    let format = extra.response_format.as_ref();
+    let grammar = match (format.map(|f| f.kind.as_str()), &extra.grammar) {
+        (Some("json_object" | "json_schema"), Some(_)) => {
+            return Err("set grammar or a JSON response_format, not both".into())
+        }
+        (None | Some("text"), None) => return Ok(None),
+        (None | Some("text"), Some(gbnf)) => Grammar::parse(gbnf)?,
+        (Some("json_object"), None) => Grammar::json_object(),
+        (Some("json_schema"), None) => {
+            let schema = format
+                .and_then(|f| f.json_schema.as_ref())
+                .and_then(|j| j.schema.as_ref())
+                .ok_or("response_format: json_schema needs json_schema.schema")?;
+            Grammar::from_json_schema(schema)?
+        }
+        (Some(other), _) => {
+            return Err(format!(
+                "response_format: type '{other}' is not text, json_object or json_schema"
+            ))
+        }
+    };
+    Ok(Some(Constraint::new(
+        Arc::new(grammar),
+        engine.token_bytes(),
+        engine.eos_tokens.clone(),
+    )))
 }
 
 /// The request's DRY settings, or `None` when its multiplier leaves it off.

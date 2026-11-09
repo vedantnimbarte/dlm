@@ -13,6 +13,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
 fn start_server() -> SocketAddr {
+    start_server_with_eos(Vec::new())
+}
+
+/// The byte model, with `eos` as its end-of-sequence ids.
+fn start_server_with_eos(eos: Vec<u32>) -> SocketAddr {
     let vocab = 256usize;
     let hidden = 16usize;
     let cfg = BlockConfig {
@@ -61,7 +66,8 @@ fn start_server() -> SocketAddr {
         0,
         8,
         0,
-    );
+    )
+    .with_eos_tokens(eos);
     let server = HttpServer::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();
     std::thread::spawn(move || server.serve(router(engine)).unwrap());
@@ -199,9 +205,110 @@ fn out_of_range_sampling_fields_are_rejected() {
             "dry_allowed_length must be at least 1",
         ),
         (r#""dry_sequence_breakers":["\n",""]"#, "empty string"),
+        (
+            r#""grammar":"root ::= missing""#,
+            "'missing' is used but never defined",
+        ),
+        (r#""grammar":"root ::= root \"a\"""#, "left-recursive"),
+        (r#""response_format":{"type":"yaml"}"#, "type 'yaml' is not"),
+        (
+            r#""response_format":{"type":"json_schema"}"#,
+            "needs json_schema.schema",
+        ),
+        (
+            r#""response_format":{"type":"json_schema","json_schema":{"schema":{"type":"date"}}}"#,
+            "unknown type 'date'",
+        ),
+        (
+            r#""grammar":"root ::= \"a\"","response_format":{"type":"json_object"}"#,
+            "not both",
+        ),
     ] {
         let resp = chat(addr, field);
         assert!(resp.starts_with("HTTP/1.1 400"), "{field}: {resp}");
         assert!(resp.contains(why), "{field}: {resp}");
     }
+}
+
+fn completion(resp: &str) -> serde_json::Value {
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {resp}"))
+}
+
+/// The model is random weights: left to itself it emits arbitrary bytes. Held
+/// to a schema, greedy or sampled, what comes back must parse as JSON of that
+/// shape, and end on EOS rather than run out of tokens.
+#[test]
+fn json_schema_output_parses_and_matches_the_schema() {
+    let addr = start_server_with_eos(vec![0]);
+    let schema = r#"{"type":"object","properties":{
+        "ok":{"type":"boolean"},
+        "color":{"enum":["red","green"]},
+        "n":{"type":"integer"},
+        "maybe":{"type":"null"}
+    },"required":["ok","color","n"]}"#
+        .replace(char::is_whitespace, "");
+    for sampling in [
+        r#""temperature":0"#,
+        r#""temperature":1.5,"seed":3"#,
+        r#""temperature":1,"seed":9"#,
+    ] {
+        let resp = chat(
+            addr,
+            &format!(
+                r#""max_tokens":400,{sampling},"response_format":{{"type":"json_schema","json_schema":{{"name":"t","schema":{schema}}}}}"#
+            ),
+        );
+        let json = completion(&resp);
+        assert_eq!(json["choices"][0]["finish_reason"], "stop", "{resp}");
+        let text = json["choices"][0]["message"]["content"].as_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("{sampling}: not JSON ({e}): {text:?}"));
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("not an object: {text:?}"));
+        assert!(obj["ok"].is_boolean(), "{text:?}");
+        assert!(
+            ["red", "green"].contains(&obj["color"].as_str().unwrap()),
+            "{text:?}"
+        );
+        assert!(obj["n"].is_i64(), "{text:?}");
+        assert!(obj.get("maybe").is_none_or(|m| m.is_null()), "{text:?}");
+        assert!(
+            obj.keys()
+                .all(|k| ["ok", "color", "n", "maybe"].contains(&k.as_str())),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn json_object_and_grammar_constrain_the_output() {
+    let addr = start_server_with_eos(vec![0]);
+    // The bias makes '}' the model's favourite; a JSON object has to open
+    // first, then '}' may close it.
+    let resp = chat(
+        addr,
+        r#""max_tokens":50,"logit_bias":{"125":100},"response_format":{"type":"json_object"}"#,
+    );
+    let text = assistant_text(&resp);
+    assert_eq!(text.trim_end(), "{}", "{resp}");
+
+    let resp = chat(
+        addr,
+        r#""max_tokens":50,"temperature":1,"grammar":"root ::= (\"yes\" | \"no\") \"!\"""#,
+    );
+    let text = assistant_text(&resp);
+    assert!(text == "yes!" || text == "no!", "{text:?}");
+}
+
+/// With no EOS token to end on, a request ends once its grammar is complete
+/// instead of running on to `max_tokens`.
+#[test]
+fn a_finished_grammar_ends_the_request_without_eos() {
+    let addr = start_server();
+    let resp = chat(addr, r#""max_tokens":50,"grammar":"root ::= \"ok\"""#);
+    let json = completion(&resp);
+    assert_eq!(json["choices"][0]["message"]["content"], "ok", "{resp}");
+    assert_eq!(json["usage"]["completion_tokens"], 2, "{resp}");
 }

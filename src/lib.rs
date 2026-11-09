@@ -13,6 +13,7 @@ pub mod error;
 pub mod forward;
 pub mod generate;
 pub mod gpu;
+pub mod grammar;
 pub mod hub;
 pub mod loader;
 pub mod memory;

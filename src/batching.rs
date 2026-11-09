@@ -446,13 +446,19 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 zero_finished.push(p.id);
                 continue;
             }
-            let Decoding { sampler, penalties } = p.decoding;
+            let Decoding {
+                sampler,
+                penalties,
+                grammar,
+            } = p.decoding;
             let decoder = match self.draft {
-                Some(draft) => Decoder::Speculative(
+                // A constrained request decodes plainly even here: see
+                // `Decoding::grammar`.
+                Some(draft) if grammar.is_none() => Decoder::Speculative(
                     SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
                         .with_penalties(penalties),
                 ),
-                None => {
+                _ => {
                     // Resume from the longest cached prefix if one exists;
                     // otherwise prefill from scratch. Either way, cache this
                     // prompt's prefix so later requests can extend it.
@@ -476,7 +482,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         }
                         None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    Decoder::Plain(session.with_penalties(penalties))
+                    let session = session.with_penalties(penalties);
+                    Decoder::Plain(match grammar {
+                        Some(g) => session.with_grammar(g),
+                        None => session,
+                    })
                 }
             };
             let cache_prompt = match (&decoder, &self.prefix_cache) {
@@ -587,6 +597,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     done = true;
                     break;
                 }
+            }
+            // A finished grammar with no EOS to end on has nothing left to say.
+            if a.eos.is_empty() && matches!(&a.decoder, Decoder::Plain(s) if s.grammar_exhausted())
+            {
+                done = true;
             }
 
             if done {
