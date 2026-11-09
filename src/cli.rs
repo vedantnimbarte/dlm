@@ -428,6 +428,17 @@ pub struct BenchOpts {
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
 
+    /// Compare against a baseline written by `--json`: print each metric's
+    /// change, and exit non-zero if prefill or decode tok/s fell by more than
+    /// `--tolerance` at any batch size both runs measured.
+    #[arg(long, value_name = "FILE")]
+    pub compare: Option<PathBuf>,
+
+    /// How far (percent) throughput may fall below the `--compare` baseline
+    /// before it counts as a regression.
+    #[arg(long, value_name = "PCT", default_value_t = 5.0)]
+    pub tolerance: f64,
+
     /// Break decode time down by streaming stage (mmap, H2D, compute, ...).
     /// Streaming paths only. Off by default: timing the stages adds overhead of
     /// its own, so leave it off when the headline numbers matter.
@@ -580,6 +591,12 @@ pub struct ScoreArgs {
     /// Write the scores as JSON to this file instead of a table on stdout.
     #[arg(long, value_name = "FILE")]
     pub json: Option<std::path::PathBuf>,
+
+    /// Weight precision, as for `dlm run`: the checkpoint's own by default, or
+    /// `int4`/`int8` to score the model quantized at load (what that costs in
+    /// log-likelihood is the point of scoring it).
+    #[arg(long, value_enum)]
+    pub quant: Option<QuantArg>,
 
     /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`).
     #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
@@ -743,6 +760,8 @@ mod tests {
             "1,4",
             "--gen-len",
             "32",
+            "--compare",
+            "base.json",
         ])
         .unwrap();
         let Command::Bench(a) = cli.command else {
@@ -753,6 +772,8 @@ mod tests {
         assert_eq!(a.opts.batch, vec![1, 4]);
         assert_eq!(a.opts.gen_len, 32);
         assert_eq!(a.opts.prompt_len, 512);
+        assert_eq!(a.opts.compare, Some(PathBuf::from("base.json")));
+        assert_eq!(a.opts.tolerance, 5.0);
         assert!(a.serve.bench.is_none());
     }
 

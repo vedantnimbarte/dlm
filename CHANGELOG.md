@@ -82,6 +82,46 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     head is still decoded to f32 on the CPU, and is over half of each token's
     bytes there; keeping it in its ggml blocks is the next step.
 
+- **`--quant int4` chooses each group's scale and zero to fit the group, not
+  just to span it.** Spanning min..max gives the two extreme weights exact
+  codes and rounds the other 126 on a coarser grid than they need. Each group of
+  128 now tries 21 grids around min..max and solves the least-squares scale and
+  zero for each one's codes (llama.cpp's `make_qkx2_quants`, the search behind
+  its K-quants, without calibration data), keeping the best. The min..max fit is
+  one of the candidates, so no group gets worse; synthetic groups lose 12–15% of
+  their squared error, and 35% when a few weights are outliers. The storage
+  layout and kernels are unchanged. `dlm score --device cpu` on a 404-token
+  text, mean NLL in nats (bf16 is the floor):
+
+  | Model | bf16 | int4 before | int4 after | int8 | int8 with the search |
+  |---|---|---|---|---|---|
+  | Qwen2.5-0.5B | 2.8421 | 3.0509 | **2.9932** | 2.8426 | 2.8434 |
+  | Qwen2.5-1.5B | 2.2849 | 2.4217 | **2.3847** | 2.2861 | 2.2869 |
+
+  That is 27–28% of int4's loss gone. int8 keeps plain rounding: it is already
+  within noise of bf16, and the search changed nothing measurable but doubled
+  its load time. The groups are fitted on every core, so loading costs about
+  2–3 s more on 0.5B and 10 s more on 1.5B (median of three, 6-core CPU); int8
+  loads no slower, and on 1.5B a little faster.
+- **`--quant int4` keeps `v_proj` and `down_proj` at int8 in the first and last
+  eighth of the layers**, the core of llama.cpp's Q4_K_M rule: those two write
+  straight into the residual stream, and the ends of the network are where it
+  is least forgiving. The embedding and LM head were never int4 (f32 on the CPU,
+  int8 on the GPU), so they needed nothing. Same text and setup as above, on
+  top of the fitted groups:
+
+  | Model | int4, all 4-bit | ends at int8 (kept) | + every 3rd layer (Q4_K_M) | all `v`/`down` int8 |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B, NLL | 2.9932 | **2.9689** | 2.9448 | 2.9121 |
+  | layer weights | 192.0 MiB | 204.8 MiB | 217.5 MiB | 243.1 MiB |
+  | Qwen2.5-1.5B, NLL | 2.3847 | **2.3564** | 2.3576 | |
+  | layer weights | 702.8 MiB | 756.8 MiB | 797.3 MiB | |
+
+  On 0.5B each extra int8 byte buys about the same, wherever it goes; on 1.5B
+  the middle layers bought nothing. So dlm takes the ends only: 7% larger, and
+  with the fitted groups, int4's loss against bf16 falls from 0.209 to 0.127
+  nats on 0.5B and from 0.137 to 0.072 on 1.5B. MLA layers (DeepSeek) are left
+  alone, since the GPU runs their dense FFN at a single dtype.
 - **The GPU's batched GEMV read every weight once per sequence instead of once
   per batch, and both GEMVs spent a third of their time in barriers.** Fixing
   the two, measured on Qwen2.5-0.5B by running the old and new binaries
@@ -154,6 +194,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Speculative decoding is skipped** for a constrained request, which
     decodes plainly beside the speculative ones: the rejection rule would need
     the draft held to the same grammar.
+- **`dlm bench --compare base.json`** checks a build for a speed regression:
+  it prints each metric's change against a baseline saved with `--json`, per
+  batch size, and exits non-zero if prefill or decode tok/s fell by more than
+  `--tolerance` percent (default 5). Latency and memory are shown but never fail
+  it. The `--json` file now also records the time, the GPU's name, per-batch
+  peak RSS, and the commit when the build sets `DLM_GIT_COMMIT`; files written
+  before this still read. `bench/BASELINES.md` describes the workflow.
+- **`dlm score --quant int4|int8`** scores a model quantized at load, so what a
+  quantization costs in log-likelihood can be measured rather than guessed. It
+  also reports the size of the layer weights it scored.
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of

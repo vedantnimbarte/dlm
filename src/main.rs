@@ -448,8 +448,15 @@ fn run_score(args: ScoreArgs) -> Result<()> {
         )));
     }
 
-    let (config, store) = dlm::loader::open_model(&args.model_path, QuantScheme::Fp16)?;
+    let quant = resolve_quant(args.quant, &MmapStore::open_path(&args.model_path)?)?;
+    let (config, store) = dlm::loader::open_model(&args.model_path, quant)?;
     let parts = dlm::loader::load_model_parts(&store, &config, tokens.len() as u32)?;
+    let weight_bytes: usize = parts
+        .layers
+        .iter()
+        .flat_map(|l| l.weights())
+        .map(|w| w.as_bytes().len())
+        .sum();
     let device = resolve_device(args.device);
     let (logprobs, next) = score_on_device(parts, device, &tokens, args.kv_quant.to_kv_quant())?;
 
@@ -463,6 +470,8 @@ fn run_score(args: ScoreArgs) -> Result<()> {
         let json = serde_json::json!({
             "model": args.model_path.display().to_string(),
             "device": format!("{device:?}").to_lowercase(),
+            "quant": format!("{quant:?}").to_lowercase(),
+            "layer_weight_bytes": weight_bytes,
             "tokens": tokens,
             // `logprobs[i]` scores `tokens[i + 1]`, so it is one shorter.
             "logprobs": logprobs,
@@ -488,6 +497,10 @@ fn run_score(args: ScoreArgs) -> Result<()> {
     // valid on its own is shown as the empty string rather than failing.
     let piece = |id: u32| tokenizer.decode(&[id]).unwrap_or_default();
     println!("device       : {device:?}");
+    println!(
+        "quant        : {quant:?} ({:.1} MiB of layer weights)",
+        weight_bytes as f64 / (1u64 << 20) as f64
+    );
     println!("tokens       : {}", tokens.len());
     println!("mean nll     : {mean_nll:.4}");
     println!();
@@ -1773,6 +1786,10 @@ fn run_bench(args: BenchArgs) -> Result<()> {
             serve.context_length
         )));
     }
+    // A bad baseline should fail now, not after the model has loaded and run.
+    if let Some(path) = &opts.compare {
+        read_bench_report(path)?;
+    }
     // Size the batch-KV fit checks for the largest batch actually measured.
     serve.max_batch = opts.batch.iter().copied().max().unwrap_or(1).max(1);
     serve.bench = Some(opts);
@@ -1832,22 +1849,27 @@ fn bench_generator<K: ComputeKernel>(
     }
 
     if let Some(path) = &opts.json {
-        let report = serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "model": args.model_path,
-            "device": format!("{:?}", args.device).to_lowercase(),
-            "gpu_backend": gpu::active_vendor().label(),
-            "quant": format!("{:?}", config.quant),
-            "stream": args.stream,
-            "kv_quant": format!("{:?}", args.kv_quant).to_lowercase(),
-            "context_length": args.context_length,
-            "prompt_len": opts.prompt_len,
-            "gen_len": opts.gen_len,
-            "runs": results,
-            "summary": summary,
-            "peak_rss_bytes": peak_rss,
-            "vram_used_bytes": vram_used,
-        });
+        let report = dlm::bench::Report {
+            version: env!("CARGO_PKG_VERSION").into(),
+            commit: option_env!("DLM_GIT_COMMIT").map(Into::into),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            model: args.model_path.display().to_string(),
+            device: format!("{:?}", args.device).to_lowercase(),
+            gpu_backend: gpu::active_vendor().label().into(),
+            gpu_name: gpu_in_use.then(gpu_name).flatten(),
+            quant: format!("{:?}", config.quant),
+            stream: args.stream,
+            kv_quant: format!("{:?}", args.kv_quant).to_lowercase(),
+            context_length: args.context_length,
+            prompt_len: opts.prompt_len,
+            gen_len: opts.gen_len,
+            runs: results,
+            summary: summary.clone(),
+            peak_rss_bytes: peak_rss,
+            vram_used_bytes: vram_used,
+        };
         let text = serde_json::to_string_pretty(&report)
             .map_err(|e| DlmError::InvalidConfig(format!("bench json: {e}")))?;
         std::fs::write(path, text).map_err(|source| DlmError::Io {
@@ -1856,7 +1878,70 @@ fn bench_generator<K: ComputeKernel>(
         })?;
         println!("json         : {}", path.display());
     }
+
+    if let Some(path) = &opts.compare {
+        let base = read_bench_report(path)?;
+        println!();
+        println!(
+            "compare      : against {} ({}, {} {})",
+            path.display(),
+            base.commit.as_deref().unwrap_or("unknown commit"),
+            base.quant,
+            base.device
+        );
+        let deltas = dlm::bench::compare(&base.summary, &summary, opts.tolerance);
+        if deltas.is_empty() {
+            println!("  no batch size in common with the baseline");
+        }
+        for d in &deltas {
+            println!(
+                "  batch {:<5}: {:<14} {:>10.2} -> {:>10.2}  {:>+7.1}%{}",
+                d.batch,
+                d.metric,
+                d.before,
+                d.after,
+                d.change_pct,
+                if d.regressed { "  REGRESSED" } else { "" }
+            );
+        }
+        let regressed = deltas.iter().filter(|d| d.regressed).count();
+        if regressed > 0 {
+            return Err(DlmError::InvalidConfig(format!(
+                "{regressed} throughput metric(s) fell more than {}% below {}",
+                opts.tolerance,
+                path.display()
+            )));
+        }
+    }
     Ok(())
+}
+
+/// A `dlm bench --json` file, for `--compare`.
+fn read_bench_report(path: &Path) -> Result<dlm::bench::Report> {
+    let text = std::fs::read_to_string(path).map_err(|source| DlmError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_str(&text).map_err(|source| DlmError::Json {
+        context: path.display().to_string(),
+        source,
+    })
+}
+
+/// The GPU's name for labelling results, from `nvidia-smi` (one line per GPU,
+/// joined). `None` where it is not installed, as on ROCm.
+fn gpu_name() -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    let names = String::from_utf8(out.stdout).ok()?;
+    let names: Vec<&str> = names
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    (out.status.success() && !names.is_empty()).then(|| names.join(", "))
 }
 
 /// Return a [`Shutdown`] wired to `SIGTERM`/`SIGINT` where the platform allows.
