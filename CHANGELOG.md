@@ -94,6 +94,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Prompts still go in piecewise and through the prefix cache**: a lookup
     request starts as a plain one and turns speculative once its prompt is in,
     at no extra pass.
+  - **Measured** on Qwen2.5-0.5B, CPU build, `--stream --resident-layers 12`,
+    greedy, 96 tokens, decode only, on a machine shared with other work (the
+    quieter round):
+
+    | | Rewrite code with comments | Free prose |
+    |---|---|---|
+    | Load-bound (`--ram-cache-gb 0`), off | 3.5 tok/s | 3.7 tok/s |
+    | Load-bound, lookup | **6.3 tok/s** (79% of 87 accepted) | 3.6 tok/s (17% of 24) |
+    | Layers all in the RAM cache, off | 8.3 tok/s | 8.6 tok/s |
+    | Layers all in the RAM cache, lookup | 7.6 tok/s | 7.6 tok/s |
+
+    The last two rows are why `auto` leaves a CPU model whose layers all fit
+    the RAM cache alone: the CPU kernels verify token by token, so a pass over
+    five tokens costs nearly five passes. Not measured: the streamed GPU path,
+    the case this is for, since the GPU was busy.
+  - **Lookup needs a two-token match.** One recurring token predicts little:
+    on the prose above, 1-token matches made 129 proposals of which 6% were
+    accepted, and cost ~10% of decode speed even load-bound. Two tokens cut that
+    to 24 proposals with no loss on the code rewrite (70 of 90 accepted before,
+    69 of 87 after). Adapting the proposal length to recent acceptance was tried
+    and dropped: it shortened the long runs a rewrite copies (2.7–3.0 tok/s
+    against 4.1–4.6) and helped prose less than the two-token minimum did.
 
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,

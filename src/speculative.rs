@@ -192,6 +192,12 @@ impl<D: ComputeKernel> Drafter for ModelDrafter<'_, D> {
 /// past a few tokens they mostly find the same place a shorter one does.
 const NGRAM_MAX: usize = 3;
 
+/// Shortest suffix worth a proposal. A single recurring token predicts little:
+/// on free prose Qwen2.5-0.5B accepted 6% of 1-gram-driven proposals, and
+/// requiring two cut the proposals there five-fold while a code rewrite kept
+/// almost all of its accepted ones.
+const NGRAM_MIN: usize = 2;
+
 /// Prompt lookup: proposes what followed the latest earlier occurrence of the
 /// context's longest recurring suffix. Deterministic, so each proposal's
 /// distribution is one-hot.
@@ -214,12 +220,13 @@ impl Drafter for NgramDrafter {
 }
 
 /// Up to `gamma` tokens that followed the most recent earlier occurrence of
-/// `seq`'s longest suffix of at most [`NGRAM_MAX`] tokens; empty if none recurs.
+/// `seq`'s longest suffix of [`NGRAM_MIN`] to [`NGRAM_MAX`] tokens; empty if none
+/// recurs.
 // ponytail: a linear scan per round, O(context). A round is a full model pass,
 // so this is noise at any context dlm serves; index n-grams in a map if it ever
 // shows in a profile.
 fn ngram_lookup(seq: &[u32], gamma: usize) -> &[u32] {
-    for n in (1..=NGRAM_MAX.min(seq.len().saturating_sub(1))).rev() {
+    for n in (NGRAM_MIN..=NGRAM_MAX.min(seq.len().saturating_sub(1))).rev() {
         let suffix = &seq[seq.len() - n..];
         if let Some(at) = (0..seq.len() - n).rev().find(|&i| &seq[i..i + n] == suffix) {
             let from = at + n;
@@ -554,8 +561,10 @@ mod tests {
         // Suffix [1, 2, 3] occurred at 0; [2, 3] alone more recently (at 5).
         let seq = [1, 2, 3, 4, 9, 2, 3, 7, 1, 2, 3];
         assert_eq!(ngram_lookup(&seq, 2), &[4, 9]);
-        // Only a 1-gram recurs: [5] last seen at 2, followed by [6, 5].
-        assert_eq!(ngram_lookup(&[8, 0, 5, 6, 5], 4), &[6, 5]);
+        // A 2-gram: [5, 6] last seen at 1, followed by [0, 5, 6].
+        assert_eq!(ngram_lookup(&[8, 5, 6, 0, 5, 6], 4), &[0, 5, 6]);
+        // A single recurring token is not enough.
+        assert!(ngram_lookup(&[8, 0, 5, 6, 5], 4).is_empty());
         // The continuation runs out at the end of the context.
         assert_eq!(ngram_lookup(&[4, 4, 4], 8), &[4]);
         // Nothing recurs, or nothing before the suffix: no proposal.
