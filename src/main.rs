@@ -448,8 +448,15 @@ fn run_score(args: ScoreArgs) -> Result<()> {
         )));
     }
 
-    let (config, store) = dlm::loader::open_model(&args.model_path, QuantScheme::Fp16)?;
+    let quant = resolve_quant(args.quant, &MmapStore::open_path(&args.model_path)?)?;
+    let (config, store) = dlm::loader::open_model(&args.model_path, quant)?;
     let parts = dlm::loader::load_model_parts(&store, &config, tokens.len() as u32)?;
+    let weight_bytes: usize = parts
+        .layers
+        .iter()
+        .flat_map(|l| l.weights())
+        .map(|w| w.as_bytes().len())
+        .sum();
     let device = resolve_device(args.device);
     let (logprobs, next) = score_on_device(parts, device, &tokens)?;
 
@@ -463,6 +470,8 @@ fn run_score(args: ScoreArgs) -> Result<()> {
         let json = serde_json::json!({
             "model": args.model_path.display().to_string(),
             "device": format!("{device:?}").to_lowercase(),
+            "quant": format!("{quant:?}").to_lowercase(),
+            "layer_weight_bytes": weight_bytes,
             "tokens": tokens,
             // `logprobs[i]` scores `tokens[i + 1]`, so it is one shorter.
             "logprobs": logprobs,
@@ -488,6 +497,10 @@ fn run_score(args: ScoreArgs) -> Result<()> {
     // valid on its own is shown as the empty string rather than failing.
     let piece = |id: u32| tokenizer.decode(&[id]).unwrap_or_default();
     println!("device       : {device:?}");
+    println!(
+        "quant        : {quant:?} ({:.1} MiB of layer weights)",
+        weight_bytes as f64 / (1u64 << 20) as f64
+    );
     println!("tokens       : {}", tokens.len());
     println!("mean nll     : {mean_nll:.4}");
     println!();

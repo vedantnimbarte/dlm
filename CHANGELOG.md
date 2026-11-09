@@ -67,6 +67,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`dlm score --quant int4|int8`** scores a model quantized at load, so what a
+  quantization costs in log-likelihood can be measured rather than guessed. It
+  also reports the size of the layer weights it scored.
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of

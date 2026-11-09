@@ -581,6 +581,12 @@ pub struct ScoreArgs {
     #[arg(long, value_name = "FILE")]
     pub json: Option<std::path::PathBuf>,
 
+    /// Weight precision, as for `dlm run`: the checkpoint's own by default, or
+    /// `int4`/`int8` to score the model quantized at load (what that costs in
+    /// log-likelihood is the point of scoring it).
+    #[arg(long, value_enum)]
+    pub quant: Option<QuantArg>,
+
     /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`).
     #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
