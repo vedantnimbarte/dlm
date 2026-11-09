@@ -911,6 +911,11 @@ inference engine):
   advance in bulk. With greedy sampling the output is provably **identical** to
   plain target decoding (tested), with acceptance-rate stats. Exposed one-shot
   (`SpeculativeDecoder`) and as a resumable per-round `SpeculativeSession`.
+  Without a draft model, **n-gram lookup** proposes what followed the last time
+  the context's latest few tokens occurred — free, and right whenever the reply
+  copies (code being rewritten, a document being quoted). `--speculative auto`,
+  the default, turns it on for a streamed model, where verifying several tokens
+  costs about what generating one does.
 - **Continuous batching** ([`src/batching.rs`](src/batching.rs)). A scheduler
   keeps up to `--max-batch` generations in flight and admits queued requests as
   slots free. Each request's output is identical to running it alone (tested),
@@ -930,7 +935,9 @@ inference engine):
     in the queue instead of failing mid-decode.
   `BatchScheduler::with_speculative` swaps each slot for a `SpeculativeSession`,
   so **the server engine decodes speculatively** when `dlm serve` is given
-  `--draft-model-path` — a tick then advances a request by a whole accept/reject
+  `--draft-model-path` (or `--speculative ngram`, or `auto` on a streamed model,
+  where a lookup slot speculates only while it is the one request decoding) — a
+  tick then advances a request by a whole accept/reject
   round, streaming the accepted tokens through the same path. Per-request
   acceptance is surfaced in the OpenAI `usage` response under a `speculative`
   block (`draft_proposed`, `draft_accepted`, `acceptance_rate`); streaming

@@ -49,7 +49,7 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
-use crate::generate::{sample_from, Generator, Sampler, SplitMix64};
+use crate::generate::{sample_from, GenerationSession, Generator, Sampler, SplitMix64};
 use std::collections::HashSet;
 
 /// Outcome of a speculative generation.
@@ -119,6 +119,9 @@ impl<T: ComputeKernel, D: ComputeKernel> SpeculativeDecoder<T, D> {
     }
 }
 
+/// A proposed token and the distribution it was drawn from.
+type Proposal = (u32, Vec<(u32, f32)>);
+
 /// Where a round's proposals come from.
 trait Drafter {
     /// Up to `gamma` tokens continuing `seq`, each with the distribution it was
@@ -131,7 +134,7 @@ trait Drafter {
         gamma: usize,
         sampler: &Sampler,
         rng: &mut SplitMix64,
-    ) -> Result<Vec<(u32, Vec<(u32, f32)>)>>;
+    ) -> Result<Vec<Proposal>>;
 
     /// Roll back to the first `len` tokens of the sequence.
     fn truncate(&mut self, _len: usize) {}
@@ -156,13 +159,13 @@ impl<D: ComputeKernel> Drafter for ModelDrafter<'_, D> {
         gamma: usize,
         sampler: &Sampler,
         rng: &mut SplitMix64,
-    ) -> Result<Vec<(u32, Vec<(u32, f32)>)>> {
+    ) -> Result<Vec<Proposal>> {
         // Catch up on the tokens it has not seen (at least the pending one),
         // then propose `gamma` tokens from its own distribution.
         let unseen = self.kv.position();
         let mut hidden = self.model.prefill(&mut self.kv, &seq[unseen..])?;
         let mut seen = seen.clone();
-        let mut proposals: Vec<(u32, Vec<(u32, f32)>)> = Vec::with_capacity(gamma);
+        let mut proposals: Vec<Proposal> = Vec::with_capacity(gamma);
         for j in 0..gamma {
             if j > 0 {
                 hidden = self.model.embed(proposals[j - 1].0, self.kv.position())?;
@@ -202,7 +205,7 @@ impl Drafter for NgramDrafter {
         gamma: usize,
         _sampler: &Sampler,
         _rng: &mut SplitMix64,
-    ) -> Result<Vec<(u32, Vec<(u32, f32)>)>> {
+    ) -> Result<Vec<Proposal>> {
         Ok(ngram_lookup(seq, gamma)
             .iter()
             .map(|&x| (x, vec![(x, 1.0)]))
@@ -275,6 +278,34 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         sampler: Sampler,
     ) -> Result<Self> {
         Self::with_drafter(target, Box::new(NgramDrafter), gamma, prompt, sampler)
+    }
+
+    /// Carry on a plain session, whose prompt (`prompt`) is in, with n-gram
+    /// speculation. Samples its next token, which this returns for the caller to
+    /// emit: chosen and not yet fed is the state a round starts from, so the
+    /// switch costs no pass. How the scheduler gets lookup speculation and still
+    /// prefills prompts piecewise and from its prefix cache.
+    pub(crate) fn ngram_from(
+        mut session: GenerationSession<'a, T>,
+        prompt: Vec<u32>,
+        gamma: usize,
+    ) -> Result<(Self, u32)> {
+        let first = session.sample_next()?;
+        let mut seq = prompt;
+        seq.push(first);
+        let speculative = Self {
+            target: session.generator,
+            target_kv: session.orchestrator,
+            drafter: Box::new(NgramDrafter),
+            gamma: gamma.max(1),
+            sampler: session.sampler,
+            rng: session.rng,
+            seq,
+            seen: session.seen,
+            proposed: 0,
+            accepted: 0,
+        };
+        Ok((speculative, first))
     }
 
     fn with_drafter(

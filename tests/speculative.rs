@@ -321,3 +321,42 @@ fn ngram_without_a_match_steps_one_token() {
     out.extend(run_session(&mut s, 7));
     assert_eq!(out, greedy(&target, &prompt, 8));
 }
+
+/// The n-gram scheduler speculates for a request decoding alone and steps
+/// concurrent ones through one shared pass; either way, and resuming prompts
+/// from the prefix cache, every request's output is exactly target-greedy.
+#[test]
+fn ngram_scheduler_matches_greedy_across_requests() {
+    let target = build_generator(1);
+    let shared = vec![4u32, 8, 15, 16, 23, 4, 8, 15, 16, 23, 4, 8];
+    let mut extended = shared.clone();
+    extended.extend([10, 9, 4, 8]);
+    let requests: Vec<(u64, Vec<u32>, usize)> =
+        vec![(1, shared, 30), (2, vec![7], 5), (3, extended, 8)];
+
+    // max_batch 2: requests 1 and 2 share passes, then 1 and 3, then 1 runs
+    // alone and speculates.
+    let mut sched = BatchScheduler::with_ngram(&target, 2, 4).with_prefix_cache(4);
+    for (id, prompt, n) in &requests {
+        sched.submit(*id, prompt.clone(), *n, vec![]).unwrap();
+    }
+    let mut results = sched.run().unwrap();
+    results.sort_by_key(|f| f.id);
+
+    for (f, (id, prompt, n)) in results.iter().zip(&requests) {
+        assert_eq!(
+            f.tokens,
+            greedy(&target, prompt, *n),
+            "request {id} diverged"
+        );
+    }
+    let (proposed, accepted) = sched.speculative_stats();
+    assert!(
+        proposed > 0 && accepted <= proposed,
+        "{accepted}/{proposed}"
+    );
+    assert!(
+        sched.resume_hits() > 0,
+        "request 3 should resume request 1's prompt"
+    );
+}

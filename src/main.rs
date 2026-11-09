@@ -12,7 +12,7 @@ use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
     GenerateArgs, KvQuantArg, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs,
-    TokenizeArgs,
+    Speculative, TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -843,7 +843,7 @@ fn publish_telemetry_snapshot(
     });
 }
 
-fn run_serve(args: ServeArgs) -> Result<()> {
+fn run_serve(mut args: ServeArgs) -> Result<()> {
     banner();
 
     // Decide up front whether `/v1/telemetry` exists. Collection still costs
@@ -976,6 +976,16 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
                 let ram_cache = resolve_ram_cache_bytes(&args, &plan);
+                // Lookup speculation pays where a pass moves weights: over PCIe
+                // into VRAM, or on the CPU from the checkpoint when the RAM cache
+                // cannot hold every layer. A CPU pass over cached layers is
+                // compute, where verifying k tokens costs nearly k passes.
+                let cached =
+                    default_ram_cache_bytes(plan.per_layer_weight_bytes, plan.num_layers, u64::MAX)
+                        .is_some_and(|all| ram_cache as u64 >= all);
+                let streamed =
+                    window < config.num_layers as usize && (device == Device::Gpu || !cached);
+                args.speculative = args.speculative.resolve(false, streamed)?;
                 publish_telemetry_snapshot(&config, &store, window as u32, true, device);
                 println!();
                 let dest = if device == Device::Gpu {
@@ -1065,6 +1075,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 return start_batched_server(generator, None, &args, &config, &listen, None);
             }
 
+            args.speculative = args
+                .speculative
+                .resolve(args.draft_model_path.is_some(), false)?;
             // Non-streaming paths materialize all layers resident.
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
 
@@ -1653,9 +1666,19 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     }
 
     // Batched, streaming engine: a background scheduler interleaves concurrent
-    // requests a token at a time. With a draft model it decodes speculatively
-    // (draft proposes, target verifies).
-    let speculative = draft.is_some();
+    // requests a token at a time. Speculating, a draft model or n-gram lookup
+    // proposes and the target verifies.
+    let mode = match (&draft, args.speculative) {
+        (Some(_), _) => format!(
+            "batched + speculative: draft model, gamma {}",
+            args.draft_gamma
+        ),
+        (None, Speculative::Ngram) => format!(
+            "batched + speculative: n-gram lookup, gamma {}",
+            args.draft_gamma
+        ),
+        _ => "batched".into(),
+    };
     let engine = match draft {
         Some(d) => dlm::server::EngineService::start_speculative(
             generator,
@@ -1667,6 +1690,17 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             usize::MAX,
             created,
             args.max_batch.max(1), // max concurrent batch (--max-batch)
+            prefix_cache,
+        ),
+        None if args.speculative == Speculative::Ngram => dlm::server::EngineService::start_ngram(
+            generator,
+            args.draft_gamma,
+            tokenizer,
+            config.vocab_size as usize,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
+            created,
+            args.max_batch.max(1),
             prefix_cache,
         ),
         None => dlm::server::EngineService::start(
@@ -1685,11 +1719,6 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     .with_context_window(args.context_length as usize);
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
-    let mode = if speculative {
-        "batched + speculative"
-    } else {
-        "batched"
-    };
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
     println!("  openai     : POST /v1/chat/completions (stream), GET /v1/models");
     println!("  anthropic  : POST /v1/messages (stream), POST /v1/messages/count_tokens");
@@ -1705,7 +1734,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             args.context_length
         );
     }
-    if prefix_cache > 0 && !speculative {
+    if prefix_cache > 0 && args.draft_model_path.is_none() {
         println!(
             "  prefix     : up to {prefix_cache} prompt prefixes cached{}",
             if kv_pool.is_some() {
@@ -1753,9 +1782,12 @@ const BENCH_TEXT: &str = "The river wound through the valley for many miles befo
 /// instead of serving it (see [`bench_generator`]).
 fn run_bench(args: BenchArgs) -> Result<()> {
     let BenchArgs { mut serve, opts } = args;
-    if serve.draft_model_path.is_some() || serve.distributed_mode != DistributedMode::Standalone {
+    if serve.draft_model_path.is_some()
+        || serve.speculative == Speculative::Ngram
+        || serve.distributed_mode != DistributedMode::Standalone
+    {
         return Err(DlmError::InvalidConfig(
-            "bench measures a single standalone model; drop --draft-model-path and --distributed-mode"
+            "bench measures plain decoding on a single standalone model; drop --draft-model-path, --speculative and --distributed-mode"
                 .into(),
         ));
     }

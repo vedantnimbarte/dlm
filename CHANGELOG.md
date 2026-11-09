@@ -67,6 +67,34 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Speculative decoding without a draft model, on by default where it pays.**
+  N-gram lookup proposes what followed the last time the context's latest few
+  tokens occurred; the target verifies the proposals in one pass, and keeps
+  the ones it agrees with. It is right whenever a reply copies — code being
+  rewritten, a document being quoted, a list being continued — and costs
+  nothing to draft.
+  - **`--speculative auto|off|ngram|draft`** on `serve`. `auto`, the default,
+    uses the draft model if `--draft-model-path` is given, else lookup when the
+    model is streamed, else nothing. Streamed means a pass moves weights: layers
+    left out of the `--stream` window, and on the CPU, more of them than the RAM
+    cache holds. That is where verifying several tokens costs about what
+    generating one does; where a pass is compute, a wrong guess is paid for in
+    full. `--draft-gamma` sets the proposals per round for either drafter.
+  - **Output is unchanged.** Greedy is exactly target-greedy (tested against
+    plain decoding, alone and in the batching scheduler). A lookup proposal is
+    a one-hot draft, so the usual rejection rule keeps it with probability
+    `p(x)` and otherwise resamples from `p` without it: sampled output follows
+    the model's own distribution (tested on the rule directly).
+  - **Acceptance is reported** in `usage.speculative`, as for a draft model.
+  - **Concurrency keeps its shared pass.** A request speculates only while it
+    is the one decoding; with several, each takes one token through the same
+    batched pass as plain decoding, since the streamed GPU kernel streams each
+    layer once for the whole batch and a verify pass per request would undo
+    that. A round with no match is a plain step, not a one-token verify.
+  - **Prompts still go in piecewise and through the prefix cache**: a lookup
+    request starts as a plain one and turns speculative once its prompt is in,
+    at no extra pass.
+
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of

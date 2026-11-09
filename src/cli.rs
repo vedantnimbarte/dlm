@@ -4,6 +4,7 @@
 //! unit-testable without spawning the binary. `main.rs` parses a [`Cli`] and
 //! dispatches on [`Command`].
 
+use crate::error::{DlmError, Result};
 use crate::model::QuantScheme;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -204,6 +205,54 @@ impl KvQuantArg {
     }
 }
 
+/// Speculative decoding (`--speculative`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Speculative {
+    /// The draft model if `--draft-model-path` is given; else n-gram lookup if
+    /// the model is streamed; else off.
+    Auto,
+    /// Decode one token per pass.
+    Off,
+    /// Propose from the request's own context: what followed the last time its
+    /// latest few tokens occurred. No second model.
+    Ngram,
+    /// Propose with the `--draft-model-path` model.
+    Draft,
+}
+
+impl Speculative {
+    /// What this comes to for a run (never `Auto`). `streamed`: whether a pass
+    /// moves layer weights, i.e. the model streams layers into VRAM, or on the
+    /// CPU from the checkpoint past what the RAM cache holds.
+    ///
+    /// Lookup is automatic only there because that is where it pays: a pass
+    /// costs moving the streamed layers' weights, so verifying a few tokens
+    /// costs little more than generating one. Where a pass is compute (a
+    /// resident model, or CPU layers all in the RAM cache), verifying k tokens
+    /// costs nearly k passes, and a wrong guess is paid for in full.
+    pub fn resolve(self, has_draft: bool, streamed: bool) -> Result<Speculative> {
+        match self {
+            Speculative::Auto if has_draft => Ok(Speculative::Draft),
+            Speculative::Auto if streamed => Ok(Speculative::Ngram),
+            Speculative::Auto => Ok(Speculative::Off),
+            Speculative::Draft if !has_draft => Err(DlmError::InvalidConfig(
+                "--speculative draft needs --draft-model-path".into(),
+            )),
+            Speculative::Off | Speculative::Ngram if has_draft => {
+                Err(DlmError::InvalidConfig(format!(
+                    "--draft-model-path would go unused with --speculative {}",
+                    if self == Speculative::Off {
+                        "off"
+                    } else {
+                        "ngram"
+                    }
+                )))
+            }
+            mode => Ok(mode),
+        }
+    }
+}
+
 /// Arguments for `dlm serve` (mirrors the schema).
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -265,10 +314,19 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     pub draft_model_path: Option<PathBuf>,
 
-    /// Draft tokens proposed per speculative round (only used with
-    /// `--draft-model-path`).
+    /// Tokens proposed per speculative round, by the draft model or n-gram
+    /// lookup.
     #[arg(long, default_value_t = 4)]
     pub draft_gamma: usize,
+
+    /// Speculative decoding: propose several tokens, verify them in one pass.
+    /// `auto` uses the draft model when `--draft-model-path` is given, else
+    /// n-gram lookup when the model is streamed (`--stream` with layers left out
+    /// of the resident window; on the CPU, also more than `--ram-cache-gb`
+    /// holds), else nothing. Output is unchanged: greedy is
+    /// exactly greedy, and sampling follows the model's own distribution.
+    #[arg(long, value_enum, default_value_t = Speculative::Auto)]
+    pub speculative: Speculative,
 
     /// Comma-separated local GPU indices to split layers across.
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
@@ -666,6 +724,28 @@ mod tests {
             panic!("expected serve");
         };
         assert_eq!(a.kv_quant, KvQuantArg::F32);
+    }
+
+    /// `auto` speculates with what it has: a draft model if given, lookup on a
+    /// streamed model, nothing on a resident one. Contradictions are refused
+    /// rather than silently resolved.
+    #[test]
+    fn speculative_resolves_auto_and_refuses_contradictions() {
+        use Speculative::*;
+        let cli = Cli::try_parse_from(["dlm", "serve", "--model-path", "/m"]).unwrap();
+        let Command::Serve(a) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(a.speculative, Auto);
+        let resolve = |m: Speculative, draft, streamed| m.resolve(draft, streamed).ok();
+        assert_eq!(resolve(Auto, true, true), Some(Draft));
+        assert_eq!(resolve(Auto, false, true), Some(Ngram));
+        assert_eq!(resolve(Auto, false, false), Some(Off));
+        assert_eq!(resolve(Ngram, false, false), Some(Ngram));
+        assert_eq!(resolve(Off, false, true), Some(Off));
+        assert_eq!(resolve(Draft, false, true), None);
+        assert_eq!(resolve(Ngram, true, true), None);
+        assert_eq!(resolve(Off, true, false), None);
     }
 
     #[test]

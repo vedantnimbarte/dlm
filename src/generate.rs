@@ -821,13 +821,13 @@ impl<K: ComputeKernel> Generator<K> {
 /// batching). Borrows the generator's weights; each session owns its own KV
 /// state, so stepping sessions in any order yields identical per-session output.
 pub struct GenerationSession<'a, K: ComputeKernel> {
-    generator: &'a Generator<K>,
-    orchestrator: crate::forward::ForwardOrchestrator<&'a K>,
+    pub(crate) generator: &'a Generator<K>,
+    pub(crate) orchestrator: crate::forward::ForwardOrchestrator<&'a K>,
     last_hidden: Vec<f32>,
-    sampler: Sampler,
-    rng: SplitMix64,
+    pub(crate) sampler: Sampler,
+    pub(crate) rng: SplitMix64,
     /// Context tokens (prompt + generated) for the repetition penalty.
-    seen: std::collections::HashSet<u32>,
+    pub(crate) seen: std::collections::HashSet<u32>,
     /// Prompt tokens not yet run through the model (see
     /// [`prefill_some`](GenerationSession::prefill_some)).
     pending: Vec<u32>,
@@ -1018,7 +1018,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
 
     /// Choose the next token and load its embedding into `last_hidden`, ready
     /// for the pass through the model that `step` (or `step_sessions`) runs.
-    fn sample_next(&mut self) -> Result<u32> {
+    pub(crate) fn sample_next(&mut self) -> Result<u32> {
         if self.is_prefilling() {
             return Err(DlmError::InvalidConfig(
                 "session has prompt tokens left to prefill".into(),

@@ -156,6 +156,36 @@ impl EngineService {
         )
     }
 
+    /// Start the engine speculating with no draft model: each request proposes
+    /// up to `gamma` tokens per round by n-gram lookup in its own context.
+    /// Output is identical to [`start`](Self::start).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_ngram<K: ComputeKernel + Send + 'static>(
+        generator: Generator<K>,
+        gamma: usize,
+        tokenizer: BpeTokenizer,
+        vocab_size: usize,
+        model_id: impl Into<String>,
+        default_max_tokens: usize,
+        created: u64,
+        max_batch: usize,
+        prefix_cache_size: usize,
+    ) -> Arc<Self> {
+        Self::start_inner(
+            generator,
+            None,
+            gamma.max(1),
+            tokenizer,
+            vocab_size,
+            model_id,
+            default_max_tokens,
+            created,
+            max_batch,
+            prefix_cache_size,
+        )
+    }
+
+    /// `gamma` 0 without a draft is plain decoding; above 0, n-gram lookup.
     #[allow(clippy::too_many_arguments)]
     fn start_inner<K: ComputeKernel + Send + 'static>(
         generator: Generator<K>,
@@ -293,8 +323,10 @@ fn engine_loop<K: ComputeKernel>(
     stream: Arc<StreamMetrics>,
 ) {
     let mut sched = match &draft {
-        // Speculative sessions can't resume, so the prefix cache is plain-path only.
+        // Draft-model sessions can't resume, so they get no prefix cache.
         Some(d) => BatchScheduler::with_speculative(&generator, d, max_batch, gamma),
+        None if gamma > 0 => BatchScheduler::with_ngram(&generator, max_batch, gamma)
+            .with_prefix_cache(prefix_cache_size),
         None => BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size),
     };
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
@@ -515,8 +547,8 @@ struct Usage {
     speculative: Option<SpeculativeUsage>,
 }
 
-/// Speculative-decoding acceptance, reported inside `usage` when a draft model
-/// served the request.
+/// Speculative-decoding acceptance, reported inside `usage` when the request
+/// was decoded speculatively (by a draft model or n-gram lookup).
 #[derive(Serialize)]
 struct SpeculativeUsage {
     draft_proposed: usize,
