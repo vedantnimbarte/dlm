@@ -40,6 +40,46 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **GPU prefill is 4.6-6x faster and decode up to 1.7x.** Measured on a GTX
+  1650 (4 GB), `dlm bench --context-length 2048 --prompt-len 512 --gen-len 128
+  --batch 1,8`, the 0.4.x build and this one run alternately, best of three:
+
+  | Model | Decode, batch 1 | Decode, batch 8 (total) | Prefill |
+  |---|---|---|---|
+  | Qwen2.5-0.5B Q4_K_M GGUF | 80.6 → **116.6** tok/s | 112 → **180** | 268 → **1614** |
+  | Qwen2.5-0.5B bf16 | 79.3 → **89.0** | 112 → **185** | 266 → **1575** |
+  | Qwen2.5-1.5B `--quant int4` | 34.1 → **59.2** | 49.8 → **64.1** | 106 → **484** |
+
+  - **GEMV:** a warp per output row, each lane decoding an aligned chunk of
+    weights with wide loads. Quantized formats dot int8-quantized activations
+    with `dp4a`, as llama.cpp does: their GEMVs had been bound by decoding at
+    16-40 GB/s, not by memory. That costs about 0.0016 nats of NLL on the GGUF
+    model (32.13 → 32.18 perplexity over 625 tokens); `DLM_GEMV_EXACT=1` keeps
+    the f32 path.
+  - **Fewer launches:** Q, K and V in one grid; the output and down
+    projections add straight into the residual; one warp per head does
+    Qwen3's head norm, RoPE and the KV append (six launches before). Fusing
+    gate, up and SwiGLU was tried and dropped: it never beat three launches.
+  - **Attention** splits the cache into chunks, reads each key once per KV head
+    instead of once per query head, and merges long contexts' chunks in a
+    second launch.
+  - **Prefill** takes up to 512 prompt tokens through a layer at once as tiled
+    GEMMs, with one attention launch for every query, instead of the decode
+    block 16 tokens at a time. Cards with tensor cores multiply on them (bf16
+    from Ampere, fp16 with per-row scaling on Volta/Turing RTX); GTX cards use
+    the f32 kernel. `DLM_GEMM=simt|tc` overrides the choice.
+  - **Greedy decoding** takes the LM head's argmax on the device, copying four
+    bytes back instead of the vocabulary's logits.
+  - **Batched decode of MoE models** reads each attention matrix once per
+    batch instead of once per sequence.
+  - `build.rs` builds the kernels for sm_75, 80, 86 and 89 plus PTX, so Ampere
+    and newer run their own code (bf16 tensor cores need it).
+    `DLM_CUDA_ARCHS=75` narrows a local build.
+- **The quantized KV cache keeps a scale per 32 values, not per token.** One
+  scale across a token's whole K or V vector let a few large key channels set
+  the range for every head. Qwen2.5-0.5B, mean NLL over 415 tokens (3.644 with
+  an exact cache): int8 3.750 → 3.685, int4 6.266 → 5.312. int4 KV is still
+  far from exact; prefer int8. `dlm score --kv-quant` measures it.
 - **CPU decode is 2.5x faster on a bf16 model and 4.5x on a GGUF one.** The
   CPU matvec summed one weight at a time (an f32 `sum()` that LLVM may not
   reorder) and decoded every quantized weight on its own. Measured on a Ryzen 5
@@ -152,6 +192,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--gpu-layers N`: the layers that do not fit in VRAM run on the CPU**,
+  where their weights already are, instead of streaming across PCIe every
+  token (llama.cpp's `-ngl`). Qwen2.5-1.5B bf16 on a 4 GB GTX 1650, against
+  `--stream` holding the same number of layers: decode 8.3 → 11.0 tok/s at 16
+  of 28 layers, 5.6 → 7.4 at 8. Prefill is slower (the CPU runs a prompt token
+  by token), so `--stream` remains the better choice for long prompts.
 - **Speculative decoding without a draft model, on by default where it pays.**
   N-gram lookup proposes what followed the last time the context's latest few
   tokens occurred; the target verifies the proposals in one pass, and keeps
