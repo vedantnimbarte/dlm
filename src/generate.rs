@@ -15,7 +15,8 @@
 
 use crate::cache::{KvCacheConfig, PagedKvCache};
 use crate::error::{DlmError, Result};
-use crate::forward::cpu::{matvec, KvLayerCache};
+use crate::forward::cpu::{matvec_native, KvLayerCache};
+use crate::forward::Weights;
 use crate::forward::{ComputeKernel, ForwardOrchestrator};
 
 /// Prompt tokens staged per prefill call. Bounds the `tokens × hidden` buffer on
@@ -328,7 +329,10 @@ pub struct Generator<K: ComputeKernel> {
     /// Final pre-head RMSNorm weight, `[hidden]`.
     final_norm: Vec<f32>,
     /// LM head, row-major `[vocab, hidden]` (untied from the embedding here).
-    lm_head: Vec<f32>,
+    /// bf16 when every value is exactly bf16, as a bf16 checkpoint's are: the
+    /// same numbers in half the bytes, and on the CPU the vocabulary-wide GEMV
+    /// is bound by those bytes.
+    lm_head: Weights,
     vocab_size: usize,
     hidden_size: usize,
     rms_eps: f32,
@@ -390,7 +394,11 @@ impl<K: ComputeKernel> Generator<K> {
             kernel,
             embedding,
             final_norm,
-            lm_head,
+            lm_head: if lm_head.iter().all(|v| v.to_bits() & 0xFFFF == 0) {
+                Weights::Bf16(lm_head.iter().map(|v| (v.to_bits() >> 16) as u16).collect())
+            } else {
+                Weights::from_f32(lm_head)
+            },
             vocab_size,
             hidden_size,
             rms_eps,
@@ -463,9 +471,8 @@ impl<K: ComputeKernel> Generator<K> {
     /// Move the LM head into VRAM, so each step's vocabulary-wide GEMV runs on the
     /// device instead of the host.
     ///
-    /// Precision follows the weights: a head that is exactly bf16-representable
-    /// (a bf16 checkpoint) uploads as bf16, losslessly and at half the size;
-    /// anything else uploads as f32. `quantize_int8` is for a model whose layers
+    /// Precision follows the weights: the host head uploads as it is held, bf16
+    /// when that is lossless and f32 otherwise. `quantize_int8` is for a model whose layers
     /// were quantized at load (`--quant int4`/`int8`) -- the user already chose
     /// lossy weights, and int8 keeps the head's error small (int4 is too coarse
     /// for the one matrix every token's choice goes through).
@@ -478,26 +485,23 @@ impl<K: ComputeKernel> Generator<K> {
     /// exhausted, say) the generator is untouched and keeps the host head.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
     pub fn place_lm_head_on_gpu(&mut self, quantize_int8: bool, device: Option<u32>) -> Result<()> {
-        use crate::forward::Weights;
+        let int8;
         let head = if quantize_int8 {
-            Weights::quantize_int8(&self.lm_head, crate::forward::QUANT_GROUP_SIZE)?
-        } else if self.lm_head.iter().all(|v| v.to_bits() & 0xFFFF == 0) {
-            Weights::Bf16(
-                self.lm_head
-                    .iter()
-                    .map(|v| (v.to_bits() >> 16) as u16)
-                    .collect(),
-            )
+            let values: Vec<f32> = (0..self.lm_head.len())
+                .map(|i| self.lm_head.get(i))
+                .collect();
+            int8 = Weights::quantize_int8(&values, crate::forward::QUANT_GROUP_SIZE)?;
+            &int8
         } else {
-            Weights::from_f32(self.lm_head.clone())
+            &self.lm_head
         };
         self.gpu_head = Some(crate::forward::GpuLmHead::new(
-            &head,
+            head,
             self.vocab_size,
             self.hidden_size,
             device,
         )?);
-        self.lm_head = Vec::new();
+        self.lm_head = Weights::default();
         Ok(())
     }
 
@@ -666,10 +670,10 @@ impl<K: ComputeKernel> Generator<K> {
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
         let mut out = match &self.gpu_head {
             Some(head) => head.logits(&normed)?,
-            None => matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size),
+            None => matvec_native(&self.lm_head, &normed, self.vocab_size, self.hidden_size),
         };
         #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
-        let mut out = matvec(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
+        let mut out = matvec_native(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
         if let Some(cap) = self.final_logit_softcap {
             for l in out.iter_mut() {
                 *l = (*l / cap).tanh() * cap;
