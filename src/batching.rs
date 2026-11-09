@@ -127,7 +127,7 @@ struct Pending {
 /// speculative session that emits a whole round's accepted tokens per step.
 enum Decoder<'a, K: ComputeKernel> {
     Plain(GenerationSession<'a, K>),
-    Speculative(SpeculativeSession<'a, K, K>),
+    Speculative(SpeculativeSession<'a, K>),
 }
 
 /// An in-flight generation occupying a batch slot.

@@ -269,3 +269,55 @@ fn sampled_speculation_follows_the_target_distribution() {
         );
     }
 }
+
+/// Drive a session to `n` tokens, a round at a time.
+fn run_session(s: &mut SpeculativeSession<CpuKernel>, n: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let emitted = s.step(n - out.len()).unwrap();
+        assert!(!emitted.is_empty(), "a round must make progress");
+        out.extend(emitted);
+    }
+    out
+}
+
+/// Lookup proposals are verified like a draft model's: under greedy the output
+/// is exactly target-greedy, whether the lookup guessed right or not.
+#[test]
+fn ngram_speculation_equals_target_greedy() {
+    let target = build_generator(1);
+    // A prompt that repeats itself, so lookup has something to propose.
+    let prompt = [4u32, 8, 15, 16, 23, 4, 8, 15, 16, 23, 4, 8];
+    let n = 24;
+    for gamma in [1, 3, 6] {
+        let mut s = SpeculativeSession::ngram(&target, gamma, &prompt, Sampler::Greedy).unwrap();
+        assert_eq!(
+            run_session(&mut s, n),
+            greedy(&target, &prompt, n),
+            "gamma {gamma}: n-gram speculation diverged from target-greedy"
+        );
+        // Both outcomes: some lookups right, some wrong.
+        assert!(
+            0 < s.accepted() && s.accepted() < s.proposed(),
+            "gamma {gamma}: {} of {} accepted, so one outcome went untested",
+            s.accepted(),
+            s.proposed()
+        );
+    }
+}
+
+/// With nothing in the context to look up, a round is a plain single-token
+/// step: one token out, nothing counted as proposed.
+#[test]
+fn ngram_without_a_match_steps_one_token() {
+    let target = build_generator(1);
+    let prompt = [3u32, 1, 4];
+    let mut s = SpeculativeSession::ngram(&target, 4, &prompt, Sampler::Greedy).unwrap();
+    let first = s.step(10).unwrap();
+    assert_eq!(first, greedy(&target, &prompt, 1));
+    assert_eq!(s.proposed(), 0);
+    // And it carries on exactly as plain decoding would.
+    let mut out = first;
+    out.extend(run_session(&mut s, 7));
+    assert_eq!(out, greedy(&target, &prompt, 8));
+}
