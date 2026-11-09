@@ -1542,6 +1542,169 @@ static const DlmBlockExt DLM_BLOCK_DEFAULT = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
 // Launch the three attention kernels for one query over `positions` cached
 // tokens. Scores live in scratch slot ATTN_SCORES.
+// ── Split-K decode attention (flash-decoding) ───────────────────────────────
+//
+// The three-kernel attention below reads every key once per *query* head (a GQA
+// group of 7 query heads reads each key 7 times), keeps a [heads, span] score
+// matrix in global memory, and mixes the values with one thread per output
+// element walking the whole history: at a few thousand tokens that walk is a
+// long serial loop on a few hundred threads.
+//
+// Here one block takes one KV head and one chunk of `C` positions: a thread
+// scores one position against every query head of the group (the key row read
+// once), the chunk's softmax runs in shared memory, and the block mixes its
+// values. Chunks are independent, so a long context spreads over many blocks;
+// each writes its unnormalized output with its running max and sum, and
+// `attn_combine_kernel` merges them with the usual rescaling. A context that
+// fits one chunk is normalized in place and needs no second launch.
+#define FA_MAX_G 16
+
+template <int KT>
+__device__ __forceinline__ void load_kv8(const void* kv, long i, float* out) {
+    if (KT == DLM_KV_F16) {
+        uint4 v = *(const uint4*)((const __half*)kv + i);
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out[2 * j] = half_bits(u[j] & 0xFFFFu);
+            out[2 * j + 1] = half_bits(u[j] >> 16);
+        }
+    } else {
+        const float4* p = (const float4*)((const float*)kv + i);
+        float4 a = p[0], b = p[1];
+        out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w;
+        out[4] = b.x; out[5] = b.y; out[6] = b.z; out[7] = b.w;
+    }
+}
+
+__device__ __forceinline__ float warp_max(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    return v;
+}
+
+// Grid (num_kv_heads, splits), block C threads (C >= head_dim, a multiple of 32).
+// Shared: G*head_dim (queries) + G*C (scores) + 2G (max, sum) floats.
+// `part` is [splits][num_heads][head_dim + 2]: output, then max and sum.
+template <int KT>
+__global__ void attn_split_kernel(const float* __restrict__ q, const void* keys, const void* values,
+                                  const int* table, int shift, int num_heads, int num_kv_heads,
+                                  int head_dim, int start, int span, float scale, float softcap,
+                                  float* part, float* ctx) {
+    extern __shared__ float smem[];
+    const int G = num_heads / num_kv_heads, kvh = blockIdx.x, split = blockIdx.y;
+    const int C = blockDim.x, t = threadIdx.x;
+    float* qs = smem;
+    float* sc = qs + G * head_dim;
+    float* ml = sc + G * C;
+    for (int i = t; i < G * head_dim; i += C) qs[i] = q[(long)kvh * G * head_dim + i];
+    __syncthreads();
+
+    const int p0 = split * C, n = min(C, span - p0);
+    const long kv_dim = (long)num_kv_heads * head_dim;
+    if (t < n) {
+        long kh = kv_row(table, shift, start + p0 + t) * kv_dim + (long)kvh * head_dim;
+        float acc[FA_MAX_G];
+        #pragma unroll
+        for (int g = 0; g < FA_MAX_G; ++g) acc[g] = 0.0f;
+        for (int d = 0; d < head_dim; d += 8) {
+            float kk[8];
+            load_kv8<KT>(keys, kh + d, kk);
+            #pragma unroll
+            for (int g = 0; g < FA_MAX_G; ++g) {
+                if (g < G) {
+                    const float* qg = qs + g * head_dim + d;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) acc[g] += qg[j] * kk[j];
+                }
+            }
+        }
+        #pragma unroll
+        for (int g = 0; g < FA_MAX_G; ++g) {
+            if (g < G) {
+                float s = acc[g] * scale;
+                if (softcap > 0.0f) s = tanhf(s / softcap) * softcap;
+                sc[g * C + t] = s;
+            }
+        }
+    }
+    __syncthreads();
+
+    // The chunk's softmax statistics, one warp per query head.
+    const int warp = t >> 5, lane = t & 31, warps = C >> 5;
+    for (int g = warp; g < G; g += warps) {
+        float m = -1e30f;
+        for (int i = lane; i < n; i += 32) m = fmaxf(m, sc[g * C + i]);
+        m = warp_max(m);
+        float l = 0.0f;
+        for (int i = lane; i < n; i += 32) {
+            float e = expf(sc[g * C + i] - m);
+            sc[g * C + i] = e;
+            l += e;
+        }
+        l = warp_sum(l);
+        if (lane == 0) {
+            ml[2 * g] = m;
+            ml[2 * g + 1] = l;
+        }
+    }
+    __syncthreads();
+
+    // Values: thread (slice, d) accumulates every head of the group over the
+    // positions `slice, slice + P, ...`, so each value element is read once.
+    const int P = C / head_dim, d = t % head_dim, slice = t / head_dim;
+    float acc[FA_MAX_G];
+    #pragma unroll
+    for (int g = 0; g < FA_MAX_G; ++g) acc[g] = 0.0f;
+    if (slice < P) {
+        for (int i = slice; i < n; i += P) {
+            float v = load_kv<KT>(values, kv_row(table, shift, start + p0 + i) * kv_dim +
+                                              (long)kvh * head_dim + d);
+            #pragma unroll
+            for (int g = 0; g < FA_MAX_G; ++g)
+                if (g < G) acc[g] += sc[g * C + i] * v;
+        }
+    }
+    __syncthreads();   // every read of the weights is done: reuse `sc` for the slices
+    if (slice < P) {
+        #pragma unroll
+        for (int g = 0; g < FA_MAX_G; ++g)
+            if (g < G) sc[(slice * G + g) * head_dim + d] = acc[g];
+    }
+    __syncthreads();
+    const bool alone = gridDim.y == 1;
+    for (int i = t; i < G * head_dim; i += C) {
+        int g = i / head_dim, dd = i % head_dim;
+        float o = 0.0f;
+        for (int s = 0; s < P; ++s) o += sc[(s * G + g) * head_dim + dd];
+        long h = (long)kvh * G + g;
+        if (alone) ctx[h * head_dim + dd] = o / ml[2 * g + 1];
+        else part[((long)split * num_heads + h) * (head_dim + 2) + dd] = o;
+    }
+    if (!alone && t < G) {
+        long at = ((long)split * num_heads + (long)kvh * G + t) * (head_dim + 2) + head_dim;
+        part[at] = ml[2 * t];
+        part[at + 1] = ml[2 * t + 1];
+    }
+}
+
+// Merge the chunks of one head: <<<num_heads, 128>>>.
+__global__ void attn_combine_kernel(const float* part, float* ctx, int num_heads, int head_dim,
+                                    int splits) {
+    const int h = blockIdx.x;
+    const long stride = (long)num_heads * (head_dim + 2);
+    const float* p = part + (long)h * (head_dim + 2);
+    float m = -1e30f;
+    for (int s = 0; s < splits; ++s) m = fmaxf(m, p[s * stride + head_dim]);
+    float l = 0.0f;
+    for (int s = 0; s < splits; ++s) l += p[s * stride + head_dim + 1] * expf(p[s * stride + head_dim] - m);
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float o = 0.0f;
+        for (int s = 0; s < splits; ++s) o += p[s * stride + d] * expf(p[s * stride + head_dim] - m);
+        ctx[(long)h * head_dim + d] = o / l;
+    }
+}
+
 static cudaError_t launch_attention(const float* q, const void* keys, const void* values,
                                     const int* table, int shift, float* ctx, int num_heads,
                                     int num_kv_heads, int head_dim, int positions,
@@ -1551,9 +1714,33 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
     int span = positions - start;
     // The span grows by one every token; sizing to it exactly would free and
     // re-malloc (two synchronizing driver calls) on every call. Grow in steps.
-    cudaError_t e = scratch_ensure(ATTN_SCORES, num_heads * ((span + 1023) & ~1023));
+    // The slot holds the score matrix (old path) or the split partials (new),
+    // whichever is larger at the rounded span.
+    const int C = head_dim > 128 ? 256 : 128;
+    int rounded = (span + 1023) & ~1023;
+    long part_need = (long)((rounded + C - 1) / C) * num_heads * (head_dim + 2);
+    long need = (long)num_heads * rounded;
+    cudaError_t e = scratch_ensure(ATTN_SCORES, (int)(part_need > need ? part_need : need));
     if (e != cudaSuccess) return e;
     float* scores = g_scratch[ATTN_SCORES];
+
+    const int G = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
+    if (G >= 1 && G <= FA_MAX_G && G * num_kv_heads == num_heads && head_dim % 8 == 0 &&
+        head_dim <= 256) {
+        const int splits = (span + C - 1) / C;
+        size_t shmem = (size_t)(G * head_dim + G * C + 2 * G) * sizeof(float);
+        dim3 grid(num_kv_heads, splits);
+        if (kv_half)
+            attn_split_kernel<DLM_KV_F16><<<grid, C, shmem>>>(q, keys, values, table, shift, num_heads,
+                                                              num_kv_heads, head_dim, start, span,
+                                                              scale, softcap, scores, ctx);
+        else
+            attn_split_kernel<DLM_KV_F32><<<grid, C, shmem>>>(q, keys, values, table, shift, num_heads,
+                                                              num_kv_heads, head_dim, start, span,
+                                                              scale, softcap, scores, ctx);
+        if (splits > 1) attn_combine_kernel<<<num_heads, 128>>>(scores, ctx, num_heads, head_dim, splits);
+        return cudaSuccess;
+    }
     if (kv_half)
         attn_scores_kernel<DLM_KV_F16><<<grid_for(num_heads * span, B), B>>>(
             q, keys, table, shift, scores, num_heads, num_kv_heads, head_dim, start, span, scale,

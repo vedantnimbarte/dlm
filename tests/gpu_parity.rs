@@ -1818,6 +1818,61 @@ fn gpu_long_context_attention_matches_cpu() {
     }
 }
 
+/// The split-K attention at real head geometries: Qwen2.5's 7 query heads per
+/// KV head at `head_dim` 64 (128 positions per chunk), and `head_dim` 256 (256
+/// per chunk), each long enough to need several chunks and their merge.
+#[test]
+fn gpu_split_attention_matches_cpu_at_real_head_shapes() {
+    for (num_heads, num_kv_heads, head_dim, tokens) in [(14, 2, 64, 300), (4, 2, 256, 600)] {
+        let cfg = BlockConfig {
+            hidden_size: 128,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            intermediate_size: 256,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            ..Default::default()
+        };
+        let layers = random_layers(&cfg, 1, 0x5A17);
+        let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
+        let gpu = GpuKernel::new(cfg, layers, tokens + 8).unwrap();
+        let kv_cfg = KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            block_size: 16,
+        };
+        let blocks = (tokens + 8).div_ceil(16) as u32;
+        let mut orch_cpu = ForwardOrchestrator::new(
+            cpu,
+            PagedKvCache::new(kv_cfg, blocks),
+            dlm::forward::KvQuant::None,
+        );
+        let mut orch_gpu = ForwardOrchestrator::new(
+            gpu,
+            PagedKvCache::new(kv_cfg, blocks),
+            dlm::forward::KvQuant::None,
+        );
+        let mut rng = Rng::new(0x5A18);
+        let h = cfg.hidden_size;
+        let mut want = rng.vec(tokens * h, 0.5);
+        let mut got = want.clone();
+        for hidden in want.chunks_mut(h) {
+            orch_cpu.decode_token(hidden).unwrap();
+        }
+        orch_gpu.prefill(&mut got).unwrap();
+        let mut a = rng.vec(h, 0.5);
+        let mut b = a.clone();
+        orch_cpu.decode_token(&mut a).unwrap();
+        orch_gpu.decode_token(&mut b).unwrap();
+        for (what, x, y) in [("prefill tail", &want[want.len() - 4 * h..], &got[got.len() - 4 * h..]), ("decode", &a[..], &b[..])] {
+            let d = x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+            assert!(d < 2e-3, "heads {num_heads}/{num_kv_heads} dim {head_dim}: {what} diverged by {d}");
+        }
+    }
+}
+
 /// The LM head on the device must pick the same tokens as the host head, in
 /// each precision it uploads: bf16 (a head whose values are exactly
 /// bf16-representable, as a bf16 checkpoint's are), f32 (anything else), and
