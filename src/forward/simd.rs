@@ -94,9 +94,10 @@ impl<'a> RowDot<'a> {
 
     /// `sum(W[base + j] * x[j])` over `x.len()` weights from element `base`.
     pub(crate) fn row(&self, base: usize, x: &[f32]) -> f32 {
-        debug_assert!(base + x.len() <= self.w.len());
-        // SAFETY: `isa` was detected on this CPU, and `new` checked the blob
-        // holds every element the row reads.
+        // The quantized kernels read codes through raw pointers; this and the
+        // blob length `new` checked keep those reads inside the blob.
+        assert!(base + x.len() <= self.w.len(), "row past the matrix");
+        // SAFETY: `isa` was detected on this CPU, and the row is in bounds.
         match self.isa {
             #[cfg(target_arch = "x86_64")]
             Isa::Avx2 => unsafe { avx2::row(self.w, base, x) },
