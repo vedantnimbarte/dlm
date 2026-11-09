@@ -1875,18 +1875,35 @@ impl KvLayerCache {
 pub(crate) fn matvec(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_dim * in_dim);
     matvec_rows(out_dim, in_dim, x, |o, x| {
-        let row = &w[o * in_dim..(o + 1) * in_dim];
-        row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum()
+        super::simd::dot_f32(&w[o * in_dim..(o + 1) * in_dim], x)
     })
 }
 
-/// `matvec` over weights in their native dtype. Dispatches on the dtype **once**
-/// so each row's inner loop is monomorphic — the F32 arm keeps the plain
-/// `&[f32]` dot product (and its autovectorization) unchanged.
+/// `matvec` over weights in their native dtype: the SIMD kernels where this CPU
+/// has them, else [`matvec_native_scalar`].
 pub(crate) fn matvec_native(w: &Weights, x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_dim * in_dim);
+    match super::simd::RowDot::new(w, in_dim) {
+        Some(dot) => matvec_rows(out_dim, in_dim, x, |o, x| dot.row(o * in_dim, x)),
+        None => matvec_native_scalar(w, x, out_dim, in_dim),
+    }
+}
+
+/// The reference `matvec_native`, one weight at a time: what the SIMD kernels
+/// are tested against, and what runs on a CPU without them. Dispatches on the
+/// dtype **once** so each row's inner loop is monomorphic.
+pub(crate) fn matvec_native_scalar(
+    w: &Weights,
+    x: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(w.len(), out_dim * in_dim);
     match w {
-        Weights::F32(v) => matvec(v, x, out_dim, in_dim),
+        Weights::F32(v) => matvec_rows(out_dim, in_dim, x, |o, x| {
+            let row = &v[o * in_dim..(o + 1) * in_dim];
+            row.iter().zip(x).map(|(&wij, &xj)| wij * xj).sum()
+        }),
         Weights::Bf16(v) => matvec_rows(out_dim, in_dim, x, |o, x| {
             let row = &v[o * in_dim..(o + 1) * in_dim];
             row.iter().zip(x).map(|(&b, &xj)| bf16_to_f32(b) * xj).sum()
