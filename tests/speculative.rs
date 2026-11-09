@@ -156,6 +156,42 @@ fn session_round_by_round_equals_target_greedy() {
     assert!(session.accepted() <= session.proposed());
 }
 
+/// Penalties depend on the tokens so far, so speculation has to apply them at
+/// each proposal's own position. Under greedy that makes its output exactly
+/// what a plain session with the same penalties produces.
+#[test]
+fn speculative_penalties_match_plain_decoding() {
+    let prompt = [1u32, 2, 3];
+    let n = 12;
+    let (target, draft) = (build_generator(1), build_generator(2));
+    let penalties = dlm::generate::Penalties {
+        logit_bias: vec![(5, -100.0)],
+        frequency: 2.0,
+        presence: 1.0,
+    };
+
+    let mut plain = target
+        .start_session(&prompt, Sampler::Greedy)
+        .unwrap()
+        .with_penalties(penalties.clone());
+    let expected: Vec<u32> = (0..n).map(|_| plain.step().unwrap()).collect();
+
+    let mut session = SpeculativeSession::new(&target, &draft, 4, &prompt, Sampler::Greedy)
+        .unwrap()
+        .with_penalties(penalties);
+    let mut out = Vec::new();
+    while out.len() < n {
+        out.extend(session.step(n - out.len()).unwrap());
+    }
+    assert_eq!(out, expected);
+    assert!(!out.contains(&5), "a -100 bias is a ban");
+    assert_ne!(
+        out,
+        greedy(&build_generator(1), &prompt, n),
+        "penalties had no effect"
+    );
+}
+
 #[test]
 fn speculative_scheduler_matches_greedy_across_requests() {
     let target = build_generator(1);

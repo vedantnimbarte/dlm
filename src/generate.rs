@@ -152,18 +152,41 @@ impl Sampler {
 /// Logit adjustments a request layers on its [`Sampler`]. Unlike the sampler's
 /// own knobs these apply under greedy too: a `-100` bias is how an OpenAI client
 /// bans a token, and a ban that `temperature: 0` ignored would not be one.
+///
+/// Each is a function of the tokens so far, so speculative decoding can apply
+/// them at every proposal position exactly as plain decoding would.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Penalties {
     /// OpenAI's `logit_bias`: `(token, bias)` pairs added to the logits.
     pub logit_bias: Vec<(u32, f32)>,
+    /// OpenAI's `frequency_penalty`: subtracted once per time a token has been
+    /// generated.
+    pub frequency: f32,
+    /// OpenAI's `presence_penalty`: subtracted once from any token generated
+    /// at all.
+    pub presence: f32,
 }
 
 impl Penalties {
-    /// Adjust `logits` in place, before the sampler sees them.
-    pub fn apply(&self, logits: &mut [f32]) {
+    /// Adjust `logits` in place, before the sampler sees them. `context` is the
+    /// prompt (its first `prompt_len` tokens) followed by what was generated.
+    /// The frequency and presence penalties count generated tokens only, as
+    /// OpenAI's do: a prompt that quotes a word should not make it unsayable.
+    pub fn apply(&self, logits: &mut [f32], context: &[u32], prompt_len: usize) {
         for &(token, bias) in &self.logit_bias {
             if let Some(l) = logits.get_mut(token as usize) {
                 *l += bias;
+            }
+        }
+        if self.frequency != 0.0 || self.presence != 0.0 {
+            let mut counts = std::collections::HashMap::new();
+            for &t in &context[prompt_len.min(context.len())..] {
+                *counts.entry(t).or_insert(0u32) += 1;
+            }
+            for (t, n) in counts {
+                if let Some(l) = logits.get_mut(t as usize) {
+                    *l -= self.frequency * n as f32 + self.presence;
+                }
             }
         }
     }
@@ -575,18 +598,24 @@ impl<K: ComputeKernel> Generator<K> {
     }
 
     /// The sampler's next-token distribution after `hidden`, with the repetition
-    /// penalty applied over `seen` and then `penalties` -- exactly what a session
-    /// samples from.
+    /// penalty and then `penalties` applied over `context` (the prompt, its
+    /// first `prompt_len` tokens, then what was generated) -- exactly what a
+    /// session samples from.
     pub(crate) fn distribution(
         &self,
         hidden: &[f32],
-        seen: &std::collections::HashSet<u32>,
         sampler: &Sampler,
         penalties: &Penalties,
+        context: &[u32],
+        prompt_len: usize,
     ) -> Result<Vec<(u32, f32)>> {
         let mut logits = self.logits(hidden)?;
-        apply_repetition_penalty(&mut logits, seen, sampler.repetition_penalty());
-        penalties.apply(&mut logits);
+        let penalty = sampler.repetition_penalty();
+        if penalty != 1.0 {
+            let seen = context.iter().copied().collect();
+            apply_repetition_penalty(&mut logits, &seen, penalty);
+        }
+        penalties.apply(&mut logits, context, prompt_len);
         Ok(sampler.distribution(&logits))
     }
 
@@ -869,6 +898,9 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     /// Context tokens (prompt + generated) for the repetition penalty.
     seen: std::collections::HashSet<u32>,
     penalties: Penalties,
+    /// The prompt then every generated token, which `penalties` read.
+    context: Vec<u32>,
+    prompt_len: usize,
     /// Prompt tokens not yet run through the model (see
     /// [`prefill_some`](GenerationSession::prefill_some)).
     pending: Vec<u32>,
@@ -909,6 +941,8 @@ impl<K: ComputeKernel> Generator<K> {
             sampler,
             seen: prompt.iter().copied().collect(),
             penalties: Penalties::default(),
+            context: prompt.to_vec(),
+            prompt_len: prompt.len(),
             pending: prompt.to_vec(),
         })
     }
@@ -969,6 +1003,8 @@ impl<K: ComputeKernel> Generator<K> {
             // run without the prefix cache.
             seen: prompt.iter().copied().collect(),
             penalties: Penalties::default(),
+            context: prompt.to_vec(),
+            prompt_len: prompt.len(),
             pending: suffix.to_vec(),
         })
     }
@@ -1075,9 +1111,11 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
         }
         let mut logits = self.generator.logits(&self.last_hidden)?;
         apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
-        self.penalties.apply(&mut logits);
+        self.penalties
+            .apply(&mut logits, &self.context, self.prompt_len);
         let next = self.sampler.sample(&logits, &mut self.rng);
         self.seen.insert(next);
+        self.context.push(next);
         self.last_hidden = self.generator.embed(next, self.orchestrator.position())?;
         Ok(next)
     }
@@ -1329,6 +1367,7 @@ mod tests {
         let gen = counting_generator();
         let penalties = Penalties {
             logit_bias: vec![(3, 100.0), (999, 1.0)],
+            ..Default::default()
         };
         let mut s = gen
             .start_session(&[0], Sampler::Greedy)
@@ -1336,6 +1375,28 @@ mod tests {
             .with_penalties(penalties);
         assert_eq!(s.step().unwrap(), 3);
         assert_eq!(s.step().unwrap(), 3);
+    }
+
+    #[test]
+    fn frequency_and_presence_penalize_generated_tokens_only() {
+        let p = Penalties {
+            frequency: 0.5,
+            presence: 1.0,
+            ..Default::default()
+        };
+        let mut logits = vec![0.0f32; 4];
+        // Prompt [3, 3], then 1, 1, 2 generated: 1 pays presence plus two
+        // frequency, 2 presence plus one, and the prompt's 3 nothing.
+        p.apply(&mut logits, &[3, 3, 1, 1, 2], 2);
+        assert_eq!(logits, vec![0.0, -2.0, -1.5, 0.0]);
+        // Negative values encourage repetition instead.
+        let p = Penalties {
+            presence: -1.0,
+            ..Default::default()
+        };
+        let mut logits = vec![0.0f32; 4];
+        p.apply(&mut logits, &[0, 2], 1);
+        assert_eq!(logits, vec![0.0, 0.0, 1.0, 0.0]);
     }
 
     #[test]

@@ -72,6 +72,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   applies under greedy decoding too, so `-100` bans a token whatever the
   temperature. A bias out of range, or a key that is not a token in the model's
   vocabulary, is a 400 that says which.
+- **`frequency_penalty` and `presence_penalty`**, with OpenAI's meaning: each
+  time a token has been generated takes `frequency_penalty` off its logit, and
+  having been generated at all takes `presence_penalty` once. Only generated
+  tokens count, not the prompt's. Range -2 to 2; negative values encourage
+  repetition. Speculative decoding applies them at each proposal's own
+  position, so its output still follows the target exactly.
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of

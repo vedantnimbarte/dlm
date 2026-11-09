@@ -470,6 +470,10 @@ struct ExtraSampling {
     /// Token id (as a string, OpenAI's shape) → bias added to its logit.
     #[serde(default)]
     logit_bias: Option<HashMap<String, f32>>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
 }
 
 /// Check the request's extra sampling fields and combine them with `sampler`.
@@ -498,9 +502,17 @@ fn decoding(
         }
         logit_bias.push((token, bias));
     }
+    let penalty = |name: &str, value: Option<f32>| match value.unwrap_or(0.0) {
+        v if (-2.0..=2.0).contains(&v) => Ok(v),
+        _ => Err(format!("{name} must be between -2 and 2")),
+    };
     Ok(Decoding {
         sampler,
-        penalties: Penalties { logit_bias },
+        penalties: Penalties {
+            logit_bias,
+            frequency: penalty("frequency_penalty", extra.frequency_penalty)?,
+            presence: penalty("presence_penalty", extra.presence_penalty)?,
+        },
     })
 }
 

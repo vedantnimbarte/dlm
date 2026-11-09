@@ -149,12 +149,34 @@ fn logit_bias_steers_even_greedy_decoding() {
 }
 
 #[test]
+fn presence_penalty_stops_a_token_repeating() {
+    let addr = start_server();
+    // A +3 bias makes 'A' the pick; once it has appeared, the -2 presence
+    // penalty and -2 per occurrence take back more than the bias gave.
+    let biased = r#""max_tokens":3,"logit_bias":{"65":3}"#;
+    assert_eq!(assistant_text(&chat(addr, biased)), "AAA");
+    let text = assistant_text(&chat(
+        addr,
+        &format!(r#"{biased},"presence_penalty":2,"frequency_penalty":2"#),
+    ));
+    assert_eq!(text.matches('A').count(), 1, "{text:?}");
+}
+
+#[test]
 fn out_of_range_sampling_fields_are_rejected() {
     let addr = start_server();
     for (field, why) in [
         (r#""logit_bias":{"65":101}"#, "between -100 and 100"),
         (r#""logit_bias":{"abc":1}"#, "not a token id"),
         (r#""logit_bias":{"256":1}"#, "outside the vocabulary"),
+        (
+            r#""frequency_penalty":2.5"#,
+            "frequency_penalty must be between -2 and 2",
+        ),
+        (
+            r#""presence_penalty":-3"#,
+            "presence_penalty must be between -2 and 2",
+        ),
     ] {
         let resp = chat(addr, field);
         assert!(resp.starts_with("HTTP/1.1 400"), "{field}: {resp}");
