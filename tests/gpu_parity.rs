@@ -27,6 +27,23 @@ impl LayerSource for VecSource {
     }
 }
 
+/// Tolerance for the parity cases with quantized weights. By default their GEMVs
+/// quantize the activations to int8 for `dp4a` (see `Dp4a` in kernels.cu), which
+/// the f32 CPU oracle does not: about a part in a thousand, 3e-3 to 1e-2 here.
+/// That is far below what a decoding bug produces (a misread nibble or high bit
+/// is off by 1 or more), so it still catches one. Run the suite a second time
+/// with `DLM_GEMV_EXACT=1` to hold the f32 decode paths to the tight bound:
+///
+/// ```sh
+/// DLM_GEMV_EXACT=1 cargo test --release --features cuda-kernels --test gpu_parity
+/// ```
+fn quantized_tol() -> f32 {
+    match std::env::var("DLM_GEMV_EXACT") {
+        Ok(v) if !v.is_empty() && v != "0" => 2e-3,
+        _ => 2e-2,
+    }
+}
+
 /// Deterministic SplitMix64 for reproducible synthetic weights.
 struct Rng(u64);
 
@@ -233,6 +250,19 @@ fn gpu_batched_sessions_keep_independent_kv() {
 /// Decode a few tokens on both kernels from the same start state and assert the
 /// GPU tracks the CPU oracle.
 fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32, what: &str) {
+    assert_gpu_close(cfg, layers, tol, false, what)
+}
+
+/// [`assert_gpu_matches_cpu`], optionally measuring the error against the
+/// hidden state's largest magnitude (at least 1): the right yardstick for an
+/// error that is relative, as the int8-activation GEMVs' is.
+fn assert_gpu_close(
+    cfg: BlockConfig,
+    layers: Vec<LayerTensors>,
+    tol: f32,
+    relative: bool,
+    what: &str,
+) {
     let num_layers = layers.len() as u32;
     let cpu = CpuKernel::new(cfg, layers.clone()).unwrap();
     let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
@@ -267,9 +297,14 @@ fn assert_gpu_matches_cpu(cfg: BlockConfig, layers: Vec<LayerTensors>, tol: f32,
             .zip(&h_gpu)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
+        let scale = if relative {
+            h_cpu.iter().fold(1.0f32, |m, v| m.max(v.abs()))
+        } else {
+            1.0
+        };
         assert!(
-            max_diff < tol,
-            "{what}: step {step}: GPU diverged from CPU by {max_diff}"
+            max_diff < tol * scale,
+            "{what}: step {step}: GPU diverged from CPU by {max_diff} (scale {scale})"
         );
     }
 }
@@ -556,10 +591,11 @@ fn gpu_matches_cpu_with_int4_weights() {
                 l
             })
             .collect();
-        assert_gpu_matches_cpu(
+        assert_gpu_close(
             cfg,
             quantized,
-            2e-3,
+            quantized_tol(),
+            true,
             &format!("int4 weights, group {group}"),
         );
     }
@@ -608,12 +644,79 @@ fn gpu_matches_cpu_with_int8_weights() {
                 l
             })
             .collect();
-        assert_gpu_matches_cpu(
+        assert_gpu_close(
             cfg,
             quantized,
-            2e-3,
+            quantized_tol(),
+            true,
             &format!("int8 weights, group {group}"),
         );
+    }
+}
+
+/// Every ggml block format through the device GEMVs. GGUF weights are decoded
+/// on the GPU straight from the file's blocks by code that shares nothing with
+/// the CPU's `ggml_quant::decode_block`, so a misread nibble or high bit on one
+/// side shows up here and nowhere else. Random bytes make valid blocks once each
+/// f16 scale field is pinned to a small finite value.
+#[test]
+fn gpu_matches_cpu_with_ggml_weights() {
+    use dlm::storage::ggml_quant::GgmlKind;
+    let cfg = BlockConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 64,
+        intermediate_size: 512,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        ..Default::default()
+    };
+    // Each kind's f16 header fields, and the f16 to pin them to: the K-quants
+    // multiply theirs by a 6-bit (Q6_K: 8-bit) sub-block scale as well, so they
+    // take a smaller one to land weights in the same range as the others.
+    let kinds = [
+        (GgmlKind::Q4_0, &[0usize][..], 0x1C00u16), // 0.0039
+        (GgmlKind::Q4_1, &[0, 2], 0x1C00),
+        (GgmlKind::Q5_0, &[0], 0x1C00),
+        (GgmlKind::Q5_1, &[0, 2], 0x1C00),
+        (GgmlKind::Q8_0, &[0], 0x1400), // 0.00098: its codes reach 127, not 15
+        (GgmlKind::Q4K, &[0, 2], 0x0800), // 0.00012
+        (GgmlKind::Q5K, &[0, 2], 0x0800),
+        (GgmlKind::Q6K, &[208], 0x0400), // 0.00006
+    ];
+    for (kind, f16_fields, scale) in kinds {
+        let mut rng = Rng::new(0x6611 + kind.dtype_code() as u64);
+        let mut ggml = |elements: usize| {
+            let mut blob: Vec<u8> =
+                (0..kind.byte_len(elements)).map(|_| rng.next_u64() as u8).collect();
+            for block in blob.chunks_mut(kind.block_bytes()) {
+                for &f in f16_fields {
+                    block[f..f + 2].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+            Weights::Ggml {
+                blob,
+                kind,
+                num_elements: elements,
+            }
+        };
+        let layers: Vec<LayerTensors> = random_layers(&cfg, 2, 0x6612)
+            .into_iter()
+            .map(|mut l| {
+                l.q_proj = ggml(cfg.q_dim() * cfg.hidden_size);
+                l.k_proj = ggml(cfg.kv_dim() * cfg.hidden_size);
+                l.v_proj = ggml(cfg.kv_dim() * cfg.hidden_size);
+                l.o_proj = ggml(cfg.hidden_size * cfg.q_dim());
+                if let Ffn::Dense(f) = &mut l.ffn {
+                    f.gate = ggml(cfg.intermediate_size * cfg.hidden_size);
+                    f.up = ggml(cfg.intermediate_size * cfg.hidden_size);
+                    f.down = ggml(cfg.hidden_size * cfg.intermediate_size);
+                }
+                l
+            })
+            .collect();
+        assert_gpu_close(cfg, layers, quantized_tol(), true, &format!("{kind:?} weights"));
     }
 }
 

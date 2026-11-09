@@ -38,6 +38,7 @@
 #include <cuda_fp16.h>
 #endif
 #include <math.h>
+#include <stdlib.h>
 
 // Threads per block for the reduction kernels. Must be <= 1024 (the CUDA
 // per-block thread cap) and a power of two for the tree reduction below.
@@ -569,15 +570,627 @@ __global__ void matvec_kernel(const void* W, const float* x, const float* bias, 
     }
 }
 
-// Dispatch the GEMV on the runtime weight dtype (one block per output row).
+// ── Chunked GEMV: one warp per row, one aligned chunk per lane ─────────────
+//
+// `matvec_kernel` above decodes one weight per loop step through `load_w`. For
+// the formats with more than a cast to decode (every quantized one) that
+// re-derives the block header -- the scale, the min, Q5's 32-bit high-bit field
+// -- for every single weight, and reads the row a byte or two at a time. A
+// one-block-per-row grid also gives a 896-wide row 64 threads with 14 weights
+// each, too little in flight to cover memory latency.
+//
+// Here a lane takes a whole **chunk** -- a run of weights that never straddles a
+// scale group or block (8 floats, 16 int8 codes, 32 int4 codes, one 32-weight
+// ggml block, one K-quant sub-block) -- reads it with wide loads, decodes the
+// header once, and dots it against the matching `x` run. Lanes take consecutive
+// chunks, so a warp still reads one contiguous stretch of the row per step, and
+// a block holds `MV_ROWS` rows so small matrices still fill the GPU.
+//
+// The decoded values are the ones `load_w` produces; only the summation order
+// changes (per chunk, then across lanes), within float rounding of the old one.
+// Shapes the chunk does not fit (a row width or group size that is not a
+// multiple of the chunk, or a misaligned pointer) keep the per-weight kernel.
+#define MV_ROWS 4
+
+__device__ __forceinline__ unsigned int ld_u16(const unsigned char* p) {
+    return (unsigned int)*(const unsigned short*)p;   // 2-byte aligned by the format
+}
+__device__ __forceinline__ float half_bits(unsigned int bits) {
+    unsigned short h = (unsigned short)bits;
+    return __half2float(*(const __half*)&h);
+}
+
+template <int DT> struct Chunk;
+
+template <> struct Chunk<DLM_W_F32> {
+    enum { N = 8 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const float4* p = (const float4*)((const float*)W + e);
+        float4 a = p[0], b = p[1];
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w;
+        w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+    }
+};
+template <> struct Chunk<DLM_W_BF16> {
+    enum { N = 8 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        uint4 v = *(const uint4*)((const unsigned short*)W + e);
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            w[2 * i] = __int_as_float(u[i] << 16);
+            w[2 * i + 1] = __int_as_float(u[i] & 0xFFFF0000u);
+        }
+    }
+};
+template <> struct Chunk<DLM_W_F16> {
+    enum { N = 8 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        uint4 v = *(const uint4*)((const __half*)W + e);
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            w[2 * i] = half_bits(u[i] & 0xFFFFu);
+            w[2 * i + 1] = half_bits(u[i] >> 16);
+        }
+    }
+};
+// 32 codes in one 16-byte load; the chunk lies in one group (`group % 32 == 0`).
+template <> struct Chunk<DLM_W_INT4> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long n, int gs, float* w) {
+        const unsigned char* bytes = (const unsigned char*)W;
+        long code_bytes = (n + 1) / 2;
+        long g = e / gs;
+        float scale = ((const float*)(bytes + q_scales_off(code_bytes)))[g];
+        float zero = ((const float*)(bytes + q_zeros_off(code_bytes, n, gs)))[g];
+        uint4 v = *(const uint4*)(bytes + (e >> 1));
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            unsigned int byte = (u[i >> 2] >> (8 * (i & 3))) & 0xFFu;
+            w[2 * i] = ((float)(byte & 0x0F) - zero) * scale;
+            w[2 * i + 1] = ((float)(byte >> 4) - zero) * scale;
+        }
+    }
+};
+template <> struct Chunk<DLM_W_INT8> {
+    enum { N = 16 };
+    __device__ static void decode(const void* W, long e, long n, int gs, float* w) {
+        const unsigned char* bytes = (const unsigned char*)W;
+        long g = e / gs;
+        float scale = ((const float*)(bytes + q_scales_off(n)))[g];
+        float zero = ((const float*)(bytes + q_zeros_off(n, n, gs)))[g];
+        uint4 v = *(const uint4*)(bytes + e);
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int i = 0; i < 16; ++i)
+            w[i] = ((float)((u[i >> 2] >> (8 * (i & 3))) & 0xFFu) - zero) * scale;
+    }
+};
+// The 32-weight ggml blocks: one block per chunk. Every block size is even, so
+// the block (and its f16 header) is 2-byte aligned and reads as u16 pairs.
+template <> struct Chunk<DLM_W_Q4_0> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 18;
+        float d = half_bits(ld_u16(b));
+        #pragma unroll
+        for (int j = 0; j < 16; j += 2) {
+            unsigned int two = ld_u16(b + 2 + j);
+            w[j] = d * ((float)(two & 0x0F) - 8.0f);
+            w[j + 16] = d * ((float)((two >> 4) & 0x0F) - 8.0f);
+            w[j + 1] = d * ((float)((two >> 8) & 0x0F) - 8.0f);
+            w[j + 17] = d * ((float)(two >> 12) - 8.0f);
+        }
+    }
+};
+template <> struct Chunk<DLM_W_Q4_1> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 20;
+        float d = half_bits(ld_u16(b)), m = half_bits(ld_u16(b + 2));
+        #pragma unroll
+        for (int j = 0; j < 16; j += 2) {
+            unsigned int two = ld_u16(b + 4 + j);
+            w[j] = d * (float)(two & 0x0F) + m;
+            w[j + 16] = d * (float)((two >> 4) & 0x0F) + m;
+            w[j + 1] = d * (float)((two >> 8) & 0x0F) + m;
+            w[j + 17] = d * (float)(two >> 12) + m;
+        }
+    }
+};
+template <> struct Chunk<DLM_W_Q5_0> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 22;
+        float d = half_bits(ld_u16(b));
+        unsigned int qh = ld_u16(b + 2) | (ld_u16(b + 4) << 16);
+        #pragma unroll
+        for (int j = 0; j < 16; j += 2) {
+            unsigned int two = ld_u16(b + 6 + j);
+            w[j] = d * ((float)((two & 0x0F) | (((qh >> j) & 1u) << 4)) - 16.0f);
+            w[j + 16] = d * ((float)(((two >> 4) & 0x0F) | (((qh >> (j + 16)) & 1u) << 4)) - 16.0f);
+            w[j + 1] = d * ((float)(((two >> 8) & 0x0F) | (((qh >> (j + 1)) & 1u) << 4)) - 16.0f);
+            w[j + 17] = d * ((float)((two >> 12) | (((qh >> (j + 17)) & 1u) << 4)) - 16.0f);
+        }
+    }
+};
+template <> struct Chunk<DLM_W_Q5_1> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 24;
+        float d = half_bits(ld_u16(b)), m = half_bits(ld_u16(b + 2));
+        unsigned int qh = ld_u16(b + 4) | (ld_u16(b + 6) << 16);
+        #pragma unroll
+        for (int j = 0; j < 16; j += 2) {
+            unsigned int two = ld_u16(b + 8 + j);
+            w[j] = d * (float)((two & 0x0F) | (((qh >> j) & 1u) << 4)) + m;
+            w[j + 16] = d * (float)(((two >> 4) & 0x0F) | (((qh >> (j + 16)) & 1u) << 4)) + m;
+            w[j + 1] = d * (float)(((two >> 8) & 0x0F) | (((qh >> (j + 1)) & 1u) << 4)) + m;
+            w[j + 17] = d * (float)((two >> 12) | (((qh >> (j + 17)) & 1u) << 4)) + m;
+        }
+    }
+};
+template <> struct Chunk<DLM_W_Q8_0> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 34;
+        float d = half_bits(ld_u16(b));
+        #pragma unroll
+        for (int j = 0; j < 32; j += 2) {
+            unsigned int two = ld_u16(b + 2 + j);
+            w[j] = d * (float)(signed char)(two & 0xFF);
+            w[j + 1] = d * (float)(signed char)(two >> 8);
+        }
+    }
+};
+// K-quants: one 32-weight sub-block per chunk (Q6_K's 16-weight scales give a
+// chunk two). Q4_K/Q5_K blocks are 16-byte multiples, so their runs load wide.
+template <> struct Chunk<DLM_W_Q4_K> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 144;
+        int sub = (int)(e & 255) >> 5;
+        unsigned char sc, m;
+        k_scale_min(sub, b + 4, &sc, &m);
+        float scale = dlm_half(b) * (float)sc, min = dlm_half(b + 2) * (float)m;
+        const uint4* qs = (const uint4*)(b + 16 + (sub >> 1) * 32);
+        int sh = (sub & 1) * 4;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint4 v = qs[h];
+            unsigned int u[4] = {v.x, v.y, v.z, v.w};
+            #pragma unroll
+            for (int i = 0; i < 16; ++i)
+                w[h * 16 + i] = scale * (float)((u[i >> 2] >> (8 * (i & 3) + sh)) & 0x0F) - min;
+        }
+    }
+};
+template <> struct Chunk<DLM_W_Q5_K> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 176;
+        int sub = (int)(e & 255) >> 5;
+        unsigned char sc, m;
+        k_scale_min(sub, b + 4, &sc, &m);
+        float scale = dlm_half(b) * (float)sc, min = dlm_half(b + 2) * (float)m;
+        const uint4* qs = (const uint4*)(b + 48 + (sub >> 1) * 32);
+        const uint4* qh = (const uint4*)(b + 16);
+        int sh = (sub & 1) * 4;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint4 v = qs[h], hv = qh[h];
+            unsigned int u[4] = {v.x, v.y, v.z, v.w};
+            unsigned int hb[4] = {hv.x, hv.y, hv.z, hv.w};
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int s = 8 * (i & 3);
+                unsigned int q = ((u[i >> 2] >> (s + sh)) & 0x0F) | (((hb[i >> 2] >> (s + sub)) & 1u) << 4);
+                w[h * 16 + i] = scale * (float)q - min;
+            }
+        }
+    }
+};
+template <> struct Chunk<DLM_W_Q6_K> {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long, int, float* w) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 210;
+        int within = (int)(e & 255);
+        int half_block = within >> 7, k4 = (within & 127) >> 5;
+        const unsigned char* ql = b + half_block * 64 + ((k4 & 1) ? 32 : 0);
+        const unsigned char* qh = b + 128 + half_block * 32;
+        float d = dlm_half(b + 208);
+        float s0 = d * (float)(signed char)b[192 + (within >> 4)];
+        float s1 = d * (float)(signed char)b[192 + (within >> 4) + 1];
+        int lo_sh = (k4 < 2) ? 0 : 4, hi_sh = 2 * k4;
+        #pragma unroll
+        for (int l = 0; l < 32; l += 2) {
+            unsigned int lo2 = ld_u16(ql + l), hi2 = ld_u16(qh + l);
+            #pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                unsigned int q = ((lo2 >> (8 * t + lo_sh)) & 0x0F) | (((hi2 >> (8 * t + hi_sh)) & 3u) << 4);
+                w[l + t] = (l < 16 ? s0 : s1) * ((float)q - 32.0f);
+            }
+        }
+    }
+};
+
+// Can `Chunk<DT>` cover this matrix? Each row must start on a chunk (the width
+// a multiple of it), a chunk must sit inside one scale group, and the wide loads
+// need 16-byte aligned weights and activations (cudaMalloc gives 256).
+template <int DT>
+static inline bool chunk_fits(const void* W, const float* x, int in_dim, int group_size) {
+    const int N = Chunk<DT>::N;
+    if (in_dim % N) return false;
+    if ((DT == DLM_W_INT4 || DT == DLM_W_INT8) && (group_size <= 0 || group_size % N)) return false;
+    if (DT == DLM_W_Q4_K || DT == DLM_W_Q5_K || DT == DLM_W_Q6_K) {
+        if (in_dim % 256) return false;
+    }
+    return ((unsigned long long)W % 16 == 0) && ((unsigned long long)x % 16 == 0);
+}
+
+template <int N>
+__device__ __forceinline__ float chunk_dot(const float* w, const float* x) {
+    const float4* x4 = (const float4*)x;
+    float s = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < N / 4; ++i) {
+        float4 v = x4[i];
+        s += w[4 * i] * v.x + w[4 * i + 1] * v.y + w[4 * i + 2] * v.z + w[4 * i + 3] * v.w;
+    }
+    return s;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
+// Launch <<<ceil(out_dim / MV_ROWS), 32 * MV_ROWS>>>.
+template <int DT>
+__global__ void matvec_chunk_kernel(const void* __restrict__ W, const float* __restrict__ x,
+                                    const float* __restrict__ bias, float* __restrict__ out,
+                                    int out_dim, int in_dim, int group_size) {
+    const int N = Chunk<DT>::N;
+    int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;   // whole warps only: `o` is per warp
+    long n = (long)out_dim * in_dim;
+    long base = (long)o * in_dim;
+    float s = 0.0f;
+    for (int i = lane * N; i < in_dim; i += 32 * N) {
+        float w[N];
+        Chunk<DT>::decode(W, base + i, n, group_size, w);
+        s += chunk_dot<N>(w, x + i);
+    }
+    s = warp_sum(s);
+    if (lane == 0) out[o] = s + (bias ? bias[o] : 0.0f);
+}
+
+// ── Integer dot products for quantized weights (dp4a) ───────────────────────
+//
+// Decoding a quantized weight to f32 costs a shift, a mask, an int-to-float
+// conversion and a multiply-add per weight, and on a GTX 1650 that -- not
+// memory -- bounds every quantized GEMV: 16-40 GB/s against the card's 128.
+// llama.cpp's answer, taken here: quantize the activation vector to int8 once
+// per GEMV (32 values per f32 scale, plus that block's scaled sum), and dot
+// four weight codes with four activation codes in one `dp4a`. The weight's own
+// scale, minimum or zero is applied once per 32 weights, through the
+// activation block's scale and sum:
+//
+//     sum_i (scale * code_i - offset) * x_i
+//       = scale * dx * sum_i code_i * xq_i  -  offset * dx * sum_i xq_i
+//
+// Measured on the Q5_0 LM head of Qwen2.5-0.5B: 4.2 ms -> 1.5 ms.
+//
+// The activation codes round `x` to 8 bits per 32-value block, which the f32
+// path does not: the result differs from it by about a part in a thousand.
+// `DLM_GEMV_EXACT=1` keeps the f32 path for quantized weights.
+#ifdef __HIP_PLATFORM_AMD__
+__device__ __forceinline__ int dlm_dp4a(int a, int b, int c) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) c += (int)(signed char)(a >> (8 * i)) * (int)(signed char)(b >> (8 * i));
+    return c;
+}
+#else
+__device__ __forceinline__ int dlm_dp4a(int a, int b, int c) { return __dp4a(a, b, c); }
+#endif
+
+// `x` as int8 per 32 values: codes, and per block (scale, scale * sum of codes).
+// One warp per block: <<<ceil(n / 32 / 8), dim3(32, 8)>>>; `n % 32 == 0`.
+__global__ void quantize_q8_kernel(const float* __restrict__ x, int n, signed char* __restrict__ q,
+                                   float2* __restrict__ ds) {
+    int b = blockIdx.x * blockDim.y + threadIdx.y, lane = threadIdx.x;
+    if (b * 32 >= n) return;
+    float v = x[b * 32 + lane];
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    float d = amax / 127.0f;
+    int qi = d == 0.0f ? 0 : __float2int_rn(v / d);
+    int sum = qi;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    q[b * 32 + lane] = (signed char)qi;
+    if (lane == 0) ds[b] = make_float2(d, d * (float)sum);
+}
+
+// Four 4-bit codes, one per byte, from two bytes of dlm's int4 layout (weight
+// 2i in byte i's low nibble, 2i + 1 in its high one).
+__device__ __forceinline__ int nib4(unsigned int two) {
+    return (int)((two & 0xFu) | ((two & 0xF0u) << 4) | ((two & 0xF00u) << 8) | ((two & 0xF000u) << 12));
+}
+// Spread four bits into the 0x10 bit of four bytes (Q5's fifth bit).
+__device__ __forceinline__ unsigned int bits4(unsigned int b) {
+    return ((b & 1u) << 4) | ((b & 2u) << 11) | ((b & 4u) << 18) | ((b & 8u) << 25);
+}
+// Four bytes from a 2-byte aligned address.
+__device__ __forceinline__ unsigned int ld_u32_2(const unsigned char* p) {
+    return ld_u16(p) | (ld_u16(p + 2) << 16);
+}
+
+// One 32-weight chunk dotted with its activation block. `e` is the chunk's
+// first element (a multiple of 32), `xi` the block's 8 code words, `dx` its
+// (scale, scaled sum).
+template <int DT> struct Dp4a {
+    enum { OK = 0 };
+    __device__ static float dot(const void*, long, long, int, const int*, float2) { return 0.0f; }
+};
+
+template <> struct Dp4a<DLM_W_INT4> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long n, int gs, const int* xi, float2 dx) {
+        const unsigned char* bytes = (const unsigned char*)W;
+        long code_bytes = (n + 1) / 2, g = e / gs;
+        float scale = ((const float*)(bytes + q_scales_off(code_bytes)))[g];
+        float zero = ((const float*)(bytes + q_zeros_off(code_bytes, n, gs)))[g];
+        uint4 v = *(const uint4*)(bytes + (e >> 1));
+        unsigned int u[4] = {v.x, v.y, v.z, v.w};
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            s = dlm_dp4a(nib4(u[j] & 0xFFFFu), xi[2 * j], s);
+            s = dlm_dp4a(nib4(u[j] >> 16), xi[2 * j + 1], s);
+        }
+        return scale * (dx.x * (float)s - zero * dx.y);
+    }
+};
+template <> struct Dp4a<DLM_W_INT8> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long n, int gs, const int* xi, float2 dx) {
+        const unsigned char* bytes = (const unsigned char*)W;
+        long g = e / gs;
+        float scale = ((const float*)(bytes + q_scales_off(n)))[g];
+        float zero = ((const float*)(bytes + q_zeros_off(n, n, gs)))[g];
+        const uint4* p = (const uint4*)(bytes + e);
+        int s = 0;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint4 v = p[h];
+            // Unsigned codes as signed bytes: code - 128.
+            s = dlm_dp4a((int)(v.x ^ 0x80808080u), xi[4 * h], s);
+            s = dlm_dp4a((int)(v.y ^ 0x80808080u), xi[4 * h + 1], s);
+            s = dlm_dp4a((int)(v.z ^ 0x80808080u), xi[4 * h + 2], s);
+            s = dlm_dp4a((int)(v.w ^ 0x80808080u), xi[4 * h + 3], s);
+        }
+        return scale * (dx.x * (float)s + (128.0f - zero) * dx.y);
+    }
+};
+template <> struct Dp4a<DLM_W_Q4_0> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 18;
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int v = ld_u32_2(b + 2 + 4 * j);
+            s = dlm_dp4a((int)(v & 0x0F0F0F0Fu), xi[j], s);
+            s = dlm_dp4a((int)((v >> 4) & 0x0F0F0F0Fu), xi[j + 4], s);
+        }
+        return half_bits(ld_u16(b)) * (dx.x * (float)s - 8.0f * dx.y);
+    }
+};
+template <> struct Dp4a<DLM_W_Q4_1> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 20;
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int v = ld_u32_2(b + 4 + 4 * j);
+            s = dlm_dp4a((int)(v & 0x0F0F0F0Fu), xi[j], s);
+            s = dlm_dp4a((int)((v >> 4) & 0x0F0F0F0Fu), xi[j + 4], s);
+        }
+        return half_bits(ld_u16(b)) * dx.x * (float)s + half_bits(ld_u16(b + 2)) * dx.y;
+    }
+};
+template <> struct Dp4a<DLM_W_Q5_0> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 22;
+        unsigned int qh = ld_u32_2(b + 2);
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int v = ld_u32_2(b + 6 + 4 * j);
+            unsigned int lo = (v & 0x0F0F0F0Fu) | bits4((qh >> (4 * j)) & 0xFu);
+            unsigned int hi = ((v >> 4) & 0x0F0F0F0Fu) | bits4((qh >> (4 * j + 16)) & 0xFu);
+            s = dlm_dp4a((int)lo, xi[j], s);
+            s = dlm_dp4a((int)hi, xi[j + 4], s);
+        }
+        return half_bits(ld_u16(b)) * (dx.x * (float)s - 16.0f * dx.y);
+    }
+};
+template <> struct Dp4a<DLM_W_Q5_1> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 24;
+        unsigned int qh = ld_u32_2(b + 4);
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int v = ld_u32_2(b + 8 + 4 * j);
+            unsigned int lo = (v & 0x0F0F0F0Fu) | bits4((qh >> (4 * j)) & 0xFu);
+            unsigned int hi = ((v >> 4) & 0x0F0F0F0Fu) | bits4((qh >> (4 * j + 16)) & 0xFu);
+            s = dlm_dp4a((int)lo, xi[j], s);
+            s = dlm_dp4a((int)hi, xi[j + 4], s);
+        }
+        return half_bits(ld_u16(b)) * dx.x * (float)s + half_bits(ld_u16(b + 2)) * dx.y;
+    }
+};
+template <> struct Dp4a<DLM_W_Q8_0> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 34;
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) s = dlm_dp4a((int)ld_u32_2(b + 2 + 4 * j), xi[j], s);
+        return half_bits(ld_u16(b)) * dx.x * (float)s;
+    }
+};
+template <> struct Dp4a<DLM_W_Q4_K> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 144;
+        int sub = (int)(e & 255) >> 5;
+        unsigned char sc, m;
+        k_scale_min(sub, b + 4, &sc, &m);
+        const uint4* qs = (const uint4*)(b + 16 + (sub >> 1) * 32);
+        int sh = (sub & 1) * 4, s = 0;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint4 v = qs[h];
+            s = dlm_dp4a((int)((v.x >> sh) & 0x0F0F0F0Fu), xi[4 * h], s);
+            s = dlm_dp4a((int)((v.y >> sh) & 0x0F0F0F0Fu), xi[4 * h + 1], s);
+            s = dlm_dp4a((int)((v.z >> sh) & 0x0F0F0F0Fu), xi[4 * h + 2], s);
+            s = dlm_dp4a((int)((v.w >> sh) & 0x0F0F0F0Fu), xi[4 * h + 3], s);
+        }
+        return dlm_half(b) * (float)sc * dx.x * (float)s - dlm_half(b + 2) * (float)m * dx.y;
+    }
+};
+template <> struct Dp4a<DLM_W_Q5_K> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 176;
+        int sub = (int)(e & 255) >> 5;
+        unsigned char sc, m;
+        k_scale_min(sub, b + 4, &sc, &m);
+        const uint4* qs = (const uint4*)(b + 48 + (sub >> 1) * 32);
+        const uint4* qh = (const uint4*)(b + 16);
+        int sh = (sub & 1) * 4, s = 0;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint4 v = qs[h], hv = qh[h];
+            unsigned int u[4] = {v.x, v.y, v.z, v.w}, hb[4] = {hv.x, hv.y, hv.z, hv.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                unsigned int q = ((u[j] >> sh) & 0x0F0F0F0Fu) | (((hb[j] >> sub) & 0x01010101u) << 4);
+                s = dlm_dp4a((int)q, xi[4 * h + j], s);
+            }
+        }
+        return dlm_half(b) * (float)sc * dx.x * (float)s - dlm_half(b + 2) * (float)m * dx.y;
+    }
+};
+// Q6_K's chunk spans two 16-weight scales, so the codes' offset of 32 is taken
+// off per half with that half's sum of activation codes.
+template <> struct Dp4a<DLM_W_Q6_K> {
+    enum { OK = 1 };
+    __device__ static float dot(const void* W, long e, long, int, const int* xi, float2 dx) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 210;
+        int within = (int)(e & 255);
+        int half_block = within >> 7, k4 = (within & 127) >> 5;
+        const unsigned char* ql = b + half_block * 64 + ((k4 & 1) ? 32 : 0);
+        const unsigned char* qh = b + 128 + half_block * 32;
+        int lo_sh = (k4 < 2) ? 0 : 4, hi_sh = 2 * k4;
+        int s[2] = {0, 0}, xs[2] = {0, 0};
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            unsigned int q = ((ld_u32_2(ql + 4 * j) >> lo_sh) & 0x0F0F0F0Fu) |
+                             (((ld_u32_2(qh + 4 * j) >> hi_sh) & 0x03030303u) << 4);
+            s[j >> 2] = dlm_dp4a((int)q, xi[j], s[j >> 2]);
+            xs[j >> 2] = dlm_dp4a(0x01010101, xi[j], xs[j >> 2]);
+        }
+        float d = dlm_half(b + 208);
+        float s0 = d * (float)(signed char)b[192 + (within >> 4)];
+        float s1 = d * (float)(signed char)b[192 + (within >> 4) + 1];
+        return dx.x * (s0 * (float)(s[0] - 32 * xs[0]) + s1 * (float)(s[1] - 32 * xs[1]));
+    }
+};
+
+// One row against the quantized activations, reduced across the warp.
+template <int DT>
+__device__ __forceinline__ float q8_row_dot(const void* W, long base, long n, int group_size,
+                                            const signed char* xq, const float2* xds, int in_dim,
+                                            int lane) {
+    float s = 0.0f;
+    for (int i = lane * 32; i < in_dim; i += 32 * 32)
+        s += Dp4a<DT>::dot(W, base + i, n, group_size, (const int*)(xq + i), xds[i >> 5]);
+    return warp_sum(s);
+}
+
+// Launch as `matvec_chunk_kernel`.
+template <int DT>
+__global__ void matvec_q8_kernel(const void* __restrict__ W, const signed char* __restrict__ xq,
+                                 const float2* __restrict__ xds, const float* __restrict__ bias,
+                                 float* __restrict__ out, int out_dim, int in_dim, int group_size) {
+    int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    float s = q8_row_dot<DT>(W, (long)o * in_dim, (long)out_dim * in_dim, group_size, xq, xds,
+                             in_dim, lane);
+    if (lane == 0) out[o] = s + (bias ? bias[o] : 0.0f);
+}
+
+// Whether `DLM_GEMV_EXACT` asked for the f32 path everywhere.
+static bool gemv_exact() {
+    static const bool exact = [] {
+        const char* v = getenv("DLM_GEMV_EXACT");
+        return v && *v && *v != '0';
+    }();
+    return exact;
+}
+
+// Can this matrix take the dp4a path? The chunked shape rules, 32-weight
+// chunks, and a format with integer codes.
+template <int DT>
+static inline bool q8_fits(const void* W, const float* x, int in_dim, int group_size) {
+    if (!Dp4a<DT>::OK || gemv_exact()) return false;
+    if (in_dim % 32 || (unsigned long long)W % 16) return false;
+    if ((DT == DLM_W_INT4 || DT == DLM_W_INT8) && (group_size <= 0 || group_size % 32)) return false;
+    if ((DT == DLM_W_Q4_K || DT == DLM_W_Q5_K || DT == DLM_W_Q6_K) && in_dim % 256) return false;
+    return true;
+}
+
+// Quantize `x` (`n` floats) into this thread's activation scratch; defined with
+// the scratch buffers below. False (nothing launched) if the scratch failed.
+static bool quantize_x(const float* x, int n, const signed char** xq, const float2** xds);
+
+// Dispatch the GEMV on the runtime weight dtype: integer dot products where the
+// format has codes, else the chunked kernel where the shape allows it, else one
+// block per output row.
 static void launch_matvec(int dt, const void* W, const float* x, const float* bias, float* out,
                           int out_dim, int in_dim, int group_size) {
-#define DLM_CASE(D) case D: matvec_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size); break;
+    const signed char* xq;
+    const float2* xds;
+#define DLM_CASE(D) case D: \
+        if (q8_fits<D>(W, x, in_dim, group_size) && quantize_x(x, in_dim, &xq, &xds)) \
+            matvec_q8_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, xq, xds, bias, out, out_dim, in_dim, group_size); \
+        else if (chunk_fits<D>(W, x, in_dim, group_size)) \
+            matvec_chunk_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, x, bias, out, out_dim, in_dim, group_size); \
+        else \
+            matvec_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size); \
+        break;
     switch (dt) {
         DLM_FOR_EACH_DTYPE(DLM_CASE)
         default:
-            matvec_kernel<DLM_W_F32>
-                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
+            if (chunk_fits<DLM_W_F32>(W, x, in_dim, group_size))
+                matvec_chunk_kernel<DLM_W_F32><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(
+                    W, x, bias, out, out_dim, in_dim, group_size);
+            else
+                matvec_kernel<DLM_W_F32>
+                    <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size);
             break;
     }
 #undef DLM_CASE
@@ -835,7 +1448,9 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slot 19 holds the attention logits/weights, [num_heads, attended positions].
 // Slots 20-21 are the LM head's input hidden and output logits.
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
-enum { SCRATCH_N = 24 };
+// Slots 24-25 are the int8 activation codes and their block scales (dp4a).
+enum { SCRATCH_N = 26 };
+enum { Q8_XQ = 24, Q8_XDS = 25 };
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
@@ -871,6 +1486,18 @@ static cudaError_t scratch_ensure(int i, int n) {
     cudaError_t e = cudaMalloc(&g_scratch[i], (size_t)n * sizeof(float));
     if (e == cudaSuccess) g_scratch_cap[i] = n;
     return e;
+}
+
+static bool quantize_x(const float* x, int n, const signed char** xq, const float2** xds) {
+    // Sizes are in floats: n codes take n / 4, n / 32 (scale, sum) pairs n / 16.
+    if (scratch_ensure(Q8_XQ, (n + 3) / 4) != cudaSuccess) return false;
+    if (scratch_ensure(Q8_XDS, n / 16 + 2) != cudaSuccess) return false;
+    *xq = (const signed char*)g_scratch[Q8_XQ];
+    *xds = (const float2*)g_scratch[Q8_XDS];
+    int blocks = n / 32;
+    quantize_q8_kernel<<<(blocks + 7) / 8, dim3(32, 8)>>>(x, n, (signed char*)g_scratch[Q8_XQ],
+                                                          (float2*)g_scratch[Q8_XDS]);
+    return true;
 }
 
 // Block shape beyond the Llama default, for the families that are not
@@ -958,7 +1585,7 @@ static void launch_kv_append(const float* k, const float* v, void* keys, void* v
     }
 }
 
-// `kv_keys` / `kv_values` are **persistent** device buffers// `kv_keys` / `kv_values` are **persistent** device buffers (capacity
+// `kv_keys` / `kv_values` are **persistent** device buffers (capacity
 // max_positions * kv_dim) owned by the caller across the whole sequence. This
 // call writes the new token's K/V into slot `num_positions` in place and attends
 // over the first `num_positions + 1` slots — so the KV history never leaves VRAM
@@ -1216,14 +1843,65 @@ __global__ void matvec_batched_kernel(const void* W, const float* x, const float
     }
 }
 
+// The chunked GEMV over a batch: each lane decodes a chunk once and multiplies
+// it into every slot's accumulator, so the weights are still read and decoded
+// once per batch. Launch as `matvec_chunk_kernel`.
+template <int DT>
+__global__ void __launch_bounds__(32 * MV_ROWS, 6) matvec_batched_chunk_kernel(const void* __restrict__ W, const float* __restrict__ x,
+                                            const float* __restrict__ bias, float* __restrict__ out,
+                                            int out_dim, int in_dim, int group_size, int batch) {
+    const int N = Chunk<DT>::N;
+    int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
+    int lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    long n = (long)out_dim * in_dim;
+    long base = (long)o * in_dim;
+    float acc[DLM_MAX_BATCH];
+    #pragma unroll
+    for (int b = 0; b < DLM_MAX_BATCH; ++b) acc[b] = 0.0f;
+    for (int i = lane * N; i < in_dim; i += 32 * N) {
+        float w[N];
+        Chunk<DT>::decode(W, base + i, n, group_size, w);
+        #pragma unroll
+        for (int b = 0; b < DLM_MAX_BATCH; ++b)
+            if (b < batch) acc[b] += chunk_dot<N>(w, x + (long)b * in_dim + i);
+    }
+    float bv = bias ? bias[o] : 0.0f;
+    #pragma unroll
+    for (int b = 0; b < DLM_MAX_BATCH; ++b) {
+        if (b < batch) {
+            float v = warp_sum(acc[b]);
+            if (lane == 0) out[(long)b * out_dim + o] = v + bv;
+        }
+    }
+}
+
+// Up to this many slots the chunked kernel wins; past it the batch is compute
+// bound and the one-block-per-row kernel's higher occupancy (about 40 registers
+// to the chunked kernel's 80) gives more back. Measured on a GTX 1650, Qwen2.5
+// 0.5B Q4_K_M: decode at batch 8 gains a few percent chunked, prefill (16 per
+// call) loses 28%. dlm's own int4/int8 always take the per-row kernel: chunked,
+// Qwen2.5-1.5B int4 at batch 8 fell from 50 to 30 tok/s.
+#define MV_CHUNK_MAX_BATCH 8
+
 static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
                                   float* out, int out_dim, int in_dim, int group_size, int batch) {
-#define DLM_CASE(D) case D: matvec_batched_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); break;
+#define DLM_CASE(D) case D: \
+        if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 && \
+            chunk_fits<D>(W, x, in_dim, group_size)) \
+            matvec_batched_chunk_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
+        else \
+            matvec_batched_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
+        break;
     switch (dt) {
         DLM_FOR_EACH_DTYPE(DLM_CASE)
         default:
-            matvec_batched_kernel<DLM_W_F32>
-                <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+            if (batch <= MV_CHUNK_MAX_BATCH && chunk_fits<DLM_W_F32>(W, x, in_dim, group_size))
+                matvec_batched_chunk_kernel<DLM_W_F32><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(
+                    W, x, bias, out, out_dim, in_dim, group_size, batch);
+            else
+                matvec_batched_kernel<DLM_W_F32>
+                    <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
             break;
     }
 #undef DLM_CASE
