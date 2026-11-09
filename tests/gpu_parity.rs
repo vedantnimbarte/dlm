@@ -1682,6 +1682,22 @@ fn gpu_prefill_matches_cpu_decode() {
     assert_prefill_matches_cpu(cfg, layers, gpu, "dense");
 }
 
+/// `--gpu-layers`: the front of the model on the GPU and the tail on the CPU
+/// computes what the whole model does. The GPU kernel must hand its hidden
+/// state back after its own last layer, not the model's.
+#[test]
+fn split_gpu_cpu_matches_cpu() {
+    let cfg = small_cfg();
+    let layers = random_layers(&cfg, 4, 0x5B17);
+    for k in [1, 3] {
+        let split = dlm::forward::SplitKernel::new(
+            GpuKernel::new(cfg, layers[..k].to_vec(), 64).unwrap(),
+            CpuKernel::for_layers(cfg, layers[k..].to_vec(), k as u32).unwrap(),
+        );
+        assert_prefill_matches_cpu(cfg, layers.clone(), split, &format!("split at {k}"));
+    }
+}
+
 /// fp16 device KV (`--kv-quant f16`) through prefill and decode, on the resident
 /// and the streaming kernel. The CPU oracle keeps f32 KV. The difference is the
 /// rounding of each stored key and value, which stays inside the same tolerance.

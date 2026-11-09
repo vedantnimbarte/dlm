@@ -274,6 +274,15 @@ pub struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     pub multi_gpu_ids: Vec<u32>,
 
+    /// Hold only the first N layers in VRAM and run the rest on the CPU, where
+    /// their weights already sit (llama.cpp's `-ngl`). An alternative to
+    /// `--stream` for a model too big for the card: streaming moves every
+    /// non-resident layer over PCIe each token, and a desktop's RAM can be
+    /// faster to compute from than to copy out of. Measure both with
+    /// `dlm bench`. GPU only; not with `--stream` or `--multi-gpu-ids`.
+    #[arg(long, value_name = "N")]
+    pub gpu_layers: Option<u32>,
+
     /// Compute device for the serving engine. Defaults to `gpu` on a
     /// `cuda-kernels` build (else `cpu`); pass `--device cpu` to force CPU.
     /// Ignored when `--multi-gpu-ids` is set. If `gpu` is chosen but no device is

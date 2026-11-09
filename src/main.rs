@@ -1437,6 +1437,24 @@ fn serve_on_gpu(
 ) -> Result<()> {
     println!();
     println!("device       : gpu ({})", gpu::active_vendor().label());
+    // `--gpu-layers N` below the model's depth: the rest run on the CPU.
+    let gpu_layers = args
+        .gpu_layers
+        .map(|n| n.min(config.num_layers))
+        .filter(|&n| n < config.num_layers);
+    let on_gpu = gpu_layers.unwrap_or(config.num_layers);
+    if let Some(n) = gpu_layers {
+        if draft_parts.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "--gpu-layers does not support speculative decoding (--draft-model-path) yet"
+                    .into(),
+            ));
+        }
+        println!(
+            "  split      : layers 0..{n} in VRAM, {n}..{} on the CPU",
+            config.num_layers
+        );
+    }
     // All weights sit resident in VRAM; each batched request adds a full-context
     // KV cache. Refuse up front if the batch won't fit rather than OOM mid-request.
     let (free, _) = resolve_free_bytes(args.vram_budget_gb);
@@ -1446,12 +1464,14 @@ fn serve_on_gpu(
         args.max_batch as u32,
         args.kv_quant != KvQuantArg::F32,
     );
-    let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
+    let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64
+        * on_gpu as u64
+        / config.num_layers.max(1) as u64;
     // KV is paged from a shared pool, so concurrent requests only need VRAM for
     // the tokens they actually hold. Give the pool whatever fits after the
     // weights, up to --max-batch full contexts.
-    let per_token = profiler.kv_bytes_per_layer(config) * config.num_layers as u64
-        / args.context_length.max(1) as u64;
+    let per_token =
+        profiler.kv_bytes_per_layer(config) * on_gpu as u64 / args.context_length.max(1) as u64;
     let pool = resident_kv_pool_tokens(
         free,
         profiler.safety_margin_bytes,
@@ -1460,6 +1480,10 @@ fn serve_on_gpu(
         args.max_batch,
         args.context_length,
     )?;
+    if let Some(n) = gpu_layers {
+        let generator = parts.into_split_generator(n as usize)?;
+        return start_batched_server(generator, None, args, config, listen, Some(pool));
+    }
     let generator = parts.into_gpu_generator()?;
     let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
     start_batched_server(generator, draft, args, config, listen, Some(pool))

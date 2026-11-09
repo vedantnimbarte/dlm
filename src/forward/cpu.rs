@@ -1748,7 +1748,9 @@ impl KvLayerCache {
                 let byte_base = pos * self.kv_dim.div_ceil(2);
                 q.iter()
                     .enumerate()
-                    .map(|(j, &a)| a * (read_i4(keys, byte_base, off + j) * s[(off + j) / KV_QGROUP]))
+                    .map(|(j, &a)| {
+                        a * (read_i4(keys, byte_base, off + j) * s[(off + j) / KV_QGROUP])
+                    })
                     .sum()
             }
         }
@@ -2808,18 +2810,37 @@ where
 pub struct CpuKernel {
     cfg: BlockConfig,
     layers: Vec<LayerTensors>,
+    /// The model layer `layers[0]` is. Non-zero when this kernel runs only the
+    /// tail of a model ([`SplitKernel`](crate::forward::SplitKernel)): the
+    /// per-layer config (Gemma3's local layers, DeepSeek's dense prefix) is
+    /// looked up by the model's own layer index, not the kernel's.
+    first_layer: u32,
 }
 
 impl CpuKernel {
     /// Build a kernel from a shared block config and one [`LayerTensors`] per
     /// layer, validating every layer's matrix dimensions up front.
     pub fn new(cfg: BlockConfig, layers: Vec<LayerTensors>) -> Result<Self> {
+        Self::for_layers(cfg, layers, 0)
+    }
+
+    /// A kernel for model layers `first_layer..first_layer + layers.len()`,
+    /// numbered from 0 within the kernel.
+    pub fn for_layers(
+        cfg: BlockConfig,
+        layers: Vec<LayerTensors>,
+        first_layer: u32,
+    ) -> Result<Self> {
         for (i, layer) in layers.iter().enumerate() {
             // Per-layer config: a DeepSeek dense prefix layer is validated as
             // dense even though the model is MoE overall.
-            layer.validate(&cfg.for_layer(i as u32))?;
+            layer.validate(&cfg.for_layer(first_layer + i as u32))?;
         }
-        Ok(Self { cfg, layers })
+        Ok(Self {
+            cfg,
+            layers,
+            first_layer,
+        })
     }
 
     /// The block configuration.
@@ -2849,7 +2870,7 @@ impl ComputeKernel for CpuKernel {
         position: usize,
     ) -> Result<()> {
         // Resolve Gemma2's alternating window for this layer; a no-op elsewhere.
-        let cfg = self.cfg.for_layer(layer);
+        let cfg = self.cfg.for_layer(self.first_layer + layer);
         let out = decode_block(&cfg, &self.layers[layer as usize], hidden, kv, position)?;
         hidden.copy_from_slice(&out);
         Ok(())

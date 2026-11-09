@@ -670,6 +670,46 @@ impl ModelParts {
         .with_lm_head_on_gpu(quantized, None))
     }
 
+    /// Hold the first `gpu_layers` layers in VRAM and run the rest on the CPU,
+    /// where their weights already are ([`SplitKernel`](crate::forward::SplitKernel)):
+    /// for a model too big for the card, an alternative to streaming the rest
+    /// across PCIe on every token.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn into_split_generator(
+        mut self,
+        gpu_layers: usize,
+    ) -> Result<Generator<crate::forward::SplitKernel<crate::forward::GpuKernel, CpuKernel>>> {
+        let gpu_layers = gpu_layers.min(self.layers.len());
+        let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
+        let embed_scale = self.embed_scale;
+        let logit_cap = self.final_logit_softcap;
+        let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
+        let head_norm = self.cfg.norm_kind;
+        let quantized = self
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
+        let back = self.layers.split_off(gpu_layers);
+        let kernel = crate::forward::SplitKernel::new(
+            crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?,
+            CpuKernel::for_layers(self.cfg, back, gpu_layers as u32)?,
+        );
+        Ok(Generator::new(
+            kernel,
+            self.embedding,
+            self.final_norm,
+            self.lm_head,
+            self.vocab_size,
+            self.rms_eps,
+            self.kv_config,
+            self.kv_blocks,
+        )?
+        .with_embed_scale(embed_scale)
+        .with_head(wpe, ln_f_bias, head_norm)
+        .with_final_logit_softcap(logit_cap)
+        .with_lm_head_on_gpu(quantized, None))
+    }
+
     /// Split the model's layers across `gpu_ids` and build a generator over a
     /// **GPU** pipeline ([`MultiGpuKernel`]) — each device holds and computes its
     /// own layer shard (real multi-GPU compute, not the CPU-backed
