@@ -51,11 +51,30 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   | Model | bf16 | int4 before | int4 after | int8 before | int8 after |
   |---|---|---|---|---|---|
   | Qwen2.5-0.5B | 2.8421 | 3.0509 | **2.9932** | 2.8426 | 2.8434 |
-  | Qwen2.5-1.5B | 2.2849 | 2.4217 | **2.3847** | | |
+  | Qwen2.5-1.5B | 2.2849 | 2.4217 | **2.3847** | 2.2861 | 2.2869 |
 
   That is 27–28% of int4's loss gone. int8 was already within noise of bf16 and
   stays there. The groups are fitted in parallel across cores to keep load time
   in check.
+- **`--quant int4` keeps `v_proj` and `down_proj` at int8 in the first and last
+  eighth of the layers**, the core of llama.cpp's Q4_K_M rule: those two write
+  straight into the residual stream, and the ends of the network are where it
+  is least forgiving. The embedding and LM head were never int4 (f32 on the CPU,
+  int8 on the GPU), so they needed nothing. Same text and setup as above, on
+  top of the fitted groups:
+
+  | Model | int4, all 4-bit | ends at int8 (kept) | + every 3rd layer (Q4_K_M) | all `v`/`down` int8 |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B, NLL | 2.9932 | **2.9689** | 2.9448 | 2.9121 |
+  | layer weights | 192.0 MiB | 204.8 MiB | 217.5 MiB | 243.1 MiB |
+  | Qwen2.5-1.5B, NLL | 2.3847 | **2.3564** | 2.3576 | |
+  | layer weights | 702.8 MiB | 756.8 MiB | 797.3 MiB | |
+
+  On 0.5B each extra int8 byte buys about the same, wherever it goes; on 1.5B
+  the middle layers bought nothing. So dlm takes the ends only: 7% larger, and
+  with the fitted groups, int4's loss against bf16 falls from 0.209 to 0.127
+  nats on 0.5B and from 0.137 to 0.072 on 1.5B. MLA layers (DeepSeek) are left
+  alone, since the GPU runs their dense FFN at a single dtype.
 - **The GPU's batched GEMV read every weight once per sequence instead of once
   per batch, and both GEMVs spent a third of their time in barriers.** Fixing
   the two, measured on Qwen2.5-0.5B by running the old and new binaries
