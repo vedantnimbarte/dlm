@@ -106,7 +106,11 @@ fn compile_cuda_kernels() {
     // cores, which `gemm_tc_kernel` then refuses. `DLM_CUDA_ARCHS=75` (comma
     // separated) narrows it for a quicker local build.
     let archs = std::env::var("DLM_CUDA_ARCHS").unwrap_or_else(|_| "75,80,86,89".to_string());
-    let archs: Vec<&str> = archs.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+    let archs: Vec<&str> = archs
+        .split(',')
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .collect();
     for a in &archs {
         cmd.arg(format!("-gencode=arch=compute_{a},code=sm_{a}"));
     }

@@ -701,8 +701,9 @@ fn gpu_matches_cpu_with_ggml_weights() {
     for (kind, f16_fields, scale) in kinds {
         let mut rng = Rng::new(0x6611 + kind.dtype_code() as u64);
         let mut ggml = |elements: usize| {
-            let mut blob: Vec<u8> =
-                (0..kind.byte_len(elements)).map(|_| rng.next_u64() as u8).collect();
+            let mut blob: Vec<u8> = (0..kind.byte_len(elements))
+                .map(|_| rng.next_u64() as u8)
+                .collect();
             for block in blob.chunks_mut(kind.block_bytes()) {
                 for &f in f16_fields {
                     block[f..f + 2].copy_from_slice(&scale.to_le_bytes());
@@ -729,7 +730,13 @@ fn gpu_matches_cpu_with_ggml_weights() {
                 l
             })
             .collect();
-        assert_gpu_close(cfg, layers, quantized_tol(), true, &format!("{kind:?} weights"));
+        assert_gpu_close(
+            cfg,
+            layers,
+            quantized_tol(),
+            true,
+            &format!("{kind:?} weights"),
+        );
     }
 }
 
@@ -1879,9 +1886,23 @@ fn gpu_split_attention_matches_cpu_at_real_head_shapes() {
         let mut b = a.clone();
         orch_cpu.decode_token(&mut a).unwrap();
         orch_gpu.decode_token(&mut b).unwrap();
-        for (what, x, y) in [("prefill tail", &want[want.len() - 4 * h..], &got[got.len() - 4 * h..]), ("decode", &a[..], &b[..])] {
-            let d = x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
-            assert!(d < 2e-3, "heads {num_heads}/{num_kv_heads} dim {head_dim}: {what} diverged by {d}");
+        for (what, x, y) in [
+            (
+                "prefill tail",
+                &want[want.len() - 4 * h..],
+                &got[got.len() - 4 * h..],
+            ),
+            ("decode", &a[..], &b[..]),
+        ] {
+            let d = x
+                .iter()
+                .zip(y)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                d < 2e-3,
+                "heads {num_heads}/{num_kv_heads} dim {head_dim}: {what} diverged by {d}"
+            );
         }
     }
 }

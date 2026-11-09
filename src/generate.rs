@@ -1252,7 +1252,11 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
             Some(Some(token)) => token?,
             _ => {
                 let mut logits = self.generator.logits(&self.last_hidden)?;
-                apply_repetition_penalty(&mut logits, &self.seen, self.sampler.repetition_penalty());
+                apply_repetition_penalty(
+                    &mut logits,
+                    &self.seen,
+                    self.sampler.repetition_penalty(),
+                );
                 self.penalties
                     .apply(&mut logits, &self.context, self.prompt_len);
                 match &mut self.grammar {
