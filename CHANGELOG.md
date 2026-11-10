@@ -30,6 +30,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     UI can reach the API. Without it the request succeeds and the browser
     discards the answer, with nothing in the log. Off by default: a server on a
     shared network should not hand its answers to any page that asks.
+- **A K-quant sub-block with a zero scale decoded to zero on the CPU.** ggml
+  decodes it as `-dmin * m`, and so do the GPU kernels; the CPU reference and
+  the expanded (int4/int8) layout dropped the minimum. Both now keep it.
 - **The end-to-end server test drove an engine nothing served.**
   `tests/server.rs` exercised a second, older OpenAI router that only the test
   referenced, so its checks said nothing about the server `dlm serve` runs. It
@@ -37,6 +40,175 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **GPU prefill is 4.6-6x faster and decode up to 1.7x.** Measured on a GTX
+  1650 (4 GB), `dlm bench --context-length 2048 --prompt-len 512 --gen-len 128
+  --batch 1,8`, the 0.4.x build and this one run alternately, best of three:
+
+  | Model | Decode, batch 1 | Decode, batch 8 (total) | Prefill |
+  |---|---|---|---|
+  | Qwen2.5-0.5B Q4_K_M GGUF | 80.6 → **116.6** tok/s | 112 → **180** | 268 → **1614** |
+  | Qwen2.5-0.5B bf16 | 79.3 → **89.0** | 112 → **185** | 266 → **1575** |
+  | Qwen2.5-1.5B `--quant int4` | 34.1 → **59.2** | 49.8 → **64.1** | 106 → **484** |
+
+  - **GEMV:** a warp per output row, each lane decoding an aligned chunk of
+    weights with wide loads. Quantized formats dot int8-quantized activations
+    with `dp4a`, as llama.cpp does: their GEMVs had been bound by decoding at
+    16-40 GB/s, not by memory. Rounding the activations to 8 bits costs at
+    most 0.003 nats of NLL on any weight type measured (see the table below);
+    `DLM_GEMV_EXACT=1` keeps the f32 path.
+  - **Fewer launches:** Q, K and V in one grid; the output and down
+    projections add straight into the residual; one warp per head does
+    Qwen3's head norm, RoPE and the KV append (six launches before). Fusing
+    gate, up and SwiGLU was tried and dropped: it never beat three launches.
+  - **Attention** splits the cache into chunks, reads each key once per KV head
+    instead of once per query head, and merges long contexts' chunks in a
+    second launch.
+  - **Prefill** takes up to 512 prompt tokens through a layer at once as tiled
+    GEMMs, with one attention launch for every query, instead of the decode
+    block 16 tokens at a time. Cards with tensor cores multiply on them (bf16
+    from Ampere, fp16 with per-row scaling on Volta/Turing RTX); GTX cards use
+    the f32 kernel. `DLM_GEMM=simt|tc` overrides the choice.
+  - **Greedy decoding** takes the LM head's argmax on the device, copying four
+    bytes back instead of the vocabulary's logits.
+  - **Batched decode of MoE models** reads each attention matrix once per
+    batch instead of once per sequence.
+  - `build.rs` builds the kernels for sm_75, 80, 86 and 89 plus PTX, so Ampere
+    and newer run their own code (bf16 tensor cores need it).
+    `DLM_CUDA_ARCHS=75` narrows a local build.
+- **Every weight type, measured.** The same GTX 1650, `--context-length 1024
+  --prompt-len 256 --gen-len 128`, the 0.4.x build against this one, run
+  alternately, best of two. Decode tok/s (batch 8 is the total over the batch),
+  and mean NLL over ~1,300 tokens of text scored the way generation decodes
+  (`dlm score --decode`), with the int8-activation GEMVs and with
+  `DLM_GEMV_EXACT=1` (noise is about 0.002):
+
+  | Model | Decode, batch 1 | Decode, batch 4 | Decode, batch 8 | Prefill | NLL (exact → dp4a) |
+  |---|---|---|---|---|---|
+  | 0.5B bf16 | 96.9 → **107.9** | 108.5 → **199.2** | 138.6 → **204.4** | 290 → **1727** | 2.7265 (no change) |
+  | 0.5B `--quant int8` | 89.6 → **137.7** | 100.2 → **197.5** | 130.2 → **205.4** | 293 → **1725** | 2.7298 → 2.7285 |
+  | 0.5B Q8_0 GGUF | 88.2 → **135.5** | 99.9 → **200.3** | 131.6 → **208.8** | 292 → **1704** | 2.7516 → 2.7531 |
+  | 0.5B Q6_K GGUF | 88.6 → **132.6** | 100.6 → **170.4** | 131.5 → **197.7** | 287 → **1732** | 2.7508 → 2.7507 |
+  | 0.5B Q5_K_M GGUF | 88.5 → **133.4** | 100.9 → **183.9** | 131.9 → **202.8** | 302 → **1696** | 2.7537 → 2.7561 |
+  | 0.5B Q4_K_M GGUF | 88.6 → **137.3** | 100.8 → **184.8** | 131.8 → **203.7** | 298 → **1720** | 2.7769 → 2.7793 |
+  | 0.5B `--quant int4` | 90.2 → **183.1** | 101.0 → **210.4** | 132.9 → **220.4** | 308 → **1785** | 2.8669 → 2.8676 |
+  | 1.5B `--quant int8` | 37.5 → **58.4** | 38.9 → **75.9** | 56.1 → **77.1** | 116 → **504** | 2.3285 → 2.3305 |
+  | 1.5B Q8_0 GGUF | 36.7 → **55.7** | 38.9 → **75.5** | 55.9 → **76.9** | 116 → **499** | 2.3408 → 2.3428 |
+  | 1.5B Q4_K_M GGUF | 36.2 → **72.8** | 39.1 → **72.3** | 56.7 → **79.4** | 117 → **504** | 2.3773 → 2.3764 |
+  | 1.5B `--quant int4` | 38.0 → **86.3** | 39.5 → **82.8** | 58.0 → **84.2** | 119 → **531** | 2.4183 → 2.4211 |
+  | 1.5B bf16, `--stream` | 18.8 → 18.3 | 33.6 → **50.8** | 49.3 → **64.6** | 116 → **124** | |
+
+  The batch-4/8 figures include the batched int8-activation GEMV below. A
+  streamed model is bound by PCIe at batch 1, so it moves little there.
+- **A batch of quantized sequences decodes through the int8-activation GEMV**
+  too. It used to decode weights to f32 element by element, so on Qwen2.5-1.5B
+  (int8, Q8_0, Q4_K_M, int4) four sequences together made fewer tokens a second
+  than one alone. Now batch 4 runs 72-83 tok/s, against 44 on the same build
+  without this kernel. At batch 4-8, int4 and Q4_K_M still only about match one
+  stream: each slot re-decodes the weights, which is compute-bound there.
+- **`--quant int4` decodes 20-27% faster on the GPU.** On short rows a
+  quantized GEMV was bound by latency, not bandwidth: a 32-weight chunk is a few
+  bytes, so a warp issued one load per row, waited, and reduced with nothing in
+  flight (int4 reached 60-65% of the bandwidth bf16 does, at full occupancy).
+  Each warp now interleaves two rows (int4, Q4_K) or four (Q4_0-Q8_0, Q6_K),
+  in the plain and the fused Q/K/V GEMVs. Every row sums in the same order as
+  before, so outputs are bit-identical. GTX 1650, batch-1 decode:
+
+  | Model | Before | After |
+  |---|---|---|
+  | Qwen2.5-1.5B `--quant int4` | 66.9 tok/s | **85.1** |
+  | Qwen2.5-0.5B `--quant int4` | 151.6 | **182.2** |
+  | Qwen2.5-0.5B Q4_K_M GGUF | 135.0 | 136.9 |
+
+  The GGUF barely moves because a model that fits is expanded to dlm's int8,
+  which was already at bandwidth; GGUF blocks read natively (a model too large
+  to expand) go 1.3-1.75x faster per GEMV.
+- **The quantized KV cache keeps a scale per 32 values, not per token.** One
+  scale across a token's whole K or V vector let a few large key channels set
+  the range for every head. Qwen2.5-0.5B, mean NLL over 415 tokens (3.644 with
+  an exact cache): int8 3.750 → 3.685, int4 6.266 → 5.312. int4 KV is still
+  far from exact; prefer int8. `dlm score --kv-quant` measures it.
+- **CPU decode is 2.5x faster on a bf16 model and 4.5x on a GGUF one.** The
+  CPU matvec summed one weight at a time (an f32 `sum()` that LLVM may not
+  reorder) and decoded every quantized weight on its own. Measured on a Ryzen 5
+  5600GT with Qwen2.5-0.5B, `dlm bench --device cpu --prompt-len 128
+  --gen-len 16`, old and new binaries run alternately, two rounds of three runs
+  each (medians per round; the machine was shared with other benchmarks, which
+  the spread shows):
+
+  | Model | Workload | Before | After |
+  |---|---|---|---|
+  | bf16 safetensors | Decode | 3.8–3.9 tok/s (runs 3.7–4.4) | **9.3–11.0 tok/s** (runs 4.4–11.5) |
+  | bf16 safetensors | Prefill | 4.9 tok/s | **6.3–12.9 tok/s** |
+  | Q4_K_M GGUF | Decode | 1.7–2.1 tok/s (runs 1.3–2.2) | **8.9–9.1 tok/s** (runs 8.5–10.0) |
+  | Q4_K_M GGUF | Prefill | 2.0–2.2 tok/s | **16.1–17.8 tok/s** |
+
+  - **SIMD kernels for every weight dtype**: f32, bf16, f16, dlm int4/int8, and
+    ggml's Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and Q6_K. AVX2+FMA+F16C on
+    x86_64, picked at run time so the same binary still runs the scalar code on
+    a CPU without them; NEON on aarch64. Each format's decoding is written once
+    against a small set of vector operations that both instruction sets
+    implement. The scalar code stays as the reference, and a test checks every
+    dtype against it on random data. Activations stay f32: llama.cpp's int8
+    activations would be faster for 4-bit weights, but this path is the oracle
+    the GPU kernels are checked against at 2e-3, and an int8 activation's error
+    is a few times that.
+  - **The thread pool no longer waits for its slowest worker to wake.** Each
+    GEMV dealt one fixed slice per thread and waited for every thread, so on a
+    loaded machine one descheduled worker stalled the whole step. Rows now go
+    out in small chunks claimed by whichever threads are running, and a worker
+    that wakes after the last chunk is taken skips the call. On the shared
+    machine above, a 4864×896 bf16 GEMV went from 1.7 ms to 0.18 ms (median).
+  - The attention projections (896×896) now run on the pool too, and attention
+    dots each query head with its keys eight lanes at a time.
+  - **The CPU's LM head is held in bf16 when that is lossless** (any bf16
+    checkpoint): the vocabulary-wide GEMV reads half the bytes, and steady-state
+    memory drops by 272 MB on Qwen2.5-0.5B. The load-time peak RSS is ~0.2 GB
+    higher (2.86 vs 2.67 GiB), since the bf16 copy is made from the f32 one the
+    loader hands over.
+  - Decode is now bound by memory bandwidth, not arithmetic. A GGUF model's LM
+    head is still decoded to f32 on the CPU, and is over half of each token's
+    bytes there; keeping it in its ggml blocks is the next step.
+
+- **`--quant int4` chooses each group's scale and zero to fit the group, not
+  just to span it.** Spanning min..max gives the two extreme weights exact
+  codes and rounds the other 126 on a coarser grid than they need. Each group of
+  128 now tries 21 grids around min..max and solves the least-squares scale and
+  zero for each one's codes (llama.cpp's `make_qkx2_quants`, the search behind
+  its K-quants, without calibration data), keeping the best. The min..max fit is
+  one of the candidates, so no group gets worse; synthetic groups lose 12–15% of
+  their squared error, and 35% when a few weights are outliers. The storage
+  layout and kernels are unchanged. `dlm score --device cpu` on a 404-token
+  text, mean NLL in nats (bf16 is the floor):
+
+  | Model | bf16 | int4 before | int4 after | int8 | int8 with the search |
+  |---|---|---|---|---|---|
+  | Qwen2.5-0.5B | 2.8421 | 3.0509 | **2.9932** | 2.8426 | 2.8434 |
+  | Qwen2.5-1.5B | 2.2849 | 2.4217 | **2.3847** | 2.2861 | 2.2869 |
+
+  That is 27–28% of int4's loss gone. int8 keeps plain rounding: it is already
+  within noise of bf16, and the search changed nothing measurable but doubled
+  its load time. The groups are fitted on every core, so loading costs about
+  2–3 s more on 0.5B and 10 s more on 1.5B (median of three, 6-core CPU); int8
+  loads no slower, and on 1.5B a little faster.
+- **`--quant int4` keeps `v_proj` and `down_proj` at int8 in the first and last
+  eighth of the layers**, the core of llama.cpp's Q4_K_M rule: those two write
+  straight into the residual stream, and the ends of the network are where it
+  is least forgiving. The embedding and LM head were never int4 (f32 on the CPU,
+  int8 on the GPU), so they needed nothing. Same text and setup as above, on
+  top of the fitted groups:
+
+  | Model | int4, all 4-bit | ends at int8 (kept) | + every 3rd layer (Q4_K_M) | all `v`/`down` int8 |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B, NLL | 2.9932 | **2.9689** | 2.9448 | 2.9121 |
+  | layer weights | 192.0 MiB | 204.8 MiB | 217.5 MiB | 243.1 MiB |
+  | Qwen2.5-1.5B, NLL | 2.3847 | **2.3564** | 2.3576 | |
+  | layer weights | 702.8 MiB | 756.8 MiB | 797.3 MiB | |
+
+  On 0.5B each extra int8 byte buys about the same, wherever it goes; on 1.5B
+  the middle layers bought nothing. So dlm takes the ends only: 7% larger, and
+  with the fitted groups, int4's loss against bf16 falls from 0.209 to 0.127
+  nats on 0.5B and from 0.137 to 0.072 on 1.5B. MLA layers (DeepSeek) are left
+  alone, since the GPU runs their dense FFN at a single dtype.
 - **The GPU's batched GEMV read every weight once per sequence instead of once
   per batch, and both GEMVs spent a third of their time in barriers.** Fixing
   the two, measured on Qwen2.5-0.5B by running the old and new binaries
@@ -67,6 +239,121 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`dlm score --decode`** scores a text one token at a time, through the
+  kernels generation uses. On the GPU those differ from prefill's (GEMVs on
+  int8-quantized activations against GEMMs on f32 ones), so plain `dlm score`
+  does not measure what a generated token goes through.
+- **`--gpu-layers N`: the layers that do not fit in VRAM run on the CPU**,
+  where their weights already are, instead of streaming across PCIe every
+  token (llama.cpp's `-ngl`). Qwen2.5-1.5B bf16 on a 4 GB GTX 1650, against
+  `--stream` holding the same number of layers: decode 8.3 → 11.0 tok/s at 16
+  of 28 layers, 5.6 → 7.4 at 8. Prefill is slower (the CPU runs a prompt token
+  by token), so `--stream` remains the better choice for long prompts.
+- **Speculative decoding without a draft model, on by default where it pays.**
+  N-gram lookup proposes what followed the last time the context's latest few
+  tokens occurred; the target verifies the proposals in one pass, and keeps
+  the ones it agrees with. It is right whenever a reply copies — code being
+  rewritten, a document being quoted, a list being continued — and costs
+  nothing to draft.
+  - **`--speculative auto|off|ngram|draft`** on `serve`. `auto`, the default,
+    uses the draft model if `--draft-model-path` is given, else lookup when the
+    model is streamed, else nothing. Streamed means a pass moves weights: layers
+    left out of the `--stream` window, and on the CPU, more of them than the RAM
+    cache holds. That is where verifying several tokens costs about what
+    generating one does; where a pass is compute, a wrong guess is paid for in
+    full. `--draft-gamma` sets the proposals per round for either drafter.
+  - **Output is unchanged.** Greedy is exactly target-greedy (tested against
+    plain decoding, alone and in the batching scheduler). A lookup proposal is
+    a one-hot draft, so the usual rejection rule keeps it with probability
+    `p(x)` and otherwise resamples from `p` without it: sampled output follows
+    the model's own distribution (tested on the rule directly). Penalties and
+    `logit_bias` hold too: the target's distribution gets them at each
+    proposal's own position, and a one-hot proposal needs none. A constrained
+    request decodes plainly, as with a draft model.
+  - **Acceptance is reported** in `usage.speculative`, as for a draft model.
+  - **Concurrency keeps its shared pass.** A request speculates only while it
+    is the one decoding; with several, each takes one token through the same
+    batched pass as plain decoding, since the streamed GPU kernel streams each
+    layer once for the whole batch and a verify pass per request would undo
+    that. A round with no match is a plain step, not a one-token verify.
+  - **Prompts still go in piecewise and through the prefix cache**: a lookup
+    request starts as a plain one and turns speculative once its prompt is in,
+    at no extra pass.
+  - **Measured** on Qwen2.5-0.5B, CPU build, `--stream --resident-layers 12`,
+    greedy, 96 tokens, decode only, on a machine shared with other work (the
+    quieter round):
+
+    | | Rewrite code with comments | Free prose |
+    |---|---|---|
+    | Load-bound (`--ram-cache-gb 0`), off | 3.5 tok/s | 3.7 tok/s |
+    | Load-bound, lookup | **6.3 tok/s** (79% of 87 accepted) | 3.6 tok/s (17% of 24) |
+    | Layers all in the RAM cache, off | 8.3 tok/s | 8.6 tok/s |
+    | Layers all in the RAM cache, lookup | 7.6 tok/s | 7.6 tok/s |
+
+    The last two rows are why `auto` leaves a CPU model whose layers all fit
+    the RAM cache alone: the CPU kernels verify token by token, so a pass over
+    five tokens costs nearly five passes. Not measured: the streamed GPU path,
+    the case this is for, since the GPU was busy.
+  - **Lookup needs a two-token match.** One recurring token predicts little:
+    on the prose above, 1-token matches made 129 proposals of which 6% were
+    accepted, and cost ~10% of decode speed even load-bound. Two tokens cut that
+    to 24 proposals with no loss on the code rewrite (70 of 90 accepted before,
+    69 of 87 after). Adapting the proposal length to recent acceptance was tried
+    and dropped: it shortened the long runs a rewrite copies (2.7–3.0 tok/s
+    against 4.1–4.6) and helped prose less than the two-token minimum did.
+
+- **`logit_bias`** on `/v1/chat/completions` and `/v1/completions`, in OpenAI's
+  shape: token id → a bias in [-100, 100] added to that token's logit. It
+  applies under greedy decoding too, so `-100` bans a token whatever the
+  temperature. A bias out of range, or a key that is not a token in the model's
+  vocabulary, is a 400 that says which.
+- **`frequency_penalty` and `presence_penalty`**, with OpenAI's meaning: each
+  time a token has been generated takes `frequency_penalty` off its logit, and
+  having been generated at all takes `presence_penalty` once. Only generated
+  tokens count, not the prompt's. Range -2 to 2; negative values encourage
+  repetition. Speculative decoding applies them at each proposal's own
+  position, so its output still follows the target exactly.
+- **DRY ("don't repeat yourself") sampling**, with llama.cpp's fields:
+  `dry_multiplier` (0, the default, leaves it off), `dry_base` (1.75),
+  `dry_allowed_length` (2) and `dry_sequence_breakers` (`["\n", ":", "\"",
+  "*"]`). It penalizes the token that would extend a run already seen earlier
+  in the context, by `multiplier · base^(run − allowed_length)` — the verbatim
+  loops a small model falls into, which per-token penalties miss because every
+  token in them is ordinary on its own. A run does not cross a token containing
+  a breaker, so repeating a structure line by line is not counted as a loop.
+- **Constrained output: JSON mode, JSON Schema, and GBNF grammars.**
+  `response_format: {"type": "json_object"}` returns a JSON object;
+  `{"type": "json_schema", "json_schema": {"schema": ...}}` returns JSON of
+  that shape; and `grammar` takes a GBNF grammar, llama.cpp's format, so
+  grammars written for it work unchanged. The output matches every time, not
+  usually: at each step a token the grammar cannot take is never emitted, and
+  EOS only once the grammar is complete.
+  - **How:** the sampler draws as it would anyway, and only when the grammar
+    refuses that token does it drop every refused candidate and draw again from
+    what is left. The grammar is matched against each token's bytes, so a
+    character split across two tokens is handled, and tokenization and grammar
+    never need to line up.
+  - **Schemas:** `type` (object, array, string, number, integer, boolean, null,
+    or a list of them), `properties` with `required` (no other keys), `items`,
+    `enum`, `const`, `anyOf` and `oneOf`. Keywords that would otherwise be
+    silently ignored — `$ref`, `allOf`, `not`, `if`, `patternProperties` — are
+    refused, as are grammars that do not parse, with a 400 naming the problem.
+    Properties come out required first, each group in key order; numbers are
+    capped at 16 digits and whitespace runs at 21 characters, so a model that
+    favours digits or spaces still has to finish.
+  - **Speculative decoding is skipped** for a constrained request, which
+    decodes plainly beside the speculative ones: the rejection rule would need
+    the draft held to the same grammar.
+- **`dlm bench --compare base.json`** checks a build for a speed regression:
+  it prints each metric's change against a baseline saved with `--json`, per
+  batch size, and exits non-zero if prefill or decode tok/s fell by more than
+  `--tolerance` percent (default 5). Latency and memory are shown but never fail
+  it. The `--json` file now also records the time, the GPU's name, per-batch
+  peak RSS, and the commit when the build sets `DLM_GIT_COMMIT`; files written
+  before this still read. `bench/BASELINES.md` describes the workflow.
+- **`dlm score --quant int4|int8`** scores a model quantized at load, so what a
+  quantization costs in log-likelihood can be measured rather than guessed. It
+  also reports the size of the layer weights it scored.
 - **dlm reads GGUF files** — the format local models are actually distributed
   in. `--model-path model.gguf` runs one on CPU or GPU, resident or streamed,
   and the file is self-contained: dlm takes the config and the tokenizer out of

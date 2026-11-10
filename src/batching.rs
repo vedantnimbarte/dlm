@@ -22,10 +22,17 @@
 //! plain path — and every emitted token flows through the same `produced` list,
 //! so streaming and length/EOS handling are unchanged. A slot with two draft
 //! rejections in a row simply emits one token per round, matching plain decoding.
+//!
+//! [`with_ngram`](BatchScheduler::with_ngram) speculates with no draft model, by
+//! lookup in each request's own context. It speculates only while a single
+//! request is decoding: with several, every slot takes one token through one
+//! shared pass, as plain slots do, because a batching kernel's shared pass costs
+//! about what one request's does, and a verify pass per request would forfeit
+//! that.
 
 use crate::error::Result;
 use crate::forward::{ComputeKernel, KvSnapshot};
-use crate::generate::{GenerationSession, Generator, Sampler};
+use crate::generate::{Decoding, GenerationSession, Generator, Sampler};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -120,14 +127,14 @@ struct Pending {
     /// Stop when any of these token ids is produced; empty means run to length.
     eos: Vec<u32>,
     /// How tokens are chosen, on the plain and the speculative path alike.
-    sampler: Sampler,
+    decoding: Decoding,
 }
 
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
 /// speculative session that emits a whole round's accepted tokens per step.
 enum Decoder<'a, K: ComputeKernel> {
     Plain(GenerationSession<'a, K>),
-    Speculative(SpeculativeSession<'a, K, K>),
+    Speculative(SpeculativeSession<'a, K>),
 }
 
 /// An in-flight generation occupying a batch slot.
@@ -141,6 +148,8 @@ struct Active<'a, K: ComputeKernel> {
     /// The prompt, kept while it is still being prefilled so its prefix can be
     /// cached once it is in. `None` when there is nothing to cache.
     cache_prompt: Option<Vec<u32>>,
+    /// Whether the slot turns speculative, by lookup, once its prompt is in.
+    ngram: bool,
 }
 
 impl<K: ComputeKernel> Active<'_, K> {
@@ -206,9 +215,10 @@ pub struct Tick {
 /// A continuous-batching scheduler over a borrowed generator.
 pub struct BatchScheduler<'a, K: ComputeKernel> {
     generator: &'a Generator<K>,
-    /// Optional draft model; when present every slot decodes speculatively.
+    /// Draft model proposing for every slot, if speculating with one.
     draft: Option<&'a Generator<K>>,
-    /// Draft tokens proposed per round when speculating.
+    /// Tokens proposed per round; 0 when not speculating. Without a draft model
+    /// slots propose by n-gram lookup.
     gamma: usize,
     max_batch: usize,
     pending: VecDeque<Pending>,
@@ -241,8 +251,8 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
 
     /// Enable a cross-request prefix cache holding up to `max_entries` KV
     /// snapshots. A request whose prompt extends a cached one resumes from the
-    /// snapshot, skipping the shared prefix's prefill. No effect on a
-    /// speculative scheduler (its sessions can't resume). `0` disables it.
+    /// snapshot, skipping the shared prefix's prefill. No effect with a draft
+    /// model (its sessions can't resume). `0` disables it.
     pub fn with_prefix_cache(mut self, max_entries: usize) -> Self {
         self.prefix_cache = if max_entries > 0 && self.draft.is_none() {
             Some(PrefixCache::new(max_entries))
@@ -263,21 +273,24 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         gamma: usize,
     ) -> Self {
         Self {
-            generator,
             draft: Some(draft),
+            ..Self::with_ngram(generator, max_batch, gamma)
+        }
+    }
+
+    /// Create a scheduler that speculates with no draft model: each request
+    /// proposes up to `gamma` tokens per round by n-gram lookup in its own
+    /// context ([`SpeculativeSession::ngram`]). Output is identical to
+    /// [`new`](Self::new).
+    pub fn with_ngram(generator: &'a Generator<K>, max_batch: usize, gamma: usize) -> Self {
+        Self {
             gamma: gamma.max(1),
-            max_batch: max_batch.max(1),
-            pending: VecDeque::new(),
-            active: Vec::new(),
-            proposed: 0,
-            accepted: 0,
-            prefix_cache: None,
-            resume_hits: 0,
+            ..Self::new(generator, max_batch)
         }
     }
 
     /// Cumulative `(proposed, accepted)` draft-token counts over all *retired*
-    /// speculative slots. Zero unless the scheduler was built with a draft.
+    /// speculative slots. Zero unless the scheduler speculates.
     pub fn speculative_stats(&self) -> (usize, usize) {
         (self.proposed, self.accepted)
     }
@@ -311,6 +324,19 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         eos: Vec<u32>,
         sampler: Sampler,
     ) -> Result<()> {
+        self.submit_decoding(id, prompt, max_new_tokens, eos, sampler.into())
+    }
+
+    /// Queue a request with a sampler and what it layers on it (see
+    /// [`Decoding`]).
+    pub fn submit_decoding(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+    ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::DlmError::InvalidConfig(
                 "prompt is empty".into(),
@@ -321,7 +347,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             prompt,
             max_new_tokens,
             eos,
-            sampler,
+            decoding,
         });
         Ok(())
     }
@@ -350,11 +376,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// token it may generate, plus, when speculating, the draft tokens a round can
     /// write before the target rejects them.
     fn reservation(&self, p: &Pending) -> usize {
-        let slack = if self.draft.is_some() {
-            self.gamma + 1
-        } else {
-            0
-        };
+        let slack = if self.gamma > 0 { self.gamma + 1 } else { 0 };
         round_to_block(p.prompt.len() + p.max_new_tokens + slack)
     }
 
@@ -433,15 +455,20 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 zero_finished.push(p.id);
                 continue;
             }
+            let Decoding {
+                sampler,
+                penalties,
+                grammar,
+            } = p.decoding;
+            // A constrained request decodes plainly even when speculating: see
+            // `Decoding::grammar`.
+            let ngram = self.draft.is_none() && self.gamma > 0 && grammar.is_none();
             let decoder = match self.draft {
-                Some(draft) => Decoder::Speculative(SpeculativeSession::new(
-                    self.generator,
-                    draft,
-                    self.gamma,
-                    &p.prompt,
-                    p.sampler,
-                )?),
-                None => {
+                Some(draft) if grammar.is_none() => Decoder::Speculative(
+                    SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
+                        .with_penalties(penalties),
+                ),
+                _ => {
                     // Resume from the longest cached prefix if one exists;
                     // otherwise prefill from scratch. Either way, cache this
                     // prompt's prefix so later requests can extend it.
@@ -461,15 +488,20 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                             // Pass the whole prompt so the repetition penalty covers
                             // the cached prefix too (resume derives the suffix).
                             self.generator
-                                .resume_session_deferred(snap, &p.prompt, p.sampler)?
+                                .resume_session_deferred(snap, &p.prompt, sampler)?
                         }
-                        None => self
-                            .generator
-                            .start_session_deferred(&p.prompt, p.sampler)?,
+                        None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    Decoder::Plain(session)
+                    let session = session.with_penalties(penalties);
+                    Decoder::Plain(match grammar {
+                        Some(g) => session.with_grammar(g),
+                        None => session,
+                    })
                 }
             };
+            // A lookup slot starts plain, so its prompt goes in piecewise and
+            // through the prefix cache like any other, and turns speculative
+            // once it is in (see `step`).
             let cache_prompt = match (&decoder, &self.prefix_cache) {
                 (Decoder::Plain(_), Some(_)) => Some(p.prompt),
                 _ => None,
@@ -481,6 +513,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 eos: p.eos,
                 reserved,
                 cache_prompt,
+                ngram,
             });
         }
         Ok(zero_finished)
@@ -548,23 +581,65 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             .active
             .iter_mut()
             .filter_map(|a| match &mut a.decoder {
-                Decoder::Plain(s) if !s.is_prefilling() => Some(s),
+                Decoder::Plain(s) if !s.is_prefilling() && !a.ngram => Some(s),
                 _ => None,
             })
             .collect();
         let mut plain_tokens = self.generator.step_sessions(&mut plain)?.into_iter();
 
+        // Lookup slots share one pass too while several are decoding; alone, a
+        // request speculates (see the module docs).
+        let speculating = self
+            .active
+            .iter()
+            .filter(|a| matches!(a.decoder, Decoder::Speculative(_)))
+            .count();
+        let fuse = self.draft.is_none() && speculating > 1;
+        let mut fused: Vec<&mut SpeculativeSession<'a, K>> = self
+            .active
+            .iter_mut()
+            .filter_map(|a| match &mut a.decoder {
+                Decoder::Speculative(s) if fuse => Some(s),
+                _ => None,
+            })
+            .collect();
+        let mut fused_tokens = if fused.is_empty() {
+            Vec::new()
+        } else {
+            SpeculativeSession::step_together(&mut fused)?
+        }
+        .into_iter();
+
         let mut still_active = Vec::with_capacity(self.active.len());
         for mut a in self.active.drain(..) {
             // Plain slots yield one token; speculative slots yield a whole
             // round's accepted tokens (never more than `remaining`).
-            let emitted = match &mut a.decoder {
+            let emitted = match a.decoder {
                 Decoder::Plain(s) if s.is_prefilling() => {
+                    a.decoder = Decoder::Plain(s);
                     still_active.push(a);
                     continue;
                 }
-                Decoder::Plain(_) => vec![plain_tokens.next().expect("one token per plain slot")],
-                Decoder::Speculative(s) => s.step(a.remaining)?,
+                // Its prompt is in: a lookup slot carries on speculatively, its
+                // first token chosen without a pass.
+                Decoder::Plain(s) if a.ngram => {
+                    let (s, first) = SpeculativeSession::ngram_from(s, self.gamma)?;
+                    a.decoder = Decoder::Speculative(s);
+                    vec![first]
+                }
+                Decoder::Plain(s) => {
+                    a.decoder = Decoder::Plain(s);
+                    vec![plain_tokens.next().expect("one token per plain slot")]
+                }
+                Decoder::Speculative(mut s) => {
+                    let emitted = if fuse {
+                        vec![fused_tokens.next().expect("one token per fused slot")]
+                    } else {
+                        s.step(a.remaining)?
+                    };
+                    a.decoder = Decoder::Speculative(s);
+                    emitted
+                }
             };
 
             // Emit tokens in order, stopping the request at the length cap or an
@@ -578,6 +653,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     done = true;
                     break;
                 }
+            }
+            // A finished grammar with no EOS to end on has nothing left to say.
+            if a.eos.is_empty() && matches!(&a.decoder, Decoder::Plain(s) if s.grammar_exhausted())
+            {
+                done = true;
             }
 
             if done {

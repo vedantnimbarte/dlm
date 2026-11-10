@@ -12,7 +12,7 @@ use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
     GenerateArgs, KvQuantArg, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs,
-    TokenizeArgs,
+    Speculative, TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -448,10 +448,23 @@ fn run_score(args: ScoreArgs) -> Result<()> {
         )));
     }
 
-    let (config, store) = dlm::loader::open_model(&args.model_path, QuantScheme::Fp16)?;
+    let quant = resolve_quant(args.quant, &MmapStore::open_path(&args.model_path)?)?;
+    let (config, store) = dlm::loader::open_model(&args.model_path, quant)?;
     let parts = dlm::loader::load_model_parts(&store, &config, tokens.len() as u32)?;
+    let weight_bytes: usize = parts
+        .layers
+        .iter()
+        .flat_map(|l| l.weights())
+        .map(|w| w.as_bytes().len())
+        .sum();
     let device = resolve_device(args.device);
-    let (logprobs, next) = score_on_device(parts, device, &tokens)?;
+    let (logprobs, next) = score_on_device(
+        parts,
+        device,
+        &tokens,
+        args.kv_quant.to_kv_quant(),
+        args.decode,
+    )?;
 
     // The mean of the negated log-probabilities: the text's cross-entropy.
     let mean_nll = -logprobs.iter().sum::<f32>() / logprobs.len() as f32;
@@ -463,6 +476,8 @@ fn run_score(args: ScoreArgs) -> Result<()> {
         let json = serde_json::json!({
             "model": args.model_path.display().to_string(),
             "device": format!("{device:?}").to_lowercase(),
+            "quant": format!("{quant:?}").to_lowercase(),
+            "layer_weight_bytes": weight_bytes,
             "tokens": tokens,
             // `logprobs[i]` scores `tokens[i + 1]`, so it is one shorter.
             "logprobs": logprobs,
@@ -488,6 +503,10 @@ fn run_score(args: ScoreArgs) -> Result<()> {
     // valid on its own is shown as the empty string rather than failing.
     let piece = |id: u32| tokenizer.decode(&[id]).unwrap_or_default();
     println!("device       : {device:?}");
+    println!(
+        "quant        : {quant:?} ({:.1} MiB of layer weights)",
+        weight_bytes as f64 / (1u64 << 20) as f64
+    );
     println!("tokens       : {}", tokens.len());
     println!("mean nll     : {mean_nll:.4}");
     println!();
@@ -512,11 +531,32 @@ fn score_on_device(
     parts: ModelParts,
     device: Device,
     tokens: &[u32],
+    kv_quant: dlm::forward::KvQuant,
+    decode: bool,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    fn score<K: ComputeKernel>(
+        g: Generator<K>,
+        tokens: &[u32],
+        decode: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        if decode {
+            g.score_and_next_decoding(tokens)
+        } else {
+            g.score_and_next(tokens)
+        }
+    }
     match device {
-        Device::Cpu => parts.into_cpu_generator()?.score_and_next(tokens),
+        Device::Cpu => score(
+            parts.into_cpu_generator()?.with_kv_quant(kv_quant),
+            tokens,
+            decode,
+        ),
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-        Device::Gpu => parts.into_gpu_generator()?.score_and_next(tokens),
+        Device::Gpu => score(
+            parts.into_gpu_generator()?.with_kv_quant(kv_quant),
+            tokens,
+            decode,
+        ),
         #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
     }
@@ -843,7 +883,7 @@ fn publish_telemetry_snapshot(
     });
 }
 
-fn run_serve(args: ServeArgs) -> Result<()> {
+fn run_serve(mut args: ServeArgs) -> Result<()> {
     banner();
 
     // Decide up front whether `/v1/telemetry` exists. Collection still costs
@@ -976,6 +1016,16 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
                 let ram_cache = resolve_ram_cache_bytes(&args, &plan);
+                // Lookup speculation pays where a pass moves weights: over PCIe
+                // into VRAM, or on the CPU from the checkpoint when the RAM cache
+                // cannot hold every layer. A CPU pass over cached layers is
+                // compute, where verifying k tokens costs nearly k passes.
+                let cached =
+                    default_ram_cache_bytes(plan.per_layer_weight_bytes, plan.num_layers, u64::MAX)
+                        .is_some_and(|all| ram_cache as u64 >= all);
+                let streamed =
+                    window < config.num_layers as usize && (device == Device::Gpu || !cached);
+                args.speculative = args.speculative.resolve(false, streamed)?;
                 publish_telemetry_snapshot(&config, &store, window as u32, true, device);
                 println!();
                 let dest = if device == Device::Gpu {
@@ -1065,6 +1115,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 return start_batched_server(generator, None, &args, &config, &listen, None);
             }
 
+            args.speculative = args
+                .speculative
+                .resolve(args.draft_model_path.is_some(), false)?;
             // Non-streaming paths materialize all layers resident.
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
 
@@ -1417,6 +1470,24 @@ fn serve_on_gpu(
 ) -> Result<()> {
     println!();
     println!("device       : gpu ({})", gpu::active_vendor().label());
+    // `--gpu-layers N` below the model's depth: the rest run on the CPU.
+    let gpu_layers = args
+        .gpu_layers
+        .map(|n| n.min(config.num_layers))
+        .filter(|&n| n < config.num_layers);
+    let on_gpu = gpu_layers.unwrap_or(config.num_layers);
+    if let Some(n) = gpu_layers {
+        if draft_parts.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "--gpu-layers does not support speculative decoding (--draft-model-path) yet"
+                    .into(),
+            ));
+        }
+        println!(
+            "  split      : layers 0..{n} in VRAM, {n}..{} on the CPU",
+            config.num_layers
+        );
+    }
     // All weights sit resident in VRAM; each batched request adds a full-context
     // KV cache. Refuse up front if the batch won't fit rather than OOM mid-request.
     let (free, _) = resolve_free_bytes(args.vram_budget_gb);
@@ -1426,12 +1497,14 @@ fn serve_on_gpu(
         args.max_batch as u32,
         args.kv_quant != KvQuantArg::F32,
     );
-    let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64;
+    let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64
+        * on_gpu as u64
+        / config.num_layers.max(1) as u64;
     // KV is paged from a shared pool, so concurrent requests only need VRAM for
     // the tokens they actually hold. Give the pool whatever fits after the
     // weights, up to --max-batch full contexts.
-    let per_token = profiler.kv_bytes_per_layer(config) * config.num_layers as u64
-        / args.context_length.max(1) as u64;
+    let per_token =
+        profiler.kv_bytes_per_layer(config) * on_gpu as u64 / args.context_length.max(1) as u64;
     let pool = resident_kv_pool_tokens(
         free,
         profiler.safety_margin_bytes,
@@ -1440,6 +1513,10 @@ fn serve_on_gpu(
         args.max_batch,
         args.context_length,
     )?;
+    if let Some(n) = gpu_layers {
+        let generator = parts.into_split_generator(n as usize)?;
+        return start_batched_server(generator, None, args, config, listen, Some(pool));
+    }
     let generator = parts.into_gpu_generator()?;
     let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
     start_batched_server(generator, draft, args, config, listen, Some(pool))
@@ -1653,9 +1730,19 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     }
 
     // Batched, streaming engine: a background scheduler interleaves concurrent
-    // requests a token at a time. With a draft model it decodes speculatively
-    // (draft proposes, target verifies).
-    let speculative = draft.is_some();
+    // requests a token at a time. Speculating, a draft model or n-gram lookup
+    // proposes and the target verifies.
+    let mode = match (&draft, args.speculative) {
+        (Some(_), _) => format!(
+            "batched + speculative: draft model, gamma {}",
+            args.draft_gamma
+        ),
+        (None, Speculative::Ngram) => format!(
+            "batched + speculative: n-gram lookup, gamma {}",
+            args.draft_gamma
+        ),
+        _ => "batched".into(),
+    };
     let engine = match draft {
         Some(d) => dlm::server::EngineService::start_speculative(
             generator,
@@ -1667,6 +1754,17 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             usize::MAX,
             created,
             args.max_batch.max(1), // max concurrent batch (--max-batch)
+            prefix_cache,
+        ),
+        None if args.speculative == Speculative::Ngram => dlm::server::EngineService::start_ngram(
+            generator,
+            args.draft_gamma,
+            tokenizer,
+            config.vocab_size as usize,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
+            created,
+            args.max_batch.max(1),
             prefix_cache,
         ),
         None => dlm::server::EngineService::start(
@@ -1685,11 +1783,6 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     .with_context_window(args.context_length as usize);
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
-    let mode = if speculative {
-        "batched + speculative"
-    } else {
-        "batched"
-    };
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
     println!("  openai     : POST /v1/chat/completions (stream), GET /v1/models");
     println!("  anthropic  : POST /v1/messages (stream), POST /v1/messages/count_tokens");
@@ -1705,7 +1798,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             args.context_length
         );
     }
-    if prefix_cache > 0 && !speculative {
+    if prefix_cache > 0 && args.draft_model_path.is_none() {
         println!(
             "  prefix     : up to {prefix_cache} prompt prefixes cached{}",
             if kv_pool.is_some() {
@@ -1753,9 +1846,12 @@ const BENCH_TEXT: &str = "The river wound through the valley for many miles befo
 /// instead of serving it (see [`bench_generator`]).
 fn run_bench(args: BenchArgs) -> Result<()> {
     let BenchArgs { mut serve, opts } = args;
-    if serve.draft_model_path.is_some() || serve.distributed_mode != DistributedMode::Standalone {
+    if serve.draft_model_path.is_some()
+        || serve.speculative == Speculative::Ngram
+        || serve.distributed_mode != DistributedMode::Standalone
+    {
         return Err(DlmError::InvalidConfig(
-            "bench measures a single standalone model; drop --draft-model-path and --distributed-mode"
+            "bench measures plain decoding on a single standalone model; drop --draft-model-path, --speculative and --distributed-mode"
                 .into(),
         ));
     }
@@ -1765,6 +1861,10 @@ fn run_bench(args: BenchArgs) -> Result<()> {
             "--prompt-len + --gen-len ({needed}) exceeds --context-length ({})",
             serve.context_length
         )));
+    }
+    // A bad baseline should fail now, not after the model has loaded and run.
+    if let Some(path) = &opts.compare {
+        read_bench_report(path)?;
     }
     // Size the batch-KV fit checks for the largest batch actually measured.
     serve.max_batch = opts.batch.iter().copied().max().unwrap_or(1).max(1);
@@ -1825,22 +1925,27 @@ fn bench_generator<K: ComputeKernel>(
     }
 
     if let Some(path) = &opts.json {
-        let report = serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "model": args.model_path,
-            "device": format!("{:?}", args.device).to_lowercase(),
-            "gpu_backend": gpu::active_vendor().label(),
-            "quant": format!("{:?}", config.quant),
-            "stream": args.stream,
-            "kv_quant": format!("{:?}", args.kv_quant).to_lowercase(),
-            "context_length": args.context_length,
-            "prompt_len": opts.prompt_len,
-            "gen_len": opts.gen_len,
-            "runs": results,
-            "summary": summary,
-            "peak_rss_bytes": peak_rss,
-            "vram_used_bytes": vram_used,
-        });
+        let report = dlm::bench::Report {
+            version: env!("CARGO_PKG_VERSION").into(),
+            commit: option_env!("DLM_GIT_COMMIT").map(Into::into),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            model: args.model_path.display().to_string(),
+            device: format!("{:?}", args.device).to_lowercase(),
+            gpu_backend: gpu::active_vendor().label().into(),
+            gpu_name: gpu_in_use.then(gpu_name).flatten(),
+            quant: format!("{:?}", config.quant),
+            stream: args.stream,
+            kv_quant: format!("{:?}", args.kv_quant).to_lowercase(),
+            context_length: args.context_length,
+            prompt_len: opts.prompt_len,
+            gen_len: opts.gen_len,
+            runs: results,
+            summary: summary.clone(),
+            peak_rss_bytes: peak_rss,
+            vram_used_bytes: vram_used,
+        };
         let text = serde_json::to_string_pretty(&report)
             .map_err(|e| DlmError::InvalidConfig(format!("bench json: {e}")))?;
         std::fs::write(path, text).map_err(|source| DlmError::Io {
@@ -1849,7 +1954,70 @@ fn bench_generator<K: ComputeKernel>(
         })?;
         println!("json         : {}", path.display());
     }
+
+    if let Some(path) = &opts.compare {
+        let base = read_bench_report(path)?;
+        println!();
+        println!(
+            "compare      : against {} ({}, {} {})",
+            path.display(),
+            base.commit.as_deref().unwrap_or("unknown commit"),
+            base.quant,
+            base.device
+        );
+        let deltas = dlm::bench::compare(&base.summary, &summary, opts.tolerance);
+        if deltas.is_empty() {
+            println!("  no batch size in common with the baseline");
+        }
+        for d in &deltas {
+            println!(
+                "  batch {:<5}: {:<14} {:>10.2} -> {:>10.2}  {:>+7.1}%{}",
+                d.batch,
+                d.metric,
+                d.before,
+                d.after,
+                d.change_pct,
+                if d.regressed { "  REGRESSED" } else { "" }
+            );
+        }
+        let regressed = deltas.iter().filter(|d| d.regressed).count();
+        if regressed > 0 {
+            return Err(DlmError::InvalidConfig(format!(
+                "{regressed} throughput metric(s) fell more than {}% below {}",
+                opts.tolerance,
+                path.display()
+            )));
+        }
+    }
     Ok(())
+}
+
+/// A `dlm bench --json` file, for `--compare`.
+fn read_bench_report(path: &Path) -> Result<dlm::bench::Report> {
+    let text = std::fs::read_to_string(path).map_err(|source| DlmError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_str(&text).map_err(|source| DlmError::Json {
+        context: path.display().to_string(),
+        source,
+    })
+}
+
+/// The GPU's name for labelling results, from `nvidia-smi` (one line per GPU,
+/// joined). `None` where it is not installed, as on ROCm.
+fn gpu_name() -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    let names = String::from_utf8(out.stdout).ok()?;
+    let names: Vec<&str> = names
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    (out.status.success() && !names.is_empty()).then(|| names.join(", "))
 }
 
 /// Return a [`Shutdown`] wired to `SIGTERM`/`SIGINT` where the platform allows.

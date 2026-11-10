@@ -4,6 +4,7 @@
 //! unit-testable without spawning the binary. `main.rs` parses a [`Cli`] and
 //! dispatches on [`Command`].
 
+use crate::error::{DlmError, Result};
 use crate::model::QuantScheme;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -204,6 +205,54 @@ impl KvQuantArg {
     }
 }
 
+/// Speculative decoding (`--speculative`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Speculative {
+    /// The draft model if `--draft-model-path` is given; else n-gram lookup if
+    /// the model is streamed; else off.
+    Auto,
+    /// Decode one token per pass.
+    Off,
+    /// Propose from the request's own context: what followed the last time its
+    /// latest few tokens occurred. No second model.
+    Ngram,
+    /// Propose with the `--draft-model-path` model.
+    Draft,
+}
+
+impl Speculative {
+    /// What this comes to for a run (never `Auto`). `streamed`: whether a pass
+    /// moves layer weights, i.e. the model streams layers into VRAM, or on the
+    /// CPU from the checkpoint past what the RAM cache holds.
+    ///
+    /// Lookup is automatic only there because that is where it pays: a pass
+    /// costs moving the streamed layers' weights, so verifying a few tokens
+    /// costs little more than generating one. Where a pass is compute (a
+    /// resident model, or CPU layers all in the RAM cache), verifying k tokens
+    /// costs nearly k passes, and a wrong guess is paid for in full.
+    pub fn resolve(self, has_draft: bool, streamed: bool) -> Result<Speculative> {
+        match self {
+            Speculative::Auto if has_draft => Ok(Speculative::Draft),
+            Speculative::Auto if streamed => Ok(Speculative::Ngram),
+            Speculative::Auto => Ok(Speculative::Off),
+            Speculative::Draft if !has_draft => Err(DlmError::InvalidConfig(
+                "--speculative draft needs --draft-model-path".into(),
+            )),
+            Speculative::Off | Speculative::Ngram if has_draft => {
+                Err(DlmError::InvalidConfig(format!(
+                    "--draft-model-path would go unused with --speculative {}",
+                    if self == Speculative::Off {
+                        "off"
+                    } else {
+                        "ngram"
+                    }
+                )))
+            }
+            mode => Ok(mode),
+        }
+    }
+}
+
 /// Arguments for `dlm serve` (mirrors the schema).
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -265,14 +314,32 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     pub draft_model_path: Option<PathBuf>,
 
-    /// Draft tokens proposed per speculative round (only used with
-    /// `--draft-model-path`).
+    /// Tokens proposed per speculative round, by the draft model or n-gram
+    /// lookup.
     #[arg(long, default_value_t = 4)]
     pub draft_gamma: usize,
+
+    /// Speculative decoding: propose several tokens, verify them in one pass.
+    /// `auto` uses the draft model when `--draft-model-path` is given, else
+    /// n-gram lookup when the model is streamed (`--stream` with layers left out
+    /// of the resident window; on the CPU, also more than `--ram-cache-gb`
+    /// holds), else nothing. Output is unchanged: greedy is
+    /// exactly greedy, and sampling follows the model's own distribution.
+    #[arg(long, value_enum, default_value_t = Speculative::Auto)]
+    pub speculative: Speculative,
 
     /// Comma-separated local GPU indices to split layers across.
     #[arg(long, value_delimiter = ',', value_name = "IDS")]
     pub multi_gpu_ids: Vec<u32>,
+
+    /// Hold only the first N layers in VRAM and run the rest on the CPU, where
+    /// their weights already sit (llama.cpp's `-ngl`). An alternative to
+    /// `--stream` for a model too big for the card: streaming moves every
+    /// non-resident layer over PCIe each token, and a desktop's RAM can be
+    /// faster to compute from than to copy out of. Measure both with
+    /// `dlm bench`. GPU only; not with `--stream` or `--multi-gpu-ids`.
+    #[arg(long, value_name = "N")]
+    pub gpu_layers: Option<u32>,
 
     /// Compute device for the serving engine. Defaults to `gpu` on a
     /// `cuda-kernels` build (else `cpu`); pass `--device cpu` to force CPU.
@@ -428,6 +495,17 @@ pub struct BenchOpts {
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
 
+    /// Compare against a baseline written by `--json`: print each metric's
+    /// change, and exit non-zero if prefill or decode tok/s fell by more than
+    /// `--tolerance` at any batch size both runs measured.
+    #[arg(long, value_name = "FILE")]
+    pub compare: Option<PathBuf>,
+
+    /// How far (percent) throughput may fall below the `--compare` baseline
+    /// before it counts as a regression.
+    #[arg(long, value_name = "PCT", default_value_t = 5.0)]
+    pub tolerance: f64,
+
     /// Break decode time down by streaming stage (mmap, H2D, compute, ...).
     /// Streaming paths only. Off by default: timing the stages adds overhead of
     /// its own, so leave it off when the headline numbers matter.
@@ -581,9 +659,26 @@ pub struct ScoreArgs {
     #[arg(long, value_name = "FILE")]
     pub json: Option<std::path::PathBuf>,
 
+    /// Weight precision, as for `dlm run`: the checkpoint's own by default, or
+    /// `int4`/`int8` to score the model quantized at load (what that costs in
+    /// log-likelihood is the point of scoring it).
+    #[arg(long, value_enum)]
+    pub quant: Option<QuantArg>,
+
     /// Compute device. Defaults to `gpu` on a `cuda-kernels` build (else `cpu`).
     #[arg(long, value_enum, default_value_t = Device::DEFAULT)]
     pub device: Device,
+
+    /// KV-cache precision to score with, to measure what a cheaper cache costs.
+    /// Exact `f32` by default, so the scores stay a parity reference.
+    #[arg(long, value_enum, default_value_t = KvQuantArg::F32)]
+    pub kv_quant: KvQuantArg,
+
+    /// Run the text through the model one token at a time, as generation
+    /// does, rather than as one prefill. On the GPU the two use different
+    /// kernels; this scores the ones a generated token goes through.
+    #[arg(long)]
+    pub decode: bool,
 }
 
 #[cfg(test)]
@@ -668,6 +763,28 @@ mod tests {
         assert_eq!(a.kv_quant, KvQuantArg::F32);
     }
 
+    /// `auto` speculates with what it has: a draft model if given, lookup on a
+    /// streamed model, nothing on a resident one. Contradictions are refused
+    /// rather than silently resolved.
+    #[test]
+    fn speculative_resolves_auto_and_refuses_contradictions() {
+        use Speculative::*;
+        let cli = Cli::try_parse_from(["dlm", "serve", "--model-path", "/m"]).unwrap();
+        let Command::Serve(a) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(a.speculative, Auto);
+        let resolve = |m: Speculative, draft, streamed| m.resolve(draft, streamed).ok();
+        assert_eq!(resolve(Auto, true, true), Some(Draft));
+        assert_eq!(resolve(Auto, false, true), Some(Ngram));
+        assert_eq!(resolve(Auto, false, false), Some(Off));
+        assert_eq!(resolve(Ngram, false, false), Some(Ngram));
+        assert_eq!(resolve(Off, false, true), Some(Off));
+        assert_eq!(resolve(Draft, false, true), None);
+        assert_eq!(resolve(Ngram, true, true), None);
+        assert_eq!(resolve(Off, true, false), None);
+    }
+
     #[test]
     fn serve_requires_model_path() {
         assert!(Cli::try_parse_from(["dlm", "serve"]).is_err());
@@ -738,6 +855,8 @@ mod tests {
             "1,4",
             "--gen-len",
             "32",
+            "--compare",
+            "base.json",
         ])
         .unwrap();
         let Command::Bench(a) = cli.command else {
@@ -748,6 +867,8 @@ mod tests {
         assert_eq!(a.opts.batch, vec![1, 4]);
         assert_eq!(a.opts.gen_len, 32);
         assert_eq!(a.opts.prompt_len, 512);
+        assert_eq!(a.opts.compare, Some(PathBuf::from("base.json")));
+        assert_eq!(a.opts.tolerance, 5.0);
         assert!(a.serve.bench.is_none());
     }
 

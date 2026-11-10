@@ -5,23 +5,48 @@
 //! These workers are started once and reused. std only: the project keeps its
 //! dependency list short, and this is all a scoped `parallel_for` needs.
 
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 type Job = &'static (dyn Fn(usize) + Sync);
-/// A chunk to run: the job, its index, and the latch counting it.
-type Task = (Job, usize, Arc<Latch>);
 
-struct Latch {
-    left: Mutex<usize>,
-    done: Condvar,
+/// One [`parallel_for`] call, shared with the workers it woke.
+///
+/// Chunks are claimed from `next` by whichever threads are running, rather than
+/// dealt one per thread: on a loaded machine a woken worker can wait a whole
+/// scheduler quantum before it runs, and a call that waited for every worker
+/// took that long however little work it had. Now the threads that are running
+/// take the chunks, and a worker that shows up after the last one is claimed
+/// leaves without touching the job.
+struct Run {
+    job: Job,
+    chunks: usize,
+    next: AtomicUsize,
+    /// Workers inside `job`, and whether the call has stopped admitting them.
+    state: Mutex<(usize, bool)>,
+    idle: Condvar,
     panicked: AtomicBool,
 }
 
+impl Run {
+    /// Claim and run chunks until none are left.
+    fn drain(&self) {
+        loop {
+            let chunk = self.next.fetch_add(1, Ordering::Relaxed);
+            if chunk >= self.chunks {
+                return;
+            }
+            if catch_unwind(AssertUnwindSafe(|| (self.job)(chunk))).is_err() {
+                self.panicked.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 struct Pool {
-    workers: Vec<Mutex<Sender<Task>>>,
+    workers: Vec<Mutex<Sender<Arc<Run>>>>,
     /// One `parallel_for` at a time owns the workers.
     busy: Mutex<()>,
 }
@@ -32,17 +57,22 @@ fn pool() -> &'static Pool {
         let n = std::thread::available_parallelism().map_or(1, |n| n.get());
         let workers = (1..n)
             .map(|i| {
-                let (tx, rx) = channel::<Task>();
+                let (tx, rx) = channel::<Arc<Run>>();
                 std::thread::Builder::new()
                     .name(format!("dlm-cpu-{i}"))
                     .spawn(move || {
-                        for (job, chunk, latch) in rx {
-                            if catch_unwind(AssertUnwindSafe(|| job(chunk))).is_err() {
-                                latch.panicked.store(true, Ordering::Relaxed);
+                        for run in rx {
+                            {
+                                let mut state = run.state.lock().unwrap_or_else(|e| e.into_inner());
+                                if state.1 {
+                                    continue;
+                                }
+                                state.0 += 1;
                             }
-                            let mut left = latch.left.lock().unwrap_or_else(|e| e.into_inner());
-                            *left -= 1;
-                            latch.done.notify_all();
+                            run.drain();
+                            let mut state = run.state.lock().unwrap_or_else(|e| e.into_inner());
+                            state.0 -= 1;
+                            run.idle.notify_all();
                         }
                     })
                     .expect("spawn CPU worker thread");
@@ -56,66 +86,65 @@ fn pool() -> &'static Pool {
     })
 }
 
-/// Chunks [`parallel_for`] can run at once: the calling thread plus the workers.
+/// Threads [`parallel_for`] can run on at once: the calling thread plus the
+/// workers.
 pub(crate) fn threads() -> usize {
     pool().workers.len() + 1
 }
 
 /// Run `f(0..chunks)` across the pool and return once every call has finished.
-/// Chunk 0 runs on the calling thread.
+/// Each chunk runs exactly once, on whichever thread claims it first; the
+/// calling thread claims chunks too.
 ///
-/// Runs serially when `chunks` exceeds [`threads`], or when another caller holds
-/// the pool (concurrent tests, a second generation thread). A serial run
-/// computes the same values, so contention costs speed, never correctness.
+/// Runs serially when another caller holds the pool (concurrent tests, a second
+/// generation thread). A serial run computes the same values, so contention
+/// costs speed, never correctness.
 pub(crate) fn parallel_for(chunks: usize, f: &(dyn Fn(usize) + Sync)) {
     let p = pool();
     let guard = match p.busy.try_lock() {
-        Ok(g) if chunks > 1 && chunks <= threads() => g,
+        Ok(g) if chunks > 1 && !p.workers.is_empty() => g,
         _ => {
             (0..chunks).for_each(f);
             return;
         }
     };
-    let latch = Arc::new(Latch {
-        left: Mutex::new(chunks - 1),
-        done: Condvar::new(),
+    // SAFETY: the reference outlives every use. A worker calls `job` only while
+    // counted in `state.0`, and only if it was counted before `state.1` was set;
+    // this function sets `state.1` and then does not return, or unwind, until
+    // the count is back to zero.
+    let job: Job = unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync), Job>(f) };
+    let run = Arc::new(Run {
+        job,
+        chunks,
+        next: AtomicUsize::new(0),
+        state: Mutex::new((0, false)),
+        idle: Condvar::new(),
         panicked: AtomicBool::new(false),
     });
-    // SAFETY: the reference outlives every use. Each chunk sent below is
-    // counted in `latch`, and this function does not return, or unwind, until
-    // the count reaches zero, so no worker can still hold `job` afterwards.
-    let job: Job = unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync), Job>(f) };
-    for chunk in 1..chunks {
-        let tx = p.workers[chunk - 1]
+    for tx in p.workers.iter().take(chunks - 1) {
+        // A worker whose thread died just never helps; the chunks still run.
+        let _ = tx
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if tx.send((job, chunk, latch.clone())).is_err() {
-            // The worker is gone (it can only exit if its thread died): do its
-            // chunk here instead.
-            drop(tx);
-            f(chunk);
-            *latch.left.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-        }
+            .unwrap_or_else(|e| e.into_inner())
+            .send(run.clone());
     }
-    let own = catch_unwind(AssertUnwindSafe(|| f(0)));
-    let mut left = latch.left.lock().unwrap_or_else(|e| e.into_inner());
-    while *left > 0 {
-        left = latch.done.wait(left).unwrap_or_else(|e| e.into_inner());
+    run.drain();
+    let mut state = run.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.1 = true;
+    while state.0 > 0 {
+        state = run.idle.wait(state).unwrap_or_else(|e| e.into_inner());
     }
-    drop(left);
+    drop(state);
     drop(guard);
-    if let Err(payload) = own {
-        resume_unwind(payload);
-    }
-    if latch.panicked.load(Ordering::Relaxed) {
-        panic!("a CPU worker panicked during parallel_for");
+    if run.panicked.load(Ordering::Relaxed) {
+        // Re-raise on the caller, as a serial loop would.
+        panic!("a CPU chunk panicked during parallel_for");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn every_chunk_runs_exactly_once_and_calls_nest_serially() {
@@ -127,6 +156,20 @@ mod tests {
                 hits[i].fetch_add(1, Ordering::Relaxed);
             });
             assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+        }
+    }
+
+    /// Calls short enough that most workers wake after the last chunk is
+    /// claimed: they must skip the call, not run its job after it has returned
+    /// (the job borrows this stack frame, which the next call reuses).
+    #[test]
+    fn workers_that_arrive_late_skip_the_call() {
+        for round in 0..2000 {
+            let hits = AtomicUsize::new(0);
+            parallel_for(threads() * 2, &|_| {
+                hits.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(hits.into_inner(), threads() * 2, "round {round}");
         }
     }
 

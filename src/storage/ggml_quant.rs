@@ -129,6 +129,9 @@ pub struct BlockAffine {
     pub codes: [u8; 256],
     pub scales: [f32; 16],
     pub zeros: [f32; 16],
+    /// ggml's own offset, `zero * scale`, kept because a zero scale loses it:
+    /// a K-quant sub-block with `sc == 0` still decodes to `-dmin * m`.
+    pub offsets: [f32; 16],
     /// Weights sharing one scale and zero.
     pub group: usize,
 }
@@ -139,22 +142,25 @@ impl BlockAffine {
             codes: [0; 256],
             scales: [0.0; 16],
             zeros: [0.0; 16],
+            offsets: [0.0; 16],
             group,
         }
     }
 
     /// Record a group from ggml's `scale * code - offset` form. dlm multiplies
     /// its zero by the scale, so the zero is the offset divided by it; a zero
-    /// scale means the whole group is zero, whatever the zero.
+    /// scale has no such zero, and [`expand`] rewrites that group instead.
     fn group(&mut self, g: usize, scale: f32, offset: f32) {
         self.scales[g] = scale;
         self.zeros[g] = if scale == 0.0 { 0.0 } else { offset / scale };
+        self.offsets[g] = offset;
     }
 
-    /// Weight `i` of the block.
+    /// Weight `i` of the block, in ggml's own form so a zero-scale group keeps
+    /// its offset, as `dequantize_row_*` and the kernels' `load_w` do.
     pub fn value(&self, i: usize) -> f32 {
         let g = i / self.group;
-        (self.codes[i] as f32 - self.zeros[g]) * self.scales[g]
+        self.codes[i] as f32 * self.scales[g] - self.offsets[g]
     }
 }
 
@@ -319,8 +325,16 @@ pub fn expand(kind: GgmlKind, blob: &[u8], elements: usize) -> crate::forward::W
     };
     let mut out = vec![0u8; layout.total_bytes];
     for b in 0..elements.div_ceil(elems) {
-        let a = decode_block(kind, &blob[b * kind.block_bytes()..]);
+        let mut a = decode_block(kind, &blob[b * kind.block_bytes()..]);
         let n = elems.min(elements - b * elems);
+        // A zero-scale group is the constant `-offset`, which `(code - zero) *
+        // scale` can only say as code 1 times scale `-offset`.
+        for g in 0..n.div_ceil(group) {
+            if a.scales[g] == 0.0 {
+                a.codes[g * group..(g + 1) * group].fill(1);
+                (a.scales[g], a.zeros[g]) = (-a.offsets[g], 0.0);
+            }
+        }
         for i in 0..n {
             let at = b * elems + i;
             if four_bit {
@@ -485,6 +499,21 @@ mod tests {
         let got = to_f32(Dtype::Q4K, &block, 256).unwrap();
         let want = 0.25 * 3.0 * 9.0 - 0.5 * 7.0;
         assert!((got[0] - want).abs() < 1e-5, "{} vs {want}", got[0]);
+    }
+
+    /// A K-quant sub-block whose 6-bit scale is zero is not zero: ggml decodes
+    /// it as `-dmin * m`, and so do the kernels.
+    #[test]
+    fn k_quant_zero_scale_keeps_its_minimum() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&h(0.25)); // d
+        block.extend_from_slice(&h(0.5)); // dmin
+        let mut scales = [0u8; 12];
+        scales[4] = 7; // sub-block 0: sc = 0, m = 7
+        block.extend_from_slice(&scales);
+        block.extend_from_slice(&[0x09; 128]);
+        let got = to_f32(Dtype::Q4K, &block, 256).unwrap();
+        assert_eq!(got[0], -0.5 * 7.0);
     }
 
     /// Q6_K's 6-bit weights come from a nibble plus two bits held elsewhere, and
