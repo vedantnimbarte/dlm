@@ -673,6 +673,12 @@ pub struct ScoreArgs {
     /// Exact `f32` by default, so the scores stay a parity reference.
     #[arg(long, value_enum, default_value_t = KvQuantArg::F32)]
     pub kv_quant: KvQuantArg,
+
+    /// Run the text through the model one token at a time, as generation
+    /// does, rather than as one prefill. On the GPU the two use different
+    /// kernels; this scores the ones a generated token goes through.
+    #[arg(long)]
+    pub decode: bool,
 }
 
 #[cfg(test)]

@@ -37,6 +37,20 @@ pub fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+/// Log-softmax in place: `x - logsumexp(x)`, shifted by the max so `exp` cannot
+/// overflow, and summed in f64 because a 150k-wide vocabulary loses real
+/// precision in f32.
+fn log_softmax_f64(logits: &mut [f32]) {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max
+        + logits
+            .iter()
+            .map(|&l| ((l - max) as f64).exp())
+            .sum::<f64>()
+            .ln() as f32;
+    logits.iter_mut().for_each(|l| *l -= lse);
+}
+
 /// A tiny SplitMix64 PRNG for stochastic sampling (no external deps). Seeded per
 /// session, so a fixed `seed` makes temperature sampling reproducible.
 #[derive(Debug, Clone)]
@@ -780,19 +794,6 @@ impl<K: ComputeKernel> Generator<K> {
     /// than raw logits, since a constant shift across the vocabulary changes
     /// every logit and no probability.
     pub fn score_and_next(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
-        // log-softmax: `x - logsumexp(x)`, shifted by the max so `exp` cannot
-        // overflow, and summed in f64 because a 150k-wide vocabulary loses real
-        // precision in f32.
-        let log_softmax = |logits: &mut Vec<f32>| {
-            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let lse = max
-                + logits
-                    .iter()
-                    .map(|&l| ((l - max) as f64).exp())
-                    .sum::<f64>()
-                    .ln() as f32;
-            logits.iter_mut().for_each(|l| *l -= lse);
-        };
         let mut orch = self.orchestrator();
         let mut out = Vec::with_capacity(tokens.len().saturating_sub(1));
         let mut next = Vec::new();
@@ -804,13 +805,37 @@ impl<K: ComputeKernel> Generator<K> {
             orch.prefill(&mut hiddens)?;
             for (i, hidden) in hiddens.chunks(self.hidden_size).enumerate() {
                 let mut logprobs = self.logits(hidden)?;
-                log_softmax(&mut logprobs);
+                log_softmax_f64(&mut logprobs);
                 match tokens.get(c * PREFILL_CHUNK + i + 1) {
                     Some(&next_token) => out.push(logprobs[next_token as usize]),
                     // The last token: no next token to score, so this is the
                     // distribution the model would generate from.
                     None => next = logprobs,
                 }
+            }
+        }
+        Ok((out, next))
+    }
+
+    /// [`score_and_next`](Self::score_and_next), with every token run through
+    /// the model one at a time, as generation decodes, instead of in a prefill.
+    ///
+    /// A GPU kernel prefills with different kernels than it decodes (GEMMs on
+    /// f32 activations, against GEMVs on int8-quantized ones for quantized
+    /// weights), so the two can score slightly differently. This measures the
+    /// kernels a generated token actually goes through.
+    pub fn score_and_next_decoding(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut orch = self.orchestrator();
+        let mut out = Vec::with_capacity(tokens.len().saturating_sub(1));
+        let mut next = Vec::new();
+        for (i, &token) in tokens.iter().enumerate() {
+            let mut hidden = self.embed(token, orch.position())?;
+            orch.decode_token(&mut hidden)?;
+            let mut logprobs = self.logits(&hidden)?;
+            log_softmax_f64(&mut logprobs);
+            match tokens.get(i + 1) {
+                Some(&next_token) => out.push(logprobs[next_token as usize]),
+                None => next = logprobs,
             }
         }
         Ok((out, next))
