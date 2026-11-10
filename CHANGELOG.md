@@ -40,6 +40,41 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Batched attention runs in three launches for the whole batch.** The fused
+  batched block read each weight once for all sequences, but still launched
+  Q/K norm, RoPE, the K/V append and split-K attention slot by slot: 2-3 small
+  launches per sequence per layer, about 1.5 ms a sequence per step on
+  Qwen2.5-0.5B. Now each launch covers every slot, which reads its own cache,
+  block table and history length. Shapes the split kernel cannot take still go
+  slot by slot. Same setup as the LM-head entry below, three builds run
+  alternately twice (the first `main` run was throttled and is left out):
+
+  | Batch | Before both | LM head shared | Plus this |
+  |---|---|---|---|
+  | 4 | 166 | 217 | 249 |
+  | 8 | 178 | 228 | 276 |
+  | 16 | 180 | 238 | 300 |
+
+  vLLM 0.33 in fp32 on the same card made 200 / 281 / 286 tok/s at these batch
+  sizes (`bench/BASELINES.md`).
+
+- **Batched decode is about 30% faster: the batch shares one LM-head pass.**
+  Each session used to run the vocabulary-wide LM head on its own, reading
+  its weights once per sequence: on Qwen2.5-0.5B at batch 16 that was 36 ms of
+  a 90 ms step. `step_sessions` (the server's scheduler and `dlm bench`) now
+  sends every session's hidden state through one call, which reads the weights
+  once per 16 rows; greedy rows still get only their argmax back. GTX 1650,
+  Qwen2.5-0.5B bf16, `--prompt-len 256 --gen-len 64`, `main` and this change
+  run alternately four times, median decode tok/s (batch 1 is the same
+  single-row path, run twice each, so its range is shown):
+
+  | Batch | Before | After |
+  |---|---|---|
+  | 1 | 85-89 | 79-88 |
+  | 4 | 153 | 203 |
+  | 8 | 165 | 218 |
+  | 16 | 181 | 235 |
+
 - **GPU prefill is 4.6-6x faster and decode up to 1.7x.** Measured on a GTX
   1650 (4 GB), `dlm bench --context-length 2048 --prompt-len 512 --gen-len 128
   --batch 1,8`, the 0.4.x build and this one run alternately, best of three:
