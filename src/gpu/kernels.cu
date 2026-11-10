@@ -1131,17 +1131,59 @@ __device__ __forceinline__ float q8_row_dot(const void* W, long base, long n, in
     return warp_sum(s);
 }
 
-// Launch as `matvec_chunk_kernel`.
-template <int DT>
+// R rows per warp, interleaved (see `Q8Rows`).
+// <<<ceil(out_dim / (R * MV_ROWS)), 32 * MV_ROWS>>>.
+template <int DT, int R>
 __global__ void matvec_q8_kernel(const void* __restrict__ W, const signed char* __restrict__ xq,
                                  const float2* __restrict__ xds, const float* __restrict__ bias,
                                  float* __restrict__ out, int out_dim, int in_dim, int group_size) {
-    int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
-    int lane = threadIdx.x & 31;
-    if (o >= out_dim) return;
-    float s = q8_row_dot<DT>(W, (long)o * in_dim, (long)out_dim * in_dim, group_size, xq, xds,
-                             in_dim, lane);
-    if (lane == 0) out[o] = s + (bias ? bias[o] : 0.0f);
+    const int o0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R;
+    const int lane = threadIdx.x & 31;
+    if (o0 >= out_dim) return;
+    const long n = (long)out_dim * in_dim;
+    float s[R];
+    long base[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        s[r] = 0.0f;
+        base[r] = (long)min(o0 + r, out_dim - 1) * in_dim;   // a short tail repeats the last row
+    }
+    for (int i = lane * 32; i < in_dim; i += 32 * 32) {
+        const int* xi = (const int*)(xq + i);
+        const float2 dx = xds[i >> 5];
+        #pragma unroll
+        for (int r = 0; r < R; ++r) s[r] += Dp4a<DT>::dot(W, base[r] + i, n, group_size, xi, dx);
+    }
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float v = warp_sum(s[r]);
+        if (lane == 0 && o0 + r < out_dim) out[o0 + r] = v + (bias ? bias[o0 + r] : 0.0f);
+    }
+}
+
+// Rows per warp for each format's int8-activation GEMV.
+//
+// A 32-weight chunk of a quantized format is a few bytes, so on the short rows
+// of small models (896 wide on Qwen2.5-0.5B: one chunk per lane) a warp issued
+// its loads, waited, and then spent its time on the reduction with nothing in
+// flight. With full occupancy that still left int4 latency-bound at 60-65% of
+// the bandwidth bf16 reaches. Interleaving R rows per warp keeps R rows' loads
+// in flight together. Swept on a GTX 1650 at Qwen2.5 0.5B/1.5B shapes (us for
+// the 151936x896 LM head, R = 1 -> chosen): int4 g128 868 -> 500, Q5_0 1092
+// -> 624, Q8_0 1607 -> 1044; Q4_K and Q6_K (no 896-wide rows) 1.3-1.5x on
+// 8960x1536. int8 reads twice int4's bytes for the same work and was already
+// at bandwidth: more rows only cost it registers.
+template <int DT> struct Q8Rows { enum { R = 4 }; };   // ggml's 32-weight blocks
+template <> struct Q8Rows<DLM_W_INT8> { enum { R = 1 }; };
+template <> struct Q8Rows<DLM_W_INT4> { enum { R = 2 }; };
+template <> struct Q8Rows<DLM_W_Q4_K> { enum { R = 2 }; };
+
+template <int DT>
+static void launch_q8(const void* W, const signed char* xq, const float2* xds, const float* bias,
+                      float* out, int out_dim, int in_dim, int group_size) {
+    const int R = Q8Rows<DT>::R, per_block = R * MV_ROWS;
+    matvec_q8_kernel<DT, R><<<(out_dim + per_block - 1) / per_block, 32 * MV_ROWS>>>(
+        W, xq, xds, bias, out, out_dim, in_dim, group_size);
 }
 
 // Whether `DLM_GEMV_EXACT` asked for the f32 path everywhere.
@@ -1177,7 +1219,7 @@ static void launch_matvec(int dt, const void* W, const float* x, const float* bi
     const float2* xds;
 #define DLM_CASE(D) case D: \
         if (q8_fits<D>(W, x, in_dim, group_size) && quantize_x(x, in_dim, &xq, &xds)) \
-            matvec_q8_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, xq, xds, bias, out, out_dim, in_dim, group_size); \
+            launch_q8<D>(W, xq, xds, bias, out, out_dim, in_dim, group_size); \
         else if (chunk_fits<D>(W, x, in_dim, group_size)) \
             matvec_chunk_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, x, bias, out, out_dim, in_dim, group_size); \
         else \
@@ -1826,8 +1868,46 @@ template <int DT, int MODE>
 __global__ void __launch_bounds__(32 * MV_ROWS)
 matvec_fused_kernel(DlmSegs s, const float* __restrict__ x, const signed char* __restrict__ xq,
                     const float2* __restrict__ xds, int in_dim, int group_size) {
-    int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
     int lane = threadIdx.x & 31;
+    if (Dp4a<DT>::OK && xq) {
+        // Q8Rows<DT>::R rows per warp, as `matvec_q8_kernel`; each row finds
+        // its own segment, so a warp's rows may straddle Q, K and V.
+        const int R = Q8Rows<DT>::R;
+        int total = 0;
+        for (int i = 0; i < s.nseg; ++i) total += s.rows[i];
+        const int g0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R;
+        if (g0 >= total) return;
+        int seg[R], row[R];
+        long base[R], n[R];
+        float acc[R];
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            int o = min(g0 + r, total - 1), sg = 0;   // a short tail repeats the last row
+            while (sg + 1 < s.nseg && o >= s.rows[sg]) o -= s.rows[sg++];
+            seg[r] = sg;
+            row[r] = o;
+            base[r] = (long)o * in_dim;
+            n[r] = (long)s.rows[sg] * in_dim;
+            acc[r] = 0.0f;
+        }
+        for (int i = lane * 32; i < in_dim; i += 32 * 32) {
+            const int* xi = (const int*)(xq + i);
+            const float2 dx = xds[i >> 5];
+            #pragma unroll
+            for (int r = 0; r < R; ++r)
+                acc[r] += Dp4a<DT>::dot(s.W[seg[r]], base[r] + i, n[r], group_size, xi, dx);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = warp_sum(acc[r]);
+            if (lane != 0 || g0 + r >= total) continue;
+            if (s.bias[seg[r]]) v += s.bias[seg[r]][row[r]];
+            if (MODE == FUSE_RESID) s.out[seg[r]][row[r]] += v;
+            else s.out[seg[r]][row[r]] = v;
+        }
+        return;
+    }
+    int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
     int seg = 0;
     while (seg + 1 < s.nseg && o >= s.rows[seg]) o -= s.rows[seg++];
     if (o >= s.rows[seg]) return;
@@ -1848,8 +1928,25 @@ static bool launch_fused(int mode, int dt, int group_size, const DlmSegs& s, con
                          int in_dim) {
     int rows = 0;
     for (int i = 0; i < s.nseg; ++i) rows += s.rows[i];
-    dim3 grid((rows + MV_ROWS - 1) / MV_ROWS), block(32 * MV_ROWS);
-#define DLM_FUSE(D)                                                                     case D: {                                                                               bool q8 = true;                                                                     for (int i = 0; i < s.nseg; ++i) {                                                      if (!chunk_fits<D>(s.W[i], x, in_dim, group_size)) return false;                    q8 = q8 && q8_fits<D>(s.W[i], x, in_dim, group_size);                           }                                                                                   const signed char* xq = 0;                                                          const float2* xds = 0;                                                              if (q8 && !quantize_x(x, in_dim, &xq, &xds)) xq = 0;                                if (mode == FUSE_RESID)                                                                 matvec_fused_kernel<D, FUSE_RESID><<<grid, block>>>(s, x, xq, xds, in_dim, group_size);         else                                                                                    matvec_fused_kernel<D, FUSE_PLAIN><<<grid, block>>>(s, x, xq, xds, in_dim, group_size);         return true;                                                                    }
+    dim3 block(32 * MV_ROWS);
+#define DLM_FUSE(D)                                                                 \
+    case D: {                                                                       \
+        bool q8 = true;                                                             \
+        for (int i = 0; i < s.nseg; ++i) {                                          \
+            if (!chunk_fits<D>(s.W[i], x, in_dim, group_size)) return false;        \
+            q8 = q8 && q8_fits<D>(s.W[i], x, in_dim, group_size);                   \
+        }                                                                           \
+        const signed char* xq = 0;                                                  \
+        const float2* xds = 0;                                                      \
+        if (q8 && !quantize_x(x, in_dim, &xq, &xds)) xq = 0;                        \
+        const int per_block = (xq ? (int)Q8Rows<D>::R : 1) * MV_ROWS;               \
+        dim3 grid((rows + per_block - 1) / per_block);                              \
+        if (mode == FUSE_RESID)                                                     \
+            matvec_fused_kernel<D, FUSE_RESID><<<grid, block>>>(s, x, xq, xds, in_dim, group_size); \
+        else                                                                        \
+            matvec_fused_kernel<D, FUSE_PLAIN><<<grid, block>>>(s, x, xq, xds, in_dim, group_size); \
+        return true;                                                                \
+    }
     switch (dt) {
         DLM_FUSE(DLM_W_F32)
         DLM_FOR_EACH_DTYPE(DLM_FUSE)

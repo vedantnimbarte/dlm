@@ -1990,6 +1990,99 @@ fn gpu_lm_head_matches_host_head() {
     }
 }
 
+/// The int8-activation GEMV takes two or four rows per warp. With a row count
+/// that is not a multiple of either (301), the last warp's group is partial and
+/// must neither drop nor duplicate a row. Checked through the device LM head,
+/// a plain GEMV, against the weights' own values on the host.
+#[test]
+fn gpu_multi_row_gemv_handles_a_partial_last_group() {
+    use dlm::storage::ggml_quant::GgmlKind;
+    let (vocab, hidden) = (301, 256);
+    let mut rng = Rng::new(0x3010);
+    let x = rng.vec(hidden, 1.0);
+    let floats = rng.vec(vocab * hidden, 0.05);
+    let ggml = |kind: GgmlKind, rng: &mut Rng| {
+        let mut blob: Vec<u8> = (0..kind.byte_len(vocab * hidden))
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        for block in blob.chunks_mut(kind.block_bytes()) {
+            block[0..2].copy_from_slice(&0x1400u16.to_le_bytes()); // d = 0.00098
+        }
+        Weights::Ggml {
+            blob,
+            kind,
+            num_elements: vocab * hidden,
+        }
+    };
+    let cases = [
+        ("int4", Weights::quantize_int4(&floats, 128).unwrap()),
+        ("q5_0", ggml(GgmlKind::Q5_0, &mut rng)),
+        ("q8_0", ggml(GgmlKind::Q8_0, &mut rng)),
+    ];
+    for (what, w) in cases {
+        let head = dlm::forward::GpuLmHead::new(&w, vocab, hidden, None).unwrap();
+        let got = head.logits(&x).unwrap();
+        let scale = (0..vocab)
+            .map(|r| {
+                (0..hidden)
+                    .map(|i| (w.get(r * hidden + i) * x[i]).abs())
+                    .sum::<f32>()
+            })
+            .fold(1.0f32, f32::max);
+        for (r, &g) in got.iter().enumerate() {
+            let want: f32 = (0..hidden).map(|i| w.get(r * hidden + i) * x[i]).sum();
+            assert!(
+                (g - want).abs() < 2e-2 * scale,
+                "{what}: row {r} of {vocab}: {g} vs {want}"
+            );
+        }
+    }
+}
+
+/// The fused Q/K/V GEMV gives each warp several rows (four for Q5_0), and a
+/// warp's rows may straddle segments: with `head_dim` 6, Q is 24 rows and K
+/// and V 6 each, so one warp takes two rows of K and two of V. Each row must
+/// read its own segment's weights.
+#[test]
+fn gpu_fused_qkv_rows_straddle_segments() {
+    use dlm::storage::ggml_quant::GgmlKind;
+    let cfg = BlockConfig {
+        hidden_size: 64,
+        num_heads: 4,
+        num_kv_heads: 1,
+        head_dim: 6,
+        intermediate_size: 64,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        ..Default::default()
+    };
+    let mut rng = Rng::new(0x57AD);
+    let mut ggml = |elements: usize| {
+        let kind = GgmlKind::Q5_0;
+        let mut blob: Vec<u8> = (0..kind.byte_len(elements))
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        for block in blob.chunks_mut(kind.block_bytes()) {
+            block[0..2].copy_from_slice(&0x1C00u16.to_le_bytes());
+        }
+        Weights::Ggml {
+            blob,
+            kind,
+            num_elements: elements,
+        }
+    };
+    let layers: Vec<LayerTensors> = random_layers(&cfg, 2, 0x57AE)
+        .into_iter()
+        .map(|mut l| {
+            l.q_proj = ggml(cfg.q_dim() * cfg.hidden_size);
+            l.k_proj = ggml(cfg.kv_dim() * cfg.hidden_size);
+            l.v_proj = ggml(cfg.kv_dim() * cfg.hidden_size);
+            l
+        })
+        .collect();
+    assert_gpu_close(cfg, layers, quantized_tol(), true, "straddling Q/K/V rows");
+}
+
 // ── Non-Llama blocks: GPT-2 and Falcon ───────────────────────────────────────
 //
 // Both differ from the Llama block in ways that produce fluent garbage rather

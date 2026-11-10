@@ -75,6 +75,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `build.rs` builds the kernels for sm_75, 80, 86 and 89 plus PTX, so Ampere
     and newer run their own code (bf16 tensor cores need it).
     `DLM_CUDA_ARCHS=75` narrows a local build.
+- **`--quant int4` decodes 20-27% faster on the GPU.** On short rows a
+  quantized GEMV was bound by latency, not bandwidth: a 32-weight chunk is a few
+  bytes, so a warp issued one load per row, waited, and reduced with nothing in
+  flight (int4 reached 60-65% of the bandwidth bf16 does, at full occupancy).
+  Each warp now interleaves two rows (int4, Q4_K) or four (Q4_0-Q8_0, Q6_K),
+  in the plain and the fused Q/K/V GEMVs. Every row sums in the same order as
+  before, so outputs are bit-identical. GTX 1650, batch-1 decode:
+
+  | Model | Before | After |
+  |---|---|---|
+  | Qwen2.5-1.5B `--quant int4` | 66.9 tok/s | **85.1** |
+  | Qwen2.5-0.5B `--quant int4` | 151.6 | **182.2** |
+  | Qwen2.5-0.5B Q4_K_M GGUF | 135.0 | 136.9 |
+
+  The GGUF barely moves because a model that fits is expanded to dlm's int8,
+  which was already at bandwidth; GGUF blocks read natively (a model too large
+  to expand) go 1.3-1.75x faster per GEMV.
 - **The quantized KV cache keeps a scale per 32 values, not per token.** One
   scale across a token's whole K or V vector let a few large key channels set
   the range for every head. Qwen2.5-0.5B, mean NLL over 415 tokens (3.644 with
