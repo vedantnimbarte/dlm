@@ -40,6 +40,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Batched decode of quantized models is 2-3x faster at batch 8-16.** The
+  int8-activation GEMV that every quantized format (int8, int4 and the GGUF
+  types) takes in a batch gave each warp one weight row and decoded each
+  32-weight chunk again for every sequence. Past batch 4 that decoding, not
+  memory, set its speed: about 250 tok/s on Qwen2.5-0.5B in any quantized
+  format, barely above batch 4. Each format's chunk decode is now separate
+  from its dot product, so a warp decodes four rows' chunks once and dots them
+  with every sequence's activations. The previous commit and this one
+  alternately on a GTX 1650, decode tok/s:
+
+  | Model | Batch 1 | Batch 4 | Batch 8 | Batch 16 |
+  |---|---|---|---|---|
+  | 0.5B Q4_K_M | 125 -> 124 | 197 -> 335 | 211 -> 513 | 237 -> 658 |
+  | 0.5B int4 | 117 -> 124 | 196 -> 413 | 217 -> 615 | 236 -> 672 |
+  | 0.5B Q6_K | 95 -> 95 | 121 -> 215 | 181 -> 340 | 226 -> 500 |
+  | 1.5B Q8_0 | 42 -> 41 | 72 -> 148 | 76 -> 223 | 76 -> 247 |
+
+  The Q6_K runs drifted widely (batch 1 from 55 to 118 tok/s on either build):
+  its batch 4-16 figures are medians of three, its batch 1 the one pair run
+  back to back on a steady card. Q6_K's one-sequence dot keeps its old fused
+  form: through the split decode it ran 5-10% slower at batch 1.
+
 - **Batched f32/bf16/f16 projections take four weight rows per warp.** At
   batch 8-16 the batched GEMV was bound by loads, not memory: it re-read
   every sequence's activations for each weight row, eight floats for eight

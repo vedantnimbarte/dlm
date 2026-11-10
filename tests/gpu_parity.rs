@@ -2041,32 +2041,54 @@ fn gpu_multi_row_gemv_handles_a_partial_last_group() {
 
 /// A batch through the device LM head in one call (the weights read once per
 /// 16 rows) gives each row the logits it gets alone, and the argmax of those
-/// logits. 17 rows also covers a second, partial group of 16.
+/// logits, for every format with its own batched GEMV. Batches of 2, 5 and 16
+/// (17 = 16 + 1) take each compiled batch size; 301 rows leave a partial last
+/// group of rows per warp.
 #[test]
 fn gpu_lm_head_batch_matches_rows_alone() {
     use dlm::storage::ggml_quant::GgmlKind;
     let (vocab, hidden) = (301, 256);
     let mut rng = Rng::new(0x1a4d);
     let floats = rng.vec(vocab * hidden, 0.05);
-    let mut q8 = vec![0u8; GgmlKind::Q8_0.byte_len(vocab * hidden)];
-    q8.iter_mut().for_each(|b| *b = rng.next_u64() as u8);
-    for block in q8.chunks_mut(GgmlKind::Q8_0.block_bytes()) {
-        block[0..2].copy_from_slice(&0x1400u16.to_le_bytes()); // d = 0.00098
-    }
-    let cases = [
+    // Random codes, with every f16 scale or minimum set small and finite: the
+    // first two (Q4_K/Q5_K's d and dmin, Q4_1/Q5_1's d and m) and Q6_K's d.
+    let mut ggml = |kind: GgmlKind| {
+        let mut blob: Vec<u8> = (0..kind.byte_len(vocab * hidden))
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        for block in blob.chunks_mut(kind.block_bytes()) {
+            block[0..2].copy_from_slice(&0x1400u16.to_le_bytes()); // 0.00098
+            block[2..4].copy_from_slice(&0x1000u16.to_le_bytes()); // 0.00049
+            if kind == GgmlKind::Q6K {
+                block[208..210].copy_from_slice(&0x1400u16.to_le_bytes());
+            }
+        }
+        Weights::Ggml {
+            blob,
+            kind,
+            num_elements: vocab * hidden,
+        }
+    };
+    let mut cases = vec![
         (
-            "bf16",
+            "bf16".to_string(),
             Weights::Bf16(floats.iter().map(|v| (v.to_bits() >> 16) as u16).collect()),
         ),
-        (
-            "q8_0",
-            Weights::Ggml {
-                blob: q8,
-                kind: GgmlKind::Q8_0,
-                num_elements: vocab * hidden,
-            },
-        ),
+        ("int8".into(), Weights::quantize_int8(&floats, 32).unwrap()),
+        ("int4".into(), Weights::quantize_int4(&floats, 128).unwrap()),
     ];
+    for kind in [
+        GgmlKind::Q4_0,
+        GgmlKind::Q4_1,
+        GgmlKind::Q5_0,
+        GgmlKind::Q5_1,
+        GgmlKind::Q8_0,
+        GgmlKind::Q4K,
+        GgmlKind::Q5K,
+        GgmlKind::Q6K,
+    ] {
+        cases.push((format!("{kind:?}"), ggml(kind)));
+    }
     for (what, w) in cases {
         let head = dlm::forward::GpuLmHead::new(&w, vocab, hidden, None).unwrap();
         for rows in [2, 5, 17] {
