@@ -24,6 +24,18 @@ use crate::grammar::Constraint;
 /// a long prompt; a streaming kernel loads each layer once per chunk.
 const PREFILL_CHUNK: usize = 512;
 
+/// What the LM head gives one hidden state ([`Generator::heads`]).
+enum Head {
+    /// The greedy token, found on the device.
+    #[cfg_attr(
+        not(any(feature = "cuda-kernels", feature = "rocm-kernels")),
+        allow(dead_code)
+    )]
+    Token(u32),
+    /// The logits, final softcap applied.
+    Logits(Vec<f32>),
+}
+
 /// Index of the largest logit (greedy pick; first max wins on ties).
 pub fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -843,45 +855,76 @@ impl<K: ComputeKernel> Generator<K> {
 
     /// Project a hidden state to vocabulary logits via final norm + LM head.
     fn logits(&self, hidden: &[f32]) -> Result<Vec<f32>> {
-        let normed = crate::forward::cpu::norm(
+        match self.heads(&[(hidden, false)])?.pop() {
+            Some(Head::Logits(l)) => Ok(l),
+            _ => unreachable!("heads gives logits for a row that did not ask for a token"),
+        }
+    }
+
+    fn final_norm(&self, hidden: &[f32]) -> Vec<f32> {
+        crate::forward::cpu::norm(
             hidden,
             &self.final_norm,
             self.final_norm_bias.as_deref(),
             self.rms_eps,
             self.final_norm_kind,
-        );
+        )
+    }
+
+    /// The LM head for several hidden states at once: for each `(hidden,
+    /// greedy)`, the greedy token when `greedy` and the head is on the device
+    /// (which finds the argmax there), else the logits. On the device the
+    /// greedy rows share one pass over the head's weights and the rest another,
+    /// so a batch of sessions must come through one call: per row, the head is
+    /// the largest single read of a decode step.
+    fn heads(&self, rows: &[(&[f32], bool)]) -> Result<Vec<Head>> {
+        let mut out: Vec<Option<Head>> = Vec::with_capacity(rows.len());
+        out.resize_with(rows.len(), || None);
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-        let mut out = match &self.gpu_head {
-            Some(head) => head.logits(&normed)?,
-            None => matvec_native(&self.lm_head, &normed, self.vocab_size, self.hidden_size),
-        };
-        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
-        let mut out = matvec_native(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
+        if let Some(head) = &self.gpu_head {
+            for want_token in [true, false] {
+                let picked: Vec<usize> = (0..rows.len())
+                    .filter(|&i| rows[i].1 == want_token)
+                    .collect();
+                if picked.is_empty() {
+                    continue;
+                }
+                let normed: Vec<f32> = picked
+                    .iter()
+                    .flat_map(|&i| self.final_norm(rows[i].0))
+                    .collect();
+                if want_token {
+                    for (&i, t) in picked.iter().zip(head.argmax(&normed)?) {
+                        out[i] = Some(Head::Token(t));
+                    }
+                } else {
+                    let logits = head.logits(&normed)?;
+                    for (&i, l) in picked.iter().zip(logits.chunks_exact(self.vocab_size)) {
+                        out[i] = Some(Head::Logits(self.softcap(l.to_vec())));
+                    }
+                }
+            }
+        }
+        for (slot, (hidden, _)) in out.iter_mut().zip(rows) {
+            if slot.is_none() {
+                let normed = self.final_norm(hidden);
+                let l = matvec_native(&self.lm_head, &normed, self.vocab_size, self.hidden_size);
+                *slot = Some(Head::Logits(self.softcap(l)));
+            }
+        }
+        Ok(out
+            .into_iter()
+            .map(|h| h.expect("every row filled"))
+            .collect())
+    }
+
+    fn softcap(&self, mut logits: Vec<f32>) -> Vec<f32> {
         if let Some(cap) = self.final_logit_softcap {
-            for l in out.iter_mut() {
+            for l in logits.iter_mut() {
                 *l = (*l / cap).tanh() * cap;
             }
         }
-        Ok(out)
-    }
-
-    /// The greedy token for `hidden` from the device LM head's argmax, or `None`
-    /// when the head is on the host (the caller then takes the logits' argmax,
-    /// which is the same token).
-    fn greedy_token(&self, hidden: &[f32]) -> Option<Result<u32>> {
-        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-        if let Some(head) = &self.gpu_head {
-            let normed = crate::forward::cpu::norm(
-                hidden,
-                &self.final_norm,
-                self.final_norm_bias.as_deref(),
-                self.rms_eps,
-                self.final_norm_kind,
-            );
-            return Some(head.argmax(&normed));
-        }
-        let _ = hidden;
-        None
+        logits
     }
 
     /// Greedy-decode a **batch** of prompts together, advancing all sequences
@@ -1008,10 +1051,9 @@ impl<K: ComputeKernel> Generator<K> {
         let mut generated = Vec::with_capacity(cfg.max_new_tokens);
         for _ in 0..cfg.max_new_tokens {
             let greedy = matches!(cfg.sampler, Sampler::Greedy);
-            let next = match greedy.then(|| self.greedy_token(&hidden)) {
-                Some(Some(token)) => token?,
-                _ => {
-                    let mut logits = self.logits(&hidden)?;
+            let next = match self.heads(&[(&hidden, greedy)])?.remove(0) {
+                Head::Token(token) => token,
+                Head::Logits(mut logits) => {
                     apply_repetition_penalty(&mut logits, &seen, penalty);
                     cfg.sampler.sample(&logits, &mut rng)
                 }
@@ -1167,15 +1209,22 @@ impl<K: ComputeKernel> Generator<K> {
         &self,
         sessions: &mut [&mut GenerationSession<'_, K>],
     ) -> Result<Vec<u32>> {
-        let mut tokens = Vec::with_capacity(sessions.len());
-        for s in sessions.iter_mut() {
-            if !std::ptr::eq(s.generator, self) {
-                return Err(DlmError::InvalidConfig(
-                    "step_sessions: a session belongs to another generator".into(),
-                ));
-            }
-            tokens.push(s.sample_next()?);
+        if sessions.iter().any(|s| !std::ptr::eq(s.generator, self)) {
+            return Err(DlmError::InvalidConfig(
+                "step_sessions: a session belongs to another generator".into(),
+            ));
         }
+        // One LM-head call for the whole batch, so its weights are read once.
+        let rows = sessions
+            .iter()
+            .map(|s| s.head_row())
+            .collect::<Result<Vec<_>>>()?;
+        let heads = self.heads(&rows)?;
+        let tokens = sessions
+            .iter_mut()
+            .zip(heads)
+            .map(|(s, head)| s.take_head(head))
+            .collect::<Result<Vec<_>>>()?;
         let (mut orchs, mut hiddens): (Vec<_>, Vec<_>) = sessions
             .iter_mut()
             .map(|s| (&mut s.orchestrator, s.last_hidden.as_mut_slice()))
@@ -1263,20 +1312,32 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// Choose the next token and load its embedding into `last_hidden`, ready
     /// for the pass through the model that `step` (or `step_sessions`) runs.
     pub(crate) fn sample_next(&mut self) -> Result<u32> {
+        let row = self.head_row()?;
+        let head = self.generator.heads(&[row])?.remove(0);
+        self.take_head(head)
+    }
+
+    /// This session's row for [`Generator::heads`]: its last hidden state, and
+    /// whether the greedy token alone will do. A plain greedy step needs only
+    /// the argmax, which the device head finds without sending the logits back.
+    fn head_row(&self) -> Result<(&[f32], bool)> {
         if self.is_prefilling() {
             return Err(DlmError::InvalidConfig(
                 "session has prompt tokens left to prefill".into(),
             ));
         }
-        // A plain greedy step needs only the argmax, which the device head finds
-        // without sending the logits back.
         let plain_greedy = matches!(self.sampler, Sampler::Greedy)
             && self.penalties.is_noop()
             && self.grammar.is_none();
-        let next = match plain_greedy.then(|| self.generator.greedy_token(&self.last_hidden)) {
-            Some(Some(token)) => token?,
-            _ => {
-                let mut logits = self.generator.logits(&self.last_hidden)?;
+        Ok((&self.last_hidden, plain_greedy))
+    }
+
+    /// Choose the next token from what the LM head gave for
+    /// [`head_row`](Self::head_row) and load its embedding into `last_hidden`.
+    fn take_head(&mut self, head: Head) -> Result<u32> {
+        let next = match head {
+            Head::Token(token) => token,
+            Head::Logits(mut logits) => {
                 apply_repetition_penalty(
                     &mut logits,
                     &self.seen,

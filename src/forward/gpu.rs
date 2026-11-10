@@ -140,7 +140,11 @@ extern "C" {
         x: *mut f32,
     ) -> i32;
 
-    /// `logits_host[0..vocab] = W · x_host`: the LM head on the device.
+    /// The LM head on the device for `batch` rows of `x_host`: every row's
+    /// logits to `logits_host` (`batch * vocab`), or with `token_host` non-null
+    /// only each row's argmax (the first maximum on a tie). The weights are
+    /// read once per 16 rows.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dlm_lm_head(
         vocab: i32,
         hidden_size: i32,
@@ -148,7 +152,9 @@ extern "C" {
         w_group_size: i32,
         w: *const c_void,
         x_host: *const f32,
+        batch: i32,
         logits_host: *mut f32,
+        token_host: *mut i32,
     ) -> i32;
 
     /// Which GEMM prefill runs on the current device: 0 the f32 kernel, 1 bf16
@@ -198,18 +204,6 @@ extern "C" {
     /// Make slot `b`'s FFN input from [`dlm_moe_attn_batched`] the one the
     /// router and expert calls read.
     pub(crate) fn dlm_moe_take_row(hidden_size: i32, b: i32) -> i32;
-
-    /// The LM head's argmax: the index of the largest logit (the first, on a
-    /// tie), without copying the logits back.
-    pub(crate) fn dlm_lm_head_argmax(
-        vocab: i32,
-        hidden_size: i32,
-        w_dtype: i32,
-        w_group_size: i32,
-        w: *const c_void,
-        x_host: *const f32,
-        token_host: *mut i32,
-    ) -> i32;
 
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
     /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
@@ -702,20 +696,46 @@ impl GpuLmHead {
         })
     }
 
-    /// Logits for the final-normed hidden state `x`.
+    /// Logits for each final-normed hidden state in `x` (`rows × hidden`,
+    /// back to back), as `rows × vocab`. Several rows share one pass over the
+    /// weights, so a batch should come here in one call.
     pub fn logits(&self, x: &[f32]) -> Result<Vec<f32>> {
-        if x.len() != self.hidden {
+        let rows = self.rows(x)?;
+        let mut out = vec![0.0f32; rows * self.vocab];
+        self.run(x, rows, out.as_mut_ptr(), std::ptr::null_mut())?;
+        Ok(out)
+    }
+
+    /// The token greedy decoding picks for each final-normed hidden state in
+    /// `x` (`rows × hidden`): [`argmax`](crate::generate::argmax) of its
+    /// [`logits`](Self::logits), found on the device. Four bytes a row come
+    /// back instead of `vocab` floats (600 KB on Qwen2.5). A final logit softcap
+    /// is `tanh`, which keeps the order, so it needs no applying here.
+    pub fn argmax(&self, x: &[f32]) -> Result<Vec<u32>> {
+        let rows = self.rows(x)?;
+        let mut tokens = vec![0i32; rows];
+        self.run(x, rows, std::ptr::null_mut(), tokens.as_mut_ptr())?;
+        Ok(tokens.into_iter().map(|t| t as u32).collect())
+    }
+
+    fn rows(&self, x: &[f32]) -> Result<usize> {
+        if x.is_empty() || x.len() % self.hidden != 0 {
             return Err(DlmError::ShapeMismatch {
                 expected: self.hidden,
                 got: x.len(),
             });
         }
+        Ok(x.len() / self.hidden)
+    }
+
+    fn run(&self, x: &[f32], rows: usize, logits: *mut f32, tokens: *mut i32) -> Result<()> {
         if let Some(id) = self.device {
             crate::gpu::set_device(id)?;
         }
-        let mut out = vec![0.0f32; self.vocab];
         // SAFETY: `w` is a live device buffer of `vocab × hidden` weights in
-        // `w_dtype`; `x` and `out` are host slices of the lengths passed.
+        // `w_dtype`; `x` holds `rows × hidden` floats, and whichever of
+        // `logits` (`rows × vocab`) or `tokens` (`rows`) is non-null is a host
+        // buffer of that length.
         let code = unsafe {
             dlm_lm_head(
                 self.vocab as i32,
@@ -724,7 +744,9 @@ impl GpuLmHead {
                 self.w_group_size,
                 self.w.as_ptr() as *const c_void,
                 x.as_ptr(),
-                out.as_mut_ptr(),
+                rows as i32,
+                logits,
+                tokens,
             )
         };
         if code != 0 {
@@ -733,44 +755,7 @@ impl GpuLmHead {
                 code,
             });
         }
-        Ok(out)
-    }
-
-    /// The token greedy decoding picks for the final-normed hidden state `x`:
-    /// [`argmax`](crate::generate::argmax) of [`logits`](Self::logits), found on
-    /// the device. Four bytes come back instead of `vocab` floats (600 KB a
-    /// token on Qwen2.5). A final logit softcap is `tanh`, which keeps the order,
-    /// so it needs no applying here.
-    pub fn argmax(&self, x: &[f32]) -> Result<u32> {
-        if x.len() != self.hidden {
-            return Err(DlmError::ShapeMismatch {
-                expected: self.hidden,
-                got: x.len(),
-            });
-        }
-        if let Some(id) = self.device {
-            crate::gpu::set_device(id)?;
-        }
-        let mut token = 0i32;
-        // SAFETY: as `logits`; `token` is one host i32.
-        let code = unsafe {
-            dlm_lm_head_argmax(
-                self.vocab as i32,
-                self.hidden as i32,
-                self.w_dtype,
-                self.w_group_size,
-                self.w.as_ptr() as *const c_void,
-                x.as_ptr(),
-                &mut token,
-            )
-        };
-        if code != 0 {
-            return Err(DlmError::Gpu {
-                api: "dlm_lm_head_argmax",
-                code,
-            });
-        }
-        Ok(token as u32)
+        Ok(())
     }
 }
 

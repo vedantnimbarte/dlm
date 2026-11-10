@@ -126,3 +126,43 @@ Each observation points at an item in the roadmap:
   PCIe copy. Copying straight from the RAM cache into pinned memory is the fix.
 - **The CPU path starts new OS threads for every large matmul** (the MLP
   projections and the LM head), and has no SIMD.
+
+## Against vLLM
+
+Measured 2026-11-10 on the machine above, dlm at commit `6b70197` against vLLM
+0.33.0 (torch 2.14+cu132) in WSL2 Ubuntu on the same card, run back to back.
+Qwen2.5-0.5B-Instruct, prompt 256 tokens, 128 generated, context 1024, greedy.
+
+```sh
+dlm bench --model-path models/Qwen2.5-0.5B-Instruct --context-length 1024 \
+          --prompt-len 256 --gen-len 128 --batch 1,4,8,16 --max-batch 16 --runs 3
+```
+
+vLLM was driven through `LLM.generate` on random token ids with
+`ignore_eos=True` and prefix caching off, median of 3 after a warmup per shape.
+Prefill is `batch * 256 / t(1 token)`; decode is `batch * 127 / (t(128) - t(1))`,
+so vLLM's prefill includes its per-call Python overhead. fp32 needed
+`max_num_seqs=16, max_num_batched_tokens=4096, gpu_memory_utilization=0.78` to
+fit beside the desktop.
+
+| Decode tok/s | dlm bf16 | vLLM fp16 | vLLM fp32 |
+|---|---|---|---|
+| batch 1 | 84 | **101** | 60 |
+| batch 4 | 170 | 22 | **200** |
+| batch 8 | 178 | 45 | **281** |
+| batch 16 | 173 | 89 | **286** |
+| **Prefill tok/s** | ~1,600 | ~450 | ~1,500–1,780 |
+
+At batch 4-16, decode tok/s is the total over all sequences.
+
+- **vLLM fp16 is crippled on this card by cuBLAS, not by vLLM.** An fp16
+  `F.linear` with 2+ rows runs 10-25x slower than with one row and ~4x slower
+  than fp32 (the LM head: 1.9 ms at M=1, 44 ms at M=4). Summed over the layers
+  that is the flat ~175 ms/step vLLM fp16 shows at any batch above 1. Compare
+  against vLLM fp32 for batched decode and prefill, fp16 only for batch 1.
+- **Batch 1 is within clock drift.** dlm ran 84 tok/s here against 108 in
+  `CHANGELOG.md` on another day; vLLM fp16's 101 sits between the two.
+- **Batched decode is the gap.** dlm stops gaining after batch 4; vLLM fp32
+  keeps scaling to ~285 tok/s while reading fp32 weights, twice dlm's bytes.
+- dlm's int4 and GGUF paths were not compared: vLLM has no Marlin kernels on
+  Turing, and its GGUF support is experimental.

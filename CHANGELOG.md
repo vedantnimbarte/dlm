@@ -40,6 +40,81 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Batched decode of quantized models is 2-3x faster at batch 8-16.** The
+  int8-activation GEMV that every quantized format (int8, int4 and the GGUF
+  types) takes in a batch gave each warp one weight row and decoded each
+  32-weight chunk again for every sequence. Past batch 4 that decoding, not
+  memory, set its speed: about 250 tok/s on Qwen2.5-0.5B in any quantized
+  format, barely above batch 4. Each format's chunk decode is now separate
+  from its dot product, so a warp decodes four rows' chunks once and dots them
+  with every sequence's activations. The previous commit and this one
+  alternately on a GTX 1650, decode tok/s:
+
+  | Model | Batch 1 | Batch 4 | Batch 8 | Batch 16 |
+  |---|---|---|---|---|
+  | 0.5B Q4_K_M | 125 -> 124 | 197 -> 335 | 211 -> 513 | 237 -> 658 |
+  | 0.5B int4 | 117 -> 124 | 196 -> 413 | 217 -> 615 | 236 -> 672 |
+  | 0.5B Q6_K | 95 -> 95 | 121 -> 215 | 181 -> 340 | 226 -> 500 |
+  | 1.5B Q8_0 | 42 -> 41 | 72 -> 148 | 76 -> 223 | 76 -> 247 |
+
+  The Q6_K runs drifted widely (batch 1 from 55 to 118 tok/s on either build):
+  its batch 4-16 figures are medians of three, its batch 1 the one pair run
+  back to back on a steady card. Q6_K's one-sequence dot keeps its old fused
+  form: through the split decode it ran 5-10% slower at batch 1.
+
+- **Batched f32/bf16/f16 projections take four weight rows per warp.** At
+  batch 8-16 the batched GEMV was bound by loads, not memory: it re-read
+  every sequence's activations for each weight row, eight floats for eight
+  multiply-adds. A warp now decodes four rows' chunks and multiplies each
+  activation chunk it loads into all four, with the batch size fixed at
+  compile time (4, 8 or 16) so the accumulators stay in registers. The
+  quantized formats keep their int8-activation kernel. The previous commit
+  and this one alternately, twice, same setup as below:
+
+  | Batch | Before | After |
+  |---|---|---|
+  | 4 | 270 | 310 |
+  | 8 | 291 | 419 |
+  | 16 | 324 | 496 |
+
+  Batch 1 and prefill take other kernels and measured the same once the run
+  order was reversed (the card runs warmer later in a series).
+
+- **Batched attention runs in three launches for the whole batch.** The fused
+  batched block read each weight once for all sequences, but still launched
+  Q/K norm, RoPE, the K/V append and split-K attention slot by slot: 2-3 small
+  launches per sequence per layer, about 1.5 ms a sequence per step on
+  Qwen2.5-0.5B. Now each launch covers every slot, which reads its own cache,
+  block table and history length. Shapes the split kernel cannot take still go
+  slot by slot. Same setup as the LM-head entry below, three builds run
+  alternately twice (the first `main` run was throttled and is left out):
+
+  | Batch | Before both | LM head shared | Plus this |
+  |---|---|---|---|
+  | 4 | 166 | 217 | 249 |
+  | 8 | 178 | 228 | 276 |
+  | 16 | 180 | 238 | 300 |
+
+  vLLM 0.33 in fp32 on the same card made 200 / 281 / 286 tok/s at these batch
+  sizes (`bench/BASELINES.md`).
+
+- **Batched decode is about 30% faster: the batch shares one LM-head pass.**
+  Each session used to run the vocabulary-wide LM head on its own, reading
+  its weights once per sequence: on Qwen2.5-0.5B at batch 16 that was 36 ms of
+  a 90 ms step. `step_sessions` (the server's scheduler and `dlm bench`) now
+  sends every session's hidden state through one call, which reads the weights
+  once per 16 rows; greedy rows still get only their argmax back. GTX 1650,
+  Qwen2.5-0.5B bf16, `--prompt-len 256 --gen-len 64`, `main` and this change
+  run alternately four times, median decode tok/s (batch 1 is the same
+  single-row path, run twice each, so its range is shown):
+
+  | Batch | Before | After |
+  |---|---|---|
+  | 1 | 85-89 | 79-88 |
+  | 4 | 153 | 203 |
+  | 8 | 165 | 218 |
+  | 16 | 181 | 235 |
+
 - **GPU prefill is 4.6-6x faster and decode up to 1.7x.** Measured on a GTX
   1650 (4 GB), `dlm bench --context-length 2048 --prompt-len 512 --gen-len 128
   --batch 1,8`, the 0.4.x build and this one run alternately, best of three:

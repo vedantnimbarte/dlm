@@ -2039,6 +2039,83 @@ fn gpu_multi_row_gemv_handles_a_partial_last_group() {
     }
 }
 
+/// A batch through the device LM head in one call (the weights read once per
+/// 16 rows) gives each row the logits it gets alone, and the argmax of those
+/// logits, for every format with its own batched GEMV. Batches of 2, 5 and 16
+/// (17 = 16 + 1) take each compiled batch size; 301 rows leave a partial last
+/// group of rows per warp.
+#[test]
+fn gpu_lm_head_batch_matches_rows_alone() {
+    use dlm::storage::ggml_quant::GgmlKind;
+    let (vocab, hidden) = (301, 256);
+    let mut rng = Rng::new(0x1a4d);
+    let floats = rng.vec(vocab * hidden, 0.05);
+    // Random codes, with every f16 scale or minimum set small and finite: the
+    // first two (Q4_K/Q5_K's d and dmin, Q4_1/Q5_1's d and m) and Q6_K's d.
+    let mut ggml = |kind: GgmlKind| {
+        let mut blob: Vec<u8> = (0..kind.byte_len(vocab * hidden))
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        for block in blob.chunks_mut(kind.block_bytes()) {
+            block[0..2].copy_from_slice(&0x1400u16.to_le_bytes()); // 0.00098
+            block[2..4].copy_from_slice(&0x1000u16.to_le_bytes()); // 0.00049
+            if kind == GgmlKind::Q6K {
+                block[208..210].copy_from_slice(&0x1400u16.to_le_bytes());
+            }
+        }
+        Weights::Ggml {
+            blob,
+            kind,
+            num_elements: vocab * hidden,
+        }
+    };
+    let mut cases = vec![
+        (
+            "bf16".to_string(),
+            Weights::Bf16(floats.iter().map(|v| (v.to_bits() >> 16) as u16).collect()),
+        ),
+        ("int8".into(), Weights::quantize_int8(&floats, 32).unwrap()),
+        ("int4".into(), Weights::quantize_int4(&floats, 128).unwrap()),
+    ];
+    for kind in [
+        GgmlKind::Q4_0,
+        GgmlKind::Q4_1,
+        GgmlKind::Q5_0,
+        GgmlKind::Q5_1,
+        GgmlKind::Q8_0,
+        GgmlKind::Q4K,
+        GgmlKind::Q5K,
+        GgmlKind::Q6K,
+    ] {
+        cases.push((format!("{kind:?}"), ggml(kind)));
+    }
+    for (what, w) in cases {
+        let head = dlm::forward::GpuLmHead::new(&w, vocab, hidden, None).unwrap();
+        for rows in [2, 5, 17] {
+            let xs = rng.vec(rows * hidden, 1.0);
+            let batch = head.logits(&xs).unwrap();
+            let tokens = head.argmax(&xs).unwrap();
+            assert_eq!(batch.len(), rows * vocab);
+            for r in 0..rows {
+                let alone = head.logits(&xs[r * hidden..(r + 1) * hidden]).unwrap();
+                let got = &batch[r * vocab..(r + 1) * vocab];
+                let scale = alone.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                for (i, (g, a)) in got.iter().zip(&alone).enumerate() {
+                    assert!(
+                        (g - a).abs() < 1e-3 * scale,
+                        "{what}, {rows} rows: row {r} logit {i}: {g} batched vs {a} alone"
+                    );
+                }
+                assert_eq!(
+                    tokens[r],
+                    dlm::generate::argmax(got),
+                    "{what}, {rows} rows: row {r}"
+                );
+            }
+        }
+    }
+}
+
 /// The fused Q/K/V GEMV gives each warp several rows (four for Q5_0), and a
 /// warp's rows may straddle segments: with `head_dim` 6, Q is 24 rows and K
 /// and V 6 each, so one warp takes two rows of K and two of V. Each row must
@@ -2316,6 +2393,19 @@ fn assert_decode_batch_matches_solo<K: ComputeKernel>(
     quant: dlm::forward::KvQuant,
     what: &str,
 ) {
+    assert_decode_batch_matches_solo_after(kernel, cfg, n, quant, what, &|b| b % 5 + 1);
+}
+
+/// [`assert_decode_batch_matches_solo`] with sequence `b` first decoding
+/// `warm_len(b)` tokens alone.
+fn assert_decode_batch_matches_solo_after<K: ComputeKernel>(
+    kernel: &K,
+    cfg: BlockConfig,
+    n: usize,
+    quant: dlm::forward::KvQuant,
+    what: &str,
+    warm_len: &dyn Fn(usize) -> usize,
+) {
     let kv_cfg = KvCacheConfig {
         num_layers: kernel.num_layers(),
         num_kv_heads: cfg.num_kv_heads as u32,
@@ -2327,17 +2417,24 @@ fn assert_decode_batch_matches_solo<K: ComputeKernel>(
             .map(|i| ((i * (b + 3)) % 29) as f32 * 0.02 - 0.3)
             .collect()
     };
-    // Sequence `b` first decodes `b % 5 + 1` tokens alone, so the batch mixes
+    let steps = 3;
+    // Each sequence first decodes `warm_len(b)` tokens alone, so the batch mixes
     // history lengths and every slot attends over a different span.
     let warm = |b: usize| {
-        let mut orch = ForwardOrchestrator::new(kernel, PagedKvCache::new(kv_cfg, 16), quant);
+        let blocks = (warm_len(b) + steps).div_ceil(16) as u32;
+        let mut orch =
+            ForwardOrchestrator::new(kernel, PagedKvCache::new(kv_cfg, blocks.max(16)), quant);
+        // A fresh input per token: fed its own output, a small random model
+        // settles, and a history of near-identical K/V rows averages the same
+        // over any part of it, which would hide a chunk of attention lost.
+        let mut rng = Rng::new(0xBA7C + b as u64);
         let mut h = start(b);
-        for _ in 0..b % 5 + 1 {
+        for _ in 0..warm_len(b) {
+            h = rng.vec(cfg.hidden_size, 0.5);
             orch.decode_token(&mut h).unwrap();
         }
         (orch, h)
     };
-    let steps = 3;
     let solo: Vec<Vec<f32>> = (0..n)
         .map(|b| {
             let (mut orch, mut h) = warm(b);
@@ -2364,7 +2461,30 @@ fn assert_decode_batch_matches_solo<K: ComputeKernel>(
             max_diff < 1e-4,
             "{what}: sequence {b} of {n}: batched decode diverged from solo by {max_diff}"
         );
-        assert_eq!(orchs[b].position(), b % 5 + 1 + steps, "{what}");
+        assert_eq!(orchs[b].position(), warm_len(b) + steps, "{what}");
+    }
+}
+
+/// Batched attention splits a span longer than one chunk (128 positions here)
+/// and merges the pieces, each slot by its own length: a batch mixing short and
+/// long histories, some ending exactly on a chunk boundary, must match each
+/// sequence decoded alone.
+#[test]
+fn gpu_decode_batch_matches_solo_over_long_histories() {
+    let cfg = small_cfg();
+    let lens = [3, 125, 130, 300, 253];
+    let gpu = GpuKernel::new(cfg, random_layers(&cfg, 2, 0x10F6), 320)
+        .unwrap()
+        .with_kv_pool_tokens(lens.len() * 320);
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
+        assert_decode_batch_matches_solo_after(
+            &gpu,
+            cfg,
+            lens.len(),
+            quant,
+            &format!("long {quant:?}"),
+            &|b| lens[b],
+        );
     }
 }
 
