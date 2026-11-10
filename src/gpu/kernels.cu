@@ -3397,6 +3397,209 @@ __global__ void attn_prefill_kernel(const float* __restrict__ q, const void* key
     }
 }
 
+// Causal prefill attention, tiled over queries (FlashAttention's loop on SIMT
+// cores). `attn_prefill_kernel` gives each query its own block, which reads the
+// whole history: a 512-token chunk over 8k positions read about 2 GB of K/V per
+// layer, and prefill fell from 1,600 tok/s at 512 tokens to 660 at 8,000 on
+// Qwen2.5-0.5B. Here a block takes R query rows -- BQ = R / G consecutive tokens
+// times the G query heads sharing one KV head -- and streams the K/V history
+// through shared memory TK positions at a time, so each K/V value is read once
+// per BQ tokens. A running softmax per row (max, sum, and the rescale of the
+// output so far) merges the tiles as the split kernel merges its chunks.
+//
+// Each thread holds an SR x SK block of scores (4x4 at head size 64, 2x2 at
+// 128) and a 4x8 block of the output, so a load from shared memory feeds
+// several multiply-adds. Rows past the
+// chunk's last token, and positions a row may not see (after it, or before its
+// sliding window), are masked out of the softmax.
+// <<<dim3(num_kv_heads, ceil(T / (R / G))), 128>>>.
+#define FA_PF_THREADS 128
+template <int KT, int HD, int R, int TK, int SR, int SK>
+__global__ void __launch_bounds__(FA_PF_THREADS)
+attn_prefill_tiled_kernel(const float* __restrict__ q, const void* keys, const void* values,
+                          const int* table, int shift, int num_heads, int num_kv_heads, int T,
+                          int history, int sliding_window, float scale, float softcap,
+                          float* __restrict__ ctx) {
+    __shared__ float Qt[HD][R];          // queries, transposed, pre-scaled
+    __shared__ float Kt[HD][TK];         // the tile's keys, transposed
+    __shared__ float V[TK][HD];          // the tile's values
+    __shared__ float S[R][TK + 1];       // scores, then probabilities
+    __shared__ float row_m[R], row_l[R], row_a[R];
+    const int G = num_heads / num_kv_heads, BQ = R / G;
+    const int kvh = blockIdx.x, tq0 = blockIdx.y * BQ, t = threadIdx.x;
+    const long q_dim = (long)num_heads * HD, kv_dim = (long)num_kv_heads * HD;
+    const int nq = min(BQ, T - tq0);          // tokens in this tile
+    const int rows = nq * G;                  // live rows; the rest are padding
+
+    for (int i = t; i < R * HD; i += FA_PF_THREADS) {
+        const int r = i / HD, d = i % HD;
+        float v = 0.0f;
+        if (r < rows) {
+            const int qi = r / G, g = r % G;
+            v = q[(long)(tq0 + qi) * q_dim + ((long)kvh * G + g) * HD + d] * scale;
+        }
+        Qt[d][r] = v;
+    }
+    for (int r = t; r < R; r += FA_PF_THREADS) {
+        row_m[r] = -INFINITY;
+        row_l[r] = 0.0f;
+    }
+
+    // The positions any row sees: from the first token's window start to the
+    // last token itself.
+    const int last = history + tq0 + nq - 1;
+    const int first_total = history + tq0 + 1;
+    const int k_lo = (sliding_window > 0 && first_total > sliding_window) ? first_total - sliding_window : 0;
+
+    // Score micro-tile: rows sr0.., keys sk0... Output micro-tile: rows or0..,
+    // dims od0...
+    constexpr int OR = 4, OD = 8;
+    static_assert((R / SR) * (TK / SK) == FA_PF_THREADS, "score tiles cover the block");
+    static_assert((R / OR) * (HD / OD) == FA_PF_THREADS, "output tiles cover the block");
+    const int sr0 = (t / (TK / SK)) * SR, sk0 = (t % (TK / SK)) * SK;
+    const int or0 = (t / (HD / OD)) * OR, od0 = (t % (HD / OD)) * OD;
+    float acc[OR][OD];
+    #pragma unroll
+    for (int i = 0; i < OR; ++i)
+        #pragma unroll
+        for (int j = 0; j < OD; ++j) acc[i][j] = 0.0f;
+    __syncthreads();
+
+    for (int k0 = k_lo; k0 <= last; k0 += TK) {
+        // Load the tile, eight values a thread at a time.
+        for (int c = t; c < TK * (HD / 8); c += FA_PF_THREADS) {
+            const int kk = c / (HD / 8), d = (c % (HD / 8)) * 8;
+            float kv8[8], vv8[8];
+            if (k0 + kk <= last) {
+                const long at = kv_row(table, shift, k0 + kk) * kv_dim + (long)kvh * HD + d;
+                load_kv8<KT>(keys, at, kv8);
+                load_kv8<KT>(values, at, vv8);
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) kv8[j] = vv8[j] = 0.0f;
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                Kt[d + j][kk] = kv8[j];
+                V[kk][d + j] = vv8[j];
+            }
+        }
+        __syncthreads();
+
+        // Scores, masked to what each row may see.
+        float s[SR][SK];
+        #pragma unroll
+        for (int i = 0; i < SR; ++i)
+            #pragma unroll
+            for (int j = 0; j < SK; ++j) s[i][j] = 0.0f;
+        #pragma unroll 8
+        for (int d = 0; d < HD; ++d) {
+            float qv[SR], kv[SK];
+            #pragma unroll
+            for (int i = 0; i < SR; ++i) qv[i] = Qt[d][sr0 + i];
+            #pragma unroll
+            for (int j = 0; j < SK; ++j) kv[j] = Kt[d][sk0 + j];
+            #pragma unroll
+            for (int i = 0; i < SR; ++i)
+                #pragma unroll
+                for (int j = 0; j < SK; ++j) s[i][j] += qv[i] * kv[j];
+        }
+        #pragma unroll
+        for (int i = 0; i < SR; ++i) {
+            const int r = sr0 + i;
+            const int pq = history + tq0 + r / G;          // the row's own position
+            const int rs = (sliding_window > 0 && pq + 1 > sliding_window) ? pq + 1 - sliding_window : 0;
+            #pragma unroll
+            for (int j = 0; j < SK; ++j) {
+                const int pk = k0 + sk0 + j;
+                float v = s[i][j];
+                if (softcap > 0.0f) v = tanhf(v / softcap) * softcap;
+                S[r][sk0 + j] = (r < rows && pk <= pq && pk >= rs) ? v : -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // Online softmax, a thread per row.
+        for (int r = t; r < R; r += FA_PF_THREADS) {
+            float mx = -INFINITY;
+            for (int j = 0; j < TK; ++j) mx = fmaxf(mx, S[r][j]);
+            const float m_old = row_m[r], m_new = fmaxf(m_old, mx);
+            float a = 1.0f, l = 0.0f;
+            if (m_new != -INFINITY) {
+                a = expf(m_old - m_new);   // 0 while m_old is -inf
+                for (int j = 0; j < TK; ++j) {
+                    const float p = S[r][j] == -INFINITY ? 0.0f : expf(S[r][j] - m_new);
+                    S[r][j] = p;
+                    l += p;
+                }
+            } else {
+                for (int j = 0; j < TK; ++j) S[r][j] = 0.0f;
+            }
+            row_m[r] = m_new;
+            row_l[r] = row_l[r] * a + l;
+            row_a[r] = a;
+        }
+        __syncthreads();
+
+        // Rescale the output so far, then add this tile's P . V.
+        #pragma unroll
+        for (int i = 0; i < OR; ++i) {
+            const float a = row_a[or0 + i];
+            #pragma unroll
+            for (int j = 0; j < OD; ++j) acc[i][j] *= a;
+        }
+        for (int kk = 0; kk < TK; ++kk) {
+            const float4 v0 = *(const float4*)&V[kk][od0];
+            const float4 v1 = *(const float4*)&V[kk][od0 + 4];
+            const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            #pragma unroll
+            for (int i = 0; i < OR; ++i) {
+                const float p = S[or0 + i][kk];
+                #pragma unroll
+                for (int j = 0; j < OD; ++j) acc[i][j] += p * vv[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < OR; ++i) {
+        const int r = or0 + i;
+        if (r >= rows) continue;
+        const int qi = r / G, g = r % G;
+        const float inv = 1.0f / row_l[r];
+        float* out = ctx + (long)(tq0 + qi) * q_dim + ((long)kvh * G + g) * HD + od0;
+        #pragma unroll
+        for (int j = 0; j < OD; ++j) out[j] = acc[i][j] * inv;
+    }
+}
+
+// The tiled prefill attention for the head sizes it is built for (64: 64 rows,
+// 32-position tiles; 128: 32 rows, 16-position tiles, to stay in 48 KiB of
+// shared memory), or false, launching nothing.
+template <int KT>
+static bool launch_attn_prefill_tiled(const float* q, const void* keys, const void* values,
+                                      const int* table, int shift, int num_heads,
+                                      int num_kv_heads, int head_dim, int T, int history,
+                                      int sliding_window, float scale, float softcap, float* ctx) {
+    const int G = num_heads / num_kv_heads;
+    if (head_dim == 64 && G <= 64) {
+        dim3 grid(num_kv_heads, (T + 64 / G - 1) / (64 / G));
+        attn_prefill_tiled_kernel<KT, 64, 64, 32, 4, 4><<<grid, FA_PF_THREADS>>>(
+            q, keys, values, table, shift, num_heads, num_kv_heads, T, history, sliding_window,
+            scale, softcap, ctx);
+        return true;
+    }
+    if (head_dim == 128 && G <= 32) {
+        dim3 grid(num_kv_heads, (T + 32 / G - 1) / (32 / G));
+        attn_prefill_tiled_kernel<KT, 128, 32, 16, 2, 2><<<grid, FA_PF_THREADS>>>(
+            q, keys, values, table, shift, num_heads, num_kv_heads, T, history, sliding_window,
+            scale, softcap, ctx);
+        return true;
+    }
+    return false;
+}
+
 // One layer over `T` consecutive tokens of one sequence (rows `x[0..T]`, at
 // positions `position, position + 1, ...`, appending KV rows `history ...`).
 // The same block as `dlm_decode_block`, step for step. Returns
@@ -3480,12 +3683,18 @@ extern "C" int dlm_prefill_block(
                    rope_mscale, o->rope, rms_eps, kv_keys, kv_values, o->kv_table,
                    o->kv_block_shift, history, o->kv_half, T);
     {
-        const int C = head_dim > 128 ? 256 : 128;
-        size_t shmem = (size_t)(G * head_dim + G * C + 3 * G) * sizeof(float);
-        dim3 grid(num_kv_heads, T);
-        DLM_KV_SWITCH(o->kv_half, attn_prefill_kernel<KT_><<<grid, C, shmem>>>(
-            q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
-            head_dim, history, sliding_window, attn_scale, attn_softcap, ctx));
+        bool done = false;
+        DLM_KV_SWITCH(o->kv_half, done = launch_attn_prefill_tiled<KT_>(
+                q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
+                head_dim, T, history, sliding_window, attn_scale, attn_softcap, ctx));
+        if (!done) {
+            const int C = head_dim > 128 ? 256 : 128;
+            size_t shmem = (size_t)(G * head_dim + G * C + 3 * G) * sizeof(float);
+            dim3 grid(num_kv_heads, T);
+            DLM_KV_SWITCH(o->kv_half, attn_prefill_kernel<KT_><<<grid, C, shmem>>>(
+                q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
+                head_dim, history, sliding_window, attn_scale, attn_softcap, ctx));
+        }
     }
     const long TH = (long)T * hidden_size;
     if (gemma2 || o->parallel) {

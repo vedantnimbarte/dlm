@@ -1750,6 +1750,41 @@ fn int8_kv_cfg() -> BlockConfig {
     }
 }
 
+/// Prefill attention tiled over queries takes heads 64 and 128 wide; narrower
+/// test heads take the per-query kernel. Four query heads per KV head: tiles of
+/// 16 tokens at 64 and 8 at 128, so the 37-token prompt spans several, and K/V
+/// tiles of 32 and 16 positions, so its history does too. With a sliding window
+/// (rows start at different positions inside one tile) and with int8 KV.
+#[test]
+fn gpu_tiled_prefill_matches_cpu() {
+    for head_dim in [64, 128] {
+        for (window, kv) in [
+            (None, dlm::forward::KvQuant::None),
+            (Some(11), dlm::forward::KvQuant::None),
+            (None, dlm::forward::KvQuant::Int8),
+        ] {
+            let cfg = BlockConfig {
+                hidden_size: 128,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim,
+                intermediate_size: 128,
+                sliding_window: window,
+                ..small_cfg()
+            };
+            let layers = random_layers(&cfg, 2, 0x711E + head_dim as u64);
+            let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+            assert_prefill_matches_cpu_kv(
+                cfg,
+                layers,
+                gpu,
+                &format!("head {head_dim}, window {window:?}, kv {kv:?}"),
+                kv,
+            );
+        }
+    }
+}
+
 /// int8 device KV (`--kv-quant int8`) through prefill and decode, on the
 /// resident and the streaming kernel, against the CPU oracle's exact f32 KV.
 #[test]

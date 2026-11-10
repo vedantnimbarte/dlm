@@ -40,6 +40,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Long-prompt prefill is up to 1.6x faster: attention is tiled over
+  queries.** Prefill attention gave each prompt token its own block, which read
+  the whole history, so a 512-token chunk at 8k positions read about 2 GB of
+  K/V per layer. A block now takes a tile of tokens (times the query heads
+  sharing a KV head) and streams the history through shared memory once for
+  all of them, with a running softmax. Heads 64 and 128 wide (Qwen, Llama,
+  Mistral); others keep the per-token kernel. GTX 1650, prefill tok/s, per-
+  token and tiled kernels alternately:
+
+  | Prompt | Qwen2.5-0.5B bf16 | Qwen2.5-1.5B Q4_K_M |
+  |---|---|---|
+  | 512 | 1,350 -> 1,490 (noise) | 486 -> 489 |
+  | 2,048 | 1,218 -> 1,447 | 397 -> 435 |
+  | 8,000 | 651 -> 1,018 | 234 -> 303 |
+
 - **`--kv-quant int8` (and `int4`) now keeps the GPU KV cache in int8: 1.76x
   or more the tokens in the same VRAM.** Both used to mean fp16 on the GPU.
   Each 32 values are now a float scale and 32 int8 codes, 1.125 bytes a value
