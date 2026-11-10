@@ -2363,10 +2363,53 @@ __global__ void __launch_bounds__(32 * MV_ROWS, 6) matvec_batched_chunk_kernel(c
 // Qwen2.5-1.5B int4 at batch 8 fell from 50 to 30 tok/s.
 #define MV_CHUNK_MAX_BATCH 8
 
+// The int8-activation GEMV over a batch: `xq` holds every slot's codes back to
+// back (`batch * in_dim`; a slot's row is whole 32-value blocks, `in_dim % 32 ==
+// 0`). A lane dots each chunk of its weight row with every slot's codes, so
+// the weights still cross memory once per batch; the repeat reads of a chunk
+// for the next slot come from L1. Without it a batch of quantized sequences
+// decoded weights to f32 per element, and on Qwen2.5-1.5B (int8, Q8_0, Q4_K_M,
+// int4) eight sequences together made fewer tokens a second than one alone.
+// Launch <<<ceil(out_dim / MV_ROWS), 32 * MV_ROWS>>>.
+template <int DT>
+__global__ void __launch_bounds__(32 * MV_ROWS)
+matvec_q8_batched_kernel(const void* __restrict__ W, const signed char* __restrict__ xq,
+                         const float2* __restrict__ xds, const float* __restrict__ bias,
+                         float* __restrict__ out, int out_dim, int in_dim, int group_size,
+                         int batch) {
+    const int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (o >= out_dim) return;
+    const long n = (long)out_dim * in_dim, base = (long)o * in_dim;
+    float acc[DLM_MAX_BATCH];
+    #pragma unroll
+    for (int b = 0; b < DLM_MAX_BATCH; ++b) acc[b] = 0.0f;
+    for (int i = lane * 32; i < in_dim; i += 32 * 32) {
+        #pragma unroll
+        for (int b = 0; b < DLM_MAX_BATCH; ++b) {
+            if (b < batch) {
+                const long at = (long)b * in_dim + i;
+                acc[b] += Dp4a<DT>::dot(W, base + i, n, group_size, (const int*)(xq + at), xds[at >> 5]);
+            }
+        }
+    }
+    const float bv = bias ? bias[o] : 0.0f;
+    #pragma unroll
+    for (int b = 0; b < DLM_MAX_BATCH; ++b) {
+        if (b < batch) {
+            const float v = warp_sum(acc[b]);
+            if (lane == 0) out[(long)b * out_dim + o] = v + bv;
+        }
+    }
+}
+
 static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
                                   float* out, int out_dim, int in_dim, int group_size, int batch) {
+    const signed char* xq;
+    const float2* xds;
 #define DLM_CASE(D) case D: \
-        if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 && \
+        if (q8_fits<D>(W, x, in_dim, group_size) && quantize_x(x, batch * in_dim, &xq, &xds)) \
+            matvec_q8_batched_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch); \
+        else if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 && \
             chunk_fits<D>(W, x, in_dim, group_size)) \
             matvec_batched_chunk_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
         else \

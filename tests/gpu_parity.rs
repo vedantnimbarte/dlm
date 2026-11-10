@@ -2422,6 +2422,46 @@ fn gpu_decode_batch_matches_solo() {
     .unwrap();
     assert_decode_batch_matches_solo(&mla, mla_cfg, 4, dlm::forward::KvQuant::None, "mla");
 
+    // Quantized weights take the batched int8-activation GEMV, which must give
+    // each slot what the one-sequence GEMV gives it (both quantize a slot's
+    // activations the same way and sum in the same order).
+    let quantized = |q: &dyn Fn(&[f32]) -> Weights| -> Vec<LayerTensors> {
+        random_layers(&cfg, 3, 0xDECE)
+            .into_iter()
+            .map(|mut l| {
+                let requant = |w: &Weights| {
+                    let floats: Vec<f32> = (0..w.len()).map(|i| w.get(i)).collect();
+                    q(&floats)
+                };
+                l.q_proj = requant(&l.q_proj);
+                l.k_proj = requant(&l.k_proj);
+                l.v_proj = requant(&l.v_proj);
+                l.o_proj = requant(&l.o_proj);
+                if let Ffn::Dense(f) = &mut l.ffn {
+                    f.gate = requant(&f.gate);
+                    f.up = requant(&f.up);
+                    f.down = requant(&f.down);
+                }
+                l
+            })
+            .collect()
+    };
+    for (what, layers) in [
+        (
+            "int8",
+            quantized(&|v| Weights::quantize_int8(v, 32).unwrap()),
+        ),
+        (
+            "int4",
+            quantized(&|v| Weights::quantize_int4(v, 32).unwrap()),
+        ),
+    ] {
+        let gpu = GpuKernel::new(cfg, layers, 64)
+            .unwrap()
+            .with_kv_pool_tokens(5 * 64);
+        assert_decode_batch_matches_solo(&gpu, cfg, 5, dlm::forward::KvQuant::None, what);
+    }
+
     // MoE batches its attention and routes each slot on its own row.
     let m = MoeConfig {
         num_experts: 4,

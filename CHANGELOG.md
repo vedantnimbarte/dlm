@@ -53,9 +53,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **GEMV:** a warp per output row, each lane decoding an aligned chunk of
     weights with wide loads. Quantized formats dot int8-quantized activations
     with `dp4a`, as llama.cpp does: their GEMVs had been bound by decoding at
-    16-40 GB/s, not by memory. That costs about 0.0016 nats of NLL on the GGUF
-    model (32.13 → 32.18 perplexity over 625 tokens); `DLM_GEMV_EXACT=1` keeps
-    the f32 path.
+    16-40 GB/s, not by memory. Rounding the activations to 8 bits costs at
+    most 0.003 nats of NLL on any weight type measured (see the table below);
+    `DLM_GEMV_EXACT=1` keeps the f32 path.
   - **Fewer launches:** Q, K and V in one grid; the output and down
     projections add straight into the residual; one warp per head does
     Qwen3's head norm, RoPE and the KV append (six launches before). Fusing
@@ -75,6 +75,36 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `build.rs` builds the kernels for sm_75, 80, 86 and 89 plus PTX, so Ampere
     and newer run their own code (bf16 tensor cores need it).
     `DLM_CUDA_ARCHS=75` narrows a local build.
+- **Every weight type, measured.** The same GTX 1650, `--context-length 1024
+  --prompt-len 256 --gen-len 128`, the 0.4.x build against this one, run
+  alternately, best of two. Decode tok/s (batch 8 is the total over the batch),
+  and mean NLL over ~1,300 tokens of text scored the way generation decodes
+  (`dlm score --decode`), with the int8-activation GEMVs and with
+  `DLM_GEMV_EXACT=1` (noise is about 0.002):
+
+  | Model | Decode, batch 1 | Decode, batch 4 | Decode, batch 8 | Prefill | NLL (exact → dp4a) |
+  |---|---|---|---|---|---|
+  | 0.5B bf16 | 96.9 → **107.9** | 108.5 → **199.2** | 138.6 → **204.4** | 290 → **1727** | 2.7265 (no change) |
+  | 0.5B `--quant int8` | 89.6 → **137.7** | 100.2 → **197.5** | 130.2 → **205.4** | 293 → **1725** | 2.7298 → 2.7285 |
+  | 0.5B Q8_0 GGUF | 88.2 → **135.5** | 99.9 → **200.3** | 131.6 → **208.8** | 292 → **1704** | 2.7516 → 2.7531 |
+  | 0.5B Q6_K GGUF | 88.6 → **132.6** | 100.6 → **170.4** | 131.5 → **197.7** | 287 → **1732** | 2.7508 → 2.7507 |
+  | 0.5B Q5_K_M GGUF | 88.5 → **133.4** | 100.9 → **183.9** | 131.9 → **202.8** | 302 → **1696** | 2.7537 → 2.7561 |
+  | 0.5B Q4_K_M GGUF | 88.6 → **137.3** | 100.8 → **184.8** | 131.8 → **203.7** | 298 → **1720** | 2.7769 → 2.7793 |
+  | 0.5B `--quant int4` | 90.2 → **183.1** | 101.0 → **210.4** | 132.9 → **220.4** | 308 → **1785** | 2.8669 → 2.8676 |
+  | 1.5B `--quant int8` | 37.5 → **58.4** | 38.9 → **75.9** | 56.1 → **77.1** | 116 → **504** | 2.3285 → 2.3305 |
+  | 1.5B Q8_0 GGUF | 36.7 → **55.7** | 38.9 → **75.5** | 55.9 → **76.9** | 116 → **499** | 2.3408 → 2.3428 |
+  | 1.5B Q4_K_M GGUF | 36.2 → **72.8** | 39.1 → **72.3** | 56.7 → **79.4** | 117 → **504** | 2.3773 → 2.3764 |
+  | 1.5B `--quant int4` | 38.0 → **86.3** | 39.5 → **82.8** | 58.0 → **84.2** | 119 → **531** | 2.4183 → 2.4211 |
+  | 1.5B bf16, `--stream` | 18.8 → 18.3 | 33.6 → **50.8** | 49.3 → **64.6** | 116 → **124** | |
+
+  The batch-4/8 figures include the batched int8-activation GEMV below. A
+  streamed model is bound by PCIe at batch 1, so it moves little there.
+- **A batch of quantized sequences decodes through the int8-activation GEMV**
+  too. It used to decode weights to f32 element by element, so on Qwen2.5-1.5B
+  (int8, Q8_0, Q4_K_M, int4) four sequences together made fewer tokens a second
+  than one alone. Now batch 4 runs 72-83 tok/s, against 44 on the same build
+  without this kernel. At batch 4-8, int4 and Q4_K_M still only about match one
+  stream: each slot re-decodes the weights, which is compute-bound there.
 - **`--quant int4` decodes 20-27% faster on the GPU.** On short rows a
   quantized GEMV was bound by latency, not bandwidth: a 32-weight chunk is a few
   bytes, so a warp issued one load per row, waited, and reduced with nothing in
@@ -209,6 +239,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`dlm score --decode`** scores a text one token at a time, through the
+  kernels generation uses. On the GPU those differ from prefill's (GEMVs on
+  int8-quantized activations against GEMMs on f32 ones), so plain `dlm score`
+  does not measure what a generated token goes through.
 - **`--gpu-layers N`: the layers that do not fit in VRAM run on the CPU**,
   where their weights already are, instead of streaming across PCIe every
   token (llama.cpp's `-ngl`). Qwen2.5-1.5B bf16 on a 4 GB GTX 1650, against
