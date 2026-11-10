@@ -1888,8 +1888,16 @@ fn bench_generator<K: ComputeKernel>(
         )
     };
     println!();
+    let sampling = if opts.temperature > 0.0 {
+        format!(
+            "temperature {} top-p {} top-k {}",
+            opts.temperature, opts.top_p, opts.top_k
+        )
+    } else {
+        "greedy".into()
+    };
     println!(
-        "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, greedy",
+        "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, {sampling}",
         opts.prompt_len, opts.gen_len, opts.batch, opts.runs
     );
     let results = dlm::bench::run(generator, &prompt, opts, |r, run| {
@@ -1938,6 +1946,7 @@ fn bench_generator<K: ComputeKernel>(
             quant: format!("{:?}", config.quant),
             stream: args.stream,
             kv_quant: format!("{:?}", args.kv_quant).to_lowercase(),
+            sampling,
             context_length: args.context_length,
             prompt_len: opts.prompt_len,
             gen_len: opts.gen_len,

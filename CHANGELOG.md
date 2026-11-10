@@ -40,6 +40,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Sampled decode is 4-8x faster at batch 16: candidates are found on the
+  GPU.** A temperature/top-k/top-p step copied each sequence's whole row of
+  logits to the host (600 KB on Qwen2.5) and found the softmax total and the
+  top candidates there, one sequence at a time; at batch 16 that took several
+  times as long as the model. The device head now returns each row's largest
+  logit, its softmax total and its largest logits sorted (4 KB for top-k 40),
+  and the host draws from those with the same arithmetic. A draw they cannot
+  decide exactly still takes the logits: a top-p nucleus wider than 1,024
+  tokens, pure temperature with neither top-k nor top-p, a repetition or
+  frequency penalty, a grammar, or a final logit softcap. The draws match the
+  host sampler's for a seed, except that the vocabulary total is summed in
+  another order and can differ in its last bit. GTX 1650, Qwen2.5-0.5B Q4_K_M,
+  temperature 0.8, decode tok/s:
+
+  | Sampler | Batch 1 | Batch 4 | Batch 16 |
+  |---|---|---|---|
+  | top-p 0.95 | 33 -> 120 | 57 -> 340 | 83 -> 673 |
+  | top-k 40 | 36 -> 115 | 106 -> 345 | 153 -> 678 |
+  | greedy, for reference | 115-128 | 341-367 | 712-722 |
+
+  `dlm bench` takes `--temperature`, `--top-p` and `--top-k` to measure it,
+  and records the sampler in its JSON.
+
 - **Batched decode of quantized models is 2-3x faster at batch 8-16.** The
   int8-activation GEMV that every quantized format (int8, int4 and the GGUF
   types) takes in a batch gave each warp one weight row and decoded each

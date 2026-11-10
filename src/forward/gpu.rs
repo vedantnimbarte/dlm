@@ -157,6 +157,26 @@ extern "C" {
         token_host: *mut i32,
     ) -> i32;
 
+    /// The LM head for sampling: per row of `x_host`, `(max logit, softmax
+    /// total at temps_host[r])` into `stats_host[2r..]`, and its `c` largest
+    /// logits sorted (logit descending, index ascending) into
+    /// `cand_l_host` / `cand_i_host[r * c..]`. `c <= 4096` and `c <= vocab`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_lm_head_top(
+        vocab: i32,
+        hidden_size: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        w: *const c_void,
+        x_host: *const f32,
+        batch: i32,
+        temps_host: *const f32,
+        c: i32,
+        stats_host: *mut f32,
+        cand_l_host: *mut f32,
+        cand_i_host: *mut i32,
+    ) -> i32;
+
     /// Which GEMM prefill runs on the current device: 0 the f32 kernel, 1 bf16
     /// and 2 fp16 tensor cores.
     pub(crate) fn dlm_gemm_mode() -> i32;
@@ -652,6 +672,10 @@ pub(crate) fn bias_ptr(b: &Option<DeviceBuffer>) -> *const f32 {
     b.as_ref().map_or(std::ptr::null(), |d| d.as_ptr())
 }
 
+/// The most sampling candidates [`GpuLmHead::top`] finds per row (`TOP_MAX` in
+/// `src/gpu/kernels.cu`).
+pub const TOP_CANDIDATES_MAX: usize = 4096;
+
 /// The LM head resident in VRAM. Decoding ends every step with a
 /// `vocab × hidden` GEMV -- 233M multiply-adds for a 151,936-token vocabulary at
 /// hidden 1536 -- which on the host costs more than the whole GPU layer stack
@@ -716,6 +740,73 @@ impl GpuLmHead {
         let mut tokens = vec![0i32; rows];
         self.run(x, rows, std::ptr::null_mut(), tokens.as_mut_ptr())?;
         Ok(tokens.into_iter().map(|t| t as u32).collect())
+    }
+
+    /// What sampling needs from each final-normed hidden state in `x`, found on
+    /// the device: `(max logit, sum over the vocabulary of exp((l - max) /
+    /// temps[r]), its c largest (logit, token) sorted by logit descending and
+    /// token ascending)`. Copies back `c` candidates a row instead of `vocab`
+    /// logits. `c` is at most [`TOP_CANDIDATES_MAX`] and the vocabulary size.
+    #[allow(clippy::type_complexity)]
+    pub fn top(
+        &self,
+        x: &[f32],
+        temps: &[f32],
+        c: usize,
+    ) -> Result<Vec<(f32, f32, Vec<(f32, u32)>)>> {
+        let rows = self.rows(x)?;
+        if temps.len() != rows {
+            return Err(DlmError::ShapeMismatch {
+                expected: rows,
+                got: temps.len(),
+            });
+        }
+        if c == 0 || c > TOP_CANDIDATES_MAX || c > self.vocab {
+            return Err(DlmError::InvalidConfig(format!(
+                "LM head candidates: {c} is outside 1..={}",
+                TOP_CANDIDATES_MAX.min(self.vocab)
+            )));
+        }
+        if let Some(id) = self.device {
+            crate::gpu::set_device(id)?;
+        }
+        let mut stats = vec![0.0f32; 2 * rows];
+        let mut cand_l = vec![0.0f32; rows * c];
+        let mut cand_i = vec![0i32; rows * c];
+        // SAFETY: `w` is a live device buffer of `vocab × hidden` weights in
+        // `w_dtype`; `x` holds `rows × hidden` floats (checked by `rows`),
+        // `temps` `rows` (checked above), and the outputs are host buffers of
+        // `2 × rows` and `rows × c`, with `c` in the range the kernel takes.
+        let code = unsafe {
+            dlm_lm_head_top(
+                self.vocab as i32,
+                self.hidden as i32,
+                self.w_dtype,
+                self.w_group_size,
+                self.w.as_ptr() as *const c_void,
+                x.as_ptr(),
+                rows as i32,
+                temps.as_ptr(),
+                c as i32,
+                stats.as_mut_ptr(),
+                cand_l.as_mut_ptr(),
+                cand_i.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_lm_head_top",
+                code,
+            });
+        }
+        Ok((0..rows)
+            .map(|r| {
+                let top = (r * c..(r + 1) * c)
+                    .map(|j| (cand_l[j], cand_i[j] as u32))
+                    .collect();
+                (stats[2 * r], stats[2 * r + 1], top)
+            })
+            .collect())
     }
 
     fn rows(&self, x: &[f32]) -> Result<usize> {

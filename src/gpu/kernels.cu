@@ -1562,8 +1562,9 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 20-21 are the LM head's input hidden and output logits.
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
 // Slots 24-25 are the int8 activation codes and their block scales (dp4a).
-enum { SCRATCH_N = 28 };
-enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26 };   // 26: fp16 tensor-core row scales
+// Slot 28 holds the LM head's sampling candidates (`dlm_lm_head_top`).
+enum { SCRATCH_N = 29 };
+enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26, LM_TOP = 28 };   // 26: fp16 tensor-core row scales
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12, MOE_NORMED2B = 27 };   // 27: a batch's FFN inputs
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
@@ -3719,20 +3720,19 @@ __global__ void argmax_kernel(const float* v, int n, int* out) {
 // The argmax saves copying `vocab` floats a row back to the host (600 KB on
 // Qwen2.5) for the host to take one maximum of. A final logit softcap is `tanh`,
 // which keeps the order, so the caller can skip it there.
-extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_size,
-                           const void* w, const float* x_host, int batch, float* logits_host,
-                           int* token_host)
-{
-    DLM_ENTER
-    if (batch <= 0) return 0;
+// The LM head's logits for `batch` rows of `x_host`, DLM_MAX_BATCH rows at a
+// time: `finish(n, r0, logits)` takes each group's `n` rows of device logits
+// (starting at row `r0`) and must end in a blocking copy to the host.
+template <typename F>
+static cudaError_t lm_head_rows(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                                const void* w, const float* x_host, int batch, F&& finish) {
     const int rows = batch < DLM_MAX_BATCH ? batch : DLM_MAX_BATCH;
     cudaError_t e = scratch_ensure(LM_X, rows * hidden_size);
     if (e == cudaSuccess) e = scratch_ensure(LM_LOGITS, rows * vocab + DLM_MAX_BATCH);
-    float* x = g_scratch[LM_X];
-    float* logits = g_scratch[LM_LOGITS];
-    int* tokens = (int*)(logits + (long)rows * vocab);
     for (int r0 = 0; r0 < batch && e == cudaSuccess; r0 += DLM_MAX_BATCH) {
         const int n = batch - r0 < DLM_MAX_BATCH ? batch - r0 : DLM_MAX_BATCH;
+        float* x = g_scratch[LM_X];
+        float* logits = g_scratch[LM_LOGITS];
         e = cudaMemcpy(x, x_host + (long)r0 * hidden_size, (size_t)n * hidden_size * sizeof(float),
                        cudaMemcpyHostToDevice);
         if (e != cudaSuccess) break;
@@ -3741,16 +3741,231 @@ extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_
         else
             launch_matvec_batched(w_dtype, w, x, (const float*)0, logits, vocab, hidden_size,
                                   w_group_size, n);
-        if (token_host) argmax_kernel<<<n, 1024>>>(logits, vocab, tokens);
         e = cudaGetLastError();
-        if (e != cudaSuccess) break;
-        // Blocking D2H, so it also waits for the launches above.
-        e = token_host
-            ? cudaMemcpy(token_host + r0, tokens, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost)
-            : cudaMemcpy(logits_host + (long)r0 * vocab, logits, (size_t)n * vocab * sizeof(float),
-                         cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess) e = finish(n, r0, logits);
     }
-    return (int)e;
+    return e;
+}
+
+extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                           const void* w, const float* x_host, int batch, float* logits_host,
+                           int* token_host)
+{
+    DLM_ENTER
+    if (batch <= 0) return 0;
+    return (int)lm_head_rows(vocab, hidden_size, w_dtype, w_group_size, w, x_host, batch,
+                             [&](int n, int r0, float* logits) {
+        if (!token_host)
+            return cudaMemcpy(logits_host + (long)r0 * vocab, logits,
+                              (size_t)n * vocab * sizeof(float), cudaMemcpyDeviceToHost);
+        int* tokens = (int*)(logits + (long)n * vocab);
+        argmax_kernel<<<n, 1024>>>(logits, vocab, tokens);
+        cudaError_t e = cudaGetLastError();
+        // Blocking D2H, so it also waits for the launches above.
+        return e != cudaSuccess ? e
+                                : cudaMemcpy(token_host + r0, tokens, (size_t)n * sizeof(int),
+                                             cudaMemcpyDeviceToHost);
+    });
+}
+
+// ── Sampling candidates on the device ──────────────────────────────────────
+//
+// A sampled token needs, from a row of `vocab` logits, only the largest few
+// sorted (top-k, or the top-p nucleus), the largest logit, and the softmax
+// total over the whole row. The host used to copy all `vocab` floats back (600
+// KB a row on Qwen2.5) and find those itself, one row at a time: at batch 16 a
+// temperature/top-p step took several times as long as the model. This finds
+// them here, one block per row, and copies back `C` candidates and two floats.
+//
+// Candidates are the C largest logits by (logit descending, index ascending),
+// the order the host sampler breaks ties in. A radix select over an
+// order-preserving key finds the C-th largest key in four 8-bit passes; every
+// key above it is taken, then the lowest-indexed keys equal to it up to C; and
+// a bitonic sort orders them.
+#define TOP_THREADS 1024
+#define TOP_MAX 4096
+
+// Float to an unsigned key in the same order (NaN aside).
+__device__ __forceinline__ unsigned int top_key(float f) {
+    unsigned int u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float top_unkey(unsigned int k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k);
+}
+
+__device__ __forceinline__ float block_reduce(float v, bool is_max, float* red) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float o = __shfl_xor_sync(0xffffffffu, v, off);
+        v = is_max ? fmaxf(v, o) : v + o;
+    }
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float a = red[0];
+        for (int w = 1; w < (int)(blockDim.x >> 5); ++w) a = is_max ? fmaxf(a, red[w]) : a + red[w];
+        red[32] = a;
+    }
+    __syncthreads();
+    float r = red[32];
+    __syncthreads();
+    return r;
+}
+
+// <<<rows, TOP_THREADS, max(32 KiB, P * 8)>>>, P = C rounded up to a power of
+// two (C <= TOP_MAX, C <= vocab). Row r: stats[r] = (max logit, sum of
+// exp((l - max) / temps[r])), and its candidates in cand_l / cand_i[r * C ..].
+__global__ void __launch_bounds__(TOP_THREADS)
+top_candidates_kernel(const float* __restrict__ logits, int vocab, const float* __restrict__ temps,
+                      int C, float2* __restrict__ stats, float* __restrict__ cand_l,
+                      int* __restrict__ cand_i) {
+    extern __shared__ unsigned long long top_buf[];   // also the per-warp histograms
+    __shared__ float red[33];
+    __shared__ unsigned int hist[256];
+    __shared__ int sel_digit, sel_rem, n_gt, taken, wbase[33];
+    const int row = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int warps = blockDim.x >> 5;
+    const float* v = logits + (long)row * vocab;
+
+    float m = -INFINITY;
+    for (int i = t; i < vocab; i += blockDim.x) m = fmaxf(m, v[i]);
+    m = block_reduce(m, true, red);
+    const float temp = temps[row];
+    float s = 0.0f;
+    if (temp > 0.0f)
+        for (int i = t; i < vocab; i += blockDim.x) s += expf((v[i] - m) / temp);
+    s = block_reduce(s, false, red);
+    if (t == 0) stats[row] = make_float2(m, s);
+
+    // The C-th largest key, a byte at a time from the top.
+    unsigned int* whist = (unsigned int*)top_buf;   // [warps][256]
+    unsigned int prefix = 0, mask = 0;
+    int remaining = C;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int j = t; j < warps * 256; j += blockDim.x) whist[j] = 0;
+        __syncthreads();
+        for (int i = t; i < vocab; i += blockDim.x) {
+            const unsigned int k = top_key(v[i]);
+            if ((k & mask) == prefix) atomicAdd(&whist[warp * 256 + ((k >> shift) & 255)], 1u);
+        }
+        __syncthreads();
+        for (int d = t; d < 256; d += blockDim.x) {
+            unsigned int c = 0;
+            for (int w = 0; w < warps; ++w) c += whist[w * 256 + d];
+            hist[d] = c;
+        }
+        __syncthreads();
+        if (t == 0) {
+            int cum = 0, d = 255;
+            for (; d > 0; --d) {
+                if (cum + (int)hist[d] >= remaining) break;
+                cum += hist[d];
+            }
+            sel_digit = d;
+            sel_rem = remaining - cum;
+        }
+        __syncthreads();
+        prefix |= (unsigned int)sel_digit << shift;
+        mask |= 255u << shift;
+        remaining = sel_rem;
+        __syncthreads();
+    }
+
+    // Gather: every key above the C-th, then the first `remaining` equal to it
+    // in index order. A candidate is (key << 32) | ~index, so sorting the
+    // 64-bit values descending orders by logit and then by lowest index.
+    int P = 1;
+    while (P < C) P <<= 1;
+    if (t == 0) { n_gt = 0; taken = 0; }
+    for (int i = t; i < P; i += blockDim.x) top_buf[i] = 0ull;
+    __syncthreads();
+    for (int i = t; i < vocab; i += blockDim.x) {
+        const unsigned int k = top_key(v[i]);
+        if (k > prefix) top_buf[atomicAdd(&n_gt, 1)] = ((unsigned long long)k << 32) | (unsigned int)~i;
+    }
+    __syncthreads();
+    const int gt = n_gt;
+    for (int base = 0; base < vocab && taken < remaining; base += blockDim.x) {
+        const int i = base + t;
+        const bool eq = i < vocab && top_key(v[i]) == prefix;
+        const unsigned int bal = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) wbase[warp] = __popc(bal);
+        __syncthreads();
+        if (t == 0) {
+            int acc = 0;
+            for (int w = 0; w < warps; ++w) { const int c = wbase[w]; wbase[w] = acc; acc += c; }
+            wbase[32] = acc;
+        }
+        __syncthreads();
+        const int pos = taken + wbase[warp] + __popc(bal & ((1u << lane) - 1u));
+        if (eq && pos < remaining)
+            top_buf[gt + pos] = ((unsigned long long)prefix << 32) | (unsigned int)~i;
+        __syncthreads();
+        if (t == 0) taken += wbase[32];
+        __syncthreads();
+    }
+
+    // Bitonic sort, descending; the zero padding sorts last.
+    for (int k = 2; k <= P; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = t; i < P; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const unsigned long long a = top_buf[i], b = top_buf[ixj];
+                    if ((a < b) == ((i & k) == 0)) { top_buf[i] = b; top_buf[ixj] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int c = t; c < C; c += blockDim.x) {
+        const unsigned long long x = top_buf[c];
+        cand_l[(long)row * C + c] = top_unkey((unsigned int)(x >> 32));
+        cand_i[(long)row * C + c] = (int)~(unsigned int)x;
+    }
+}
+
+// The LM head for sampling: for each of `batch` rows, (max logit, softmax total
+// at temps_host[r]) into stats_host[2r..], and its `C` largest logits sorted
+// (logit descending, index ascending) into cand_l_host / cand_i_host[r * C ..].
+// C <= TOP_MAX and C <= vocab, else cudaErrorInvalidValue.
+extern "C" int dlm_lm_head_top(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                               const void* w, const float* x_host, int batch,
+                               const float* temps_host, int C, float* stats_host,
+                               float* cand_l_host, int* cand_i_host)
+{
+    DLM_ENTER
+    if (batch <= 0) return 0;
+    if (C <= 0 || C > TOP_MAX || C > vocab) return (int)cudaErrorInvalidValue;
+    const int rows = batch < DLM_MAX_BATCH ? batch : DLM_MAX_BATCH;
+    int P = 1;
+    while (P < C) P <<= 1;
+    // 32 KiB either way: TOP_MAX candidates, or 32 warps' 256-bin histograms.
+    const size_t shmem = (size_t)(P * 8 > 32 * 256 * 4 ? P * 8 : 32 * 256 * 4);
+    return (int)lm_head_rows(vocab, hidden_size, w_dtype, w_group_size, w, x_host, batch,
+                             [&](int n, int r0, float* logits) {
+        cudaError_t e = scratch_ensure(LM_TOP, rows + (rows & 1) + 2 * rows + 2 * rows * C);
+        if (e != cudaSuccess) return e;
+        float* temps = g_scratch[LM_TOP];
+        float2* stats = (float2*)(temps + rows + (rows & 1));
+        float* cl = (float*)(stats + rows);
+        int* ci = (int*)(cl + (long)rows * C);
+        e = cudaMemcpy(temps, temps_host + r0, (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) return e;
+        top_candidates_kernel<<<n, TOP_THREADS, shmem>>>(logits, vocab, temps, C, stats, cl, ci);
+        e = cudaGetLastError();
+        if (e == cudaSuccess)
+            e = cudaMemcpy(stats_host + 2L * r0, stats, (size_t)n * sizeof(float2), cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess)
+            e = cudaMemcpy(cand_l_host + (long)r0 * C, cl, (size_t)n * C * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess)
+            e = cudaMemcpy(cand_i_host + (long)r0 * C, ci, (size_t)n * C * sizeof(int),
+                           cudaMemcpyDeviceToHost);
+        return e;
+    });
 }
 
 // Apply one expert to the residual: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.

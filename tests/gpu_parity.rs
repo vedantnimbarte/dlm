@@ -2337,6 +2337,120 @@ fn gpu_mla_long_context_matches_cpu() {
     }
 }
 
+/// The device's sampling candidates are the first `c` of the row's logits
+/// sorted by logit (descending) and token (ascending), with the row's max and
+/// softmax total. The head repeats every 97th row, so each logit appears about
+/// 31 times and the candidates end mid-way through runs of exact ties.
+#[test]
+fn gpu_lm_head_top_matches_sorted_logits() {
+    let (vocab, hidden) = (3001, 64);
+    let mut rng = Rng::new(0x70C4);
+    let base = rng.vec(97 * hidden, 0.2);
+    let w: Vec<f32> = (0..vocab * hidden)
+        .map(|e| base[(e / hidden % 97) * hidden + e % hidden])
+        .collect();
+    let head = dlm::forward::GpuLmHead::new(&Weights::from_f32(w), vocab, hidden, None).unwrap();
+    let xs = rng.vec(3 * hidden, 1.0);
+    let temps = [0.7f32, 1.0, 1.5];
+    let logits = head.logits(&xs).unwrap();
+    for c in [1, 40, 97, 1024, 3001] {
+        let got = head.top(&xs, &temps, c).unwrap();
+        for (r, (max, total, top)) in got.iter().enumerate() {
+            let row = &logits[r * vocab..(r + 1) * vocab];
+            let mut want: Vec<(f32, u32)> = row.iter().copied().zip(0u32..).collect();
+            want.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            want.truncate(c);
+            assert_eq!(top, &want, "c {c}, row {r}");
+            assert_eq!(*max, want[0].0, "c {c}, row {r}: max");
+            let host_total: f32 = row.iter().map(|&l| ((l - max) / temps[r]).exp()).sum();
+            assert!(
+                (total - host_total).abs() <= 1e-4 * host_total,
+                "c {c}, row {r}: total {total} vs {host_total}"
+            );
+        }
+    }
+}
+
+/// Sampled sessions draw the same tokens whether the LM head is on the host
+/// (logits sorted there) or the device (candidates sorted there), alone and
+/// stepped together, for top-k and top-p.
+#[test]
+fn gpu_sampled_sessions_match_host_head() {
+    use dlm::generate::{Generator, Sampler};
+    let cfg = small_cfg();
+    let vocab = 300;
+    let layers = random_layers(&cfg, 2, 0x5A3F);
+    let mut rng = Rng::new(0x5A40);
+    let embedding = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let head = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let kv = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let build = || {
+        Generator::new(
+            GpuKernel::new(cfg, layers.clone(), 64)
+                .unwrap()
+                .with_kv_pool_tokens(4 * 64),
+            embedding.clone(),
+            vec![1.0; cfg.hidden_size],
+            head.clone(),
+            vocab,
+            1e-5,
+            kv,
+            16,
+        )
+        .unwrap()
+    };
+    let sampler = |top_p: f32, top_k: u32, seed: u64| Sampler::TopPK {
+        temperature: 0.9,
+        top_p,
+        top_k,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        seed,
+    };
+    let host = build();
+    let mut dev = build();
+    dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    let prompts: [&[u32]; 3] = [&[9, 200, 41], &[3, 77], &[150, 2, 8, 99]];
+    for (top_p, top_k) in [(1.0, 20), (0.8, 0)] {
+        let run = |g: &Generator<GpuKernel>, together: bool| -> Vec<Vec<u32>> {
+            let mut sessions: Vec<_> = prompts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    g.start_session(p, sampler(top_p, top_k, i as u64 + 7))
+                        .unwrap()
+                })
+                .collect();
+            let mut out = vec![Vec::new(); prompts.len()];
+            for _ in 0..16 {
+                if together {
+                    let mut refs: Vec<_> = sessions.iter_mut().collect();
+                    for (o, t) in out.iter_mut().zip(g.step_sessions(&mut refs).unwrap()) {
+                        o.push(t);
+                    }
+                } else {
+                    for (o, s) in out.iter_mut().zip(sessions.iter_mut()) {
+                        o.push(s.step().unwrap());
+                    }
+                }
+            }
+            out
+        };
+        let want = run(&host, false);
+        assert_eq!(run(&dev, false), want, "top_p {top_p} top_k {top_k}, alone");
+        assert_eq!(
+            run(&dev, true),
+            want,
+            "top_p {top_p} top_k {top_k}, together"
+        );
+    }
+}
+
 /// A multi-GPU pipeline's LM head lives on the last stage's GPU and must select
 /// that device itself: whichever stage ran last is current when logits run.
 /// With one GPU this can only check the wiring -- a pipeline over `[0, 0]` with

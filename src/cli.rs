@@ -506,6 +506,19 @@ pub struct BenchOpts {
     #[arg(long, value_name = "PCT", default_value_t = 5.0)]
     pub tolerance: f64,
 
+    /// Sample at this temperature instead of decoding greedily (0, the default,
+    /// is greedy). Each sequence gets its own seed.
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Nucleus sampling cut-off, with `--temperature`; 1.0 disables it.
+    #[arg(long, default_value_t = 1.0)]
+    pub top_p: f32,
+
+    /// Keep only the `k` most likely tokens, with `--temperature`; 0 keeps all.
+    #[arg(long, default_value_t = 0)]
+    pub top_k: u32,
+
     /// Break decode time down by streaming stage (mmap, H2D, compute, ...).
     /// Streaming paths only. Off by default: timing the stages adds overhead of
     /// its own, so leave it off when the headline numbers matter.
