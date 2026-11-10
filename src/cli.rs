@@ -186,10 +186,12 @@ pub enum KvQuantArg {
     /// Exact f32 everywhere. `none` is accepted as an alias.
     #[value(alias = "none")]
     F32,
-    /// int8 — about half the KV memory. On the GPU, stored as fp16.
+    /// int8 — about half the KV memory. On the GPU, int8 with a scale per 32
+    /// values (1.125 bytes a value, 56% of fp16), or fp16 for models whose head
+    /// size is not a multiple of 32.
     Int8,
-    /// int4 — about a quarter of the KV memory, more error. On the GPU, stored as
-    /// fp16 (half).
+    /// int4 — about a quarter of the KV memory, more error. On the GPU, held as
+    /// int8 as for `int8`.
     Int4,
 }
 

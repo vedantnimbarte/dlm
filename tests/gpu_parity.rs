@@ -1464,54 +1464,63 @@ fn gpu_mla_dense_streaming_matches_cpu() {
 /// `--prefix-cache-size` used to be refused with `--device gpu`.
 #[test]
 fn gpu_resumed_prefix_matches_full_prefill() {
-    let cfg = small_cfg();
-    let num_layers = 3u32;
-    let layers = random_layers(&cfg, num_layers, 0x9E7C);
-    let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
-    let kv_cfg = KvCacheConfig {
-        num_layers,
-        num_kv_heads: cfg.num_kv_heads as u32,
-        head_dim: cfg.head_dim as u32,
-        block_size: 16,
-    };
-
-    // Decode `steps` tokens, optionally snapshotting after `split` of them and
-    // resuming from that snapshot — the two must agree step for step.
-    // With fp16 KV the snapshot converts fp16 -> f32 on the way out and back on
-    // resume. Every fp16 value survives that exactly, so the tolerance is the same.
-    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::F16] {
-        let run = |split: Option<usize>| -> Vec<Vec<f32>> {
-            let mut orch = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
-            let mut h: Vec<f32> = (0..cfg.hidden_size)
-                .map(|i| (i as f32) * 0.02 - 0.3)
-                .collect();
-            let mut out = Vec::new();
-            for step in 0..6 {
-                if Some(step) == split {
-                    // Round-trip the session through a synced snapshot.
-                    let snap = orch.snapshot_synced().unwrap();
-                    orch = ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap)
-                        .unwrap();
-                }
-                orch.decode_token(&mut h).unwrap();
-                out.push(h.clone());
-            }
-            out
+    use dlm::forward::KvQuant;
+    // int8 KV needs heads a multiple of 32 wide (`int8_kv_cfg`).
+    let cases = [
+        (small_cfg(), &[KvQuant::None, KvQuant::F16][..]),
+        (int8_kv_cfg(), &[KvQuant::Int8][..]),
+    ];
+    for (cfg, quants) in cases {
+        let num_layers = 3u32;
+        let layers = random_layers(&cfg, num_layers, 0x9E7C);
+        let gpu = GpuKernel::new(cfg, layers, 64).unwrap();
+        let kv_cfg = KvCacheConfig {
+            num_layers,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            head_dim: cfg.head_dim as u32,
+            block_size: 16,
         };
 
-        let straight = run(None);
-        // Resume mid-sequence, where there is real history to carry across.
-        let resumed = run(Some(3));
-        for (step, (a, b)) in straight.iter().zip(&resumed).enumerate() {
-            let max_diff = a
-                .iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
+        // Decode `steps` tokens, optionally snapshotting after `split` of them and
+        // resuming from that snapshot — the two must agree step for step.
+        // With fp16 KV the snapshot converts fp16 -> f32 on the way out and back on
+        // resume. Every fp16 value survives that exactly, so the tolerance is the
+        // same; so does every int8 group, whose largest value re-encodes to ±127.
+        for &quant in quants {
+            let run = |split: Option<usize>| -> Vec<Vec<f32>> {
+                let mut orch = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
+                let mut h: Vec<f32> = (0..cfg.hidden_size)
+                    .map(|i| (i as f32) * 0.02 - 0.3)
+                    .collect();
+                let mut out = Vec::new();
+                for step in 0..6 {
+                    if Some(step) == split {
+                        // Round-trip the session through a synced snapshot.
+                        let snap = orch.snapshot_synced().unwrap();
+                        orch =
+                            ForwardOrchestrator::resume(&gpu, PagedKvCache::new(kv_cfg, 16), snap)
+                                .unwrap();
+                    }
+                    orch.decode_token(&mut h).unwrap();
+                    out.push(h.clone());
+                }
+                out
+            };
+
+            let straight = run(None);
+            // Resume mid-sequence, where there is real history to carry across.
+            let resumed = run(Some(3));
+            for (step, (a, b)) in straight.iter().zip(&resumed).enumerate() {
+                let max_diff = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
                 max_diff < 1e-4,
                 "{quant:?}: step {step}: resumed prefix diverged from full prefill by {max_diff}"
             );
+            }
         }
     }
 }
@@ -1666,8 +1675,13 @@ fn assert_prefill_matches_cpu_kv<K: ComputeKernel>(
             .zip(&got)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
+        // int8 KV rounds each value to 1/254 of its group's largest magnitude.
+        let tol = match gpu_kv {
+            dlm::forward::KvQuant::Int8 | dlm::forward::KvQuant::Int4 => 1e-2,
+            _ => prefill_tol(),
+        };
         assert!(
-            max_diff < prefill_tol(),
+            max_diff < tol,
             "{what}: round {round} ({tokens} tokens) diverged by {max_diff}"
         );
         assert_eq!(orch_cpu.position(), orch_gpu.position(), "{what}");
@@ -1720,6 +1734,43 @@ fn gpu_prefill_matches_cpu_decode_with_f16_kv() {
         streaming,
         "streaming f16 kv",
         dlm::forward::KvQuant::F16,
+    );
+}
+
+/// A config whose heads are 32 wide: int8 device KV needs every 32-value group
+/// inside one head, and `small_cfg`'s 8-wide heads fall back to fp16.
+fn int8_kv_cfg() -> BlockConfig {
+    BlockConfig {
+        hidden_size: 64,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 32,
+        intermediate_size: 128,
+        ..small_cfg()
+    }
+}
+
+/// int8 device KV (`--kv-quant int8`) through prefill and decode, on the
+/// resident and the streaming kernel, against the CPU oracle's exact f32 KV.
+#[test]
+fn gpu_prefill_matches_cpu_decode_with_int8_kv() {
+    let cfg = int8_kv_cfg();
+    let layers = random_layers(&cfg, 3, 0x1E8);
+    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+    assert_prefill_matches_cpu_kv(
+        cfg,
+        layers.clone(),
+        gpu,
+        "dense int8 kv",
+        dlm::forward::KvQuant::Int8,
+    );
+    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+    assert_prefill_matches_cpu_kv(
+        cfg,
+        layers,
+        streaming,
+        "streaming int8 kv",
+        dlm::forward::KvQuant::Int8,
     );
 }
 
@@ -2600,6 +2651,19 @@ fn gpu_decode_batch_matches_solo_over_long_histories() {
             &|b| lens[b],
         );
     }
+    // int8 KV: both paths quantize each group the same way.
+    let cfg = int8_kv_cfg();
+    let gpu = GpuKernel::new(cfg, random_layers(&cfg, 2, 0x10F7), 320)
+        .unwrap()
+        .with_kv_pool_tokens(lens.len() * 320);
+    assert_decode_batch_matches_solo_after(
+        &gpu,
+        cfg,
+        lens.len(),
+        dlm::forward::KvQuant::Int8,
+        "long Int8",
+        &|b| lens[b],
+    );
 }
 
 #[test]
@@ -2804,7 +2868,7 @@ fn gpu_paged_kv_reuses_freed_blocks_out_of_order() {
     let gpu = GpuKernel::new(cfg, layers, 64)
         .unwrap()
         .with_kv_pool_tokens(8 * 16);
-    let total = gpu.kv_free_tokens(true).unwrap();
+    let total = gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap();
     assert_eq!(total, 8 * 16);
     {
         // Fill blocks in three sessions, then free the middle one's first, so the
@@ -2818,9 +2882,15 @@ fn gpu_paged_kv_reuses_freed_blocks_out_of_order() {
                 orch.decode_token(&mut h).unwrap();
             }
         }
-        assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 3 * 2 * 16);
+        assert_eq!(
+            gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+            total - 3 * 2 * 16
+        );
         orchs.remove(1);
-        assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 2 * 2 * 16);
+        assert_eq!(
+            gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+            total - 2 * 2 * 16
+        );
         let got = decode(&gpu, 40);
         let max_diff = got
             .iter()
@@ -2832,7 +2902,11 @@ fn gpu_paged_kv_reuses_freed_blocks_out_of_order() {
             "scrambled block table diverged by {max_diff}"
         );
     }
-    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total, "blocks came back");
+    assert_eq!(
+        gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+        total,
+        "blocks came back"
+    );
 
     // An exhausted pool refuses the next block, and frees it again once a
     // session ends.
@@ -2944,7 +3018,7 @@ fn gpu_prefix_snapshot_shares_kv_blocks() {
     let quant = dlm::forward::KvQuant::F16;
     let mut rng = Rng::new(0x5AE);
     let inputs: Vec<Vec<f32>> = (0..40).map(|_| rng.vec(cfg.hidden_size, 0.5)).collect();
-    let total = gpu.kv_free_tokens(true).unwrap();
+    let total = gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap();
 
     let mut orch = ForwardOrchestrator::new(&gpu, PagedKvCache::new(kv_cfg, 16), quant);
     let mut want = Vec::new();
@@ -2954,12 +3028,15 @@ fn gpu_prefix_snapshot_shares_kv_blocks() {
         want.push(h);
     }
     // 40 rows: three blocks.
-    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 48);
+    assert_eq!(
+        gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+        total - 48
+    );
 
     let snap = orch.snapshot_prefix(32).unwrap();
     assert_eq!(snap.position(), 32);
     assert_eq!(
-        gpu.kv_free_tokens(true).unwrap(),
+        gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
         total - 48,
         "sharing the prefix allocates nothing"
     );
@@ -2981,17 +3058,29 @@ fn gpu_prefix_snapshot_shares_kv_blocks() {
         );
     }
     // The resumed session's tail took one block of its own.
-    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 64);
+    assert_eq!(
+        gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+        total - 64
+    );
 
     // Blocks free only when nobody holds them: the original's third block now,
     // its private tail; the shared prefix once the snapshot and the resumed
     // session are gone too.
     drop(orch);
-    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 48);
+    assert_eq!(
+        gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+        total - 48
+    );
     drop(resumed);
-    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total - 32);
+    assert_eq!(
+        gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+        total - 32
+    );
     drop(snap);
-    assert_eq!(gpu.kv_free_tokens(true).unwrap(), total);
+    assert_eq!(
+        gpu.kv_free_tokens(dlm::forward::cpu::KvElem::F16).unwrap(),
+        total
+    );
 }
 
 /// With the prefix cache on, requests sharing an opening resume from shared

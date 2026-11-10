@@ -465,7 +465,7 @@ pub(crate) struct SlotKv {
     pub(crate) tables: DlmTables,
     pub(crate) num_positions: DlmInts,
     pub(crate) positions: DlmInts,
-    pub(crate) half: bool,
+    pub(crate) elem: crate::forward::cpu::KvElem,
     len: usize,
 }
 
@@ -487,7 +487,7 @@ impl SlotKv {
             positions: DlmInts {
                 v: [0; DLM_MAX_BATCH],
             },
-            half: false,
+            elem: crate::forward::cpu::KvElem::F32,
             len: 0,
         }
     }
@@ -506,7 +506,7 @@ impl SlotKv {
         self.tables.p[b] = kv.table;
         self.num_positions.v[b] = row as i32;
         self.positions.v[b] = position as i32;
-        self.half = kv.half;
+        self.elem = kv.elem;
         self.len += 1;
     }
 }
@@ -524,7 +524,8 @@ pub(crate) struct DlmBlockExt {
     o_bias: *const f32,
     up_bias: *const f32,
     down_bias: *const f32,
-    /// 1: the KV buffers hold fp16 (see [`KvLayerCache::device_half`]).
+    /// How the KV buffers hold their values: a `DLM_KV_*` code (see
+    /// [`KvElem`](crate::forward::cpu::KvElem)).
     kv_half: i32,
     /// The sequence's KV block table (single-sequence calls; batched calls pass
     /// one per slot).
@@ -557,7 +558,7 @@ impl DlmBlockExt {
     pub(crate) fn new(
         cfg: &BlockConfig,
         b: &GpuBlockBiases,
-        kv_half: bool,
+        kv: crate::forward::cpu::KvElem,
         kv_table: *const i32,
     ) -> Self {
         use crate::forward::cpu::{FfnKind, NormKind};
@@ -571,7 +572,7 @@ impl DlmBlockExt {
             o_bias: bias_ptr(&b.o),
             up_bias: bias_ptr(&b.up),
             down_bias: bias_ptr(&b.down),
-            kv_half: kv_half as i32,
+            kv_half: kv.code(),
             kv_table,
             kv_block_shift: crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
             // Filled by `with_weight_dtypes`; -1 in the first slot tells the
@@ -1291,7 +1292,12 @@ impl GpuKernel {
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
         // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
-        let kv_pools = crate::forward::kv_pool::KvPools::new(gpu_layers.len(), cfg.kv_dim(), cap);
+        let kv_pools = crate::forward::kv_pool::KvPools::new(
+            gpu_layers.len(),
+            cfg.kv_dim(),
+            cfg.head_dim,
+            cap,
+        );
         Ok(Self {
             cfg,
             kv_pools,
@@ -1374,7 +1380,7 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&cfg, &w.biases, slots.half, std::ptr::null())
+                &DlmBlockExt::new(&cfg, &w.biases, slots.elem, std::ptr::null())
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1441,7 +1447,7 @@ impl GpuKernel {
                 crate::forward::cpu::rope_mscale(cfg.for_layer(layer).rope_scaling),
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
-                &DlmBlockExt::new(cfg, &w.biases, slots.half, std::ptr::null())
+                &DlmBlockExt::new(cfg, &w.biases, slots.elem, std::ptr::null())
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1550,7 +1556,7 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&cfg, &w.biases, dkv.half, dkv.table)
+                &DlmBlockExt::new(&cfg, &w.biases, dkv.elem, dkv.table)
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1569,13 +1575,17 @@ impl GpuKernel {
 }
 
 impl ComputeKernel for GpuKernel {
-    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
-        Some(self.kv_pools.free_tokens(fp16))
+    fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
+        Some(self.kv_pools.free_tokens(elem))
     }
 
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
-        self.kv_pools =
-            crate::forward::kv_pool::KvPools::new(self.layers.len(), self.cfg.kv_dim(), tokens);
+        self.kv_pools = crate::forward::kv_pool::KvPools::new(
+            self.layers.len(),
+            self.cfg.kv_dim(),
+            self.cfg.head_dim,
+            tokens,
+        );
     }
 
     fn num_layers(&self) -> u32 {
@@ -1971,10 +1981,10 @@ impl GpuKernel {
                         crate::forward::cpu::rope_mscale(self.cfg.for_layer(layer).rope_scaling),
                         self.cfg.attn_scale(),
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
-                        dkv.half as i32,
+                        dkv.elem.code(),
                         dkv.table,
                         crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
-                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table)
+                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.elem, dkv.table)
                             .with_weight_dtypes(&w.dtypes),
                     )
                 };
@@ -2030,7 +2040,7 @@ impl GpuKernel {
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table)
+                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.elem, dkv.table)
                             .with_weight_dtypes(&w.dtypes),
                     )
                 };
@@ -2133,10 +2143,10 @@ impl ComputeKernel for MultiGpuKernel {
         self.layer_map.len() as u32
     }
 
-    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+    fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
         self.stages
             .iter()
-            .filter_map(|s| s.kv_free_tokens(fp16))
+            .filter_map(|s| s.kv_free_tokens(elem))
             .min()
     }
 

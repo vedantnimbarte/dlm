@@ -40,6 +40,25 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--kv-quant int8` (and `int4`) now keeps the GPU KV cache in int8: 1.76x
+  or more the tokens in the same VRAM.** Both used to mean fp16 on the GPU.
+  Each 32 values are now a float scale and 32 int8 codes, 1.125 bytes a value
+  against fp16's 2; models whose heads are not a multiple of 32 wide keep
+  fp16. The pool sizing and the fit check count it, and the server prints the
+  pool (`kv cache : N tokens`). On a GTX 1650, Qwen2.5-1.5B Q4_K_M at
+  `--context-length 32768` with four requests: 74,608 tokens of fp16 KV fit
+  beside the weights, against all 131,072 in int8. Decode and prefill speed
+  are within a few percent of fp16 (0.5B Q4_K_M, 3,000-token prompt: batch 8
+  decode 354 -> 365 tok/s, prefill 1,130 -> 1,090).
+
+  **It costs accuracy, so fp16 stays the default.** Scoring 833 tokens of
+  this README through the decode kernels (`dlm score --decode`) on
+  Qwen2.5-0.5B: mean NLL 2.841 with fp16 KV, 2.901 with int8 (the CPU's int8
+  store, the same scheme: 2.878). Qwen's keys have a few channels far larger
+  than the rest, and a 32-value group holding one quantizes its neighbours
+  coarsely; per-channel key scales are the known fix. The GPU's int8 agrees
+  with the CPU's to 1e-7 on the same inputs.
+
 - **Sampled decode is 4-8x faster at batch 16: candidates are found on the
   GPU.** A temperature/top-k/top-p step copied each sequence's whole row of
   logits to the host (600 KB on Qwen2.5) and found the softmax total and the

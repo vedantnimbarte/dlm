@@ -800,7 +800,7 @@ impl<K: ComputeKernel> Generator<K> {
     /// precision, or `None` if the kernel has no fixed pool (the CPU kernels).
     pub fn kv_free_tokens(&self) -> Option<usize> {
         self.kernel
-            .kv_free_tokens(self.kv_quant != crate::forward::KvQuant::None)
+            .kv_free_tokens(crate::forward::cpu::KvElem::for_quant(self.kv_quant))
     }
 
     /// A fresh single-sequence orchestrator over this generator's kernel and KV

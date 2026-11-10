@@ -1373,6 +1373,22 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
 // `kv_append_kernel`, so the choice is one template argument.
 #define DLM_KV_F32 0
 #define DLM_KV_F16 1
+// int8 (`--kv-quant int8/int4`): each run of 32 values is a 36-byte group, a
+// float scale then 32 signed codes, so value `i` is code `i % 32` of group
+// `i / 32` and the element indexing above it is unchanged. 1.125 bytes a
+// value against fp16's 2. A group must lie inside one head: the writes take its
+// scale from one warp's 32 lanes (`kv_store_i8`), so the host keeps fp16 for
+// heads that are not a multiple of 32.
+#define DLM_KV_I8 2
+#define KV_I8_GROUP_BYTES 36
+
+// Launch `...` (which names the element type `KT_`) for KV held as `kind`.
+#define DLM_KV_SWITCH(kind, ...)                                        \
+    switch (kind) {                                                     \
+        case DLM_KV_I8: { constexpr int KT_ = DLM_KV_I8; __VA_ARGS__; } break;   \
+        case DLM_KV_F16: { constexpr int KT_ = DLM_KV_F16; __VA_ARGS__; } break; \
+        default: { constexpr int KT_ = DLM_KV_F32; __VA_ARGS__; } break;         \
+    }
 template <int KT>
 __device__ __forceinline__ float load_kv(const void* kv, long i);
 template <>
@@ -1382,6 +1398,25 @@ __device__ __forceinline__ float load_kv<DLM_KV_F32>(const void* kv, long i) {
 template <>
 __device__ __forceinline__ float load_kv<DLM_KV_F16>(const void* kv, long i) {
     return __half2float(((const __half*)kv)[i]);
+}
+template <>
+__device__ __forceinline__ float load_kv<DLM_KV_I8>(const void* kv, long i) {
+    const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
+    return *(const float*)g * (float)(signed char)g[4 + (i & 31)];
+}
+
+// Write 32 values, one per lane of a full warp, as the int8 group starting at
+// element `at` (a multiple of 32): the group's largest magnitude over 127 is
+// its scale.
+__device__ __forceinline__ void kv_store_i8(float x, void* kv, long at) {
+    const int lane = threadIdx.x & 31;
+    float amax = fabsf(x);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float scale = amax / 127.0f;
+    unsigned char* g = (unsigned char*)kv + (at >> 5) * KV_I8_GROUP_BYTES;
+    g[4 + lane] = (unsigned char)(signed char)(scale > 0.0f ? __float2int_rn(x / scale) : 0);
+    if (lane == 0) *(float*)g = scale;
 }
 
 // The KV cache is paged. A layer's keys (and values) live in one pool of
@@ -1403,6 +1438,14 @@ __global__ void kv_append_kernel(const float* src, void* kv, const int* table, i
     long at = kv_row(table, shift, row) * n + i;
     if (KT == DLM_KV_F16) ((__half*)kv)[at] = __float2half(src[i]);
     else ((float*)kv)[at] = src[i];
+}
+
+// `kv_append_kernel` for int8: one warp per 32-value group. `n % 32 == 0`.
+// <<<n / 32, 32>>>.
+__global__ void kv_append_i8_kernel(const float* src, void* kv, const int* table, int shift,
+                                    long row, int n) {
+    const int i = blockIdx.x * 32 + threadIdx.x;
+    kv_store_i8(src[i], kv, kv_row(table, shift, row) * n + blockIdx.x * 32);
 }
 
 template <int KT>
@@ -1680,9 +1723,17 @@ typedef struct { float* p[DLM_MAX_BATCH]; } DlmSlots;
 typedef struct { const int* p[DLM_MAX_BATCH]; } DlmTables;
 typedef struct { int v[DLM_MAX_BATCH]; } DlmInts;
 
+// Eight values from element `i`, a multiple of 8.
 template <int KT>
 __device__ __forceinline__ void load_kv8(const void* kv, long i, float* out) {
-    if (KT == DLM_KV_F16) {
+    if (KT == DLM_KV_I8) {
+        const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
+        const float s = *(const float*)g;
+        const unsigned int* c = (const unsigned int*)(g + 4 + (i & 31));   // 4-byte aligned
+        const unsigned int u[2] = {c[0], c[1]};
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = s * (float)(signed char)(u[j >> 2] >> (8 * (j & 3)));
+    } else if (KT == DLM_KV_F16) {
         uint4 v = *(const uint4*)((const __half*)kv + i);
         unsigned int u[4] = {v.x, v.y, v.z, v.w};
         #pragma unroll
@@ -1909,32 +1960,18 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
         const int splits = (span + C - 1) / C;
         size_t shmem = (size_t)(G * head_dim + G * C + 2 * G) * sizeof(float);
         dim3 grid(num_kv_heads, splits);
-        if (kv_half)
-            attn_split_kernel<DLM_KV_F16><<<grid, C, shmem>>>(q, keys, values, table, shift, num_heads,
-                                                              num_kv_heads, head_dim, start, span,
-                                                              scale, softcap, scores, ctx);
-        else
-            attn_split_kernel<DLM_KV_F32><<<grid, C, shmem>>>(q, keys, values, table, shift, num_heads,
-                                                              num_kv_heads, head_dim, start, span,
-                                                              scale, softcap, scores, ctx);
+        DLM_KV_SWITCH(kv_half, attn_split_kernel<KT_><<<grid, C, shmem>>>(
+            q, keys, values, table, shift, num_heads, num_kv_heads, head_dim, start, span, scale,
+            softcap, scores, ctx));
         if (splits > 1) attn_combine_kernel<<<num_heads, 128>>>(scores, ctx, num_heads, head_dim, splits);
         return cudaSuccess;
     }
-    if (kv_half)
-        attn_scores_kernel<DLM_KV_F16><<<grid_for(num_heads * span, B), B>>>(
-            q, keys, table, shift, scores, num_heads, num_kv_heads, head_dim, start, span, scale,
-            softcap);
-    else
-        attn_scores_kernel<DLM_KV_F32><<<grid_for(num_heads * span, B), B>>>(
-            q, keys, table, shift, scores, num_heads, num_kv_heads, head_dim, start, span, scale,
-            softcap);
+    DLM_KV_SWITCH(kv_half, attn_scores_kernel<KT_><<<grid_for(num_heads * span, B), B>>>(
+        q, keys, table, shift, scores, num_heads, num_kv_heads, head_dim, start, span, scale,
+        softcap));
     attn_softmax_kernel<<<num_heads, SOFTMAX_THREADS>>>(scores, num_heads, span);
-    if (kv_half)
-        attn_mix_kernel<DLM_KV_F16><<<grid_for(num_heads * head_dim, B), B>>>(
-            scores, values, table, shift, ctx, num_heads, num_kv_heads, head_dim, start, span);
-    else
-        attn_mix_kernel<DLM_KV_F32><<<grid_for(num_heads * head_dim, B), B>>>(
-            scores, values, table, shift, ctx, num_heads, num_kv_heads, head_dim, start, span);
+    DLM_KV_SWITCH(kv_half, attn_mix_kernel<KT_><<<grid_for(num_heads * head_dim, B), B>>>(
+        scores, values, table, shift, ctx, num_heads, num_kv_heads, head_dim, start, span));
     return cudaSuccess;
 }
 
@@ -1942,7 +1979,10 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
 static void launch_kv_append(const float* k, const float* v, void* keys, void* values,
                              const int* table, int shift, long row, int kv_dim, int kv_half) {
     const int B = 256;
-    if (kv_half) {
+    if (kv_half == DLM_KV_I8) {
+        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
+        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
+    } else if (kv_half) {
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(k, keys, table, shift, row, kv_dim);
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(v, values, table, shift, row, kv_dim);
     } else {
@@ -2136,7 +2176,7 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
         }
         vec[i] = a;
         vec[i + half] = b;
-        if (is_k) {
+        if (is_k && KT != DLM_KV_I8) {
             if (KT == DLM_KV_F16) {
                 ((__half*)kv_keys)[dst + i] = __float2half(a);
                 ((__half*)kv_keys)[dst + i + half] = __float2half(b);
@@ -2148,6 +2188,16 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
     }
     if (is_k) {
         const float* vh = v + (long)head * head_dim;
+        if (KT == DLM_KV_I8) {
+            // Whole groups (head_dim % 32 == 0), each lane's value written by
+            // another lane above: wait for the warp's writes to `vec`.
+            __syncwarp();
+            for (int g = 0; g < head_dim; g += 32) {
+                kv_store_i8(vec[g + lane], kv_keys, dst + g);
+                kv_store_i8(vh[g + lane], kv_values, dst + g);
+            }
+            return;
+        }
         for (int i = lane; i < head_dim; i += 32) {
             if (KT == DLM_KV_F16) ((__half*)kv_values)[dst + i] = __float2half(vh[i]);
             else ((float*)kv_values)[dst + i] = vh[i];
@@ -2190,14 +2240,9 @@ static void launch_qk_post(float* q, float* k, const float* v, const float* q_no
                            void* keys, void* values, const int* table, int shift, long row,
                            int kv_half, int tokens = 1) {
     dim3 grid(num_heads + num_kv_heads, tokens);
-    if (kv_half)
-        qk_post_kernel<DLM_KV_F16><<<grid, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                 head_dim, position, inv_freq, mscale, rope, eps,
-                                                 keys, values, table, shift, row);
-    else
-        qk_post_kernel<DLM_KV_F32><<<grid, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                 head_dim, position, inv_freq, mscale, rope, eps,
-                                                 keys, values, table, shift, row);
+    DLM_KV_SWITCH(kv_half, qk_post_kernel<KT_><<<grid, 32>>>(
+        q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position, inv_freq, mscale,
+        rope, eps, keys, values, table, shift, row));
 }
 
 // The per-slot half of a batched decode layer's attention, for every slot at
@@ -2235,14 +2280,9 @@ static cudaError_t launch_attention_slots(float* q, float* k, const float* v, fl
     }
 
     dim3 post(num_heads + num_kv_heads, batch);
-    if (kv_half)
-        qk_post_slots_kernel<DLM_KV_F16><<<post, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                      head_dim, *positions, inv_freq, mscale, rope, eps,
-                                                      *keys, *values, *tables, shift, *num_positions);
-    else
-        qk_post_slots_kernel<DLM_KV_F32><<<post, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                      head_dim, *positions, inv_freq, mscale, rope, eps,
-                                                      *keys, *values, *tables, shift, *num_positions);
+    DLM_KV_SWITCH(kv_half, qk_post_slots_kernel<KT_><<<post, 32>>>(
+        q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, *positions, inv_freq, mscale,
+        rope, eps, *keys, *values, *tables, shift, *num_positions));
 
     // Partials for every slot, each sized to the longest span rounded up as
     // `launch_attention` does, so the slot grows in steps, not every token.
@@ -2262,14 +2302,9 @@ static cudaError_t launch_attention_slots(float* q, float* k, const float* v, fl
 
     size_t shmem = (size_t)(G * head_dim + G * C + 2 * G) * sizeof(float);
     dim3 grid(num_kv_heads, splits, batch);
-    if (kv_half)
-        attn_split_slots_kernel<DLM_KV_F16><<<grid, C, shmem>>>(
-            q, *keys, *values, *tables, shift, num_heads, num_kv_heads, head_dim, *num_positions,
-            sliding_window, scale, softcap, part, part_stride, ctx);
-    else
-        attn_split_slots_kernel<DLM_KV_F32><<<grid, C, shmem>>>(
-            q, *keys, *values, *tables, shift, num_heads, num_kv_heads, head_dim, *num_positions,
-            sliding_window, scale, softcap, part, part_stride, ctx);
+    DLM_KV_SWITCH(kv_half, attn_split_slots_kernel<KT_><<<grid, C, shmem>>>(
+        q, *keys, *values, *tables, shift, num_heads, num_kv_heads, head_dim, *num_positions,
+        sliding_window, scale, softcap, part, part_stride, ctx));
     if (splits > 1)
         attn_combine_slots_kernel<<<dim3(num_heads, batch), 128>>>(
             part, part_stride, ctx, num_heads, head_dim, *num_positions, sliding_window, C);
@@ -3448,14 +3483,9 @@ extern "C" int dlm_prefill_block(
         const int C = head_dim > 128 ? 256 : 128;
         size_t shmem = (size_t)(G * head_dim + G * C + 3 * G) * sizeof(float);
         dim3 grid(num_kv_heads, T);
-        if (o->kv_half)
-            attn_prefill_kernel<DLM_KV_F16><<<grid, C, shmem>>>(q, kv_keys, kv_values, o->kv_table,
-                o->kv_block_shift, num_heads, num_kv_heads, head_dim, history, sliding_window,
-                attn_scale, attn_softcap, ctx);
-        else
-            attn_prefill_kernel<DLM_KV_F32><<<grid, C, shmem>>>(q, kv_keys, kv_values, o->kv_table,
-                o->kv_block_shift, num_heads, num_kv_heads, head_dim, history, sliding_window,
-                attn_scale, attn_softcap, ctx);
+        DLM_KV_SWITCH(o->kv_half, attn_prefill_kernel<KT_><<<grid, C, shmem>>>(
+            q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
+            head_dim, history, sliding_window, attn_scale, attn_softcap, ctx));
     }
     const long TH = (long)T * hidden_size;
     if (gemma2 || o->parallel) {

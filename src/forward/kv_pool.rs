@@ -8,8 +8,13 @@
 //! (`kv_row` in `src/gpu/kernels.cu`).
 
 use crate::error::{DlmError, Result};
+use crate::forward::cpu::KvElem;
 use crate::gpu::device::DeviceBuffer;
 use std::sync::{Arc, Mutex};
+
+/// Values per int8 group ([`KvElem::I8`]): a 4-byte f32 scale, then the codes.
+const I8_GROUP: usize = 32;
+const I8_GROUP_BYTES: usize = 4 + I8_GROUP;
 
 /// Rows per block, as a shift: the kernels map rows with shifts, not division.
 pub const KV_BLOCK_SHIFT: u32 = 4;
@@ -22,8 +27,7 @@ const _: () = assert!(KV_BLOCK_ROWS == crate::batching::KV_BLOCK_TOKENS);
 pub struct KvPool {
     keys: DeviceBuffer,
     values: DeviceBuffer,
-    /// Elements are fp16, not f32.
-    half: bool,
+    elem: KvElem,
     kv_dim: usize,
     total_blocks: u32,
     blocks: Mutex<Blocks>,
@@ -37,20 +41,19 @@ struct Blocks {
 }
 
 impl KvPool {
-    /// A pool of `blocks` blocks for K/V of width `kv_dim`, in fp16 when `half`.
-    pub fn new(blocks: u32, kv_dim: usize, half: bool) -> Result<Self> {
+    /// A pool of `blocks` blocks for K/V of width `kv_dim`, held as `elem`.
+    /// [`KvElem::I8`] needs `kv_dim` to be a whole number of groups.
+    pub fn new(blocks: u32, kv_dim: usize, elem: KvElem) -> Result<Self> {
         let elems = blocks as usize * KV_BLOCK_ROWS * kv_dim;
-        let alloc = || {
-            if half {
-                DeviceBuffer::new_bytes(elems * 2, elems)
-            } else {
-                DeviceBuffer::new(elems)
-            }
+        debug_assert!(elem != KvElem::I8 || kv_dim % I8_GROUP == 0);
+        let alloc = || match elem {
+            KvElem::F32 => DeviceBuffer::new(elems),
+            _ => DeviceBuffer::new_bytes(bytes_of(elem, elems), elems),
         };
         Ok(Self {
             keys: alloc()?,
             values: alloc()?,
-            half,
+            elem,
             kv_dim,
             total_blocks: blocks,
             blocks: Mutex::new(Blocks {
@@ -61,8 +64,8 @@ impl KvPool {
         })
     }
 
-    pub fn half(&self) -> bool {
-        self.half
+    pub fn elem(&self) -> KvElem {
+        self.elem
     }
 
     /// Tokens the free blocks can hold.
@@ -116,41 +119,72 @@ impl KvPool {
         }
     }
 
-    fn elem_bytes(&self) -> usize {
-        if self.half {
-            2
-        } else {
-            4
-        }
-    }
-
     /// Byte offset of the first element of `block` in either pool buffer.
     fn block_offset(&self, block: u32) -> usize {
-        block as usize * KV_BLOCK_ROWS * self.kv_dim * self.elem_bytes()
+        bytes_of(self.elem, block as usize * KV_BLOCK_ROWS * self.kv_dim)
     }
 
-    /// Encode f32 rows in the pool's element type.
+    /// Encode f32 rows in the pool's element type. An int8 group takes its
+    /// largest magnitude over 127 as its scale, as the kernels' writes do.
     fn encode(&self, rows: &[f32]) -> Vec<u8> {
-        if self.half {
-            rows.iter()
+        match self.elem {
+            KvElem::F32 => rows.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            KvElem::F16 => rows
+                .iter()
                 .flat_map(|&v| crate::storage::f32_to_f16(v).to_le_bytes())
-                .collect()
-        } else {
-            rows.iter().flat_map(|v| v.to_le_bytes()).collect()
+                .collect(),
+            KvElem::I8 => rows
+                .chunks(I8_GROUP)
+                .flat_map(|g| {
+                    let scale = g.iter().fold(0.0f32, |m, v| m.max(v.abs())) / 127.0;
+                    let codes = g.iter().map(move |&v| {
+                        let q = if scale > 0.0 {
+                            (v / scale).round()
+                        } else {
+                            0.0
+                        };
+                        q as i8 as u8
+                    });
+                    scale.to_le_bytes().into_iter().chain(codes)
+                })
+                .collect(),
         }
     }
 
     /// Decode pool bytes into f32 rows.
     fn decode(&self, bytes: &[u8], out: &mut [f32]) {
-        if self.half {
-            for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                *o = crate::storage::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        match self.elem {
+            KvElem::F32 => {
+                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
             }
-        } else {
-            for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-                *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            KvElem::F16 => {
+                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                    *o = crate::storage::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                }
+            }
+            KvElem::I8 => {
+                for (o, g) in out
+                    .chunks_mut(I8_GROUP)
+                    .zip(bytes.chunks_exact(I8_GROUP_BYTES))
+                {
+                    let scale = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+                    for (v, &c) in o.iter_mut().zip(&g[4..]) {
+                        *v = scale * (c as i8) as f32;
+                    }
+                }
             }
         }
+    }
+}
+
+/// Bytes `elems` K/V values take as `elem` (a whole number of int8 groups).
+fn bytes_of(elem: KvElem, elems: usize) -> usize {
+    match elem {
+        KvElem::F32 => elems * 4,
+        KvElem::F16 => elems * 2,
+        KvElem::I8 => elems / I8_GROUP * I8_GROUP_BYTES,
     }
 }
 
@@ -265,7 +299,6 @@ impl PagedKv {
     /// Read rows `0..keys.len() / kv_dim` of keys and values back as f32.
     pub(crate) fn download_rows(&self, keys: &mut [f32], values: &mut [f32]) -> Result<()> {
         let per_block = KV_BLOCK_ROWS * self.pool.kv_dim;
-        let eb = self.pool.elem_bytes();
         let mut bytes = Vec::new();
         for (i, (k, v)) in keys
             .chunks_mut(per_block)
@@ -273,7 +306,7 @@ impl PagedKv {
             .enumerate()
         {
             let at = self.pool.block_offset(self.blocks[i]);
-            bytes.resize(k.len() * eb, 0);
+            bytes.resize(bytes_of(self.pool.elem, k.len()), 0);
             self.pool.keys.download_bytes_at(at, &mut bytes)?;
             self.pool.decode(&bytes, k);
             self.pool.values.download_bytes_at(at, &mut bytes)?;
@@ -287,7 +320,7 @@ impl std::fmt::Debug for PagedKv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PagedKv")
             .field("blocks", &self.blocks.len())
-            .field("half", &self.pool.half)
+            .field("elem", &self.pool.elem)
             .finish()
     }
 }
@@ -299,20 +332,37 @@ impl Drop for PagedKv {
 }
 
 /// Every layer's pools for one kernel, created on first use: one per element
-/// type a session asks for (f32, fp16).
+/// type a session asks for.
 pub struct KvPools {
-    layers: Vec<Mutex<[Option<Arc<KvPool>>; 2]>>,
+    layers: Vec<Mutex<[Option<Arc<KvPool>>; 3]>>,
     blocks: u32,
     kv_dim: usize,
+    /// int8 groups fit inside heads (`head_dim % 32 == 0`); else int8 asks get
+    /// fp16 pools.
+    int8: bool,
 }
 
 impl KvPools {
-    /// Pools for `num_layers` layers holding up to `tokens` tokens each.
-    pub fn new(num_layers: usize, kv_dim: usize, tokens: usize) -> Self {
+    /// Pools for `num_layers` layers of K/V width `kv_dim` (heads of
+    /// `head_dim`) holding up to `tokens` tokens each.
+    pub fn new(num_layers: usize, kv_dim: usize, head_dim: usize, tokens: usize) -> Self {
         Self {
-            layers: (0..num_layers).map(|_| Mutex::new([None, None])).collect(),
+            layers: (0..num_layers)
+                .map(|_| Mutex::new([None, None, None]))
+                .collect(),
             blocks: tokens.div_ceil(KV_BLOCK_ROWS).max(1).min(u32::MAX as usize) as u32,
             kv_dim,
+            int8: head_dim > 0 && head_dim % I8_GROUP == 0 && kv_dim % I8_GROUP == 0,
+        }
+    }
+
+    /// The element type a session asking for `elem` gets: int8 only where its
+    /// groups fit inside heads.
+    pub fn elem_for(&self, elem: KvElem) -> KvElem {
+        if elem == KvElem::I8 && !self.int8 {
+            KvElem::F16
+        } else {
+            elem
         }
     }
 
@@ -321,25 +371,28 @@ impl KvPools {
         self.blocks as usize * KV_BLOCK_ROWS
     }
 
-    /// Layer `layer`'s pool at `half` precision, allocated on first use.
-    pub fn get(&self, layer: usize, half: bool) -> Result<Arc<KvPool>> {
+    /// Layer `layer`'s pool for `elem` ([`elem_for`](Self::elem_for)),
+    /// allocated on first use.
+    pub fn get(&self, layer: usize, elem: KvElem) -> Result<Arc<KvPool>> {
+        let elem = self.elem_for(elem);
         let mut slots = self.layers[layer].lock().unwrap();
-        let slot = &mut slots[half as usize];
+        let slot = &mut slots[elem.code() as usize];
         if let Some(pool) = slot {
             return Ok(Arc::clone(pool));
         }
-        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dim, half)?);
+        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dim, elem)?);
         *slot = Some(Arc::clone(&pool));
         Ok(pool)
     }
 
-    /// Tokens every layer can still take at `half` precision. Layers all grow
-    /// together, so the fullest layer bounds what a session can still add.
-    pub fn free_tokens(&self, half: bool) -> usize {
+    /// Tokens every layer can still take for `elem`. Layers all grow together,
+    /// so the fullest layer bounds what a session can still add.
+    pub fn free_tokens(&self, elem: KvElem) -> usize {
+        let elem = self.elem_for(elem);
         self.layers
             .iter()
             .map(|l| {
-                l.lock().unwrap()[half as usize]
+                l.lock().unwrap()[elem.code() as usize]
                     .as_ref()
                     .map_or(self.capacity_tokens(), |p| p.free_tokens())
             })
