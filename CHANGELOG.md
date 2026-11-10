@@ -40,6 +40,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Batched f32/bf16/f16 projections take four weight rows per warp.** At
+  batch 8-16 the batched GEMV was bound by loads, not memory: it re-read
+  every sequence's activations for each weight row, eight floats for eight
+  multiply-adds. A warp now decodes four rows' chunks and multiplies each
+  activation chunk it loads into all four, with the batch size fixed at
+  compile time (4, 8 or 16) so the accumulators stay in registers. The
+  quantized formats keep their int8-activation kernel. The previous commit
+  and this one alternately, twice, same setup as below:
+
+  | Batch | Before | After |
+  |---|---|---|
+  | 4 | 270 | 310 |
+  | 8 | 291 | 419 |
+  | 16 | 324 | 496 |
+
+  Batch 1 and prefill take other kernels and measured the same once the run
+  order was reversed (the card runs warmer later in a series).
+
 - **Batched attention runs in three launches for the whole batch.** The fused
   batched block read each weight once for all sequences, but still launched
   Q/K norm, RoPE, the K/V append and split-K attention slot by slot: 2-3 small

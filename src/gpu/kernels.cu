@@ -2515,6 +2515,85 @@ __global__ void __launch_bounds__(32 * MV_ROWS, 6) matvec_batched_chunk_kernel(c
     }
 }
 
+// The chunked batch GEMV with R weight rows per warp and the slot count fixed
+// at compile time (TB, the batch rounded up). The kernel above loads every
+// slot's activations once per weight row, eight floats for eight multiply-adds,
+// so at batch 16 the load units, not memory, set its speed. Here each loaded
+// activation chunk is used for R rows, and a warp's accumulators are R x TB
+// registers rather than a fixed sixteen. Launch
+// <<<ceil(out_dim / (R * MV_ROWS)), 32 * MV_ROWS>>>.
+template <int DT, int R, int TB>
+__global__ void __launch_bounds__(32 * MV_ROWS)
+matvec_batched_rows_kernel(const void* __restrict__ W, const float* __restrict__ x,
+                           const float* __restrict__ bias, float* __restrict__ out, int out_dim,
+                           int in_dim, int group_size, int batch) {
+    const int N = Chunk<DT>::N;
+    const int o0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (o0 >= out_dim) return;
+    const long n = (long)out_dim * in_dim;
+    float acc[R][TB];
+    #pragma unroll
+    for (int r = 0; r < R; ++r)
+        #pragma unroll
+        for (int b = 0; b < TB; ++b) acc[r][b] = 0.0f;
+    for (int i = lane * N; i < in_dim; i += 32 * N) {
+        float w[R][N];
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (o0 + r < out_dim) Chunk<DT>::decode(W, (long)(o0 + r) * in_dim + i, n, group_size, w[r]);
+            else
+                #pragma unroll
+                for (int j = 0; j < N; ++j) w[r][j] = 0.0f;
+        }
+        #pragma unroll
+        for (int b = 0; b < TB; ++b) {
+            if (b < batch) {
+                const float4* x4 = (const float4*)(x + (long)b * in_dim + i);
+                #pragma unroll
+                for (int q = 0; q < N / 4; ++q) {
+                    const float4 v = x4[q];
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        acc[r][b] += w[r][4 * q] * v.x + w[r][4 * q + 1] * v.y +
+                                     w[r][4 * q + 2] * v.z + w[r][4 * q + 3] * v.w;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int o = o0 + r;
+        const float bv = (bias && o < out_dim) ? bias[o] : 0.0f;
+        #pragma unroll
+        for (int b = 0; b < TB; ++b) {
+            if (b < batch) {
+                const float v = warp_sum(acc[r][b]);
+                if (lane == 0 && o < out_dim) out[(long)b * out_dim + o] = v + bv;
+            }
+        }
+    }
+}
+
+template <int DT, int R, int TB>
+static void launch_batched_rows(const void* W, const float* x, const float* bias, float* out,
+                                int out_dim, int in_dim, int group_size, int batch) {
+    const int per_block = R * MV_ROWS;
+    matvec_batched_rows_kernel<DT, R, TB><<<(out_dim + per_block - 1) / per_block, 32 * MV_ROWS>>>(
+        W, x, bias, out, out_dim, in_dim, group_size, batch);
+}
+
+// Four rows a warp, swept on a GTX 1650 with Qwen2.5-0.5B bf16 (decode tok/s at
+// batch 4 / 8 / 16): the one-row kernels 245 / 269 / 290, R = 1 243 / 268 /
+// 271, R = 2 276 / 339 / 356, R = 4 287 / 376 / 435-475. R = 8 holds 128
+// accumulators at batch 16 and falls back to 359-396 there.
+template <int DT>
+static void launch_batched_rows_tb(const void* W, const float* x, const float* bias, float* out,
+                                   int out_dim, int in_dim, int group_size, int batch) {
+    if (batch <= 4) launch_batched_rows<DT, 4, 4>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+    else if (batch <= 8) launch_batched_rows<DT, 4, 8>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+    else launch_batched_rows<DT, 4, 16>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+}
+
 // Up to this many slots the chunked kernel wins; past it the batch is compute
 // bound and the one-block-per-row kernel's higher occupancy (about 40 registers
 // to the chunked kernel's 80) gives more back. Measured on a GTX 1650, Qwen2.5
@@ -2562,6 +2641,20 @@ matvec_q8_batched_kernel(const void* __restrict__ W, const signed char* __restri
     }
 }
 
+// The multi-row kernel, for the formats with 8-weight chunks (f32, bf16, f16);
+// false, launching nothing, for any other format or shape.
+template <int DT>
+static bool try_batched_rows(const void* W, const float* x, const float* bias, float* out,
+                             int out_dim, int in_dim, int group_size, int batch) {
+    if constexpr (Chunk<DT>::N == 8) {
+        if (!chunk_fits<DT>(W, x, in_dim, group_size)) return false;
+        launch_batched_rows_tb<DT>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+        return true;
+    } else {
+        return false;
+    }
+}
+
 static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
                                   float* out, int out_dim, int in_dim, int group_size, int batch) {
     const signed char* xq;
@@ -2569,6 +2662,7 @@ static void launch_matvec_batched(int dt, const void* W, const float* x, const f
 #define DLM_CASE(D) case D: \
         if (q8_fits<D>(W, x, in_dim, group_size) && quantize_x(x, batch * in_dim, &xq, &xds)) \
             matvec_q8_batched_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch); \
+        else if (try_batched_rows<D>(W, x, bias, out, out_dim, in_dim, group_size, batch)) {} \
         else if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 && \
             chunk_fits<D>(W, x, in_dim, group_size)) \
             matvec_batched_chunk_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
@@ -2578,7 +2672,8 @@ static void launch_matvec_batched(int dt, const void* W, const float* x, const f
     switch (dt) {
         DLM_FOR_EACH_DTYPE(DLM_CASE)
         default:
-            if (batch <= MV_CHUNK_MAX_BATCH && chunk_fits<DLM_W_F32>(W, x, in_dim, group_size))
+            if (try_batched_rows<DLM_W_F32>(W, x, bias, out, out_dim, in_dim, group_size, batch)) {}
+            else if (batch <= MV_CHUNK_MAX_BATCH && chunk_fits<DLM_W_F32>(W, x, in_dim, group_size))
                 matvec_batched_chunk_kernel<DLM_W_F32><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(
                     W, x, bias, out, out_dim, in_dim, group_size, batch);
             else
