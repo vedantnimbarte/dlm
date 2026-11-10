@@ -236,12 +236,20 @@ pub fn enable() {
 /// Detach a subscriber. Collection stops, and the buffer is discarded, only
 /// when the last one leaves.
 pub fn disable() {
-    let prev = SUBSCRIBERS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_sub(1))
-    });
+    // A compare-and-swap loop rather than `fetch_update`, which current stable
+    // deprecates for `try_update` -- a name the 1.85 MSRV does not have.
+    let mut prev = SUBSCRIBERS.load(Ordering::Relaxed);
+    while let Err(seen) = SUBSCRIBERS.compare_exchange_weak(
+        prev,
+        prev.saturating_sub(1),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        prev = seen;
+    }
     // Only the transition to zero clears the ring; clearing on every detach
     // would throw away a live subscriber's unread events.
-    if matches!(prev, Ok(1)) {
+    if prev == 1 {
         if let Ok(mut ring) = ring().lock() {
             ring.clear();
         }
