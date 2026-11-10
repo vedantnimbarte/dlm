@@ -60,6 +60,9 @@ pub struct Report {
     pub quant: String,
     pub stream: bool,
     pub kv_quant: String,
+    /// `greedy`, or the `--temperature`/`--top-p`/`--top-k` the run sampled with.
+    #[serde(default)]
+    pub sampling: String,
     pub context_length: u32,
     pub prompt_len: usize,
     pub gen_len: usize,
@@ -156,7 +159,25 @@ pub fn prompt_ids(seed: &[u32], len: usize, vocab_size: usize) -> Vec<u32> {
         .collect()
 }
 
-/// Run every batch size in `opts.batch`, `opts.runs` times each, greedily.
+/// The sampler `opts` asks for, seeded with `seed`: greedy unless
+/// `--temperature` is above 0.
+pub fn sampler(opts: &BenchOpts, seed: u64) -> Sampler {
+    if opts.temperature > 0.0 {
+        Sampler::TopPK {
+            temperature: opts.temperature,
+            top_p: opts.top_p,
+            top_k: opts.top_k,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed,
+        }
+    } else {
+        Sampler::Greedy
+    }
+}
+
+/// Run every batch size in `opts.batch`, `opts.runs` times each, greedily or
+/// with the sampler `opts` asks for.
 pub fn run<K: ComputeKernel>(
     generator: &Generator<K>,
     prompt: &[u32],
@@ -181,6 +202,7 @@ pub fn run<K: ComputeKernel>(
                     opts.gen_len,
                     batch.max(1),
                     opts.breakdown,
+                    |i| sampler(opts, i as u64 + 1),
                 )?;
                 on_result(&r, run);
                 results.push(r);
@@ -200,12 +222,13 @@ fn run_once<K: ComputeKernel>(
     gen_len: usize,
     batch: usize,
     breakdown: bool,
+    sampler: impl Fn(usize) -> Sampler,
 ) -> Result<RunResult> {
     let prefill_start = Instant::now();
     let mut first_prefill = 0.0;
     let mut sessions = Vec::with_capacity(batch);
     for i in 0..batch {
-        sessions.push(generator.start_session(prompt, Sampler::Greedy)?);
+        sessions.push(generator.start_session(prompt, sampler(i))?);
         if i == 0 {
             first_prefill = prefill_start.elapsed().as_secs_f64();
         }
@@ -372,6 +395,7 @@ mod tests {
             quant: "Int4".into(),
             stream: false,
             kv_quant: "f16".into(),
+            sampling: "greedy".into(),
             context_length: 1024,
             prompt_len: 512,
             gen_len: 64,

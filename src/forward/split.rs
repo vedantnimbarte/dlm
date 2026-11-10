@@ -106,10 +106,10 @@ impl<F: ComputeKernel, B: ComputeKernel> ComputeKernel for SplitKernel<F, B> {
         self.back.prefill(hiddens, back, start)
     }
 
-    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+    fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
         match (
-            self.front.kv_free_tokens(fp16),
-            self.back.kv_free_tokens(fp16),
+            self.front.kv_free_tokens(elem),
+            self.back.kv_free_tokens(elem),
         ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),

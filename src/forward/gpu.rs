@@ -157,6 +157,26 @@ extern "C" {
         token_host: *mut i32,
     ) -> i32;
 
+    /// The LM head for sampling: per row of `x_host`, `(max logit, softmax
+    /// total at temps_host[r])` into `stats_host[2r..]`, and its `c` largest
+    /// logits sorted (logit descending, index ascending) into
+    /// `cand_l_host` / `cand_i_host[r * c..]`. `c <= 4096` and `c <= vocab`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_lm_head_top(
+        vocab: i32,
+        hidden_size: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        w: *const c_void,
+        x_host: *const f32,
+        batch: i32,
+        temps_host: *const f32,
+        c: i32,
+        stats_host: *mut f32,
+        cand_l_host: *mut f32,
+        cand_i_host: *mut i32,
+    ) -> i32;
+
     /// Which GEMM prefill runs on the current device: 0 the f32 kernel, 1 bf16
     /// and 2 fp16 tensor cores.
     pub(crate) fn dlm_gemm_mode() -> i32;
@@ -445,7 +465,7 @@ pub(crate) struct SlotKv {
     pub(crate) tables: DlmTables,
     pub(crate) num_positions: DlmInts,
     pub(crate) positions: DlmInts,
-    pub(crate) half: bool,
+    pub(crate) elem: crate::forward::cpu::KvElem,
     len: usize,
 }
 
@@ -467,7 +487,7 @@ impl SlotKv {
             positions: DlmInts {
                 v: [0; DLM_MAX_BATCH],
             },
-            half: false,
+            elem: crate::forward::cpu::KvElem::F32,
             len: 0,
         }
     }
@@ -486,7 +506,7 @@ impl SlotKv {
         self.tables.p[b] = kv.table;
         self.num_positions.v[b] = row as i32;
         self.positions.v[b] = position as i32;
-        self.half = kv.half;
+        self.elem = kv.elem;
         self.len += 1;
     }
 }
@@ -504,7 +524,8 @@ pub(crate) struct DlmBlockExt {
     o_bias: *const f32,
     up_bias: *const f32,
     down_bias: *const f32,
-    /// 1: the KV buffers hold fp16 (see [`KvLayerCache::device_half`]).
+    /// How the KV buffers hold their values: a `DLM_KV_*` code (see
+    /// [`KvElem`](crate::forward::cpu::KvElem)).
     kv_half: i32,
     /// The sequence's KV block table (single-sequence calls; batched calls pass
     /// one per slot).
@@ -537,7 +558,7 @@ impl DlmBlockExt {
     pub(crate) fn new(
         cfg: &BlockConfig,
         b: &GpuBlockBiases,
-        kv_half: bool,
+        kv: crate::forward::cpu::KvElem,
         kv_table: *const i32,
     ) -> Self {
         use crate::forward::cpu::{FfnKind, NormKind};
@@ -551,7 +572,7 @@ impl DlmBlockExt {
             o_bias: bias_ptr(&b.o),
             up_bias: bias_ptr(&b.up),
             down_bias: bias_ptr(&b.down),
-            kv_half: kv_half as i32,
+            kv_half: kv.code(),
             kv_table,
             kv_block_shift: crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
             // Filled by `with_weight_dtypes`; -1 in the first slot tells the
@@ -652,6 +673,10 @@ pub(crate) fn bias_ptr(b: &Option<DeviceBuffer>) -> *const f32 {
     b.as_ref().map_or(std::ptr::null(), |d| d.as_ptr())
 }
 
+/// The most sampling candidates [`GpuLmHead::top`] finds per row (`TOP_MAX` in
+/// `src/gpu/kernels.cu`).
+pub const TOP_CANDIDATES_MAX: usize = 4096;
+
 /// The LM head resident in VRAM. Decoding ends every step with a
 /// `vocab × hidden` GEMV -- 233M multiply-adds for a 151,936-token vocabulary at
 /// hidden 1536 -- which on the host costs more than the whole GPU layer stack
@@ -716,6 +741,73 @@ impl GpuLmHead {
         let mut tokens = vec![0i32; rows];
         self.run(x, rows, std::ptr::null_mut(), tokens.as_mut_ptr())?;
         Ok(tokens.into_iter().map(|t| t as u32).collect())
+    }
+
+    /// What sampling needs from each final-normed hidden state in `x`, found on
+    /// the device: `(max logit, sum over the vocabulary of exp((l - max) /
+    /// temps[r]), its c largest (logit, token) sorted by logit descending and
+    /// token ascending)`. Copies back `c` candidates a row instead of `vocab`
+    /// logits. `c` is at most [`TOP_CANDIDATES_MAX`] and the vocabulary size.
+    #[allow(clippy::type_complexity)]
+    pub fn top(
+        &self,
+        x: &[f32],
+        temps: &[f32],
+        c: usize,
+    ) -> Result<Vec<(f32, f32, Vec<(f32, u32)>)>> {
+        let rows = self.rows(x)?;
+        if temps.len() != rows {
+            return Err(DlmError::ShapeMismatch {
+                expected: rows,
+                got: temps.len(),
+            });
+        }
+        if c == 0 || c > TOP_CANDIDATES_MAX || c > self.vocab {
+            return Err(DlmError::InvalidConfig(format!(
+                "LM head candidates: {c} is outside 1..={}",
+                TOP_CANDIDATES_MAX.min(self.vocab)
+            )));
+        }
+        if let Some(id) = self.device {
+            crate::gpu::set_device(id)?;
+        }
+        let mut stats = vec![0.0f32; 2 * rows];
+        let mut cand_l = vec![0.0f32; rows * c];
+        let mut cand_i = vec![0i32; rows * c];
+        // SAFETY: `w` is a live device buffer of `vocab × hidden` weights in
+        // `w_dtype`; `x` holds `rows × hidden` floats (checked by `rows`),
+        // `temps` `rows` (checked above), and the outputs are host buffers of
+        // `2 × rows` and `rows × c`, with `c` in the range the kernel takes.
+        let code = unsafe {
+            dlm_lm_head_top(
+                self.vocab as i32,
+                self.hidden as i32,
+                self.w_dtype,
+                self.w_group_size,
+                self.w.as_ptr() as *const c_void,
+                x.as_ptr(),
+                rows as i32,
+                temps.as_ptr(),
+                c as i32,
+                stats.as_mut_ptr(),
+                cand_l.as_mut_ptr(),
+                cand_i.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_lm_head_top",
+                code,
+            });
+        }
+        Ok((0..rows)
+            .map(|r| {
+                let top = (r * c..(r + 1) * c)
+                    .map(|j| (cand_l[j], cand_i[j] as u32))
+                    .collect();
+                (stats[2 * r], stats[2 * r + 1], top)
+            })
+            .collect())
     }
 
     fn rows(&self, x: &[f32]) -> Result<usize> {
@@ -1200,7 +1292,12 @@ impl GpuKernel {
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
         // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
-        let kv_pools = crate::forward::kv_pool::KvPools::new(gpu_layers.len(), cfg.kv_dim(), cap);
+        let kv_pools = crate::forward::kv_pool::KvPools::new(
+            gpu_layers.len(),
+            cfg.kv_dim(),
+            cfg.head_dim,
+            cap,
+        );
         Ok(Self {
             cfg,
             kv_pools,
@@ -1283,7 +1380,7 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&cfg, &w.biases, slots.half, std::ptr::null())
+                &DlmBlockExt::new(&cfg, &w.biases, slots.elem, std::ptr::null())
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1350,7 +1447,7 @@ impl GpuKernel {
                 crate::forward::cpu::rope_mscale(cfg.for_layer(layer).rope_scaling),
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
-                &DlmBlockExt::new(cfg, &w.biases, slots.half, std::ptr::null())
+                &DlmBlockExt::new(cfg, &w.biases, slots.elem, std::ptr::null())
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1459,7 +1556,7 @@ impl GpuKernel {
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&cfg, &w.biases, dkv.half, dkv.table)
+                &DlmBlockExt::new(&cfg, &w.biases, dkv.elem, dkv.table)
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1478,13 +1575,17 @@ impl GpuKernel {
 }
 
 impl ComputeKernel for GpuKernel {
-    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
-        Some(self.kv_pools.free_tokens(fp16))
+    fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
+        Some(self.kv_pools.free_tokens(elem))
     }
 
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
-        self.kv_pools =
-            crate::forward::kv_pool::KvPools::new(self.layers.len(), self.cfg.kv_dim(), tokens);
+        self.kv_pools = crate::forward::kv_pool::KvPools::new(
+            self.layers.len(),
+            self.cfg.kv_dim(),
+            self.cfg.head_dim,
+            tokens,
+        );
     }
 
     fn num_layers(&self) -> u32 {
@@ -1880,10 +1981,10 @@ impl GpuKernel {
                         crate::forward::cpu::rope_mscale(self.cfg.for_layer(layer).rope_scaling),
                         self.cfg.attn_scale(),
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
-                        dkv.half as i32,
+                        dkv.elem.code(),
                         dkv.table,
                         crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
-                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table)
+                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.elem, dkv.table)
                             .with_weight_dtypes(&w.dtypes),
                     )
                 };
@@ -1939,7 +2040,7 @@ impl GpuKernel {
                         self.cfg.attn_logit_softcap.unwrap_or(0.0),
                         bias_ptr(&w.pre_ffn_norm),
                         bias_ptr(&w.post_ffn_norm),
-                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.half, dkv.table)
+                        &DlmBlockExt::new(&self.cfg, &w.biases, dkv.elem, dkv.table)
                             .with_weight_dtypes(&w.dtypes),
                     )
                 };
@@ -2042,10 +2143,10 @@ impl ComputeKernel for MultiGpuKernel {
         self.layer_map.len() as u32
     }
 
-    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
+    fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
         self.stages
             .iter()
-            .filter_map(|s| s.kv_free_tokens(fp16))
+            .filter_map(|s| s.kv_free_tokens(elem))
             .min()
     }
 

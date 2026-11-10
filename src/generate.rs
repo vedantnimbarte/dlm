@@ -24,6 +24,40 @@ use crate::grammar::Constraint;
 /// a long prompt; a streaming kernel loads each layer once per chunk.
 const PREFILL_CHUNK: usize = 512;
 
+/// What a session needs from the LM head for one hidden state
+/// ([`Generator::heads`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Want {
+    /// Only the greedy token.
+    Token,
+    /// The whole row of logits.
+    Logits,
+    /// Sampling candidates at this temperature: the `c` largest logits, the
+    /// largest, and the softmax total ([`SampleTop`]).
+    #[cfg_attr(
+        not(any(feature = "cuda-kernels", feature = "rocm-kernels")),
+        allow(dead_code)
+    )]
+    Top { temperature: f32, c: usize },
+}
+
+/// Candidates for sampling one row, found on the device: everything
+/// [`sample_topk_topp`] reads from the logits when the draw falls within them.
+struct SampleTop {
+    /// The largest logit.
+    max: f32,
+    /// Sum over the vocabulary of `exp((l - max) / temperature)`.
+    total: f32,
+    /// The largest logits as `(logit, token)`, by logit descending and token
+    /// ascending on ties.
+    top: Vec<(f32, u32)>,
+}
+
+/// Candidates fetched for a top-p row (a top-k row fetches `top_k`). The host
+/// sampler grew its own candidate set from 256 by fours until it held the
+/// nucleus; a row whose nucleus is wider than this falls back to the logits.
+const TOP_P_CANDIDATES: usize = 1024;
+
 /// What the LM head gives one hidden state ([`Generator::heads`]).
 enum Head {
     /// The greedy token, found on the device.
@@ -34,6 +68,12 @@ enum Head {
     Token(u32),
     /// The logits, final softcap applied.
     Logits(Vec<f32>),
+    /// Sampling candidates, found on the device.
+    #[cfg_attr(
+        not(any(feature = "cuda-kernels", feature = "rocm-kernels")),
+        allow(dead_code)
+    )]
+    Top(SampleTop),
 }
 
 /// Index of the largest logit (greedy pick; first max wins on ties).
@@ -406,35 +446,92 @@ fn topk_topp_distribution(
     };
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let weight = |l: f32| ((l - max_logit) / temperature).exp();
+    let total = || logits.iter().map(|&l| weight(l)).sum::<f32>();
 
-    let cand = if top_k > 0 {
-        top(top_k)
+    let (cand, total) = if top_k > 0 {
+        (top(top_k), None)
     } else if top_p > 0.0 && top_p < 1.0 {
         // The nucleus is the shortest prefix holding `top_p` of the mass. Grow
         // the selected prefix until it holds that much.
-        let total: f32 = logits.iter().map(|&l| weight(l)).sum();
+        let total = total();
         let mut k = 256;
-        loop {
+        let cand = loop {
             let c = top(k.min(logits.len()));
             let mass: f32 = c.iter().map(|&(l, _)| weight(l)).sum();
             if mass >= top_p * total || k >= logits.len() {
                 break c;
             }
             k *= 4;
-        }
+        };
+        (cand, Some(total))
     } else {
-        top(logits.len())
+        (top(logits.len()), Some(total()))
     };
+    truncate_distribution(&cand, weight, total, top_p, min_p)
+}
+
+/// [`topk_topp_distribution`] from device candidates ([`SampleTop`]), or `None`
+/// when they do not hold the whole draw: fewer than `top_k`, a top-p nucleus
+/// they do not reach, or a draw over the whole vocabulary. The same arithmetic
+/// over the same candidates; only the vocabulary total is summed on the device,
+/// in another order, so a probability can differ in its last bits.
+fn top_distribution(
+    t: &SampleTop,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    min_p: f32,
+    vocab: usize,
+) -> Option<(Vec<usize>, Vec<f32>)> {
+    let weight = |l: f32| ((l - t.max) / temperature).exp();
+    let whole = t.top.len() >= vocab;
+    if top_k > 0 {
+        let k = top_k.min(vocab);
+        if t.top.len() < k {
+            return None;
+        }
+        return Some(truncate_distribution(
+            &t.top[..k],
+            weight,
+            None,
+            top_p,
+            min_p,
+        ));
+    }
+    if top_p > 0.0 && top_p < 1.0 {
+        let mass: f32 = t.top.iter().map(|&(l, _)| weight(l)).sum();
+        if mass < top_p * t.total && !whole {
+            return None;
+        }
+    } else if !whole {
+        return None;
+    }
+    Some(truncate_distribution(
+        &t.top,
+        weight,
+        Some(t.total),
+        top_p,
+        min_p,
+    ))
+}
+
+/// The tail of [`topk_topp_distribution`]: softmax over candidates already
+/// sorted by logit (descending), then the top-p and min-p cuts. `total` is the
+/// whole vocabulary's weight, or `None` for top-k, which renormalizes over the
+/// tokens it keeps.
+fn truncate_distribution(
+    cand: &[(f32, u32)],
+    weight: impl Fn(f32) -> f32,
+    total: Option<f32>,
+    top_p: f32,
+    min_p: f32,
+) -> (Vec<usize>, Vec<f32>) {
     let mut idx: Vec<usize> = cand.iter().map(|&(_, i)| i as usize).collect();
 
     // Softmax with temperature. Top-k renormalizes over the tokens it keeps;
     // otherwise probabilities are over the whole vocabulary.
     let mut probs: Vec<f32> = cand.iter().map(|&(l, _)| weight(l)).collect();
-    let sum: f32 = if top_k > 0 {
-        probs.iter().sum()
-    } else {
-        logits.iter().map(|&l| weight(l)).sum()
-    };
+    let sum: f32 = total.unwrap_or_else(|| probs.iter().sum());
     for p in &mut probs {
         *p /= sum;
     }
@@ -703,7 +800,7 @@ impl<K: ComputeKernel> Generator<K> {
     /// precision, or `None` if the kernel has no fixed pool (the CPU kernels).
     pub fn kv_free_tokens(&self) -> Option<usize> {
         self.kernel
-            .kv_free_tokens(self.kv_quant != crate::forward::KvQuant::None)
+            .kv_free_tokens(crate::forward::cpu::KvElem::for_quant(self.kv_quant))
     }
 
     /// A fresh single-sequence orchestrator over this generator's kernel and KV
@@ -855,10 +952,54 @@ impl<K: ComputeKernel> Generator<K> {
 
     /// Project a hidden state to vocabulary logits via final norm + LM head.
     fn logits(&self, hidden: &[f32]) -> Result<Vec<f32>> {
-        match self.heads(&[(hidden, false)])?.pop() {
+        match self.heads(&[(hidden, Want::Logits)])?.pop() {
             Some(Head::Logits(l)) => Ok(l),
-            _ => unreachable!("heads gives logits for a row that did not ask for a token"),
+            _ => unreachable!("heads gives logits for a row that asked for them"),
         }
+    }
+
+    /// What a step with `sampler` needs from the LM head, when nothing but the
+    /// sampler shapes the logits (no penalties, no grammar): the greedy token,
+    /// sampling candidates when the device head can find them and they decide
+    /// the draw exactly, else the logits.
+    fn want(&self, sampler: &Sampler, plain: bool) -> Want {
+        match *sampler {
+            Sampler::Greedy if plain => Want::Token,
+            Sampler::TopPK {
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                ..
+            } if plain
+                && temperature > 0.0
+                && repetition_penalty == 1.0
+                && self.final_logit_softcap.is_none()
+                && self.has_gpu_head() =>
+            {
+                let c = if top_k > 0 {
+                    (top_k as usize).min(self.vocab_size)
+                } else if top_p > 0.0 && top_p < 1.0 {
+                    TOP_P_CANDIDATES.min(self.vocab_size)
+                } else {
+                    return Want::Logits;
+                };
+                #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+                if c <= crate::forward::TOP_CANDIDATES_MAX {
+                    return Want::Top { temperature, c };
+                }
+                let _ = c;
+                Want::Logits
+            }
+            _ => Want::Logits,
+        }
+    }
+
+    fn has_gpu_head(&self) -> bool {
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        return self.gpu_head.is_some();
+        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+        false
     }
 
     fn final_norm(&self, hidden: &[f32]) -> Vec<f32> {
@@ -871,20 +1012,24 @@ impl<K: ComputeKernel> Generator<K> {
         )
     }
 
-    /// The LM head for several hidden states at once: for each `(hidden,
-    /// greedy)`, the greedy token when `greedy` and the head is on the device
-    /// (which finds the argmax there), else the logits. On the device the
-    /// greedy rows share one pass over the head's weights and the rest another,
-    /// so a batch of sessions must come through one call: per row, the head is
-    /// the largest single read of a decode step.
-    fn heads(&self, rows: &[(&[f32], bool)]) -> Result<Vec<Head>> {
+    /// The LM head for several hidden states at once, each giving what its
+    /// [`Want`] asks for. The greedy token and sampling candidates come only
+    /// from a device head; without one every row gets its logits. On the device
+    /// the rows wanting each kind share one pass over the head's weights, so a
+    /// batch of sessions must come through one call: per row, the head is the
+    /// largest single read of a decode step.
+    fn heads(&self, rows: &[(&[f32], Want)]) -> Result<Vec<Head>> {
         let mut out: Vec<Option<Head>> = Vec::with_capacity(rows.len());
         out.resize_with(rows.len(), || None);
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
         if let Some(head) = &self.gpu_head {
-            for want_token in [true, false] {
+            for kind in 0..3 {
                 let picked: Vec<usize> = (0..rows.len())
-                    .filter(|&i| rows[i].1 == want_token)
+                    .filter(|&i| match rows[i].1 {
+                        Want::Token => kind == 0,
+                        Want::Logits => kind == 1,
+                        Want::Top { .. } => kind == 2,
+                    })
                     .collect();
                 if picked.is_empty() {
                     continue;
@@ -893,14 +1038,34 @@ impl<K: ComputeKernel> Generator<K> {
                     .iter()
                     .flat_map(|&i| self.final_norm(rows[i].0))
                     .collect();
-                if want_token {
-                    for (&i, t) in picked.iter().zip(head.argmax(&normed)?) {
-                        out[i] = Some(Head::Token(t));
+                match kind {
+                    0 => {
+                        for (&i, t) in picked.iter().zip(head.argmax(&normed)?) {
+                            out[i] = Some(Head::Token(t));
+                        }
                     }
-                } else {
-                    let logits = head.logits(&normed)?;
-                    for (&i, l) in picked.iter().zip(logits.chunks_exact(self.vocab_size)) {
-                        out[i] = Some(Head::Logits(self.softcap(l.to_vec())));
+                    1 => {
+                        let logits = head.logits(&normed)?;
+                        for (&i, l) in picked.iter().zip(logits.chunks_exact(self.vocab_size)) {
+                            out[i] = Some(Head::Logits(self.softcap(l.to_vec())));
+                        }
+                    }
+                    _ => {
+                        // One candidate count for the call: the most any row
+                        // asks for. A top-k row reads only its first `top_k`.
+                        let (temps, c): (Vec<f32>, usize) =
+                            picked.iter().fold((Vec::new(), 0), |(mut t, c), &i| {
+                                let Want::Top { temperature, c: ci } = rows[i].1 else {
+                                    unreachable!("picked only Top rows")
+                                };
+                                t.push(temperature);
+                                (t, c.max(ci))
+                            });
+                        for (&i, (max, total, top)) in
+                            picked.iter().zip(head.top(&normed, &temps, c)?)
+                        {
+                            out[i] = Some(Head::Top(SampleTop { max, total, top }));
+                        }
                     }
                 }
             }
@@ -1050,13 +1215,17 @@ impl<K: ComputeKernel> Generator<K> {
         let mut seen: std::collections::HashSet<u32> = prompt.iter().copied().collect();
         let mut generated = Vec::with_capacity(cfg.max_new_tokens);
         for _ in 0..cfg.max_new_tokens {
-            let greedy = matches!(cfg.sampler, Sampler::Greedy);
-            let next = match self.heads(&[(&hidden, greedy)])?.remove(0) {
+            let want = match cfg.sampler {
+                Sampler::Greedy => Want::Token,
+                _ => Want::Logits,
+            };
+            let next = match self.heads(&[(&hidden, want)])?.remove(0) {
                 Head::Token(token) => token,
                 Head::Logits(mut logits) => {
                     apply_repetition_penalty(&mut logits, &seen, penalty);
                     cfg.sampler.sample(&logits, &mut rng)
                 }
+                Head::Top(_) => unreachable!("asked for a token or the logits"),
             };
             generated.push(next);
             seen.insert(next);
@@ -1320,23 +1489,51 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// This session's row for [`Generator::heads`]: its last hidden state, and
     /// whether the greedy token alone will do. A plain greedy step needs only
     /// the argmax, which the device head finds without sending the logits back.
-    fn head_row(&self) -> Result<(&[f32], bool)> {
+    fn head_row(&self) -> Result<(&[f32], Want)> {
         if self.is_prefilling() {
             return Err(DlmError::InvalidConfig(
                 "session has prompt tokens left to prefill".into(),
             ));
         }
-        let plain_greedy = matches!(self.sampler, Sampler::Greedy)
-            && self.penalties.is_noop()
-            && self.grammar.is_none();
-        Ok((&self.last_hidden, plain_greedy))
+        let plain = self.penalties.is_noop() && self.grammar.is_none();
+        Ok((&self.last_hidden, self.generator.want(&self.sampler, plain)))
     }
 
     /// Choose the next token from what the LM head gave for
     /// [`head_row`](Self::head_row) and load its embedding into `last_hidden`.
     fn take_head(&mut self, head: Head) -> Result<u32> {
+        // Candidates that do not decide the draw (a nucleus wider than them)
+        // give way to the logits, before the draw takes its random number.
+        let head = match head {
+            Head::Top(top) => match self.sampler {
+                Sampler::TopPK {
+                    temperature,
+                    top_p,
+                    top_k,
+                    min_p,
+                    ..
+                } => match top_distribution(
+                    &top,
+                    temperature,
+                    top_p,
+                    top_k as usize,
+                    min_p,
+                    self.generator.vocab_size,
+                ) {
+                    Some((idx, probs)) => {
+                        let pairs: Vec<(u32, f32)> =
+                            idx.into_iter().map(|i| i as u32).zip(probs).collect();
+                        Head::Token(sample_from(&pairs, &mut self.rng))
+                    }
+                    None => Head::Logits(self.generator.logits(&self.last_hidden)?),
+                },
+                Sampler::Greedy => unreachable!("greedy never asks for candidates"),
+            },
+            other => other,
+        };
         let next = match head {
             Head::Token(token) => token,
+            Head::Top(_) => unreachable!("resolved above"),
             Head::Logits(mut logits) => {
                 apply_repetition_penalty(
                     &mut logits,

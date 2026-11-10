@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
-    GenerateArgs, KvQuantArg, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs,
-    Speculative, TokenizeArgs,
+    GenerateArgs, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs, Speculative,
+    TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -1238,7 +1238,7 @@ fn stream_plan(config: &ModelConfig, args: &ServeArgs, store: &MmapStore) -> Vra
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
-        args.kv_quant != KvQuantArg::F32,
+        dlm::forward::cpu::KvElem::for_quant(args.kv_quant.to_kv_quant()),
     );
     let catalog = LayerCatalog::build(store);
     let native = dlm::loader::checkpoint_scheme(store).unwrap_or(config.quant);
@@ -1337,11 +1337,11 @@ fn build_profiler(
     context_length: u32,
     safety_margin_gb: Option<f64>,
     max_batch: u32,
-    half_kv: bool,
+    kv_elem: dlm::forward::cpu::KvElem,
 ) -> VramProfiler {
     let p = VramProfiler::new(context_length)
         .with_max_batch(max_batch)
-        .with_half_kv(half_kv);
+        .with_kv_elem(kv_elem);
     let bytes = match safety_margin_gb {
         Some(gb) => (gb.max(0.0) * GIB as f64) as u64,
         // Scaled to the card when there is one; the flat default otherwise.
@@ -1495,7 +1495,7 @@ fn serve_on_gpu(
         args.context_length,
         args.safety_margin_gb,
         args.max_batch as u32,
-        args.kv_quant != KvQuantArg::F32,
+        dlm::forward::cpu::KvElem::for_quant(args.kv_quant.to_kv_quant()),
     );
     let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64
         * on_gpu as u64
@@ -1719,6 +1719,12 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     let generator = generator.with_kv_quant(kv_quant);
     let draft = draft.map(|d| d.with_kv_quant(kv_quant));
     let kv_pool = generator.kv_free_tokens();
+    if let Some(tokens) = kv_pool {
+        println!(
+            "kv cache     : {tokens} tokens of GPU KV ({:?}), shared by every request",
+            dlm::forward::cpu::KvElem::for_quant(kv_quant)
+        );
+    }
     // Cached prefixes share paged device KV and give it back under pressure, so
     // they are on by default where the kernel pages KV. On the CPU each one is a
     // host copy of its KV, so only when asked for.
@@ -1888,8 +1894,16 @@ fn bench_generator<K: ComputeKernel>(
         )
     };
     println!();
+    let sampling = if opts.temperature > 0.0 {
+        format!(
+            "temperature {} top-p {} top-k {}",
+            opts.temperature, opts.top_p, opts.top_k
+        )
+    } else {
+        "greedy".into()
+    };
     println!(
-        "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, greedy",
+        "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, {sampling}",
         opts.prompt_len, opts.gen_len, opts.batch, opts.runs
     );
     let results = dlm::bench::run(generator, &prompt, opts, |r, run| {
@@ -1938,6 +1952,7 @@ fn bench_generator<K: ComputeKernel>(
             quant: format!("{:?}", config.quant),
             stream: args.stream,
             kv_quant: format!("{:?}", args.kv_quant).to_lowercase(),
+            sampling,
             context_length: args.context_length,
             prompt_len: opts.prompt_len,
             gen_len: opts.gen_len,
@@ -2118,7 +2133,12 @@ fn report_plan(
 
     // Resolve free VRAM: explicit budget > live device query > simulated 16 GiB.
     // `profile` plans for a single sequence (batch is a serve-time concern).
-    let profiler = build_profiler(context_length, safety_margin_gb, 1, false);
+    let profiler = build_profiler(
+        context_length,
+        safety_margin_gb,
+        1,
+        dlm::forward::cpu::KvElem::F32,
+    );
     let (free_bytes, free_source) = resolve_free_bytes(vram_budget_gb);
     println!("free VRAM    : {free_source}");
 

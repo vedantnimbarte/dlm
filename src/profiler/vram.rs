@@ -56,8 +56,8 @@ pub struct VramProfiler {
     /// Each in-flight request owns a full-context KV cache, so `M_kv_total` scales
     /// with this; `1` sizes for a single sequence (the historical behavior).
     pub max_batch: u32,
-    /// Bytes per KV element on the device: 4 for f32, 2 for fp16.
-    pub kv_bytes_per_element: u64,
+    /// How the device holds K/V ([`KvElem`](crate::forward::cpu::KvElem)).
+    pub kv_elem: crate::forward::cpu::KvElem,
 }
 
 impl Default for VramProfiler {
@@ -66,7 +66,7 @@ impl Default for VramProfiler {
             target_context: 8192,
             safety_margin_bytes: DEFAULT_SAFETY_MARGIN_BYTES,
             max_batch: 1,
-            kv_bytes_per_element: KV_BYTES_PER_ELEMENT,
+            kv_elem: crate::forward::cpu::KvElem::F32,
         }
     }
 }
@@ -138,18 +138,27 @@ impl VramProfiler {
         self
     }
 
-    /// Plan the device KV cache as fp16 (`--kv-quant` other than `none`).
-    pub fn with_half_kv(mut self, half: bool) -> Self {
-        self.kv_bytes_per_element = if half { 2 } else { KV_BYTES_PER_ELEMENT };
+    /// Plan the device KV cache as `elem` (`--kv-quant`, through
+    /// [`KvElem::for_quant`](crate::forward::cpu::KvElem::for_quant)).
+    pub fn with_kv_elem(mut self, elem: crate::forward::cpu::KvElem) -> Self {
+        self.kv_elem = elem;
         self
     }
 
     /// KV-cache bytes for a **single** layer across the full target context:
-    /// `2 (K,V) × N_kv_heads × D_head × bytes per element × L_context`.
+    /// `2 (K,V) × N_kv_heads × D_head × bytes per element × L_context`. int8
+    /// takes 1.125 bytes a value (a 4-byte scale per 32), and only where a
+    /// head is a whole number of 32-value groups; elsewhere the pool is fp16.
     pub fn kv_bytes_per_layer(&self, config: &ModelConfig) -> u64 {
-        let per_token =
-            2 * config.num_kv_heads as u64 * config.head_dim() as u64 * self.kv_bytes_per_element;
-        per_token * self.target_context as u64
+        use crate::forward::cpu::KvElem;
+        let values = 2 * config.num_kv_heads as u64 * config.head_dim() as u64;
+        let eighths = match self.kv_elem {
+            KvElem::F32 => 32,
+            KvElem::F16 => 16,
+            KvElem::I8 if config.head_dim() % 32 == 0 => 9,
+            KvElem::I8 => 16,
+        };
+        (values * eighths).div_ceil(8) * self.target_context as u64
     }
 
     /// Total KV-cache footprint (`M_kv_total`) — per-layer KV summed over every
@@ -307,13 +316,21 @@ mod tests {
     #[test]
     fn half_kv_halves_the_reservation() {
         let c = cfg();
+        use crate::forward::cpu::KvElem;
         let full = VramProfiler::new(2048);
-        let half = VramProfiler::new(2048).with_half_kv(true);
+        let half = VramProfiler::new(2048).with_kv_elem(KvElem::F16);
         assert_eq!(2 * half.kv_total_bytes(&c), full.kv_total_bytes(&c));
         assert_eq!(
-            half.with_half_kv(false).kv_total_bytes(&c),
+            half.clone().with_kv_elem(KvElem::F32).kv_total_bytes(&c),
             full.kv_total_bytes(&c)
         );
+        // int8: 36 bytes per 32 values, where heads take whole groups.
+        let int8 = half.with_kv_elem(KvElem::I8);
+        if c.head_dim() % 32 == 0 {
+            assert_eq!(32 * int8.kv_total_bytes(&c), 9 * full.kv_total_bytes(&c));
+        } else {
+            assert_eq!(int8.kv_total_bytes(&c), 2 * full.kv_total_bytes(&c) / 4);
+        }
     }
 
     #[test]

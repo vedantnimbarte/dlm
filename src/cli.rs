@@ -186,10 +186,12 @@ pub enum KvQuantArg {
     /// Exact f32 everywhere. `none` is accepted as an alias.
     #[value(alias = "none")]
     F32,
-    /// int8 — about half the KV memory. On the GPU, stored as fp16.
+    /// int8 — about half the KV memory. On the GPU, int8 with a scale per 32
+    /// values (1.125 bytes a value, 56% of fp16), or fp16 for models whose head
+    /// size is not a multiple of 32.
     Int8,
-    /// int4 — about a quarter of the KV memory, more error. On the GPU, stored as
-    /// fp16 (half).
+    /// int4 — about a quarter of the KV memory, more error. On the GPU, held as
+    /// int8 as for `int8`.
     Int4,
 }
 
@@ -505,6 +507,19 @@ pub struct BenchOpts {
     /// before it counts as a regression.
     #[arg(long, value_name = "PCT", default_value_t = 5.0)]
     pub tolerance: f64,
+
+    /// Sample at this temperature instead of decoding greedily (0, the default,
+    /// is greedy). Each sequence gets its own seed.
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Nucleus sampling cut-off, with `--temperature`; 1.0 disables it.
+    #[arg(long, default_value_t = 1.0)]
+    pub top_p: f32,
+
+    /// Keep only the `k` most likely tokens, with `--temperature`; 0 keeps all.
+    #[arg(long, default_value_t = 0)]
+    pub top_k: u32,
 
     /// Break decode time down by streaming stage (mmap, H2D, compute, ...).
     /// Streaming paths only. Off by default: timing the stages adds overhead of

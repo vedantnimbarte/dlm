@@ -40,6 +40,73 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A batched decode layer launches Q/K/V as one GEMV and gate/up as
+  another.** Each layer issued about 21 launches, and the host spent 5-8 ms
+  of a batched step issuing them; on Qwen2.5-0.5B, K and V alone were 128 rows,
+  8 blocks each on a 14-SM card. Matrices that share a dtype now go through
+  one launch over their row segments, with the activations quantized once.
+  GTX 1650, Qwen2.5-0.5B, decode tok/s at batch 4 / 8 / 16, the previous commit
+  and this one alternately: bf16 311 / 410 / 473 -> 328 / 408 / 487, Q8_0
+  435 / 654 / 760 -> 480 / 637 / 798. A GGUF layer whose V is Q6_K beside
+  Q4_K Q and K keeps three launches.
+
+- **Long-prompt prefill is up to 1.6x faster: attention is tiled over
+  queries.** Prefill attention gave each prompt token its own block, which read
+  the whole history, so a 512-token chunk at 8k positions read about 2 GB of
+  K/V per layer. A block now takes a tile of tokens (times the query heads
+  sharing a KV head) and streams the history through shared memory once for
+  all of them, with a running softmax. Heads 64 and 128 wide (Qwen, Llama,
+  Mistral); others keep the per-token kernel. GTX 1650, prefill tok/s, per-
+  token and tiled kernels alternately:
+
+  | Prompt | Qwen2.5-0.5B bf16 | Qwen2.5-1.5B Q4_K_M |
+  |---|---|---|
+  | 512 | 1,350 -> 1,490 (noise) | 486 -> 489 |
+  | 2,048 | 1,218 -> 1,447 | 397 -> 435 |
+  | 8,000 | 651 -> 1,018 | 234 -> 303 |
+
+- **`--kv-quant int8` (and `int4`) now keeps the GPU KV cache in int8: 1.76x
+  or more the tokens in the same VRAM.** Both used to mean fp16 on the GPU.
+  Each 32 values are now a float scale and 32 int8 codes, 1.125 bytes a value
+  against fp16's 2; models whose heads are not a multiple of 32 wide keep
+  fp16. The pool sizing and the fit check count it, and the server prints the
+  pool (`kv cache : N tokens`). On a GTX 1650, Qwen2.5-1.5B Q4_K_M at
+  `--context-length 32768` with four requests: 74,608 tokens of fp16 KV fit
+  beside the weights, against all 131,072 in int8. Decode and prefill speed
+  are within a few percent of fp16 (0.5B Q4_K_M, 3,000-token prompt: batch 8
+  decode 354 -> 365 tok/s, prefill 1,130 -> 1,090).
+
+  **It costs accuracy, so fp16 stays the default.** Scoring 833 tokens of
+  this README through the decode kernels (`dlm score --decode`) on
+  Qwen2.5-0.5B: mean NLL 2.841 with fp16 KV, 2.901 with int8 (the CPU's int8
+  store, the same scheme: 2.878). Qwen's keys have a few channels far larger
+  than the rest, and a 32-value group holding one quantizes its neighbours
+  coarsely; per-channel key scales are the known fix. The GPU's int8 agrees
+  with the CPU's to 1e-7 on the same inputs.
+
+- **Sampled decode is 4-8x faster at batch 16: candidates are found on the
+  GPU.** A temperature/top-k/top-p step copied each sequence's whole row of
+  logits to the host (600 KB on Qwen2.5) and found the softmax total and the
+  top candidates there, one sequence at a time; at batch 16 that took several
+  times as long as the model. The device head now returns each row's largest
+  logit, its softmax total and its largest logits sorted (4 KB for top-k 40),
+  and the host draws from those with the same arithmetic. A draw they cannot
+  decide exactly still takes the logits: a top-p nucleus wider than 1,024
+  tokens, pure temperature with neither top-k nor top-p, a repetition or
+  frequency penalty, a grammar, or a final logit softcap. The draws match the
+  host sampler's for a seed, except that the vocabulary total is summed in
+  another order and can differ in its last bit. GTX 1650, Qwen2.5-0.5B Q4_K_M,
+  temperature 0.8, decode tok/s:
+
+  | Sampler | Batch 1 | Batch 4 | Batch 16 |
+  |---|---|---|---|
+  | top-p 0.95 | 33 -> 120 | 57 -> 340 | 83 -> 673 |
+  | top-k 40 | 36 -> 115 | 106 -> 345 | 153 -> 678 |
+  | greedy, for reference | 115-128 | 341-367 | 712-722 |
+
+  `dlm bench` takes `--temperature`, `--top-p` and `--top-k` to measure it,
+  and records the sampler in its JSON.
+
 - **Batched decode of quantized models is 2-3x faster at batch 8-16.** The
   int8-activation GEMV that every quantized format (int8, int4 and the GGUF
   types) takes in a batch gave each warp one weight row and decoded each

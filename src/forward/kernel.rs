@@ -110,7 +110,7 @@ pub trait ComputeKernel {
     /// Tokens of KV the kernel's shared pools can still take at the given
     /// precision, if it pages KV from a fixed pool (the GPU kernels). `None`
     /// means no fixed limit: the CPU kernels keep KV in growable host memory.
-    fn kv_free_tokens(&self, _fp16: bool) -> Option<usize> {
+    fn kv_free_tokens(&self, _elem: crate::forward::cpu::KvElem) -> Option<usize> {
         None
     }
 
@@ -175,8 +175,8 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         (**self).decode_batch(hiddens, kv_layers, positions)
     }
 
-    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
-        (**self).kv_free_tokens(fp16)
+    fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
+        (**self).kv_free_tokens(elem)
     }
 
     fn prefill(

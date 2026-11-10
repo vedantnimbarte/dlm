@@ -1143,14 +1143,45 @@ impl LayerTensors {
 }
 
 /// What a GPU kernel needs to address one session-layer's K/V: the key and value
-/// buffers, the block table (null for MLA's contiguous latent cache), and whether
-/// elements are fp16.
+/// buffers, the block table (null for MLA's contiguous latent cache), and how
+/// the elements are held.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) struct DeviceKv {
     pub keys: *mut f32,
     pub values: *mut f32,
     pub table: *const i32,
-    pub half: bool,
+    pub elem: KvElem,
+}
+
+/// How the GPU kernels hold K/V, numbered as their `DLM_KV_*` codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvElem {
+    /// Exact f32.
+    #[default]
+    F32 = 0,
+    /// fp16.
+    F16 = 1,
+    /// int8 in groups of 32 values, each group a float scale then its 32
+    /// codes (36 bytes): 1.125 bytes a value. Needs every 32-value group inside
+    /// one head (`head_dim % 32 == 0`); a pool falls back to fp16 otherwise.
+    I8 = 2,
+}
+
+impl KvElem {
+    /// The device element type `quant` asks for. Both quantized modes take
+    /// int8 on the GPU: the CPU's int4 store has no device counterpart.
+    pub fn for_quant(quant: KvQuant) -> Self {
+        match quant {
+            KvQuant::None => KvElem::F32,
+            KvQuant::F16 => KvElem::F16,
+            KvQuant::Int8 | KvQuant::Int4 => KvElem::I8,
+        }
+    }
+
+    /// The kernels' `DLM_KV_*` code.
+    pub fn code(self) -> i32 {
+        self as i32
+    }
 }
 
 /// Device-resident K/V history for one layer on the GPU path, owned by the
@@ -1179,8 +1210,8 @@ pub struct KvLayerCache {
     /// Positions past the host `store` whose K/V exist only on the device (see
     /// [`advance`](Self::advance)).
     device_tokens: usize,
-    /// The GPU keeps this layer's K/V as fp16 (any `KvQuant` but `None`).
-    device_half: bool,
+    /// How the GPU keeps this layer's K/V ([`KvElem::for_quant`]).
+    device_elem: KvElem,
     /// Device K/V for the GPU path; `None` until the first GPU `run_block` for
     /// this session+layer allocates it.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1196,7 +1227,7 @@ impl Clone for KvLayerCache {
             kv_dim: self.kv_dim,
             store: self.store.clone(),
             device_tokens: self.device_tokens,
-            device_half: self.device_half,
+            device_elem: self.device_elem,
             // Contiguous GPU KV is per-session device memory; a clone starts with
             // none and re-allocates on next GPU use.
             #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1364,7 +1395,7 @@ impl KvLayerCache {
             kv_dim,
             store,
             device_tokens: 0,
-            device_half: quant != KvQuant::None,
+            device_elem: KvElem::for_quant(quant),
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             gpu: None,
             #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1394,8 +1425,8 @@ impl KvLayerCache {
             use crate::gpu::device::DeviceBuffer;
             let len = capacity_tokens * self.kv_dim.max(1);
             // MLA's latent cache is read by f32 kernels, so only standard
-            // attention goes to fp16.
-            let half = self.device_half && needs_values;
+            // attention goes to fp16. This contiguous buffer has no int8 form.
+            let half = self.device_elem != KvElem::F32 && needs_values;
             let alloc = |n: usize| {
                 if half {
                     DeviceBuffer::new_bytes(n * 2, n)
@@ -1501,19 +1532,20 @@ impl KvLayerCache {
                 KvStore::Int4 { .. } => Self::new_quant(self.kv_dim, KvQuant::Int4).store,
             },
             device_tokens: rows,
-            device_half: self.device_half,
+            device_elem: self.device_elem,
             gpu: None,
             paged: Some(p.share_prefix(rows)),
         })
     }
 
-    /// Whether the kernels must read and write this layer's device K/V as fp16.
-    /// Meaningful once [`gpu_kv`](Self::gpu_kv) has allocated it.
+    /// How the kernels must read and write this layer's device K/V. Meaningful
+    /// once [`device_kv`](Self::device_kv) has allocated it.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    pub fn device_half(&self) -> bool {
+    pub fn device_elem(&self) -> KvElem {
         match &self.paged {
-            Some(p) => p.pool().half(),
-            None => self.gpu.as_ref().is_some_and(|h| h.half),
+            Some(p) => p.pool().elem(),
+            None if self.gpu.as_ref().is_some_and(|h| h.half) => KvElem::F16,
+            None => KvElem::F32,
         }
     }
 
@@ -1540,7 +1572,7 @@ impl KvLayerCache {
                 keys,
                 values,
                 table: std::ptr::null(),
-                half: false,
+                elem: KvElem::F32,
             });
         }
         if self.paged.is_none() {
@@ -1549,7 +1581,7 @@ impl KvLayerCache {
                     "KV snapshot holds device-only history; take it with snapshot_synced".into(),
                 ));
             }
-            let pool = pools.get(layer, self.device_half)?;
+            let pool = pools.get(layer, self.device_elem)?;
             let mut paged = crate::forward::kv_pool::PagedKv::new(pool, capacity_rows)?;
             let n = self.host_len();
             if n > 0 {
@@ -1574,7 +1606,7 @@ impl KvLayerCache {
             keys: p.pool().keys_ptr(),
             values: p.pool().values_ptr(),
             table: p.table_ptr(),
-            half: p.pool().half(),
+            elem: p.pool().elem(),
         })
     }
 

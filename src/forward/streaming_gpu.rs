@@ -918,7 +918,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 lcfg.attn_logit_softcap.unwrap_or(0.0),
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
-                &DlmBlockExt::new(&lcfg, &w.biases, slots.half, std::ptr::null())
+                &DlmBlockExt::new(&lcfg, &w.biases, slots.elem, std::ptr::null())
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1049,7 +1049,12 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
         Ok(Self {
             // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
-            kv_pools: crate::forward::kv_pool::KvPools::new(num_layers as usize, cfg.kv_dim(), cap),
+            kv_pools: crate::forward::kv_pool::KvPools::new(
+                num_layers as usize,
+                cfg.kv_dim(),
+                cfg.head_dim,
+                cap,
+            ),
             shared,
             num_layers,
             kv_capacity_tokens: cap,
@@ -1127,10 +1132,10 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 crate::forward::cpu::rope_mscale(cfg.rope_scaling),
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
-                dkv.half as i32,
+                dkv.elem.code(),
                 dkv.table,
                 crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
-                &DlmBlockExt::new(cfg, &w.biases, dkv.half, dkv.table)
+                &DlmBlockExt::new(cfg, &w.biases, dkv.elem, dkv.table)
                     .with_weight_dtypes(&w.dtypes),
             )
         };
@@ -1312,7 +1317,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             cfg.attn_logit_softcap.unwrap_or(0.0),
                             bias_ptr(&w.pre_ffn_norm),
                             bias_ptr(&w.post_ffn_norm),
-                            &DlmBlockExt::new(cfg, &w.biases, dkv.half, dkv.table)
+                            &DlmBlockExt::new(cfg, &w.biases, dkv.elem, dkv.table)
                                 .with_weight_dtypes(&w.dtypes),
                         )
                     };
@@ -1358,14 +1363,15 @@ impl<S: LayerSource + 'static> Drop for StreamingGpuKernel<S> {
 }
 
 impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
-    fn kv_free_tokens(&self, fp16: bool) -> Option<usize> {
-        Some(self.kv_pools.free_tokens(fp16))
+    fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
+        Some(self.kv_pools.free_tokens(elem))
     }
 
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
         self.kv_pools = crate::forward::kv_pool::KvPools::new(
             self.num_layers as usize,
             self.shared.cfg.kv_dim(),
+            self.shared.cfg.head_dim,
             tokens,
         );
     }

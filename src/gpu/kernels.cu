@@ -1373,6 +1373,22 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
 // `kv_append_kernel`, so the choice is one template argument.
 #define DLM_KV_F32 0
 #define DLM_KV_F16 1
+// int8 (`--kv-quant int8/int4`): each run of 32 values is a 36-byte group, a
+// float scale then 32 signed codes, so value `i` is code `i % 32` of group
+// `i / 32` and the element indexing above it is unchanged. 1.125 bytes a
+// value against fp16's 2. A group must lie inside one head: the writes take its
+// scale from one warp's 32 lanes (`kv_store_i8`), so the host keeps fp16 for
+// heads that are not a multiple of 32.
+#define DLM_KV_I8 2
+#define KV_I8_GROUP_BYTES 36
+
+// Launch `...` (which names the element type `KT_`) for KV held as `kind`.
+#define DLM_KV_SWITCH(kind, ...)                                        \
+    switch (kind) {                                                     \
+        case DLM_KV_I8: { constexpr int KT_ = DLM_KV_I8; __VA_ARGS__; } break;   \
+        case DLM_KV_F16: { constexpr int KT_ = DLM_KV_F16; __VA_ARGS__; } break; \
+        default: { constexpr int KT_ = DLM_KV_F32; __VA_ARGS__; } break;         \
+    }
 template <int KT>
 __device__ __forceinline__ float load_kv(const void* kv, long i);
 template <>
@@ -1382,6 +1398,25 @@ __device__ __forceinline__ float load_kv<DLM_KV_F32>(const void* kv, long i) {
 template <>
 __device__ __forceinline__ float load_kv<DLM_KV_F16>(const void* kv, long i) {
     return __half2float(((const __half*)kv)[i]);
+}
+template <>
+__device__ __forceinline__ float load_kv<DLM_KV_I8>(const void* kv, long i) {
+    const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
+    return *(const float*)g * (float)(signed char)g[4 + (i & 31)];
+}
+
+// Write 32 values, one per lane of a full warp, as the int8 group starting at
+// element `at` (a multiple of 32): the group's largest magnitude over 127 is
+// its scale.
+__device__ __forceinline__ void kv_store_i8(float x, void* kv, long at) {
+    const int lane = threadIdx.x & 31;
+    float amax = fabsf(x);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float scale = amax / 127.0f;
+    unsigned char* g = (unsigned char*)kv + (at >> 5) * KV_I8_GROUP_BYTES;
+    g[4 + lane] = (unsigned char)(signed char)(scale > 0.0f ? __float2int_rn(x / scale) : 0);
+    if (lane == 0) *(float*)g = scale;
 }
 
 // The KV cache is paged. A layer's keys (and values) live in one pool of
@@ -1403,6 +1438,14 @@ __global__ void kv_append_kernel(const float* src, void* kv, const int* table, i
     long at = kv_row(table, shift, row) * n + i;
     if (KT == DLM_KV_F16) ((__half*)kv)[at] = __float2half(src[i]);
     else ((float*)kv)[at] = src[i];
+}
+
+// `kv_append_kernel` for int8: one warp per 32-value group. `n % 32 == 0`.
+// <<<n / 32, 32>>>.
+__global__ void kv_append_i8_kernel(const float* src, void* kv, const int* table, int shift,
+                                    long row, int n) {
+    const int i = blockIdx.x * 32 + threadIdx.x;
+    kv_store_i8(src[i], kv, kv_row(table, shift, row) * n + blockIdx.x * 32);
 }
 
 template <int KT>
@@ -1562,8 +1605,9 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 20-21 are the LM head's input hidden and output logits.
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
 // Slots 24-25 are the int8 activation codes and their block scales (dp4a).
-enum { SCRATCH_N = 28 };
-enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26 };   // 26: fp16 tensor-core row scales
+// Slot 28 holds the LM head's sampling candidates (`dlm_lm_head_top`).
+enum { SCRATCH_N = 29 };
+enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26, LM_TOP = 28 };   // 26: fp16 tensor-core row scales
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12, MOE_NORMED2B = 27 };   // 27: a batch's FFN inputs
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
@@ -1679,9 +1723,17 @@ typedef struct { float* p[DLM_MAX_BATCH]; } DlmSlots;
 typedef struct { const int* p[DLM_MAX_BATCH]; } DlmTables;
 typedef struct { int v[DLM_MAX_BATCH]; } DlmInts;
 
+// Eight values from element `i`, a multiple of 8.
 template <int KT>
 __device__ __forceinline__ void load_kv8(const void* kv, long i, float* out) {
-    if (KT == DLM_KV_F16) {
+    if (KT == DLM_KV_I8) {
+        const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
+        const float s = *(const float*)g;
+        const unsigned int* c = (const unsigned int*)(g + 4 + (i & 31));   // 4-byte aligned
+        const unsigned int u[2] = {c[0], c[1]};
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = s * (float)(signed char)(u[j >> 2] >> (8 * (j & 3)));
+    } else if (KT == DLM_KV_F16) {
         uint4 v = *(const uint4*)((const __half*)kv + i);
         unsigned int u[4] = {v.x, v.y, v.z, v.w};
         #pragma unroll
@@ -1908,32 +1960,18 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
         const int splits = (span + C - 1) / C;
         size_t shmem = (size_t)(G * head_dim + G * C + 2 * G) * sizeof(float);
         dim3 grid(num_kv_heads, splits);
-        if (kv_half)
-            attn_split_kernel<DLM_KV_F16><<<grid, C, shmem>>>(q, keys, values, table, shift, num_heads,
-                                                              num_kv_heads, head_dim, start, span,
-                                                              scale, softcap, scores, ctx);
-        else
-            attn_split_kernel<DLM_KV_F32><<<grid, C, shmem>>>(q, keys, values, table, shift, num_heads,
-                                                              num_kv_heads, head_dim, start, span,
-                                                              scale, softcap, scores, ctx);
+        DLM_KV_SWITCH(kv_half, attn_split_kernel<KT_><<<grid, C, shmem>>>(
+            q, keys, values, table, shift, num_heads, num_kv_heads, head_dim, start, span, scale,
+            softcap, scores, ctx));
         if (splits > 1) attn_combine_kernel<<<num_heads, 128>>>(scores, ctx, num_heads, head_dim, splits);
         return cudaSuccess;
     }
-    if (kv_half)
-        attn_scores_kernel<DLM_KV_F16><<<grid_for(num_heads * span, B), B>>>(
-            q, keys, table, shift, scores, num_heads, num_kv_heads, head_dim, start, span, scale,
-            softcap);
-    else
-        attn_scores_kernel<DLM_KV_F32><<<grid_for(num_heads * span, B), B>>>(
-            q, keys, table, shift, scores, num_heads, num_kv_heads, head_dim, start, span, scale,
-            softcap);
+    DLM_KV_SWITCH(kv_half, attn_scores_kernel<KT_><<<grid_for(num_heads * span, B), B>>>(
+        q, keys, table, shift, scores, num_heads, num_kv_heads, head_dim, start, span, scale,
+        softcap));
     attn_softmax_kernel<<<num_heads, SOFTMAX_THREADS>>>(scores, num_heads, span);
-    if (kv_half)
-        attn_mix_kernel<DLM_KV_F16><<<grid_for(num_heads * head_dim, B), B>>>(
-            scores, values, table, shift, ctx, num_heads, num_kv_heads, head_dim, start, span);
-    else
-        attn_mix_kernel<DLM_KV_F32><<<grid_for(num_heads * head_dim, B), B>>>(
-            scores, values, table, shift, ctx, num_heads, num_kv_heads, head_dim, start, span);
+    DLM_KV_SWITCH(kv_half, attn_mix_kernel<KT_><<<grid_for(num_heads * head_dim, B), B>>>(
+        scores, values, table, shift, ctx, num_heads, num_kv_heads, head_dim, start, span));
     return cudaSuccess;
 }
 
@@ -1941,7 +1979,10 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
 static void launch_kv_append(const float* k, const float* v, void* keys, void* values,
                              const int* table, int shift, long row, int kv_dim, int kv_half) {
     const int B = 256;
-    if (kv_half) {
+    if (kv_half == DLM_KV_I8) {
+        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
+        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
+    } else if (kv_half) {
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(k, keys, table, shift, row, kv_dim);
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(v, values, table, shift, row, kv_dim);
     } else {
@@ -2135,7 +2176,7 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
         }
         vec[i] = a;
         vec[i + half] = b;
-        if (is_k) {
+        if (is_k && KT != DLM_KV_I8) {
             if (KT == DLM_KV_F16) {
                 ((__half*)kv_keys)[dst + i] = __float2half(a);
                 ((__half*)kv_keys)[dst + i + half] = __float2half(b);
@@ -2147,6 +2188,16 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
     }
     if (is_k) {
         const float* vh = v + (long)head * head_dim;
+        if (KT == DLM_KV_I8) {
+            // Whole groups (head_dim % 32 == 0), each lane's value written by
+            // another lane above: wait for the warp's writes to `vec`.
+            __syncwarp();
+            for (int g = 0; g < head_dim; g += 32) {
+                kv_store_i8(vec[g + lane], kv_keys, dst + g);
+                kv_store_i8(vh[g + lane], kv_values, dst + g);
+            }
+            return;
+        }
         for (int i = lane; i < head_dim; i += 32) {
             if (KT == DLM_KV_F16) ((__half*)kv_values)[dst + i] = __float2half(vh[i]);
             else ((float*)kv_values)[dst + i] = vh[i];
@@ -2189,14 +2240,9 @@ static void launch_qk_post(float* q, float* k, const float* v, const float* q_no
                            void* keys, void* values, const int* table, int shift, long row,
                            int kv_half, int tokens = 1) {
     dim3 grid(num_heads + num_kv_heads, tokens);
-    if (kv_half)
-        qk_post_kernel<DLM_KV_F16><<<grid, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                 head_dim, position, inv_freq, mscale, rope, eps,
-                                                 keys, values, table, shift, row);
-    else
-        qk_post_kernel<DLM_KV_F32><<<grid, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                 head_dim, position, inv_freq, mscale, rope, eps,
-                                                 keys, values, table, shift, row);
+    DLM_KV_SWITCH(kv_half, qk_post_kernel<KT_><<<grid, 32>>>(
+        q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position, inv_freq, mscale,
+        rope, eps, keys, values, table, shift, row));
 }
 
 // The per-slot half of a batched decode layer's attention, for every slot at
@@ -2234,14 +2280,9 @@ static cudaError_t launch_attention_slots(float* q, float* k, const float* v, fl
     }
 
     dim3 post(num_heads + num_kv_heads, batch);
-    if (kv_half)
-        qk_post_slots_kernel<DLM_KV_F16><<<post, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                      head_dim, *positions, inv_freq, mscale, rope, eps,
-                                                      *keys, *values, *tables, shift, *num_positions);
-    else
-        qk_post_slots_kernel<DLM_KV_F32><<<post, 32>>>(q, k, v, q_norm, k_norm, num_heads, num_kv_heads,
-                                                      head_dim, *positions, inv_freq, mscale, rope, eps,
-                                                      *keys, *values, *tables, shift, *num_positions);
+    DLM_KV_SWITCH(kv_half, qk_post_slots_kernel<KT_><<<post, 32>>>(
+        q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, *positions, inv_freq, mscale,
+        rope, eps, *keys, *values, *tables, shift, *num_positions));
 
     // Partials for every slot, each sized to the longest span rounded up as
     // `launch_attention` does, so the slot grows in steps, not every token.
@@ -2261,14 +2302,9 @@ static cudaError_t launch_attention_slots(float* q, float* k, const float* v, fl
 
     size_t shmem = (size_t)(G * head_dim + G * C + 2 * G) * sizeof(float);
     dim3 grid(num_kv_heads, splits, batch);
-    if (kv_half)
-        attn_split_slots_kernel<DLM_KV_F16><<<grid, C, shmem>>>(
-            q, *keys, *values, *tables, shift, num_heads, num_kv_heads, head_dim, *num_positions,
-            sliding_window, scale, softcap, part, part_stride, ctx);
-    else
-        attn_split_slots_kernel<DLM_KV_F32><<<grid, C, shmem>>>(
-            q, *keys, *values, *tables, shift, num_heads, num_kv_heads, head_dim, *num_positions,
-            sliding_window, scale, softcap, part, part_stride, ctx);
+    DLM_KV_SWITCH(kv_half, attn_split_slots_kernel<KT_><<<grid, C, shmem>>>(
+        q, *keys, *values, *tables, shift, num_heads, num_kv_heads, head_dim, *num_positions,
+        sliding_window, scale, softcap, part, part_stride, ctx));
     if (splits > 1)
         attn_combine_slots_kernel<<<dim3(num_heads, batch), 128>>>(
             part, part_stride, ctx, num_heads, head_dim, *num_positions, sliding_window, C);
@@ -2590,15 +2626,56 @@ __global__ void __launch_bounds__(32 * MV_ROWS, 6) matvec_batched_chunk_kernel(c
 // slot's activations once per weight row, eight floats for eight multiply-adds,
 // so at batch 16 the load units, not memory, set its speed. Here each loaded
 // activation chunk is used for R rows, and a warp's accumulators are R x TB
-// registers rather than a fixed sixteen. Launch
-// <<<ceil(out_dim / (R * MV_ROWS)), 32 * MV_ROWS>>>.
+// registers rather than a fixed sixteen. Launched over its segments by
+// `launch_batched_rows`.
+// The batched GEMVs below take their matrices as segments (`DlmSegs`): one
+// launch for Q, K and V, or for gate and up, which read the same activations.
+// Each segment gets ceil(rows / per_block) blocks of its own, so no warp's rows
+// straddle two matrices. Apart from saving launches (a batched layer issued
+// about 21), it fills the GPU: Qwen2.5-0.5B's K and V are 128 rows, 8 blocks
+// each on a 14-SM card when launched alone.
+// Unrolled with constant indices: indexing the parameter struct by a runtime
+// segment copies all of it to every thread's stack.
+__device__ __forceinline__ int seg_of_block(const DlmSegs& s, int per_block, int* local) {
+    int b = blockIdx.x;
+    const int nb0 = (s.rows[0] + per_block - 1) / per_block;
+    if (s.nseg == 1 || b < nb0) {
+        *local = b;
+        return 0;
+    }
+    b -= nb0;
+    const int nb1 = (s.rows[1] + per_block - 1) / per_block;
+    if (s.nseg == 2 || b < nb1) {
+        *local = b;
+        return 1;
+    }
+    *local = b - nb1;
+    return 2;
+}
+static int seg_blocks(const DlmSegs& s, int per_block) {
+    int n = 0;
+    for (int i = 0; i < s.nseg; ++i) n += (s.rows[i] + per_block - 1) / per_block;
+    return n;
+}
+
 template <int DT, int R, int TB>
 __global__ void __launch_bounds__(32 * MV_ROWS)
-matvec_batched_rows_kernel(const void* __restrict__ W, const float* __restrict__ x,
-                           const float* __restrict__ bias, float* __restrict__ out, int out_dim,
-                           int in_dim, int group_size, int batch) {
+matvec_batched_rows_kernel(const void* __restrict__ W0, const void* __restrict__ W1,
+                           const void* __restrict__ W2, DlmSegs s, const float* __restrict__ x,
+                           int in_dim, int group_size,
+                           int batch) {
     const int N = Chunk<DT>::N;
-    const int o0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    int lb;
+    const int seg = seg_of_block(s, R * MV_ROWS, &lb);
+    // The weights come in as their own read-only parameters, so their loads keep
+    // the read-only cache path: taken from the struct, they lost it, and the
+    // batched GEMVs ran 15-20% slower. Constant indices for the rest: an indexed
+    // read of the parameter struct would copy it to local memory.
+    const void* W = seg == 0 ? W0 : seg == 1 ? W1 : W2;
+    const float* __restrict__ bias = seg == 0 ? s.bias[0] : seg == 1 ? s.bias[1] : s.bias[2];
+    float* __restrict__ out = seg == 0 ? s.out[0] : seg == 1 ? s.out[1] : s.out[2];
+    const int out_dim = seg == 0 ? s.rows[0] : seg == 1 ? s.rows[1] : s.rows[2];
+    const int o0 = (lb * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
     if (o0 >= out_dim) return;
     const long n = (long)out_dim * in_dim;
     float acc[R][TB];
@@ -2645,11 +2722,10 @@ matvec_batched_rows_kernel(const void* __restrict__ W, const float* __restrict__
 }
 
 template <int DT, int R, int TB>
-static void launch_batched_rows(const void* W, const float* x, const float* bias, float* out,
-                                int out_dim, int in_dim, int group_size, int batch) {
-    const int per_block = R * MV_ROWS;
-    matvec_batched_rows_kernel<DT, R, TB><<<(out_dim + per_block - 1) / per_block, 32 * MV_ROWS>>>(
-        W, x, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_batched_rows(const DlmSegs& s, const float* x, int in_dim, int group_size,
+                                int batch) {
+    matvec_batched_rows_kernel<DT, R, TB><<<seg_blocks(s, R * MV_ROWS), 32 * MV_ROWS>>>(
+        s.W[0], s.W[1], s.W[2], s, x, in_dim, group_size, batch);
 }
 
 // Four rows a warp, swept on a GTX 1650 with Qwen2.5-0.5B bf16 (decode tok/s at
@@ -2657,11 +2733,11 @@ static void launch_batched_rows(const void* W, const float* x, const float* bias
 // 271, R = 2 276 / 339 / 356, R = 4 287 / 376 / 435-475. R = 8 holds 128
 // accumulators at batch 16 and falls back to 359-396 there.
 template <int DT>
-static void launch_batched_rows_tb(const void* W, const float* x, const float* bias, float* out,
-                                   int out_dim, int in_dim, int group_size, int batch) {
-    if (batch <= 4) launch_batched_rows<DT, 4, 4>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-    else if (batch <= 8) launch_batched_rows<DT, 4, 8>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-    else launch_batched_rows<DT, 4, 16>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_batched_rows_tb(const DlmSegs& s, const float* x, int in_dim, int group_size,
+                                   int batch) {
+    if (batch <= 4) launch_batched_rows<DT, 4, 4>(s, x, in_dim, group_size, batch);
+    else if (batch <= 8) launch_batched_rows<DT, 4, 8>(s, x, in_dim, group_size, batch);
+    else launch_batched_rows<DT, 4, 16>(s, x, in_dim, group_size, batch);
 }
 
 // Up to this many slots the chunked kernel wins; past it the batch is compute
@@ -2676,11 +2752,12 @@ static void launch_batched_rows_tb(const void* W, const float* x, const float* b
 // The multi-row kernel, for the formats with 8-weight chunks (f32, bf16, f16);
 // false, launching nothing, for any other format or shape.
 template <int DT>
-static bool try_batched_rows(const void* W, const float* x, const float* bias, float* out,
-                             int out_dim, int in_dim, int group_size, int batch) {
+static bool try_batched_rows(const DlmSegs& s, const float* x, int in_dim, int group_size,
+                             int batch) {
     if constexpr (Chunk<DT>::N == 8) {
-        if (!chunk_fits<DT>(W, x, in_dim, group_size)) return false;
-        launch_batched_rows_tb<DT>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+        for (int i = 0; i < s.nseg; ++i)
+            if (!chunk_fits<DT>(s.W[i], x, in_dim, group_size)) return false;
+        launch_batched_rows_tb<DT>(s, x, in_dim, group_size, batch);
         return true;
     } else {
         return false;
@@ -2697,14 +2774,24 @@ static bool try_batched_rows(const void* W, const float* x, const float* bias, f
 // barely above batch 4. The slot count is fixed at compile time (TB, the batch
 // rounded up) so the R x TB accumulators stay in registers. A short tail
 // repeats the last row, as `matvec_q8_kernel` does.
-// <<<ceil(out_dim / (R * MV_ROWS)), 32 * MV_ROWS>>>.
 template <int DT, int R, int TB>
 __global__ void __launch_bounds__(32 * MV_ROWS)
-matvec_q8_batched_rows_kernel(const void* __restrict__ W, const signed char* __restrict__ xq,
-                              const float2* __restrict__ xds, const float* __restrict__ bias,
-                              float* __restrict__ out, int out_dim, int in_dim, int group_size,
+matvec_q8_batched_rows_kernel(const void* __restrict__ W0, const void* __restrict__ W1,
+                              const void* __restrict__ W2, DlmSegs s,
+                              const signed char* __restrict__ xq,
+                              const float2* __restrict__ xds, int in_dim, int group_size,
                               int batch) {
-    const int o0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    int lb;
+    const int seg = seg_of_block(s, R * MV_ROWS, &lb);
+    // The weights come in as their own read-only parameters, so their loads keep
+    // the read-only cache path: taken from the struct, they lost it, and the
+    // batched GEMVs ran 15-20% slower. Constant indices for the rest: an indexed
+    // read of the parameter struct would copy it to local memory.
+    const void* W = seg == 0 ? W0 : seg == 1 ? W1 : W2;
+    const float* __restrict__ bias = seg == 0 ? s.bias[0] : seg == 1 ? s.bias[1] : s.bias[2];
+    float* __restrict__ out = seg == 0 ? s.out[0] : seg == 1 ? s.out[1] : s.out[2];
+    const int out_dim = seg == 0 ? s.rows[0] : seg == 1 ? s.rows[1] : s.rows[2];
+    const int o0 = (lb * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
     if (o0 >= out_dim) return;
     const long n = (long)out_dim * in_dim;
     float acc[R][TB];
@@ -2748,12 +2835,10 @@ matvec_q8_batched_rows_kernel(const void* __restrict__ W, const signed char* __r
 }
 
 template <int DT, int R, int TB>
-static void launch_q8_batched_rows(const void* W, const signed char* xq, const float2* xds,
-                                   const float* bias, float* out, int out_dim, int in_dim,
-                                   int group_size, int batch) {
-    const int per_block = R * MV_ROWS;
-    matvec_q8_batched_rows_kernel<DT, R, TB><<<(out_dim + per_block - 1) / per_block, 32 * MV_ROWS>>>(
-        W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_q8_batched_rows(const DlmSegs& s, const signed char* xq, const float2* xds,
+                                   int in_dim, int group_size, int batch) {
+    matvec_q8_batched_rows_kernel<DT, R, TB><<<seg_blocks(s, R * MV_ROWS), 32 * MV_ROWS>>>(
+        s.W[0], s.W[1], s.W[2], s, xq, xds, in_dim, group_size, batch);
 }
 
 // Four rows a warp for every format. Swept on a GTX 1650 (decode tok/s at
@@ -2763,41 +2848,54 @@ static void launch_q8_batched_rows(const void* W, const signed char* xq, const f
 // Q4_K_M 91 -> 265 / 270, Q8_0 83 -> 310 / 309. At batch 4 and 8, R = 4 led or
 // tied in all but Q6_K at batch 8 (436 at R = 2, 417 at 4).
 template <int DT>
-static void launch_q8_batched(const void* W, const signed char* xq, const float2* xds,
-                              const float* bias, float* out, int out_dim, int in_dim,
-                              int group_size, int batch) {
-    if (batch <= 4) launch_q8_batched_rows<DT, 4, 4>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
-    else if (batch <= 8) launch_q8_batched_rows<DT, 4, 8>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
-    else launch_q8_batched_rows<DT, 4, 16>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_q8_batched(const DlmSegs& s, const signed char* xq, const float2* xds,
+                              int in_dim, int group_size, int batch) {
+    if (batch <= 4) launch_q8_batched_rows<DT, 4, 4>(s, xq, xds, in_dim, group_size, batch);
+    else if (batch <= 8) launch_q8_batched_rows<DT, 4, 8>(s, xq, xds, in_dim, group_size, batch);
+    else launch_q8_batched_rows<DT, 4, 16>(s, xq, xds, in_dim, group_size, batch);
+}
+
+// The batched GEMV over every segment of `s` (all one dtype and group size):
+// one launch for the multi-row kernels, the activations quantized once for the
+// int8 one. Shapes they cannot take run segment by segment on the older
+// kernels.
+static void launch_matvec_batched_segs(int dt, const DlmSegs& s, const float* x, int in_dim,
+                                       int group_size, int batch) {
+    const signed char* xq;
+    const float2* xds;
+#define DLM_SEG_FALLBACK(D)                                                                       \
+    for (int i = 0; i < s.nseg; ++i) {                                                            \
+        if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 &&                  \
+            chunk_fits<D>(s.W[i], x, in_dim, group_size))                                         \
+            matvec_batched_chunk_kernel<D><<<(s.rows[i] + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>( \
+                s.W[i], x, s.bias[i], s.out[i], s.rows[i], in_dim, group_size, batch);            \
+        else                                                                                      \
+            matvec_batched_kernel<D><<<s.rows[i], MATVEC_THREADS>>>(                              \
+                s.W[i], x, s.bias[i], s.out[i], s.rows[i], in_dim, group_size, batch);            \
+    }
+#define DLM_CASE(D) case D: {                                                                     \
+        bool q8 = true;                                                                           \
+        for (int i = 0; i < s.nseg; ++i) q8 = q8 && q8_fits<D>(s.W[i], x, in_dim, group_size);    \
+        if (q8 && quantize_x(x, batch * in_dim, &xq, &xds))                                       \
+            launch_q8_batched<D>(s, xq, xds, in_dim, group_size, batch);                          \
+        else if (try_batched_rows<D>(s, x, in_dim, group_size, batch)) {}                          \
+        else DLM_SEG_FALLBACK(D)                                                                  \
+        break; }
+    switch (dt) {
+        DLM_FOR_EACH_DTYPE(DLM_CASE)
+        default:
+            if (try_batched_rows<DLM_W_F32>(s, x, in_dim, group_size, batch)) {}
+            else DLM_SEG_FALLBACK(DLM_W_F32)
+            break;
+    }
+#undef DLM_CASE
+#undef DLM_SEG_FALLBACK
 }
 
 static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
                                   float* out, int out_dim, int in_dim, int group_size, int batch) {
-    const signed char* xq;
-    const float2* xds;
-#define DLM_CASE(D) case D: \
-        if (q8_fits<D>(W, x, in_dim, group_size) && quantize_x(x, batch * in_dim, &xq, &xds)) \
-            launch_q8_batched<D>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch); \
-        else if (try_batched_rows<D>(W, x, bias, out, out_dim, in_dim, group_size, batch)) {} \
-        else if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 && \
-            chunk_fits<D>(W, x, in_dim, group_size)) \
-            matvec_batched_chunk_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
-        else \
-            matvec_batched_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
-        break;
-    switch (dt) {
-        DLM_FOR_EACH_DTYPE(DLM_CASE)
-        default:
-            if (try_batched_rows<DLM_W_F32>(W, x, bias, out, out_dim, in_dim, group_size, batch)) {}
-            else if (batch <= MV_CHUNK_MAX_BATCH && chunk_fits<DLM_W_F32>(W, x, in_dim, group_size))
-                matvec_batched_chunk_kernel<DLM_W_F32><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(
-                    W, x, bias, out, out_dim, in_dim, group_size, batch);
-            else
-                matvec_batched_kernel<DLM_W_F32>
-                    <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-            break;
-    }
-#undef DLM_CASE
+    const DlmSegs s = {{W, 0, 0}, {bias, 0, 0}, {out, 0, 0}, {out_dim, 0, 0}, 1};
+    launch_matvec_batched_segs(dt, s, x, in_dim, group_size, batch);
 }
 
 // rmsnorm over B rows: one block per row (grid.x = batch).
@@ -2928,9 +3026,18 @@ extern "C" int dlm_decode_block_batched(
     // Attention sublayer. Projections are batched (one weight read for all
     // slots); everything downstream of them is per-slot state.
     DLM_NORM_B(x, in_norm, o->in_norm_bias, normed)
-    launch_matvec_batched(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q), batch);
-    launch_matvec_batched(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K), batch);
-    launch_matvec_batched(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V), batch);
+    // One launch for Q, K and V when they share a dtype (a GGUF file can mix
+    // Q4_K and Q6_K inside a layer).
+    if (DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_K) && DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_V) &&
+        DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_K) && DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_V)) {
+        const DlmSegs qkv = {{q_proj, k_proj, v_proj}, {q_bias, k_bias, v_bias}, {q, k, v},
+                             {q_dim, kv_dim, kv_dim}, 3};
+        launch_matvec_batched_segs(DLM_WDT(DLM_W_Q), qkv, normed, hidden_size, DLM_WGRP(DLM_W_Q), batch);
+    } else {
+        launch_matvec_batched(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q), batch);
+        launch_matvec_batched(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K), batch);
+        launch_matvec_batched(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V), batch);
+    }
 
     e = launch_attention_slots(q, k, v, ctx, q_norm, k_norm, num_heads, num_kv_heads, head_dim,
                                inv_freq, rope_mscale, o->rope, rms_eps, kv_keys, kv_values,
@@ -2950,9 +3057,18 @@ extern "C" int dlm_decode_block_batched(
         if (gemma2) rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
         else DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
     }
-    launch_matvec_batched(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, DLM_WGRP(DLM_W_UP), batch);
+    if (o->gated && DLM_WDT(DLM_W_UP) == DLM_WDT(DLM_W_GATE) &&
+        DLM_WGRP(DLM_W_UP) == DLM_WGRP(DLM_W_GATE)) {
+        // Gate and up read the same input: one launch.
+        const DlmSegs gu = {{up_proj, gate_proj, 0}, {o->up_bias, 0, 0}, {up, gate, 0},
+                            {inter, inter, 0}, 2};
+        launch_matvec_batched_segs(DLM_WDT(DLM_W_UP), gu, normed2, hidden_size, DLM_WGRP(DLM_W_UP), batch);
+    } else {
+        launch_matvec_batched(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, DLM_WGRP(DLM_W_UP), batch);
+        if (o->gated)
+            launch_matvec_batched(DLM_WDT(DLM_W_GATE), gate_proj, normed2, (const float*)0, gate, inter, hidden_size, DLM_WGRP(DLM_W_GATE), batch);
+    }
     if (o->gated) {
-        launch_matvec_batched(DLM_WDT(DLM_W_GATE), gate_proj, normed2, (const float*)0, gate, inter, hidden_size, DLM_WGRP(DLM_W_GATE), batch);
         swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
     } else {
         activate_kernel<<<grid_for(batch * inter, B), B>>>(up, inter_buf, (long)batch * inter, activation);
@@ -3361,6 +3477,209 @@ __global__ void attn_prefill_kernel(const float* __restrict__ q, const void* key
     }
 }
 
+// Causal prefill attention, tiled over queries (FlashAttention's loop on SIMT
+// cores). `attn_prefill_kernel` gives each query its own block, which reads the
+// whole history: a 512-token chunk over 8k positions read about 2 GB of K/V per
+// layer, and prefill fell from 1,600 tok/s at 512 tokens to 660 at 8,000 on
+// Qwen2.5-0.5B. Here a block takes R query rows -- BQ = R / G consecutive tokens
+// times the G query heads sharing one KV head -- and streams the K/V history
+// through shared memory TK positions at a time, so each K/V value is read once
+// per BQ tokens. A running softmax per row (max, sum, and the rescale of the
+// output so far) merges the tiles as the split kernel merges its chunks.
+//
+// Each thread holds an SR x SK block of scores (4x4 at head size 64, 2x2 at
+// 128) and a 4x8 block of the output, so a load from shared memory feeds
+// several multiply-adds. Rows past the
+// chunk's last token, and positions a row may not see (after it, or before its
+// sliding window), are masked out of the softmax.
+// <<<dim3(num_kv_heads, ceil(T / (R / G))), 128>>>.
+#define FA_PF_THREADS 128
+template <int KT, int HD, int R, int TK, int SR, int SK>
+__global__ void __launch_bounds__(FA_PF_THREADS)
+attn_prefill_tiled_kernel(const float* __restrict__ q, const void* keys, const void* values,
+                          const int* table, int shift, int num_heads, int num_kv_heads, int T,
+                          int history, int sliding_window, float scale, float softcap,
+                          float* __restrict__ ctx) {
+    __shared__ float Qt[HD][R];          // queries, transposed, pre-scaled
+    __shared__ float Kt[HD][TK];         // the tile's keys, transposed
+    __shared__ float V[TK][HD];          // the tile's values
+    __shared__ float S[R][TK + 1];       // scores, then probabilities
+    __shared__ float row_m[R], row_l[R], row_a[R];
+    const int G = num_heads / num_kv_heads, BQ = R / G;
+    const int kvh = blockIdx.x, tq0 = blockIdx.y * BQ, t = threadIdx.x;
+    const long q_dim = (long)num_heads * HD, kv_dim = (long)num_kv_heads * HD;
+    const int nq = min(BQ, T - tq0);          // tokens in this tile
+    const int rows = nq * G;                  // live rows; the rest are padding
+
+    for (int i = t; i < R * HD; i += FA_PF_THREADS) {
+        const int r = i / HD, d = i % HD;
+        float v = 0.0f;
+        if (r < rows) {
+            const int qi = r / G, g = r % G;
+            v = q[(long)(tq0 + qi) * q_dim + ((long)kvh * G + g) * HD + d] * scale;
+        }
+        Qt[d][r] = v;
+    }
+    for (int r = t; r < R; r += FA_PF_THREADS) {
+        row_m[r] = -INFINITY;
+        row_l[r] = 0.0f;
+    }
+
+    // The positions any row sees: from the first token's window start to the
+    // last token itself.
+    const int last = history + tq0 + nq - 1;
+    const int first_total = history + tq0 + 1;
+    const int k_lo = (sliding_window > 0 && first_total > sliding_window) ? first_total - sliding_window : 0;
+
+    // Score micro-tile: rows sr0.., keys sk0... Output micro-tile: rows or0..,
+    // dims od0...
+    constexpr int OR = 4, OD = 8;
+    static_assert((R / SR) * (TK / SK) == FA_PF_THREADS, "score tiles cover the block");
+    static_assert((R / OR) * (HD / OD) == FA_PF_THREADS, "output tiles cover the block");
+    const int sr0 = (t / (TK / SK)) * SR, sk0 = (t % (TK / SK)) * SK;
+    const int or0 = (t / (HD / OD)) * OR, od0 = (t % (HD / OD)) * OD;
+    float acc[OR][OD];
+    #pragma unroll
+    for (int i = 0; i < OR; ++i)
+        #pragma unroll
+        for (int j = 0; j < OD; ++j) acc[i][j] = 0.0f;
+    __syncthreads();
+
+    for (int k0 = k_lo; k0 <= last; k0 += TK) {
+        // Load the tile, eight values a thread at a time.
+        for (int c = t; c < TK * (HD / 8); c += FA_PF_THREADS) {
+            const int kk = c / (HD / 8), d = (c % (HD / 8)) * 8;
+            float kv8[8], vv8[8];
+            if (k0 + kk <= last) {
+                const long at = kv_row(table, shift, k0 + kk) * kv_dim + (long)kvh * HD + d;
+                load_kv8<KT>(keys, at, kv8);
+                load_kv8<KT>(values, at, vv8);
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) kv8[j] = vv8[j] = 0.0f;
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                Kt[d + j][kk] = kv8[j];
+                V[kk][d + j] = vv8[j];
+            }
+        }
+        __syncthreads();
+
+        // Scores, masked to what each row may see.
+        float s[SR][SK];
+        #pragma unroll
+        for (int i = 0; i < SR; ++i)
+            #pragma unroll
+            for (int j = 0; j < SK; ++j) s[i][j] = 0.0f;
+        #pragma unroll 8
+        for (int d = 0; d < HD; ++d) {
+            float qv[SR], kv[SK];
+            #pragma unroll
+            for (int i = 0; i < SR; ++i) qv[i] = Qt[d][sr0 + i];
+            #pragma unroll
+            for (int j = 0; j < SK; ++j) kv[j] = Kt[d][sk0 + j];
+            #pragma unroll
+            for (int i = 0; i < SR; ++i)
+                #pragma unroll
+                for (int j = 0; j < SK; ++j) s[i][j] += qv[i] * kv[j];
+        }
+        #pragma unroll
+        for (int i = 0; i < SR; ++i) {
+            const int r = sr0 + i;
+            const int pq = history + tq0 + r / G;          // the row's own position
+            const int rs = (sliding_window > 0 && pq + 1 > sliding_window) ? pq + 1 - sliding_window : 0;
+            #pragma unroll
+            for (int j = 0; j < SK; ++j) {
+                const int pk = k0 + sk0 + j;
+                float v = s[i][j];
+                if (softcap > 0.0f) v = tanhf(v / softcap) * softcap;
+                S[r][sk0 + j] = (r < rows && pk <= pq && pk >= rs) ? v : -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // Online softmax, a thread per row.
+        for (int r = t; r < R; r += FA_PF_THREADS) {
+            float mx = -INFINITY;
+            for (int j = 0; j < TK; ++j) mx = fmaxf(mx, S[r][j]);
+            const float m_old = row_m[r], m_new = fmaxf(m_old, mx);
+            float a = 1.0f, l = 0.0f;
+            if (m_new != -INFINITY) {
+                a = expf(m_old - m_new);   // 0 while m_old is -inf
+                for (int j = 0; j < TK; ++j) {
+                    const float p = S[r][j] == -INFINITY ? 0.0f : expf(S[r][j] - m_new);
+                    S[r][j] = p;
+                    l += p;
+                }
+            } else {
+                for (int j = 0; j < TK; ++j) S[r][j] = 0.0f;
+            }
+            row_m[r] = m_new;
+            row_l[r] = row_l[r] * a + l;
+            row_a[r] = a;
+        }
+        __syncthreads();
+
+        // Rescale the output so far, then add this tile's P . V.
+        #pragma unroll
+        for (int i = 0; i < OR; ++i) {
+            const float a = row_a[or0 + i];
+            #pragma unroll
+            for (int j = 0; j < OD; ++j) acc[i][j] *= a;
+        }
+        for (int kk = 0; kk < TK; ++kk) {
+            const float4 v0 = *(const float4*)&V[kk][od0];
+            const float4 v1 = *(const float4*)&V[kk][od0 + 4];
+            const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            #pragma unroll
+            for (int i = 0; i < OR; ++i) {
+                const float p = S[or0 + i][kk];
+                #pragma unroll
+                for (int j = 0; j < OD; ++j) acc[i][j] += p * vv[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < OR; ++i) {
+        const int r = or0 + i;
+        if (r >= rows) continue;
+        const int qi = r / G, g = r % G;
+        const float inv = 1.0f / row_l[r];
+        float* out = ctx + (long)(tq0 + qi) * q_dim + ((long)kvh * G + g) * HD + od0;
+        #pragma unroll
+        for (int j = 0; j < OD; ++j) out[j] = acc[i][j] * inv;
+    }
+}
+
+// The tiled prefill attention for the head sizes it is built for (64: 64 rows,
+// 32-position tiles; 128: 32 rows, 16-position tiles, to stay in 48 KiB of
+// shared memory), or false, launching nothing.
+template <int KT>
+static bool launch_attn_prefill_tiled(const float* q, const void* keys, const void* values,
+                                      const int* table, int shift, int num_heads,
+                                      int num_kv_heads, int head_dim, int T, int history,
+                                      int sliding_window, float scale, float softcap, float* ctx) {
+    const int G = num_heads / num_kv_heads;
+    if (head_dim == 64 && G <= 64) {
+        dim3 grid(num_kv_heads, (T + 64 / G - 1) / (64 / G));
+        attn_prefill_tiled_kernel<KT, 64, 64, 32, 4, 4><<<grid, FA_PF_THREADS>>>(
+            q, keys, values, table, shift, num_heads, num_kv_heads, T, history, sliding_window,
+            scale, softcap, ctx);
+        return true;
+    }
+    if (head_dim == 128 && G <= 32) {
+        dim3 grid(num_kv_heads, (T + 32 / G - 1) / (32 / G));
+        attn_prefill_tiled_kernel<KT, 128, 32, 16, 2, 2><<<grid, FA_PF_THREADS>>>(
+            q, keys, values, table, shift, num_heads, num_kv_heads, T, history, sliding_window,
+            scale, softcap, ctx);
+        return true;
+    }
+    return false;
+}
+
 // One layer over `T` consecutive tokens of one sequence (rows `x[0..T]`, at
 // positions `position, position + 1, ...`, appending KV rows `history ...`).
 // The same block as `dlm_decode_block`, step for step. Returns
@@ -3444,17 +3763,18 @@ extern "C" int dlm_prefill_block(
                    rope_mscale, o->rope, rms_eps, kv_keys, kv_values, o->kv_table,
                    o->kv_block_shift, history, o->kv_half, T);
     {
-        const int C = head_dim > 128 ? 256 : 128;
-        size_t shmem = (size_t)(G * head_dim + G * C + 3 * G) * sizeof(float);
-        dim3 grid(num_kv_heads, T);
-        if (o->kv_half)
-            attn_prefill_kernel<DLM_KV_F16><<<grid, C, shmem>>>(q, kv_keys, kv_values, o->kv_table,
-                o->kv_block_shift, num_heads, num_kv_heads, head_dim, history, sliding_window,
-                attn_scale, attn_softcap, ctx);
-        else
-            attn_prefill_kernel<DLM_KV_F32><<<grid, C, shmem>>>(q, kv_keys, kv_values, o->kv_table,
-                o->kv_block_shift, num_heads, num_kv_heads, head_dim, history, sliding_window,
-                attn_scale, attn_softcap, ctx);
+        bool done = false;
+        DLM_KV_SWITCH(o->kv_half, done = launch_attn_prefill_tiled<KT_>(
+                q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
+                head_dim, T, history, sliding_window, attn_scale, attn_softcap, ctx));
+        if (!done) {
+            const int C = head_dim > 128 ? 256 : 128;
+            size_t shmem = (size_t)(G * head_dim + G * C + 3 * G) * sizeof(float);
+            dim3 grid(num_kv_heads, T);
+            DLM_KV_SWITCH(o->kv_half, attn_prefill_kernel<KT_><<<grid, C, shmem>>>(
+                q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
+                head_dim, history, sliding_window, attn_scale, attn_softcap, ctx));
+        }
     }
     const long TH = (long)T * hidden_size;
     if (gemma2 || o->parallel) {
@@ -3719,20 +4039,19 @@ __global__ void argmax_kernel(const float* v, int n, int* out) {
 // The argmax saves copying `vocab` floats a row back to the host (600 KB on
 // Qwen2.5) for the host to take one maximum of. A final logit softcap is `tanh`,
 // which keeps the order, so the caller can skip it there.
-extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_size,
-                           const void* w, const float* x_host, int batch, float* logits_host,
-                           int* token_host)
-{
-    DLM_ENTER
-    if (batch <= 0) return 0;
+// The LM head's logits for `batch` rows of `x_host`, DLM_MAX_BATCH rows at a
+// time: `finish(n, r0, logits)` takes each group's `n` rows of device logits
+// (starting at row `r0`) and must end in a blocking copy to the host.
+template <typename F>
+static cudaError_t lm_head_rows(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                                const void* w, const float* x_host, int batch, F&& finish) {
     const int rows = batch < DLM_MAX_BATCH ? batch : DLM_MAX_BATCH;
     cudaError_t e = scratch_ensure(LM_X, rows * hidden_size);
     if (e == cudaSuccess) e = scratch_ensure(LM_LOGITS, rows * vocab + DLM_MAX_BATCH);
-    float* x = g_scratch[LM_X];
-    float* logits = g_scratch[LM_LOGITS];
-    int* tokens = (int*)(logits + (long)rows * vocab);
     for (int r0 = 0; r0 < batch && e == cudaSuccess; r0 += DLM_MAX_BATCH) {
         const int n = batch - r0 < DLM_MAX_BATCH ? batch - r0 : DLM_MAX_BATCH;
+        float* x = g_scratch[LM_X];
+        float* logits = g_scratch[LM_LOGITS];
         e = cudaMemcpy(x, x_host + (long)r0 * hidden_size, (size_t)n * hidden_size * sizeof(float),
                        cudaMemcpyHostToDevice);
         if (e != cudaSuccess) break;
@@ -3741,16 +4060,231 @@ extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_
         else
             launch_matvec_batched(w_dtype, w, x, (const float*)0, logits, vocab, hidden_size,
                                   w_group_size, n);
-        if (token_host) argmax_kernel<<<n, 1024>>>(logits, vocab, tokens);
         e = cudaGetLastError();
-        if (e != cudaSuccess) break;
-        // Blocking D2H, so it also waits for the launches above.
-        e = token_host
-            ? cudaMemcpy(token_host + r0, tokens, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost)
-            : cudaMemcpy(logits_host + (long)r0 * vocab, logits, (size_t)n * vocab * sizeof(float),
-                         cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess) e = finish(n, r0, logits);
     }
-    return (int)e;
+    return e;
+}
+
+extern "C" int dlm_lm_head(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                           const void* w, const float* x_host, int batch, float* logits_host,
+                           int* token_host)
+{
+    DLM_ENTER
+    if (batch <= 0) return 0;
+    return (int)lm_head_rows(vocab, hidden_size, w_dtype, w_group_size, w, x_host, batch,
+                             [&](int n, int r0, float* logits) {
+        if (!token_host)
+            return cudaMemcpy(logits_host + (long)r0 * vocab, logits,
+                              (size_t)n * vocab * sizeof(float), cudaMemcpyDeviceToHost);
+        int* tokens = (int*)(logits + (long)n * vocab);
+        argmax_kernel<<<n, 1024>>>(logits, vocab, tokens);
+        cudaError_t e = cudaGetLastError();
+        // Blocking D2H, so it also waits for the launches above.
+        return e != cudaSuccess ? e
+                                : cudaMemcpy(token_host + r0, tokens, (size_t)n * sizeof(int),
+                                             cudaMemcpyDeviceToHost);
+    });
+}
+
+// ── Sampling candidates on the device ──────────────────────────────────────
+//
+// A sampled token needs, from a row of `vocab` logits, only the largest few
+// sorted (top-k, or the top-p nucleus), the largest logit, and the softmax
+// total over the whole row. The host used to copy all `vocab` floats back (600
+// KB a row on Qwen2.5) and find those itself, one row at a time: at batch 16 a
+// temperature/top-p step took several times as long as the model. This finds
+// them here, one block per row, and copies back `C` candidates and two floats.
+//
+// Candidates are the C largest logits by (logit descending, index ascending),
+// the order the host sampler breaks ties in. A radix select over an
+// order-preserving key finds the C-th largest key in four 8-bit passes; every
+// key above it is taken, then the lowest-indexed keys equal to it up to C; and
+// a bitonic sort orders them.
+#define TOP_THREADS 1024
+#define TOP_MAX 4096
+
+// Float to an unsigned key in the same order (NaN aside).
+__device__ __forceinline__ unsigned int top_key(float f) {
+    unsigned int u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float top_unkey(unsigned int k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k);
+}
+
+__device__ __forceinline__ float block_reduce(float v, bool is_max, float* red) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float o = __shfl_xor_sync(0xffffffffu, v, off);
+        v = is_max ? fmaxf(v, o) : v + o;
+    }
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float a = red[0];
+        for (int w = 1; w < (int)(blockDim.x >> 5); ++w) a = is_max ? fmaxf(a, red[w]) : a + red[w];
+        red[32] = a;
+    }
+    __syncthreads();
+    float r = red[32];
+    __syncthreads();
+    return r;
+}
+
+// <<<rows, TOP_THREADS, max(32 KiB, P * 8)>>>, P = C rounded up to a power of
+// two (C <= TOP_MAX, C <= vocab). Row r: stats[r] = (max logit, sum of
+// exp((l - max) / temps[r])), and its candidates in cand_l / cand_i[r * C ..].
+__global__ void __launch_bounds__(TOP_THREADS)
+top_candidates_kernel(const float* __restrict__ logits, int vocab, const float* __restrict__ temps,
+                      int C, float2* __restrict__ stats, float* __restrict__ cand_l,
+                      int* __restrict__ cand_i) {
+    extern __shared__ unsigned long long top_buf[];   // also the per-warp histograms
+    __shared__ float red[33];
+    __shared__ unsigned int hist[256];
+    __shared__ int sel_digit, sel_rem, n_gt, taken, wbase[33];
+    const int row = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int warps = blockDim.x >> 5;
+    const float* v = logits + (long)row * vocab;
+
+    float m = -INFINITY;
+    for (int i = t; i < vocab; i += blockDim.x) m = fmaxf(m, v[i]);
+    m = block_reduce(m, true, red);
+    const float temp = temps[row];
+    float s = 0.0f;
+    if (temp > 0.0f)
+        for (int i = t; i < vocab; i += blockDim.x) s += expf((v[i] - m) / temp);
+    s = block_reduce(s, false, red);
+    if (t == 0) stats[row] = make_float2(m, s);
+
+    // The C-th largest key, a byte at a time from the top.
+    unsigned int* whist = (unsigned int*)top_buf;   // [warps][256]
+    unsigned int prefix = 0, mask = 0;
+    int remaining = C;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int j = t; j < warps * 256; j += blockDim.x) whist[j] = 0;
+        __syncthreads();
+        for (int i = t; i < vocab; i += blockDim.x) {
+            const unsigned int k = top_key(v[i]);
+            if ((k & mask) == prefix) atomicAdd(&whist[warp * 256 + ((k >> shift) & 255)], 1u);
+        }
+        __syncthreads();
+        for (int d = t; d < 256; d += blockDim.x) {
+            unsigned int c = 0;
+            for (int w = 0; w < warps; ++w) c += whist[w * 256 + d];
+            hist[d] = c;
+        }
+        __syncthreads();
+        if (t == 0) {
+            int cum = 0, d = 255;
+            for (; d > 0; --d) {
+                if (cum + (int)hist[d] >= remaining) break;
+                cum += hist[d];
+            }
+            sel_digit = d;
+            sel_rem = remaining - cum;
+        }
+        __syncthreads();
+        prefix |= (unsigned int)sel_digit << shift;
+        mask |= 255u << shift;
+        remaining = sel_rem;
+        __syncthreads();
+    }
+
+    // Gather: every key above the C-th, then the first `remaining` equal to it
+    // in index order. A candidate is (key << 32) | ~index, so sorting the
+    // 64-bit values descending orders by logit and then by lowest index.
+    int P = 1;
+    while (P < C) P <<= 1;
+    if (t == 0) { n_gt = 0; taken = 0; }
+    for (int i = t; i < P; i += blockDim.x) top_buf[i] = 0ull;
+    __syncthreads();
+    for (int i = t; i < vocab; i += blockDim.x) {
+        const unsigned int k = top_key(v[i]);
+        if (k > prefix) top_buf[atomicAdd(&n_gt, 1)] = ((unsigned long long)k << 32) | (unsigned int)~i;
+    }
+    __syncthreads();
+    const int gt = n_gt;
+    for (int base = 0; base < vocab && taken < remaining; base += blockDim.x) {
+        const int i = base + t;
+        const bool eq = i < vocab && top_key(v[i]) == prefix;
+        const unsigned int bal = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) wbase[warp] = __popc(bal);
+        __syncthreads();
+        if (t == 0) {
+            int acc = 0;
+            for (int w = 0; w < warps; ++w) { const int c = wbase[w]; wbase[w] = acc; acc += c; }
+            wbase[32] = acc;
+        }
+        __syncthreads();
+        const int pos = taken + wbase[warp] + __popc(bal & ((1u << lane) - 1u));
+        if (eq && pos < remaining)
+            top_buf[gt + pos] = ((unsigned long long)prefix << 32) | (unsigned int)~i;
+        __syncthreads();
+        if (t == 0) taken += wbase[32];
+        __syncthreads();
+    }
+
+    // Bitonic sort, descending; the zero padding sorts last.
+    for (int k = 2; k <= P; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = t; i < P; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const unsigned long long a = top_buf[i], b = top_buf[ixj];
+                    if ((a < b) == ((i & k) == 0)) { top_buf[i] = b; top_buf[ixj] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int c = t; c < C; c += blockDim.x) {
+        const unsigned long long x = top_buf[c];
+        cand_l[(long)row * C + c] = top_unkey((unsigned int)(x >> 32));
+        cand_i[(long)row * C + c] = (int)~(unsigned int)x;
+    }
+}
+
+// The LM head for sampling: for each of `batch` rows, (max logit, softmax total
+// at temps_host[r]) into stats_host[2r..], and its `C` largest logits sorted
+// (logit descending, index ascending) into cand_l_host / cand_i_host[r * C ..].
+// C <= TOP_MAX and C <= vocab, else cudaErrorInvalidValue.
+extern "C" int dlm_lm_head_top(int vocab, int hidden_size, int w_dtype, int w_group_size,
+                               const void* w, const float* x_host, int batch,
+                               const float* temps_host, int C, float* stats_host,
+                               float* cand_l_host, int* cand_i_host)
+{
+    DLM_ENTER
+    if (batch <= 0) return 0;
+    if (C <= 0 || C > TOP_MAX || C > vocab) return (int)cudaErrorInvalidValue;
+    const int rows = batch < DLM_MAX_BATCH ? batch : DLM_MAX_BATCH;
+    int P = 1;
+    while (P < C) P <<= 1;
+    // 32 KiB either way: TOP_MAX candidates, or 32 warps' 256-bin histograms.
+    const size_t shmem = (size_t)(P * 8 > 32 * 256 * 4 ? P * 8 : 32 * 256 * 4);
+    return (int)lm_head_rows(vocab, hidden_size, w_dtype, w_group_size, w, x_host, batch,
+                             [&](int n, int r0, float* logits) {
+        cudaError_t e = scratch_ensure(LM_TOP, rows + (rows & 1) + 2 * rows + 2 * rows * C);
+        if (e != cudaSuccess) return e;
+        float* temps = g_scratch[LM_TOP];
+        float2* stats = (float2*)(temps + rows + (rows & 1));
+        float* cl = (float*)(stats + rows);
+        int* ci = (int*)(cl + (long)rows * C);
+        e = cudaMemcpy(temps, temps_host + r0, (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) return e;
+        top_candidates_kernel<<<n, TOP_THREADS, shmem>>>(logits, vocab, temps, C, stats, cl, ci);
+        e = cudaGetLastError();
+        if (e == cudaSuccess)
+            e = cudaMemcpy(stats_host + 2L * r0, stats, (size_t)n * sizeof(float2), cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess)
+            e = cudaMemcpy(cand_l_host + (long)r0 * C, cl, (size_t)n * C * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+        if (e == cudaSuccess)
+            e = cudaMemcpy(cand_i_host + (long)r0 * C, ci, (size_t)n * C * sizeof(int),
+                           cudaMemcpyDeviceToHost);
+        return e;
+    });
 }
 
 // Apply one expert to the residual: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.
