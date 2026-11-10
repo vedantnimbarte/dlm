@@ -40,6 +40,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A batched decode layer launches Q/K/V as one GEMV and gate/up as
+  another.** Each layer issued about 21 launches, and the host spent 5-8 ms
+  of a batched step issuing them; on Qwen2.5-0.5B, K and V alone were 128 rows,
+  8 blocks each on a 14-SM card. Matrices that share a dtype now go through
+  one launch over their row segments, with the activations quantized once.
+  GTX 1650, Qwen2.5-0.5B, decode tok/s at batch 4 / 8 / 16, the previous commit
+  and this one alternately: bf16 311 / 410 / 473 -> 328 / 408 / 487, Q8_0
+  435 / 654 / 760 -> 480 / 637 / 798. A GGUF layer whose V is Q6_K beside
+  Q4_K Q and K keeps three launches.
+
 - **Long-prompt prefill is up to 1.6x faster: attention is tiled over
   queries.** Prefill attention gave each prompt token its own block, which read
   the whole history, so a 512-token chunk at 8k positions read about 2 GB of

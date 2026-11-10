@@ -2626,15 +2626,56 @@ __global__ void __launch_bounds__(32 * MV_ROWS, 6) matvec_batched_chunk_kernel(c
 // slot's activations once per weight row, eight floats for eight multiply-adds,
 // so at batch 16 the load units, not memory, set its speed. Here each loaded
 // activation chunk is used for R rows, and a warp's accumulators are R x TB
-// registers rather than a fixed sixteen. Launch
-// <<<ceil(out_dim / (R * MV_ROWS)), 32 * MV_ROWS>>>.
+// registers rather than a fixed sixteen. Launched over its segments by
+// `launch_batched_rows`.
+// The batched GEMVs below take their matrices as segments (`DlmSegs`): one
+// launch for Q, K and V, or for gate and up, which read the same activations.
+// Each segment gets ceil(rows / per_block) blocks of its own, so no warp's rows
+// straddle two matrices. Apart from saving launches (a batched layer issued
+// about 21), it fills the GPU: Qwen2.5-0.5B's K and V are 128 rows, 8 blocks
+// each on a 14-SM card when launched alone.
+// Unrolled with constant indices: indexing the parameter struct by a runtime
+// segment copies all of it to every thread's stack.
+__device__ __forceinline__ int seg_of_block(const DlmSegs& s, int per_block, int* local) {
+    int b = blockIdx.x;
+    const int nb0 = (s.rows[0] + per_block - 1) / per_block;
+    if (s.nseg == 1 || b < nb0) {
+        *local = b;
+        return 0;
+    }
+    b -= nb0;
+    const int nb1 = (s.rows[1] + per_block - 1) / per_block;
+    if (s.nseg == 2 || b < nb1) {
+        *local = b;
+        return 1;
+    }
+    *local = b - nb1;
+    return 2;
+}
+static int seg_blocks(const DlmSegs& s, int per_block) {
+    int n = 0;
+    for (int i = 0; i < s.nseg; ++i) n += (s.rows[i] + per_block - 1) / per_block;
+    return n;
+}
+
 template <int DT, int R, int TB>
 __global__ void __launch_bounds__(32 * MV_ROWS)
-matvec_batched_rows_kernel(const void* __restrict__ W, const float* __restrict__ x,
-                           const float* __restrict__ bias, float* __restrict__ out, int out_dim,
-                           int in_dim, int group_size, int batch) {
+matvec_batched_rows_kernel(const void* __restrict__ W0, const void* __restrict__ W1,
+                           const void* __restrict__ W2, DlmSegs s, const float* __restrict__ x,
+                           int in_dim, int group_size,
+                           int batch) {
     const int N = Chunk<DT>::N;
-    const int o0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    int lb;
+    const int seg = seg_of_block(s, R * MV_ROWS, &lb);
+    // The weights come in as their own read-only parameters, so their loads keep
+    // the read-only cache path: taken from the struct, they lost it, and the
+    // batched GEMVs ran 15-20% slower. Constant indices for the rest: an indexed
+    // read of the parameter struct would copy it to local memory.
+    const void* W = seg == 0 ? W0 : seg == 1 ? W1 : W2;
+    const float* __restrict__ bias = seg == 0 ? s.bias[0] : seg == 1 ? s.bias[1] : s.bias[2];
+    float* __restrict__ out = seg == 0 ? s.out[0] : seg == 1 ? s.out[1] : s.out[2];
+    const int out_dim = seg == 0 ? s.rows[0] : seg == 1 ? s.rows[1] : s.rows[2];
+    const int o0 = (lb * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
     if (o0 >= out_dim) return;
     const long n = (long)out_dim * in_dim;
     float acc[R][TB];
@@ -2681,11 +2722,10 @@ matvec_batched_rows_kernel(const void* __restrict__ W, const float* __restrict__
 }
 
 template <int DT, int R, int TB>
-static void launch_batched_rows(const void* W, const float* x, const float* bias, float* out,
-                                int out_dim, int in_dim, int group_size, int batch) {
-    const int per_block = R * MV_ROWS;
-    matvec_batched_rows_kernel<DT, R, TB><<<(out_dim + per_block - 1) / per_block, 32 * MV_ROWS>>>(
-        W, x, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_batched_rows(const DlmSegs& s, const float* x, int in_dim, int group_size,
+                                int batch) {
+    matvec_batched_rows_kernel<DT, R, TB><<<seg_blocks(s, R * MV_ROWS), 32 * MV_ROWS>>>(
+        s.W[0], s.W[1], s.W[2], s, x, in_dim, group_size, batch);
 }
 
 // Four rows a warp, swept on a GTX 1650 with Qwen2.5-0.5B bf16 (decode tok/s at
@@ -2693,11 +2733,11 @@ static void launch_batched_rows(const void* W, const float* x, const float* bias
 // 271, R = 2 276 / 339 / 356, R = 4 287 / 376 / 435-475. R = 8 holds 128
 // accumulators at batch 16 and falls back to 359-396 there.
 template <int DT>
-static void launch_batched_rows_tb(const void* W, const float* x, const float* bias, float* out,
-                                   int out_dim, int in_dim, int group_size, int batch) {
-    if (batch <= 4) launch_batched_rows<DT, 4, 4>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-    else if (batch <= 8) launch_batched_rows<DT, 4, 8>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-    else launch_batched_rows<DT, 4, 16>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_batched_rows_tb(const DlmSegs& s, const float* x, int in_dim, int group_size,
+                                   int batch) {
+    if (batch <= 4) launch_batched_rows<DT, 4, 4>(s, x, in_dim, group_size, batch);
+    else if (batch <= 8) launch_batched_rows<DT, 4, 8>(s, x, in_dim, group_size, batch);
+    else launch_batched_rows<DT, 4, 16>(s, x, in_dim, group_size, batch);
 }
 
 // Up to this many slots the chunked kernel wins; past it the batch is compute
@@ -2712,11 +2752,12 @@ static void launch_batched_rows_tb(const void* W, const float* x, const float* b
 // The multi-row kernel, for the formats with 8-weight chunks (f32, bf16, f16);
 // false, launching nothing, for any other format or shape.
 template <int DT>
-static bool try_batched_rows(const void* W, const float* x, const float* bias, float* out,
-                             int out_dim, int in_dim, int group_size, int batch) {
+static bool try_batched_rows(const DlmSegs& s, const float* x, int in_dim, int group_size,
+                             int batch) {
     if constexpr (Chunk<DT>::N == 8) {
-        if (!chunk_fits<DT>(W, x, in_dim, group_size)) return false;
-        launch_batched_rows_tb<DT>(W, x, bias, out, out_dim, in_dim, group_size, batch);
+        for (int i = 0; i < s.nseg; ++i)
+            if (!chunk_fits<DT>(s.W[i], x, in_dim, group_size)) return false;
+        launch_batched_rows_tb<DT>(s, x, in_dim, group_size, batch);
         return true;
     } else {
         return false;
@@ -2733,14 +2774,24 @@ static bool try_batched_rows(const void* W, const float* x, const float* bias, f
 // barely above batch 4. The slot count is fixed at compile time (TB, the batch
 // rounded up) so the R x TB accumulators stay in registers. A short tail
 // repeats the last row, as `matvec_q8_kernel` does.
-// <<<ceil(out_dim / (R * MV_ROWS)), 32 * MV_ROWS>>>.
 template <int DT, int R, int TB>
 __global__ void __launch_bounds__(32 * MV_ROWS)
-matvec_q8_batched_rows_kernel(const void* __restrict__ W, const signed char* __restrict__ xq,
-                              const float2* __restrict__ xds, const float* __restrict__ bias,
-                              float* __restrict__ out, int out_dim, int in_dim, int group_size,
+matvec_q8_batched_rows_kernel(const void* __restrict__ W0, const void* __restrict__ W1,
+                              const void* __restrict__ W2, DlmSegs s,
+                              const signed char* __restrict__ xq,
+                              const float2* __restrict__ xds, int in_dim, int group_size,
                               int batch) {
-    const int o0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    int lb;
+    const int seg = seg_of_block(s, R * MV_ROWS, &lb);
+    // The weights come in as their own read-only parameters, so their loads keep
+    // the read-only cache path: taken from the struct, they lost it, and the
+    // batched GEMVs ran 15-20% slower. Constant indices for the rest: an indexed
+    // read of the parameter struct would copy it to local memory.
+    const void* W = seg == 0 ? W0 : seg == 1 ? W1 : W2;
+    const float* __restrict__ bias = seg == 0 ? s.bias[0] : seg == 1 ? s.bias[1] : s.bias[2];
+    float* __restrict__ out = seg == 0 ? s.out[0] : seg == 1 ? s.out[1] : s.out[2];
+    const int out_dim = seg == 0 ? s.rows[0] : seg == 1 ? s.rows[1] : s.rows[2];
+    const int o0 = (lb * MV_ROWS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
     if (o0 >= out_dim) return;
     const long n = (long)out_dim * in_dim;
     float acc[R][TB];
@@ -2784,12 +2835,10 @@ matvec_q8_batched_rows_kernel(const void* __restrict__ W, const signed char* __r
 }
 
 template <int DT, int R, int TB>
-static void launch_q8_batched_rows(const void* W, const signed char* xq, const float2* xds,
-                                   const float* bias, float* out, int out_dim, int in_dim,
-                                   int group_size, int batch) {
-    const int per_block = R * MV_ROWS;
-    matvec_q8_batched_rows_kernel<DT, R, TB><<<(out_dim + per_block - 1) / per_block, 32 * MV_ROWS>>>(
-        W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_q8_batched_rows(const DlmSegs& s, const signed char* xq, const float2* xds,
+                                   int in_dim, int group_size, int batch) {
+    matvec_q8_batched_rows_kernel<DT, R, TB><<<seg_blocks(s, R * MV_ROWS), 32 * MV_ROWS>>>(
+        s.W[0], s.W[1], s.W[2], s, xq, xds, in_dim, group_size, batch);
 }
 
 // Four rows a warp for every format. Swept on a GTX 1650 (decode tok/s at
@@ -2799,41 +2848,54 @@ static void launch_q8_batched_rows(const void* W, const signed char* xq, const f
 // Q4_K_M 91 -> 265 / 270, Q8_0 83 -> 310 / 309. At batch 4 and 8, R = 4 led or
 // tied in all but Q6_K at batch 8 (436 at R = 2, 417 at 4).
 template <int DT>
-static void launch_q8_batched(const void* W, const signed char* xq, const float2* xds,
-                              const float* bias, float* out, int out_dim, int in_dim,
-                              int group_size, int batch) {
-    if (batch <= 4) launch_q8_batched_rows<DT, 4, 4>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
-    else if (batch <= 8) launch_q8_batched_rows<DT, 4, 8>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
-    else launch_q8_batched_rows<DT, 4, 16>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch);
+static void launch_q8_batched(const DlmSegs& s, const signed char* xq, const float2* xds,
+                              int in_dim, int group_size, int batch) {
+    if (batch <= 4) launch_q8_batched_rows<DT, 4, 4>(s, xq, xds, in_dim, group_size, batch);
+    else if (batch <= 8) launch_q8_batched_rows<DT, 4, 8>(s, xq, xds, in_dim, group_size, batch);
+    else launch_q8_batched_rows<DT, 4, 16>(s, xq, xds, in_dim, group_size, batch);
+}
+
+// The batched GEMV over every segment of `s` (all one dtype and group size):
+// one launch for the multi-row kernels, the activations quantized once for the
+// int8 one. Shapes they cannot take run segment by segment on the older
+// kernels.
+static void launch_matvec_batched_segs(int dt, const DlmSegs& s, const float* x, int in_dim,
+                                       int group_size, int batch) {
+    const signed char* xq;
+    const float2* xds;
+#define DLM_SEG_FALLBACK(D)                                                                       \
+    for (int i = 0; i < s.nseg; ++i) {                                                            \
+        if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 &&                  \
+            chunk_fits<D>(s.W[i], x, in_dim, group_size))                                         \
+            matvec_batched_chunk_kernel<D><<<(s.rows[i] + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>( \
+                s.W[i], x, s.bias[i], s.out[i], s.rows[i], in_dim, group_size, batch);            \
+        else                                                                                      \
+            matvec_batched_kernel<D><<<s.rows[i], MATVEC_THREADS>>>(                              \
+                s.W[i], x, s.bias[i], s.out[i], s.rows[i], in_dim, group_size, batch);            \
+    }
+#define DLM_CASE(D) case D: {                                                                     \
+        bool q8 = true;                                                                           \
+        for (int i = 0; i < s.nseg; ++i) q8 = q8 && q8_fits<D>(s.W[i], x, in_dim, group_size);    \
+        if (q8 && quantize_x(x, batch * in_dim, &xq, &xds))                                       \
+            launch_q8_batched<D>(s, xq, xds, in_dim, group_size, batch);                          \
+        else if (try_batched_rows<D>(s, x, in_dim, group_size, batch)) {}                          \
+        else DLM_SEG_FALLBACK(D)                                                                  \
+        break; }
+    switch (dt) {
+        DLM_FOR_EACH_DTYPE(DLM_CASE)
+        default:
+            if (try_batched_rows<DLM_W_F32>(s, x, in_dim, group_size, batch)) {}
+            else DLM_SEG_FALLBACK(DLM_W_F32)
+            break;
+    }
+#undef DLM_CASE
+#undef DLM_SEG_FALLBACK
 }
 
 static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
                                   float* out, int out_dim, int in_dim, int group_size, int batch) {
-    const signed char* xq;
-    const float2* xds;
-#define DLM_CASE(D) case D: \
-        if (q8_fits<D>(W, x, in_dim, group_size) && quantize_x(x, batch * in_dim, &xq, &xds)) \
-            launch_q8_batched<D>(W, xq, xds, bias, out, out_dim, in_dim, group_size, batch); \
-        else if (try_batched_rows<D>(W, x, bias, out, out_dim, in_dim, group_size, batch)) {} \
-        else if (batch <= MV_CHUNK_MAX_BATCH && D != DLM_W_INT4 && D != DLM_W_INT8 && \
-            chunk_fits<D>(W, x, in_dim, group_size)) \
-            matvec_batched_chunk_kernel<D><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
-        else \
-            matvec_batched_kernel<D><<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch); \
-        break;
-    switch (dt) {
-        DLM_FOR_EACH_DTYPE(DLM_CASE)
-        default:
-            if (try_batched_rows<DLM_W_F32>(W, x, bias, out, out_dim, in_dim, group_size, batch)) {}
-            else if (batch <= MV_CHUNK_MAX_BATCH && chunk_fits<DLM_W_F32>(W, x, in_dim, group_size))
-                matvec_batched_chunk_kernel<DLM_W_F32><<<(out_dim + MV_ROWS - 1) / MV_ROWS, 32 * MV_ROWS>>>(
-                    W, x, bias, out, out_dim, in_dim, group_size, batch);
-            else
-                matvec_batched_kernel<DLM_W_F32>
-                    <<<out_dim, MATVEC_THREADS>>>(W, x, bias, out, out_dim, in_dim, group_size, batch);
-            break;
-    }
-#undef DLM_CASE
+    const DlmSegs s = {{W, 0, 0}, {bias, 0, 0}, {out, 0, 0}, {out_dim, 0, 0}, 1};
+    launch_matvec_batched_segs(dt, s, x, in_dim, group_size, batch);
 }
 
 // rmsnorm over B rows: one block per row (grid.x = batch).
@@ -2964,9 +3026,18 @@ extern "C" int dlm_decode_block_batched(
     // Attention sublayer. Projections are batched (one weight read for all
     // slots); everything downstream of them is per-slot state.
     DLM_NORM_B(x, in_norm, o->in_norm_bias, normed)
-    launch_matvec_batched(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q), batch);
-    launch_matvec_batched(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K), batch);
-    launch_matvec_batched(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V), batch);
+    // One launch for Q, K and V when they share a dtype (a GGUF file can mix
+    // Q4_K and Q6_K inside a layer).
+    if (DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_K) && DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_V) &&
+        DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_K) && DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_V)) {
+        const DlmSegs qkv = {{q_proj, k_proj, v_proj}, {q_bias, k_bias, v_bias}, {q, k, v},
+                             {q_dim, kv_dim, kv_dim}, 3};
+        launch_matvec_batched_segs(DLM_WDT(DLM_W_Q), qkv, normed, hidden_size, DLM_WGRP(DLM_W_Q), batch);
+    } else {
+        launch_matvec_batched(DLM_WDT(DLM_W_Q), q_proj, normed, q_bias, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q), batch);
+        launch_matvec_batched(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K), batch);
+        launch_matvec_batched(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V), batch);
+    }
 
     e = launch_attention_slots(q, k, v, ctx, q_norm, k_norm, num_heads, num_kv_heads, head_dim,
                                inv_freq, rope_mscale, o->rope, rms_eps, kv_keys, kv_values,
@@ -2986,9 +3057,18 @@ extern "C" int dlm_decode_block_batched(
         if (gemma2) rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
         else DLM_NORM_B(x, post_norm, o->post_norm_bias, normed2)
     }
-    launch_matvec_batched(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, DLM_WGRP(DLM_W_UP), batch);
+    if (o->gated && DLM_WDT(DLM_W_UP) == DLM_WDT(DLM_W_GATE) &&
+        DLM_WGRP(DLM_W_UP) == DLM_WGRP(DLM_W_GATE)) {
+        // Gate and up read the same input: one launch.
+        const DlmSegs gu = {{up_proj, gate_proj, 0}, {o->up_bias, 0, 0}, {up, gate, 0},
+                            {inter, inter, 0}, 2};
+        launch_matvec_batched_segs(DLM_WDT(DLM_W_UP), gu, normed2, hidden_size, DLM_WGRP(DLM_W_UP), batch);
+    } else {
+        launch_matvec_batched(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, DLM_WGRP(DLM_W_UP), batch);
+        if (o->gated)
+            launch_matvec_batched(DLM_WDT(DLM_W_GATE), gate_proj, normed2, (const float*)0, gate, inter, hidden_size, DLM_WGRP(DLM_W_GATE), batch);
+    }
     if (o->gated) {
-        launch_matvec_batched(DLM_WDT(DLM_W_GATE), gate_proj, normed2, (const float*)0, gate, inter, hidden_size, DLM_WGRP(DLM_W_GATE), batch);
         swiglu_batched_kernel<<<grid_for(batch * inter, B), B>>>(gate, up, inter_buf, (long)batch * inter, activation);
     } else {
         activate_kernel<<<grid_for(batch * inter, B), B>>>(up, inter_buf, (long)batch * inter, activation);
