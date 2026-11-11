@@ -654,6 +654,12 @@ fn gpu_matches_cpu_with_int8_weights() {
                     f.up = q(&f.up);
                     f.down = q(&f.down);
                 }
+                // Norm weights other than 1: a single-token layer with int8
+                // activations applies them inside its norm-and-quantize kernel.
+                let n = cfg.hidden_size;
+                l.input_layernorm = (0..n).map(|i| 0.6 + 0.8 * (i % 7) as f32 / 7.0).collect();
+                l.post_attention_layernorm =
+                    (0..n).map(|i| 1.3 - 0.6 * (i % 5) as f32 / 5.0).collect();
                 l
             })
             .collect();
@@ -2054,24 +2060,31 @@ fn gpu_lm_head_matches_host_head() {
         sampler: Sampler::Greedy,
     };
     let prompt = [5u32, 77, 140, 3];
-    for (what, head, int8) in [
-        ("bf16", &bf16_head, false),
-        ("f32", &f32_head, false),
-        ("int8", &f32_head, true),
+    use dlm::generate::LmHeadQuant;
+    for (what, head, quant) in [
+        ("bf16", &bf16_head, LmHeadQuant::Native),
+        ("f32", &f32_head, LmHeadQuant::Native),
+        ("int8", &f32_head, LmHeadQuant::Int8),
+        ("int4", &f32_head, LmHeadQuant::Int4),
     ] {
         let host = build(head).generate(&prompt, &greedy).unwrap();
         let mut dev = build(head);
-        dev.place_lm_head_on_gpu(int8, None).unwrap();
+        dev.place_lm_head_on_gpu(quant, None).unwrap();
         let got = dev.generate(&prompt, &greedy).unwrap();
-        if int8 {
+        let same = host.iter().zip(&got).filter(|(a, b)| a == b).count();
+        match quant {
+            LmHeadQuant::Native => {
+                assert_eq!(got, host, "{what}: device head chose different tokens")
+            }
             // Quantization may move a near-tie; most tokens must still agree.
-            let same = host.iter().zip(&got).filter(|(a, b)| a == b).count();
-            assert!(
+            LmHeadQuant::Int8 => assert!(
                 same >= 20,
                 "{what}: only {same}/24 tokens match the host head"
-            );
-        } else {
-            assert_eq!(got, host, "{what}: device head chose different tokens");
+            ),
+            // int4 moves more of them, and once one token differs, so does all
+            // that follows: the run must agree until then (8 tokens here; a head
+            // quantized into noise misses the first).
+            LmHeadQuant::Int4 => assert_eq!(got[..4], host[..4], "{what}: first tokens differ"),
         }
     }
 }
@@ -2500,7 +2513,8 @@ fn gpu_sampled_sessions_match_host_head() {
     };
     let host = build();
     let mut dev = build();
-    dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    dev.place_lm_head_on_gpu(dlm::generate::LmHeadQuant::Native, Some(0))
+        .unwrap();
     let prompts: [&[u32]; 3] = [&[9, 200, 41], &[3, 77], &[150, 2, 8, 99]];
     for (top_p, top_k) in [(1.0, 20), (0.8, 0)] {
         let run = |g: &Generator<GpuKernel>, together: bool| -> Vec<Vec<u32>> {
@@ -2534,6 +2548,65 @@ fn gpu_sampled_sessions_match_host_head() {
             want,
             "top_p {top_p} top_k {top_k}, together"
         );
+    }
+}
+
+/// Greedy n-gram speculation on the GPU emits exactly what plain greedy decoding
+/// does. Its verify scores the pending token and the proposals as one short
+/// prefill (the batched decode block) and one LM-head call; plain decoding runs
+/// one token at a time through the single-sequence block. The prompt repeats,
+/// so lookup proposes every round, and the random model's continuation rejects
+/// some of what it proposes.
+#[test]
+fn gpu_ngram_speculation_matches_plain_greedy() {
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    use dlm::speculative::SpeculativeSession;
+    let cfg = small_cfg();
+    let vocab = 300;
+    let layers = random_layers(&cfg, 2, 0x59EC);
+    let mut rng = Rng::new(0x59ED);
+    let embedding = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let head = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let kv = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut g = Generator::new(
+        GpuKernel::new(cfg, layers, 128)
+            .unwrap()
+            .with_kv_pool_tokens(2 * 128),
+        embedding,
+        vec![1.0; cfg.hidden_size],
+        head,
+        vocab,
+        1e-5,
+        kv,
+        16,
+    )
+    .unwrap();
+    g.place_lm_head_on_gpu(dlm::generate::LmHeadQuant::Native, Some(0))
+        .unwrap();
+    let prompt: Vec<u32> = [5u32, 9, 13, 7].iter().copied().cycle().take(24).collect();
+    let want = g
+        .generate(
+            &prompt,
+            &GenerationConfig {
+                max_new_tokens: 40,
+                eos_token: None,
+                sampler: Sampler::Greedy,
+            },
+        )
+        .unwrap();
+    for gamma in [1, 4, 8] {
+        let mut s = SpeculativeSession::ngram(&g, gamma, &prompt, Sampler::Greedy).unwrap();
+        let mut got = Vec::new();
+        while got.len() < want.len() {
+            got.extend(s.step(want.len() - got.len()).unwrap());
+        }
+        assert_eq!(got, want, "gamma {gamma}");
+        assert!(s.proposed() > 0, "gamma {gamma}: lookup never proposed");
     }
 }
 
@@ -2579,7 +2652,8 @@ fn multi_gpu_lm_head_matches_host_head() {
     let prompt = [9u32, 200, 41];
     let want = build().generate(&prompt, &greedy).unwrap();
     let mut dev = build();
-    dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    dev.place_lm_head_on_gpu(dlm::generate::LmHeadQuant::Native, Some(0))
+        .unwrap();
     assert_eq!(dev.generate(&prompt, &greedy).unwrap(), want);
 }
 

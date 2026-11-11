@@ -1693,9 +1693,13 @@ impl ComputeKernel for GpuKernel {
             let kv = &mut kv_layers[layer as usize];
             // The GEMM prefill takes the layer a big piece at a time; a layer it
             // cannot take (its shape, or the heads) goes 16 tokens per call
-            // through the batched decode block below.
+            // through the batched decode block below. So does a piece of 16
+            // tokens or fewer -- a speculative verify, a short prompt, a long
+            // prompt's tail: the GEMM computes 64-token tiles, and on Qwen2.5
+            // 1.5B verifying 5 tokens through it cost what decoding them one by
+            // one did, so speculation could not win.
             let mut done = 0;
-            while done < n {
+            while n - done > DLM_MAX_BATCH {
                 let t = (n - done).min(DLM_PREFILL_T);
                 let x = unsafe { d_hiddens.as_mut_ptr().add(done * hidden_size) };
                 if !self.launch_prefill_block(layer, x, kv, start + done, t)? {

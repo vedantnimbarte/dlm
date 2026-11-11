@@ -104,7 +104,7 @@ fn gpt2_on_gpu_matches_cpu() {
 
     let store = MmapStore::open_dir(&dir).unwrap();
     let streamed =
-        dlm::loader::build_streaming_gpu_generator(store, &config, 128, 4, 0, 0).unwrap();
+        dlm::loader::build_streaming_gpu_generator(store, &config, 128, 4, 0, 0, false).unwrap();
     assert_eq!(
         greedy(&streamed, &ids),
         want,

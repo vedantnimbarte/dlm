@@ -794,6 +794,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         kv_blocks,
         embed_scale: None,
         final_logit_softcap: None,
+        head_int4: false,
     })
 }
 
@@ -1016,16 +1017,16 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
                 let ram_cache = resolve_ram_cache_bytes(&args, &plan);
-                // Lookup speculation pays where a pass moves weights: over PCIe
-                // into VRAM, or on the CPU from the checkpoint when the RAM cache
-                // cannot hold every layer. A CPU pass over cached layers is
-                // compute, where verifying k tokens costs nearly k passes.
+                // Lookup speculation pays on the GPU, and on the CPU where a pass
+                // moves layers from the checkpoint because the RAM cache cannot
+                // hold every one. A CPU pass over cached layers is compute, where
+                // verifying k tokens costs nearly k passes.
                 let cached =
                     default_ram_cache_bytes(plan.per_layer_weight_bytes, plan.num_layers, u64::MAX)
                         .is_some_and(|all| ram_cache as u64 >= all);
-                let streamed =
-                    window < config.num_layers as usize && (device == Device::Gpu || !cached);
-                args.speculative = args.speculative.resolve(false, streamed)?;
+                let cheap_verify =
+                    device == Device::Gpu || (window < config.num_layers as usize && !cached);
+                args.speculative = args.speculative.resolve(false, cheap_verify)?;
                 publish_telemetry_snapshot(&config, &store, window as u32, true, device);
                 println!();
                 let dest = if device == Device::Gpu {
@@ -1117,7 +1118,7 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
 
             args.speculative = args
                 .speculative
-                .resolve(args.draft_model_path.is_some(), false)?;
+                .resolve(args.draft_model_path.is_some(), device == Device::Gpu)?;
             // Non-streaming paths materialize all layers resident.
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
 
@@ -1432,7 +1433,11 @@ fn serve_multi_gpu(
     listen: &str,
 ) -> Result<()> {
     println!("  compute    : gpu (each stage runs its shard on its device)");
-    let generator = parts.into_multi_gpu_generator(ids)?;
+    let generator = ModelParts {
+        head_int4: args.lm_head_int4,
+        ..parts
+    }
+    .into_multi_gpu_generator(ids)?;
     let draft = draft_parts
         .map(|p| p.into_multi_gpu_generator(&ids[..1]))
         .transpose()?;
@@ -1513,6 +1518,10 @@ fn serve_on_gpu(
         args.max_batch,
         args.context_length,
     )?;
+    let parts = ModelParts {
+        head_int4: args.lm_head_int4,
+        ..parts
+    };
     if let Some(n) = gpu_layers {
         let generator = parts.into_split_generator(n as usize)?;
         return start_batched_server(generator, None, args, config, listen, Some(pool));
@@ -1557,6 +1566,7 @@ fn serve_streaming_gpu(
         window,
         ram_cache,
         expert_cache,
+        args.lm_head_int4,
     )?;
     start_batched_server(generator, None, args, config, listen, None)
 }
@@ -1852,12 +1862,14 @@ const BENCH_TEXT: &str = "The river wound through the valley for many miles befo
 /// instead of serving it (see [`bench_generator`]).
 fn run_bench(args: BenchArgs) -> Result<()> {
     let BenchArgs { mut serve, opts } = args;
-    if serve.draft_model_path.is_some()
-        || serve.speculative == Speculative::Ngram
-        || serve.distributed_mode != DistributedMode::Standalone
-    {
+    // Plain decoding unless `--speculative ngram` asks: `auto` would speculate
+    // on the GPU and move the numbers a baseline is compared against.
+    if serve.speculative == Speculative::Auto {
+        serve.speculative = Speculative::Off;
+    }
+    if serve.draft_model_path.is_some() || serve.distributed_mode != DistributedMode::Standalone {
         return Err(DlmError::InvalidConfig(
-            "bench measures plain decoding on a single standalone model; drop --draft-model-path, --speculative and --distributed-mode"
+            "bench measures a single standalone model, plain or with --speculative ngram; drop --draft-model-path and --distributed-mode"
                 .into(),
         ));
     }
@@ -1888,10 +1900,30 @@ fn bench_generator<K: ComputeKernel>(
     let seed = tokenizer.encode(BENCH_TEXT)?;
     let prompt = dlm::bench::prompt_ids(&seed, opts.prompt_len, config.vocab_size as usize);
     let row = |r: &dlm::bench::RunResult| {
+        let accept = r
+            .accept_rate
+            .map_or(String::new(), |a| format!(" | accepted {:.0}%", a * 100.0));
         format!(
-            "prefill {:>9.1} tok/s | ttft {:>9.1} ms | decode {:>8.2} tok/s ({:.1} ms/step)",
+            "prefill {:>9.1} tok/s | ttft {:>9.1} ms | decode {:>8.2} tok/s ({:.1} ms/step){accept}",
             r.prefill_tok_s, r.ttft_ms, r.decode_tok_s, r.ms_per_step
         )
+    };
+    // `--speculative ngram`: a lone request speculates by lookup, as served.
+    let ngram_gamma = match args.speculative {
+        Speculative::Ngram => {
+            println!(
+                "speculative  : n-gram lookup, gamma {} (batch 1)",
+                args.draft_gamma
+            );
+            Some(args.draft_gamma)
+        }
+        Speculative::Draft => {
+            return Err(DlmError::InvalidConfig(
+                "dlm bench measures n-gram speculation; draft-model speculation is serve-only"
+                    .into(),
+            ))
+        }
+        _ => None,
     };
     println!();
     let sampling = if opts.temperature > 0.0 {
@@ -1906,7 +1938,7 @@ fn bench_generator<K: ComputeKernel>(
         "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, {sampling}",
         opts.prompt_len, opts.gen_len, opts.batch, opts.runs
     );
-    let results = dlm::bench::run(generator, &prompt, opts, |r, run| {
+    let results = dlm::bench::run(generator, &prompt, opts, ngram_gamma, |r, run| {
         println!("  b{:<3} run {:<2}: {}", r.batch, run + 1, row(r));
     })?;
 

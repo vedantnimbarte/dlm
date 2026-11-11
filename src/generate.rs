@@ -24,6 +24,37 @@ use crate::grammar::Constraint;
 /// a long prompt; a streaming kernel loads each layer once per chunk.
 const PREFILL_CHUNK: usize = 512;
 
+/// The precision the device LM head is held in
+/// ([`Generator::place_lm_head_on_gpu`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LmHeadQuant {
+    /// As the checkpoint holds it (bf16 when lossless, else f32).
+    Native,
+    /// int8, a scale and zero per group.
+    Int8,
+    /// int4, a scale and zero per [`LM_HEAD_INT4_GROUP`] values: the head is a
+    /// large share of a small model's bytes per token, so this is the fastest,
+    /// at some cost in accuracy. On a GTX 1650 with Qwen2.5-0.5B bf16: batch-8
+    /// decode about 9% faster (batch 1 within noise to +6%), mean NLL +0.025.
+    Int4,
+}
+
+impl LmHeadQuant {
+    /// `Int4` when asked for; else `Int8` for a model whose layers were
+    /// quantized at load, `Native` otherwise.
+    pub fn choose(int4: bool, layers_quantized: bool) -> Self {
+        match (int4, layers_quantized) {
+            (true, _) => LmHeadQuant::Int4,
+            (false, true) => LmHeadQuant::Int8,
+            (false, false) => LmHeadQuant::Native,
+        }
+    }
+}
+
+/// Values per scale in an int4 LM head: smaller groups than the layers' keep
+/// the one matrix every token's choice goes through closer to its floats.
+pub const LM_HEAD_INT4_GROUP: usize = 32;
+
 /// What a session needs from the LM head for one hidden state
 /// ([`Generator::heads`]).
 #[derive(Clone, Copy, PartialEq)]
@@ -743,11 +774,10 @@ impl<K: ComputeKernel> Generator<K> {
     /// Move the LM head into VRAM, so each step's vocabulary-wide GEMV runs on the
     /// device instead of the host.
     ///
-    /// Precision follows the weights: the host head uploads as it is held, bf16
-    /// when that is lossless and f32 otherwise. `quantize_int8` is for a model whose layers
-    /// were quantized at load (`--quant int4`/`int8`) -- the user already chose
-    /// lossy weights, and int8 keeps the head's error small (int4 is too coarse
-    /// for the one matrix every token's choice goes through).
+    /// Precision is `quant`'s: [`LmHeadQuant::Native`] uploads the head as it is
+    /// held, bf16 when that is lossless and f32 otherwise; `Int8` is what a
+    /// model quantized at load (`--quant int4`/`int8`) gets, since the user
+    /// already chose lossy weights; `Int4` is opt-in (`--lm-head-int4`).
     ///
     /// `device` names the GPU to hold it; `None` uses the current device, which
     /// is right for a single-GPU kernel. A multi-GPU pipeline passes its last
@@ -756,16 +786,23 @@ impl<K: ComputeKernel> Generator<K> {
     /// The host copy is released once the upload succeeds; on failure (VRAM
     /// exhausted, say) the generator is untouched and keeps the host head.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-    pub fn place_lm_head_on_gpu(&mut self, quantize_int8: bool, device: Option<u32>) -> Result<()> {
-        let int8;
-        let head = if quantize_int8 {
-            let values: Vec<f32> = (0..self.lm_head.len())
+    pub fn place_lm_head_on_gpu(&mut self, quant: LmHeadQuant, device: Option<u32>) -> Result<()> {
+        let quantized;
+        let values = || -> Vec<f32> {
+            (0..self.lm_head.len())
                 .map(|i| self.lm_head.get(i))
-                .collect();
-            int8 = Weights::quantize_int8(&values, crate::forward::QUANT_GROUP_SIZE)?;
-            &int8
-        } else {
-            &self.lm_head
+                .collect()
+        };
+        let head = match quant {
+            LmHeadQuant::Native => &self.lm_head,
+            LmHeadQuant::Int8 => {
+                quantized = Weights::quantize_int8(&values(), crate::forward::QUANT_GROUP_SIZE)?;
+                &quantized
+            }
+            LmHeadQuant::Int4 => {
+                quantized = Weights::quantize_int4(&values(), LM_HEAD_INT4_GROUP)?;
+                &quantized
+            }
         };
         self.gpu_head = Some(crate::forward::GpuLmHead::new(
             head,
@@ -781,8 +818,8 @@ impl<K: ComputeKernel> Generator<K> {
     /// host head with a warning rather than failing: a host head is slower, not
     /// wrong.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-    pub fn with_lm_head_on_gpu(mut self, quantize_int8: bool, device: Option<u32>) -> Self {
-        if let Err(e) = self.place_lm_head_on_gpu(quantize_int8, device) {
+    pub fn with_lm_head_on_gpu(mut self, quant: LmHeadQuant, device: Option<u32>) -> Self {
+        if let Err(e) = self.place_lm_head_on_gpu(quant, device) {
             eprintln!("warning: the LM head stays on the CPU ({e}); decoding will be slower");
         }
         self
@@ -825,14 +862,44 @@ impl<K: ComputeKernel> Generator<K> {
         context: &[u32],
         prompt_len: usize,
     ) -> Result<Vec<(u32, f32)>> {
-        let mut logits = self.logits(hidden)?;
-        let penalty = sampler.repetition_penalty();
-        if penalty != 1.0 {
-            let seen = context.iter().copied().collect();
-            apply_repetition_penalty(&mut logits, &seen, penalty);
-        }
-        penalties.apply(&mut logits, context, prompt_len);
-        Ok(sampler.distribution(&logits))
+        Ok(self
+            .distributions(&[hidden], sampler, penalties, &[context], prompt_len)?
+            .remove(0))
+    }
+
+    /// [`distribution`](Self::distribution) for several hidden states, row `j`
+    /// with its own `contexts[j]`, through one LM-head call: a speculative
+    /// verify scores every proposal at once, and called position by position it
+    /// read the head's weights and copied a row of logits to the host for each.
+    /// Plain greedy needs only each row's argmax, found on the device.
+    pub(crate) fn distributions(
+        &self,
+        hiddens: &[&[f32]],
+        sampler: &Sampler,
+        penalties: &Penalties,
+        contexts: &[&[u32]],
+        prompt_len: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        let greedy = matches!(sampler, Sampler::Greedy) && penalties.is_noop();
+        let want = if greedy { Want::Token } else { Want::Logits };
+        let rows: Vec<(&[f32], Want)> = hiddens.iter().map(|&h| (h, want)).collect();
+        self.heads(&rows)?
+            .into_iter()
+            .zip(contexts)
+            .map(|(head, context)| match head {
+                Head::Token(t) => Ok(vec![(t, 1.0)]),
+                Head::Logits(mut logits) => {
+                    let penalty = sampler.repetition_penalty();
+                    if penalty != 1.0 {
+                        let seen = context.iter().copied().collect();
+                        apply_repetition_penalty(&mut logits, &seen, penalty);
+                    }
+                    penalties.apply(&mut logits, context, prompt_len);
+                    Ok(sampler.distribution(&logits))
+                }
+                Head::Top(_) => unreachable!("asked for a token or the logits"),
+            })
+            .collect()
     }
 
     pub(crate) fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {

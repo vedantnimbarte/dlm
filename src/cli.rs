@@ -210,8 +210,8 @@ impl KvQuantArg {
 /// Speculative decoding (`--speculative`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Speculative {
-    /// The draft model if `--draft-model-path` is given; else n-gram lookup if
-    /// the model is streamed; else off.
+    /// The draft model if `--draft-model-path` is given; else n-gram lookup on
+    /// the GPU, or a CPU model streamed from disk; else off.
     Auto,
     /// Decode one token per pass.
     Off,
@@ -223,19 +223,22 @@ pub enum Speculative {
 }
 
 impl Speculative {
-    /// What this comes to for a run (never `Auto`). `streamed`: whether a pass
-    /// moves layer weights, i.e. the model streams layers into VRAM, or on the
-    /// CPU from the checkpoint past what the RAM cache holds.
+    /// What this comes to for a run (never `Auto`). `cheap_verify`: whether
+    /// scoring a few tokens in one pass costs little more than generating one --
+    /// on the GPU, resident or streamed (a few tokens go through the batched
+    /// decode block, which reads each weight once for all of them), and on the
+    /// CPU when a pass moves layers from the checkpoint past the RAM cache.
     ///
-    /// Lookup is automatic only there because that is where it pays: a pass
-    /// costs moving the streamed layers' weights, so verifying a few tokens
-    /// costs little more than generating one. Where a pass is compute (a
-    /// resident model, or CPU layers all in the RAM cache), verifying k tokens
-    /// costs nearly k passes, and a wrong guess is paid for in full.
-    pub fn resolve(self, has_draft: bool, streamed: bool) -> Result<Speculative> {
+    /// Lookup is automatic only there. On a GTX 1650, verifying 5 tokens cost
+    /// 1.55x one step, so Qwen2.5-0.5B Q4_K_M decoded 3.2x faster with every
+    /// guess kept and still 11% faster with 39% kept; a round whose every guess
+    /// misses costs about a third of a step more. Where a pass is compute on the
+    /// CPU, verifying k tokens costs nearly k passes, and a wrong guess is paid
+    /// for in full.
+    pub fn resolve(self, has_draft: bool, cheap_verify: bool) -> Result<Speculative> {
         match self {
             Speculative::Auto if has_draft => Ok(Speculative::Draft),
-            Speculative::Auto if streamed => Ok(Speculative::Ngram),
+            Speculative::Auto if cheap_verify => Ok(Speculative::Ngram),
             Speculative::Auto => Ok(Speculative::Off),
             Speculative::Draft if !has_draft => Err(DlmError::InvalidConfig(
                 "--speculative draft needs --draft-model-path".into(),
@@ -375,11 +378,20 @@ pub struct ServeArgs {
 
     /// KV cache precision. The KV cache can exceed the weights at long context,
     /// so a smaller one fits more context or a bigger batch in the same budget.
-    /// On the GPU: `f16` (default, half the memory) or `f32` (exact); `int8` and
-    /// `int4` store fp16 there too. On the CPU kernels: `f32`, `int8` (≈half
-    /// memory) or `int4` (≈quarter, more error); `f16` stays f32.
+    /// On the GPU: `f16` (default, half the memory), `f32` (exact), or `int8`
+    /// and `int4`, both stored as int8 there (56% of fp16, some accuracy cost;
+    /// fp16 for heads not a multiple of 32 wide). On the CPU kernels: `f32`,
+    /// `int8` (≈half memory) or `int4` (≈quarter, more error); `f16` stays f32.
     #[arg(long, value_enum, default_value_t = KvQuantArg::F16)]
     pub kv_quant: KvQuantArg,
+
+    /// Hold the GPU's LM head in int4. The head is a large share of a small
+    /// model's bytes per token: on Qwen2.5-0.5B bf16, batched decode about 9%
+    /// faster (batch 1 within noise to +6%) for +0.025 nats of mean NLL. Off:
+    /// the head stays as the checkpoint holds it, or int8 for a model quantized
+    /// with `--quant`.
+    #[arg(long, default_value_t = false)]
+    pub lm_head_int4: bool,
 
     /// Cluster role.
     #[arg(long, value_enum, default_value_t = DistributedMode::Standalone)]

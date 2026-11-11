@@ -40,6 +40,67 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A single-token layer's attention half takes fewer launches.** Two merges
+  that need no grid-wide synchronization:
+  - **RoPE and the K/V append run inside the attention kernel**
+    (`attn_split_post_kernel`), removing `qk_post`'s launch. Each attention
+    block normalizes and rotates its own query heads in shared memory; the
+    block for the last chunk, the only one that reads the token's own row,
+    rotates its key and appends K and V before attending. Qwen2.5-0.5B batch
+    1: Q4_K_M 132 -> 137 tok/s, bf16 97 -> 103; Qwen2.5-1.5B unchanged (65.6
+    / 65.7 over six runs).
+  - **For int8 activations, the input and post-attention norms and their
+    quantization are one launch** (`rmsnorm_q8_kernel`), and the GEMVs that
+    read the row (Q/K/V; gate and up, which also stop quantizing it twice)
+    reuse its codes. Batch 1, four alternating pairs: Qwen2.5-0.5B Q8_0 129 ->
+    138 tok/s, int8 129 -> 145. Q4_K_M at 0.5B is unchanged: its 896-wide
+    rows do not take int8 activations.
+
+  A single kernel for the whole half would need a grid-wide sync between the
+  Q/K/V GEMV, attention and the output GEMV (a cooperative launch, which
+  limits the GEMVs' occupancy); these two cover the launches that need none.
+
+- **Single-request decode is 13-22% faster: the fused GEMV no longer spills
+  to the stack.** The kernel that runs a layer's Q/K/V, output and down
+  projections for one sequence found each row's matrix by indexing its
+  segment struct with a runtime value, which copied all 88 bytes of it to
+  every thread's stack, and then read the row's weight pointer from that stack
+  inside its inner loop. It now selects with constant indices and takes the
+  weights as their own read-only parameters (`STACK:0`). Batch-1 decode,
+  GTX 1650, tok/s: Qwen2.5-0.5B bf16 85 -> 104, Q4_K_M 110 -> 133, Q8_0
+  109 -> 130, Qwen2.5-1.5B Q4_K_M 59 -> 67. bf16 batch 1 now matches the 101
+  tok/s vLLM (fp16) made on this card. Batched decode runs other kernels and
+  is unchanged.
+
+- **N-gram speculation now pays on the GPU, and `--speculative auto` turns it
+  on there.** A speculative round scores the pending token and its proposals
+  in one target pass, but on the GPU that pass went through the prefill GEMM,
+  which computes 64-token tiles, and each position then ran the LM head on its
+  own and copied its logits to the host. Verifying 5 tokens cost what decoding
+  them one by one did, so speculation could not win, and `auto` left it off for
+  resident models. Now a piece of 16 tokens or fewer goes through the batched
+  decode block (a verify, a short prompt, a long prompt's tail), and the verify
+  scores every position in one LM-head call (`Generator::distributions`), only
+  the argmax coming back under plain greedy. Batch 1 on a GTX 1650, n-gram
+  lookup proposing 4, decode tok/s (`dlm bench --speculative ngram`, which
+  now measures it):
+
+  | Model | Plain | Before | After | Accepted |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B bf16, greedy | 85 | 84 | 317 | 100% |
+  | Qwen2.5-0.5B Q4_K_M, greedy | 111 | 98 | 358 | 100% |
+  | Qwen2.5-1.5B Q4_K_M, greedy | 58 | 33 | 130 | 100% |
+  | Qwen2.5-0.5B Q4_K_M, temperature 1.2 | 71 | | 79 | 39% |
+  | Qwen2.5-1.5B Q4_K_M, temperature 1.2 | 52 | | 65 | 78% |
+
+  The bench prompt repeats, the case lookup is for, so the greedy rows are
+  its best case; real text proposes less often. A round whose every guess
+  misses costs about a third of a step more than a plain step (a 5-token
+  verify is 1.55x one). Several requests at once still decode plainly in one
+  batched pass, as before. Short prompts gain too: time to first token for 8
+  / 16 tokens 66 / 58 ms -> 30 / 39 ms. `--speculative off` restores plain
+  decoding; `dlm bench` stays plain unless asked.
+
 - **A batched decode layer launches Q/K/V as one GEMV and gate/up as
   another.** Each layer issued about 21 launches, and the host spent 5-8 ms
   of a batched step issuing them; on Qwen2.5-0.5B, K and V alone were 128 rows,
@@ -380,6 +441,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     single-slot GEMV, and MoE decode does not use the batched block at all.
 
 ### Added
+
+- **`--lm-head-int4`: hold the GPU's LM head in int4.** The vocabulary-wide
+  head is a large share of a small model's bytes per token (272 MB of
+  Qwen2.5-0.5B bf16's ~1 GB). Opt-in, since it costs accuracy; without it the
+  head stays as before (the checkpoint's precision, or int8 for `--quant`).
+  `place_lm_head_on_gpu` takes an `LmHeadQuant` (`Native`, `Int8`, `Int4`)
+  in place of its `bool`. GTX 1650, Qwen2.5-0.5B bf16, two alternating pairs:
+  batch-8 decode 404 / 371 -> 441 / 406 tok/s (+9%), batch 1 109 / 102 ->
+  115 / 99 (noise). Mean NLL over 833 tokens (`dlm score --decode`): 0.5B
+  bf16 2.841 -> 2.865, 0.5B Q4_K_M 2.908 -> 2.928, 1.5B Q4_K_M 2.525 ->
+  2.567. It pays most on a bf16 head; a GGUF head is already 6-8 bits.
 
 - **`dlm score --decode`** scores a text one token at a time, through the
   kernels generation uses. On the GPU those differ from prefill's (GEMVs on

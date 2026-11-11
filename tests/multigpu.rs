@@ -87,6 +87,7 @@ fn build_parts() -> ModelParts {
         kv_blocks: 64,
         embed_scale: None,
         final_logit_softcap: None,
+        head_int4: false,
     }
 }
 
