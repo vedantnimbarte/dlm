@@ -378,11 +378,20 @@ pub struct ServeArgs {
 
     /// KV cache precision. The KV cache can exceed the weights at long context,
     /// so a smaller one fits more context or a bigger batch in the same budget.
-    /// On the GPU: `f16` (default, half the memory) or `f32` (exact); `int8` and
-    /// `int4` store fp16 there too. On the CPU kernels: `f32`, `int8` (≈half
-    /// memory) or `int4` (≈quarter, more error); `f16` stays f32.
+    /// On the GPU: `f16` (default, half the memory), `f32` (exact), or `int8`
+    /// and `int4`, both stored as int8 there (56% of fp16, some accuracy cost;
+    /// fp16 for heads not a multiple of 32 wide). On the CPU kernels: `f32`,
+    /// `int8` (≈half memory) or `int4` (≈quarter, more error); `f16` stays f32.
     #[arg(long, value_enum, default_value_t = KvQuantArg::F16)]
     pub kv_quant: KvQuantArg,
+
+    /// Hold the GPU's LM head in int4. The head is a large share of a small
+    /// model's bytes per token: on Qwen2.5-0.5B bf16, batched decode about 9%
+    /// faster (batch 1 within noise to +6%) for +0.025 nats of mean NLL. Off:
+    /// the head stays as the checkpoint holds it, or int8 for a model quantized
+    /// with `--quant`.
+    #[arg(long, default_value_t = false)]
+    pub lm_head_int4: bool,
 
     /// Cluster role.
     #[arg(long, value_enum, default_value_t = DistributedMode::Standalone)]

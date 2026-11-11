@@ -143,7 +143,8 @@ fn gemma3_long_context_fit() {
     // A host RAM cache, so a streamed layer is read from the checkpoint once
     // rather than on every decode miss: this checks correctness, not disk speed.
     let streamed =
-        dlm::loader::build_streaming_gpu_generator(store, &config, 1536, 8, 3 << 30, 0).unwrap();
+        dlm::loader::build_streaming_gpu_generator(store, &config, 1536, 8, 3 << 30, 0, false)
+            .unwrap();
     let streamed_all = nll(&streamed.score(&ids).unwrap());
     assert!(
         (streamed_all - all).abs() < 1e-3,
@@ -207,7 +208,8 @@ fn gemma3_4b_long_context_fit() {
         .encode(&format!("{PASSAGE}\n\n{PASSAGE}"))
         .unwrap();
     let store = MmapStore::open_dir(&dir).unwrap();
-    let g = dlm::loader::build_streaming_gpu_generator(store, &config, 1536, 8, 0, 0).unwrap();
+    let g =
+        dlm::loader::build_streaming_gpu_generator(store, &config, 1536, 8, 0, 0, false).unwrap();
     let t = std::time::Instant::now();
     let lp = g.score(&ids).unwrap();
     let nll = |s: &[f32]| -s.iter().map(|&x| x as f64).sum::<f64>() / s.len() as f64;

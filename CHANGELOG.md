@@ -422,6 +422,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--lm-head-int4`: hold the GPU's LM head in int4.** The vocabulary-wide
+  head is a large share of a small model's bytes per token (272 MB of
+  Qwen2.5-0.5B bf16's ~1 GB). Opt-in, since it costs accuracy; without it the
+  head stays as before (the checkpoint's precision, or int8 for `--quant`).
+  `place_lm_head_on_gpu` takes an `LmHeadQuant` (`Native`, `Int8`, `Int4`)
+  in place of its `bool`. GTX 1650, Qwen2.5-0.5B bf16, two alternating pairs:
+  batch-8 decode 404 / 371 -> 441 / 406 tok/s (+9%), batch 1 109 / 102 ->
+  115 / 99 (noise). Mean NLL over 833 tokens (`dlm score --decode`): 0.5B
+  bf16 2.841 -> 2.865, 0.5B Q4_K_M 2.908 -> 2.928, 1.5B Q4_K_M 2.525 ->
+  2.567. It pays most on a bf16 head; a GGUF head is already 6-8 bits.
+
 - **`dlm score --decode`** scores a text one token at a time, through the
   kernels generation uses. On the GPU those differ from prefill's (GEMVs on
   int8-quantized activations against GEMMs on f32 ones), so plain `dlm score`

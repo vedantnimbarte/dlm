@@ -2054,24 +2054,31 @@ fn gpu_lm_head_matches_host_head() {
         sampler: Sampler::Greedy,
     };
     let prompt = [5u32, 77, 140, 3];
-    for (what, head, int8) in [
-        ("bf16", &bf16_head, false),
-        ("f32", &f32_head, false),
-        ("int8", &f32_head, true),
+    use dlm::generate::LmHeadQuant;
+    for (what, head, quant) in [
+        ("bf16", &bf16_head, LmHeadQuant::Native),
+        ("f32", &f32_head, LmHeadQuant::Native),
+        ("int8", &f32_head, LmHeadQuant::Int8),
+        ("int4", &f32_head, LmHeadQuant::Int4),
     ] {
         let host = build(head).generate(&prompt, &greedy).unwrap();
         let mut dev = build(head);
-        dev.place_lm_head_on_gpu(int8, None).unwrap();
+        dev.place_lm_head_on_gpu(quant, None).unwrap();
         let got = dev.generate(&prompt, &greedy).unwrap();
-        if int8 {
+        let same = host.iter().zip(&got).filter(|(a, b)| a == b).count();
+        match quant {
+            LmHeadQuant::Native => {
+                assert_eq!(got, host, "{what}: device head chose different tokens")
+            }
             // Quantization may move a near-tie; most tokens must still agree.
-            let same = host.iter().zip(&got).filter(|(a, b)| a == b).count();
-            assert!(
+            LmHeadQuant::Int8 => assert!(
                 same >= 20,
                 "{what}: only {same}/24 tokens match the host head"
-            );
-        } else {
-            assert_eq!(got, host, "{what}: device head chose different tokens");
+            ),
+            // int4 moves more of them, and once one token differs, so does all
+            // that follows: the run must agree until then (8 tokens here; a head
+            // quantized into noise misses the first).
+            LmHeadQuant::Int4 => assert_eq!(got[..4], host[..4], "{what}: first tokens differ"),
         }
     }
 }
@@ -2500,7 +2507,8 @@ fn gpu_sampled_sessions_match_host_head() {
     };
     let host = build();
     let mut dev = build();
-    dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    dev.place_lm_head_on_gpu(dlm::generate::LmHeadQuant::Native, Some(0))
+        .unwrap();
     let prompts: [&[u32]; 3] = [&[9, 200, 41], &[3, 77], &[150, 2, 8, 99]];
     for (top_p, top_k) in [(1.0, 20), (0.8, 0)] {
         let run = |g: &Generator<GpuKernel>, together: bool| -> Vec<Vec<u32>> {
@@ -2572,7 +2580,8 @@ fn gpu_ngram_speculation_matches_plain_greedy() {
         16,
     )
     .unwrap();
-    g.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    g.place_lm_head_on_gpu(dlm::generate::LmHeadQuant::Native, Some(0))
+        .unwrap();
     let prompt: Vec<u32> = [5u32, 9, 13, 7].iter().copied().cycle().take(24).collect();
     let want = g
         .generate(
@@ -2637,7 +2646,8 @@ fn multi_gpu_lm_head_matches_host_head() {
     let prompt = [9u32, 200, 41];
     let want = build().generate(&prompt, &greedy).unwrap();
     let mut dev = build();
-    dev.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    dev.place_lm_head_on_gpu(dlm::generate::LmHeadQuant::Native, Some(0))
+        .unwrap();
     assert_eq!(dev.generate(&prompt, &greedy).unwrap(), want);
 }
 

@@ -794,6 +794,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         kv_blocks,
         embed_scale: None,
         final_logit_softcap: None,
+        head_int4: false,
     })
 }
 
@@ -1432,7 +1433,11 @@ fn serve_multi_gpu(
     listen: &str,
 ) -> Result<()> {
     println!("  compute    : gpu (each stage runs its shard on its device)");
-    let generator = parts.into_multi_gpu_generator(ids)?;
+    let generator = ModelParts {
+        head_int4: args.lm_head_int4,
+        ..parts
+    }
+    .into_multi_gpu_generator(ids)?;
     let draft = draft_parts
         .map(|p| p.into_multi_gpu_generator(&ids[..1]))
         .transpose()?;
@@ -1513,6 +1518,10 @@ fn serve_on_gpu(
         args.max_batch,
         args.context_length,
     )?;
+    let parts = ModelParts {
+        head_int4: args.lm_head_int4,
+        ..parts
+    };
     if let Some(n) = gpu_layers {
         let generator = parts.into_split_generator(n as usize)?;
         return start_batched_server(generator, None, args, config, listen, Some(pool));
@@ -1557,6 +1566,7 @@ fn serve_streaming_gpu(
         window,
         ram_cache,
         expert_cache,
+        args.lm_head_int4,
     )?;
     start_batched_server(generator, None, args, config, listen, None)
 }

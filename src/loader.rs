@@ -527,9 +527,22 @@ pub struct ModelParts {
     pub final_norm_bias: Option<Vec<f32>>,
     /// Gemma2 final-logit softcap; `None` elsewhere.
     pub final_logit_softcap: Option<f32>,
+    /// Hold the device LM head in int4 (`--lm-head-int4`).
+    pub head_int4: bool,
 }
 
 impl ModelParts {
+    /// The device LM head's precision: int4 when asked for, else int8 for
+    /// layers quantized at load, else the checkpoint's own.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    fn head_quant(&self) -> crate::generate::LmHeadQuant {
+        let quantized = self
+            .layers
+            .first()
+            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
+        crate::generate::LmHeadQuant::choose(self.head_int4, quantized)
+    }
+
     /// Wrap the CPU kernel around these weights and build a generator.
     pub fn into_cpu_generator(mut self) -> Result<Generator<CpuKernel>> {
         // Resident on the host: the same trade as on the GPU, against RAM. A
@@ -647,12 +660,9 @@ impl ModelParts {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let head = self.head_quant();
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
-        let quantized = self
-            .layers
-            .first()
-            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
         let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
         Ok(Generator::new(
             kernel,
@@ -667,7 +677,7 @@ impl ModelParts {
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap)
-        .with_lm_head_on_gpu(quantized, None))
+        .with_lm_head_on_gpu(head, None))
     }
 
     /// Hold the first `gpu_layers` layers in VRAM and run the rest on the CPU,
@@ -683,12 +693,9 @@ impl ModelParts {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let head = self.head_quant();
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
-        let quantized = self
-            .layers
-            .first()
-            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
         let back = self.layers.split_off(gpu_layers);
         let kernel = crate::forward::SplitKernel::new(
             crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?,
@@ -707,7 +714,7 @@ impl ModelParts {
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap)
-        .with_lm_head_on_gpu(quantized, None))
+        .with_lm_head_on_gpu(head, None))
     }
 
     /// Split the model's layers across `gpu_ids` and build a generator over a
@@ -722,12 +729,9 @@ impl ModelParts {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
+        let head = self.head_quant();
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
-        let quantized = self
-            .layers
-            .first()
-            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
         let kernel =
             crate::forward::MultiGpuKernel::new(self.cfg, self.layers, gpu_ids, max_kv_tokens)?;
         // The head goes on the last stage's GPU, which produces the final hidden
@@ -746,7 +750,7 @@ impl ModelParts {
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap)
-        .with_lm_head_on_gpu(quantized, head_device))
+        .with_lm_head_on_gpu(head, head_device))
     }
 
     /// Split the model's layers across `gpu_ids` (multi-GPU pipeline
@@ -1707,6 +1711,7 @@ pub fn build_streaming_gpu_generator(
     resident_layers: usize,
     ram_cache_bytes: usize,
     expert_cache_bytes: usize,
+    head_int4: bool,
 ) -> Result<Generator<crate::forward::StreamingGpuKernel<CachedLayerSource<MmapLayerSource>>>> {
     let p = load_streaming_pieces(store, config, max_context)?;
     let cfg = p.source.cfg;
@@ -1748,7 +1753,10 @@ pub fn build_streaming_gpu_generator(
     // The VRAM plan already reserves the pinned zone (embedding, head, norms)
     // before sizing the window, so the head fits in what was set aside for it.
     .with_lm_head_on_gpu(
-        matches!(config.quant, QuantScheme::Int4 | QuantScheme::Int8),
+        crate::generate::LmHeadQuant::choose(
+            head_int4,
+            matches!(config.quant, QuantScheme::Int4 | QuantScheme::Int8),
+        ),
         None,
     ))
 }
@@ -1852,6 +1860,7 @@ pub fn load_model_parts(
         kv_blocks,
         embed_scale: config.embed_scale,
         final_logit_softcap: config.final_logit_softcap,
+        head_int4: false,
     })
 }
 
