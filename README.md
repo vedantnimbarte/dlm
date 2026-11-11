@@ -948,8 +948,17 @@ inference engine):
     A request takes blocks as it grows and returns them when it ends, so it uses
     VRAM for the tokens it holds, not a full `--context-length`.
   - **Pool size:** `serve` gives the pool whatever VRAM fits after the weights,
-    up to `--max-batch` full contexts. It refuses to start only if one
-    full-context request would not fit.
+    up to `--max-batch` full contexts.
+  - **KV in host RAM:** when not even one full-context request fits, the pool
+    holds one, and only the layers that fit keep their KV in VRAM; the rest
+    keep it in page-locked host RAM, which the kernels read over PCIe. That is
+    slower per step, but a context the card cannot hold runs instead of being
+    refused (`kv offload` in the startup banner says which layers). Qwen2.5-1.5B
+    `Q8_0` on a GTX 1650 capped at 2.4 GB, 32k context, 4k-token history: 21 of
+    28 layers' KV in host RAM, decode 21 tok/s against 49 with it all in VRAM.
+    It refuses only if the host part would take over half the RAM. Resident
+    GPU only: when streaming, KV in VRAM costs a few streamed layers, which is
+    cheaper than reading it over the bus.
   - **Admission control:** a request starts only once the pool can hold its
     prompt plus `max_tokens` alongside the running requests. Otherwise it waits
     in the queue instead of failing mid-decode.

@@ -27,6 +27,8 @@ pub type cudaEvent_t = *mut c_void;
 
 pub const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+/// Direction inferred from the pointers (unified addressing).
+pub const CUDA_MEMCPY_DEFAULT: c_int = 4;
 
 pub const CUDA_HOST_ALLOC_DEFAULT: c_uint = 0x00;
 pub const CUDA_HOST_ALLOC_PORTABLE: c_uint = 0x01;
@@ -211,6 +213,42 @@ pub(super) fn device_free(ptr: *mut c_void) {
     unsafe {
         let _ = cudaFree(ptr);
     }
+}
+
+/// Page-locked host memory the device reads and writes in place over the bus,
+/// at the same address on both sides (unified addressing). Freed with
+/// [`host_free`]. Uninitialized.
+pub(super) fn host_mapped_alloc(bytes: usize) -> Result<*mut c_void> {
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: valid out-pointer.
+    let code = unsafe {
+        cudaHostAlloc(
+            &mut raw,
+            bytes.max(1),
+            CUDA_HOST_ALLOC_PORTABLE | CUDA_HOST_ALLOC_MAPPED,
+        )
+    };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "cudaHostAlloc(mapped)",
+            code,
+        });
+    }
+    Ok(raw)
+}
+
+/// Synchronous copy between any two addresses the runtime knows, host or
+/// device: for buffers in [`host_mapped_alloc`] memory.
+pub(super) fn copy_any(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+    // SAFETY: caller guarantees `bytes` valid on both sides.
+    let code = unsafe { cudaMemcpy(dst, src, bytes, CUDA_MEMCPY_DEFAULT) };
+    if code != CUDA_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "cudaMemcpy(default)",
+            code,
+        });
+    }
+    Ok(())
 }
 
 /// Synchronous host→device copy.

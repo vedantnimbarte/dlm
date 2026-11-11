@@ -833,6 +833,13 @@ impl<K: ComputeKernel> Generator<K> {
         self
     }
 
+    /// Keep the KV of layers `from..` in host RAM (the GPU kernels; no effect on
+    /// the others). Call before the first session.
+    pub fn with_kv_host_layers(mut self, from: usize) -> Self {
+        self.kernel.set_kv_host_layers(from);
+        self
+    }
+
     /// KV tokens the kernel's pools can still take at this generator's KV
     /// precision, or `None` if the kernel has no fixed pool (the CPU kernels).
     pub fn kv_free_tokens(&self) -> Option<usize> {

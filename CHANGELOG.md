@@ -453,6 +453,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **KV cache in host RAM for a context the card cannot hold.** A resident GPU
+  model whose one full-context request did not fit beside the weights was
+  refused at startup. Now the layers that fit keep their KV in VRAM and the
+  rest keep it in page-locked host RAM, mapped so the same kernels read and
+  write it over PCIe; the banner's `kv offload` line names the layers. Qwen2.5-
+  1.5B `Q8_0` on a GTX 1650 capped at 2.4 GB (`--vram-budget-gb 2.4
+  --safety-margin-gb 0.5`), 32k context, 4,096-token prompt: refused before;
+  now 21 of 28 layers' KV in host RAM, prefill 298 tok/s and decode 21 tok/s,
+  against 325 and 49 with a context that fits. Refused only if the host part
+  would take over half the RAM. Not when streaming, where KV in VRAM costs a
+  few more streamed layers, cheaper than reading it over the bus.
+  `tests/gpu_parity.rs` checks host-RAM KV decodes bit for bit like VRAM KV,
+  in fp16 and int8.
+
 - **2- and 3-bit GGUF files: Q2_K, Q3_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
   IQ3_S, IQ4_NL and IQ4_XS.** These were refused by name, which ruled out every
   `Q2_K`, `Q3_K_*`, `IQ2_*`, `IQ3_*` and `IQ4_*` download, the files that make a

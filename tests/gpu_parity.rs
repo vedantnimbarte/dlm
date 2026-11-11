@@ -928,6 +928,47 @@ fn streaming_gpu_worker_prefetches() {
     );
 }
 
+/// KV kept in host RAM for the layers that do not fit the card decodes exactly
+/// as KV in VRAM: the same kernels read the same values, only over the bus.
+/// Layers 1.. are in host RAM, across enough steps that attention reads a
+/// history of several blocks, in fp16 and int8.
+#[test]
+fn gpu_kv_in_host_ram_matches_vram() {
+    use dlm::forward::ComputeKernel;
+    // Heads of 32, so the int8 KV groups fit (else int8 asks get fp16).
+    let cfg = BlockConfig {
+        hidden_size: 64,
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 32,
+        ..small_cfg()
+    };
+    let num_layers = 3u32;
+    let layers = random_layers(&cfg, num_layers, 0x4057);
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::Int8] {
+        let orch = |host_from: usize| {
+            let mut k = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+            k.set_kv_host_layers(host_from);
+            ForwardOrchestrator::new(k, PagedKvCache::new(kv_cfg, 32), quant)
+        };
+        let (mut vram, mut host) = (orch(num_layers as usize), orch(1));
+        let mut rng = Rng::new(0x4058);
+        for step in 0..40 {
+            let mut a = rng.vec(cfg.hidden_size, 1.0);
+            let mut b = a.clone();
+            vram.decode_token(&mut a).unwrap();
+            host.decode_token(&mut b).unwrap();
+            assert_eq!(a, b, "{quant:?} step {step}: host-RAM KV diverged");
+        }
+    }
+}
+
 /// The worker loads the next layer the pass is missing, not just the next
 /// layer: when that one is already resident, the copy engine has the time it
 /// takes to compute it to fetch a later one.
