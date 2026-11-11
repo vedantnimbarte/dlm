@@ -1118,6 +1118,30 @@ impl<K: ComputeKernel> Generator<K> {
         false
     }
 
+    /// `tokens`' embedding: the final-normed hidden state of the last token,
+    /// scaled to unit length. Last-token pooling is what decoder embedding
+    /// models (Qwen3-Embedding, gte-Qwen2) are trained for; on a chat model it
+    /// is still a usable summary of the text, not a tuned one.
+    pub fn embedding(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(DlmError::InvalidConfig("nothing to embed".into()));
+        }
+        let mut orch = self.orchestrator();
+        let last = self.prefill(&mut orch, tokens)?;
+        let mut v = self.final_norm(&last);
+        let norm = v
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            .sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x = (*x as f64 / norm) as f32;
+            }
+        }
+        Ok(v)
+    }
+
     fn final_norm(&self, hidden: &[f32]) -> Vec<f32> {
         crate::forward::cpu::norm(
             hidden,

@@ -30,6 +30,16 @@ pub enum TokenEvent {
     Done(Option<AcceptanceStats>),
 }
 
+/// What the engine thread is asked to do: generate, or embed a text (run
+/// between decode steps, on its own KV).
+enum Work {
+    Generate(Box<Job>),
+    Embed {
+        tokens: Vec<u32>,
+        reply: Sender<Result<Vec<f32>, String>>,
+    },
+}
+
 struct Job {
     id: u64,
     prompt: Vec<u32>,
@@ -81,7 +91,7 @@ impl StreamMetrics {
 
 /// A handle to the background batching engine.
 pub struct EngineService {
-    job_tx: Mutex<Sender<Job>>,
+    job_tx: Mutex<Sender<Work>>,
     next_id: AtomicU64,
     tokenizer: BpeTokenizer,
     vocab_size: usize,
@@ -203,7 +213,7 @@ impl EngineService {
         max_batch: usize,
         prefix_cache_size: usize,
     ) -> Arc<Self> {
-        let (job_tx, job_rx) = channel::<Job>();
+        let (job_tx, job_rx) = channel::<Work>();
         let stream = Arc::new(StreamMetrics::default());
         let stream_loop = Arc::clone(&stream);
         std::thread::spawn(move || {
@@ -299,15 +309,28 @@ impl EngineService {
             .job_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send(Job {
+            .send(Work::Generate(Box::new(Job {
                 id,
                 prompt,
                 max_new,
                 eos,
                 decoding,
                 sink,
-            });
+            })));
         out
+    }
+
+    /// `tokens`' embedding (see [`Generator::embedding`]), computed on the
+    /// engine thread between decode steps.
+    fn embed(&self, tokens: Vec<u32>) -> Result<Vec<f32>, String> {
+        let (reply, out) = channel();
+        self.job_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(Work::Embed { tokens, reply })
+            .map_err(|_| "the engine has stopped".to_string())?;
+        out.recv()
+            .map_err(|_| "the engine has stopped".to_string())?
     }
 
     /// Encode a prompt string to token ids, validating against the vocabulary.
@@ -333,7 +356,7 @@ fn engine_loop<K: ComputeKernel>(
     generator: Generator<K>,
     draft: Option<Generator<K>>,
     gamma: usize,
-    job_rx: Receiver<Job>,
+    job_rx: Receiver<Work>,
     max_batch: usize,
     prefix_cache_size: usize,
     stream: Arc<StreamMetrics>,
@@ -348,14 +371,20 @@ fn engine_loop<K: ComputeKernel>(
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
 
     loop {
+        let mut take = |work: Work, sched: &mut BatchScheduler<'_, K>| match work {
+            Work::Generate(job) => enqueue(sched, &mut sinks, *job),
+            Work::Embed { tokens, reply } => {
+                let _ = reply.send(generator.embedding(&tokens).map_err(|e| e.to_string()));
+            }
+        };
         if !sched.has_work() {
             match job_rx.recv() {
-                Ok(job) => enqueue(&mut sched, &mut sinks, job),
+                Ok(work) => take(work, &mut sched),
                 Err(_) => break, // all handles dropped
             }
         }
-        while let Ok(job) = job_rx.try_recv() {
-            enqueue(&mut sched, &mut sinks, job);
+        while let Ok(work) = job_rx.try_recv() {
+            take(work, &mut sched);
         }
         if !sched.has_work() {
             continue;
@@ -1374,6 +1403,7 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
             }
             ("POST", "/v1/chat/completions") => handle_chat(&engine, req),
             ("POST", "/v1/completions") => handle_completion(&engine, req),
+            ("POST", "/v1/embeddings") => handle_embeddings(&engine, req),
             ("POST", "/v1/messages") => handle_messages(&engine, req),
             ("POST", "/v1/messages/count_tokens") => handle_count_tokens(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
@@ -1734,6 +1764,172 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
     }
+}
+
+// ── OpenAI embeddings (`POST /v1/embeddings`) ───────────────────────────────
+
+/// `input`: one text or several, each as a string or as token ids.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Text(String),
+    Texts(Vec<String>),
+    Ids(Vec<u32>),
+    IdLists(Vec<Vec<u32>>),
+}
+
+#[derive(Deserialize)]
+struct EmbeddingRequest {
+    #[serde(default)]
+    model: Option<String>,
+    input: EmbeddingInput,
+    /// `float` (the default) or `base64`, the little-endian f32 bytes, which
+    /// the OpenAI Python SDK asks for unless told otherwise.
+    #[serde(default)]
+    encoding_format: Option<String>,
+    /// Keep the first this many dimensions, scaled back to unit length.
+    #[serde(default)]
+    dimensions: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum EmbeddingVector {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+#[derive(Serialize)]
+struct EmbeddingData {
+    object: &'static str,
+    index: usize,
+    embedding: EmbeddingVector,
+}
+
+#[derive(Serialize)]
+struct EmbeddingUsage {
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct EmbeddingResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: String,
+    usage: EmbeddingUsage,
+}
+
+/// Standard base64 (RFC 4648, padded).
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for k in 0..4 {
+            if k <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * k) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn handle_embeddings(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: EmbeddingRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
+    };
+    let base64_out = match parsed.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return Response::json(
+                400,
+                error_json(&format!(
+                    "encoding_format must be float or base64, not {other}"
+                )),
+            )
+        }
+    };
+    let texts: Result<Vec<Vec<u32>>, String> = match parsed.input {
+        EmbeddingInput::Text(t) => engine.encode_prompt(&t).map(|ids| vec![ids]),
+        EmbeddingInput::Texts(ts) => ts.iter().map(|t| engine.encode_prompt(t)).collect(),
+        EmbeddingInput::Ids(ids) => Ok(vec![ids]),
+        EmbeddingInput::IdLists(lists) => Ok(lists),
+    };
+    let texts = match texts {
+        Ok(t) if !t.is_empty() => t,
+        Ok(_) => return Response::json(400, error_json("input must not be empty")),
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    for ids in &texts {
+        let bad = ids.iter().any(|&t| t as usize >= engine.vocab_size);
+        if ids.is_empty() || bad || ids.len() > engine.max_context {
+            return Response::json(
+                400,
+                error_json(&format!(
+                    "each input must be 1 to {} tokens of the model's vocabulary",
+                    engine.max_context
+                )),
+            );
+        }
+    }
+    let mut data = Vec::with_capacity(texts.len());
+    let mut tokens = 0;
+    for (index, ids) in texts.into_iter().enumerate() {
+        tokens += ids.len();
+        let mut v = match engine.embed(ids) {
+            Ok(v) => v,
+            Err(e) => return Response::json(500, error_json(&format!("embedding failed: {e}"))),
+        };
+        if let Some(d) = parsed.dimensions {
+            if d == 0 || d > v.len() {
+                return Response::json(
+                    400,
+                    error_json(&format!("dimensions must be between 1 and {}", v.len())),
+                );
+            }
+            v.truncate(d);
+            let norm = v
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>()
+                .sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x = (*x as f64 / norm) as f32);
+            }
+        }
+        let embedding = if base64_out {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            EmbeddingVector::Base64(base64(&bytes))
+        } else {
+            EmbeddingVector::Float(v)
+        };
+        data.push(EmbeddingData {
+            object: "embedding",
+            index,
+            embedding,
+        });
+    }
+    engine.record(tokens, 0);
+    let body = EmbeddingResponse {
+        object: "list",
+        data,
+        model: parsed.model.unwrap_or_else(|| engine.model_id.clone()),
+        usage: EmbeddingUsage {
+            prompt_tokens: tokens,
+            total_tokens: tokens,
+        },
+    };
+    Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
 }
 
 // ── OpenAI legacy completions (`POST /v1/completions`) ──────────────────────
@@ -2447,6 +2643,20 @@ fn stream_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 4648's own examples, every padding case.
+    #[test]
+    fn base64_matches_the_rfc() {
+        for (raw, enc) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(raw.as_bytes()), enc, "{raw:?}");
+        }
+    }
 
     /// OpenAI's `content` arrives as a string from some clients and as a list of
     /// parts from others — the SDKs and anything that can attach an image. Both

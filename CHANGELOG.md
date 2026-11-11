@@ -503,6 +503,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/v1/embeddings`.** Each input's embedding is the final-normed hidden
+  state of its last token, at unit length: the pooling decoder embedding
+  models (Qwen3-Embedding, gte-Qwen2) are trained for. `input` takes a string,
+  strings, token ids or lists of them; `encoding_format` `float` or `base64`
+  (what the OpenAI Python SDK asks for by default); `dimensions` keeps the
+  leading ones, back at unit length. It runs on the engine thread between
+  decode steps, on its own KV. Qwen2.5-0.5B (a chat model) on the GPU: two
+  paraphrases at cosine 0.885, each against an unrelated sentence 0.76-0.80.
+
 - **`n` on the OpenAI endpoints: several completions of one prompt.** It was
   ignored. Chat and `/v1/completions` now return `n` choices (1-16), queued
   together so they decode in one batch and share the prompt's cached prefix;

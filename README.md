@@ -832,7 +832,7 @@ inference engine):
 
 - **OpenAI- and Anthropic-compatible server** ([`src/server`](src/server)) — a
   dependency-free HTTP/1.1 server exposing `/v1/chat/completions`,
-  `/v1/completions` and `/v1/models` (OpenAI) plus `/v1/messages` and
+  `/v1/completions`, `/v1/embeddings` and `/v1/models` (OpenAI) plus `/v1/messages` and
   `/v1/messages/count_tokens` (Anthropic), both dialects with `stream: true` SSE.
   Behind it, an `EngineService` runs a background
   batching thread so concurrent requests are **continuously batched** and each can
@@ -855,7 +855,12 @@ inference engine):
   step. **`n`** (1-16, both OpenAI endpoints) returns that many completions of
   the prompt, decoded together in one batch; a sampled choice `i` draws with
   seed `seed + i`, so the choices differ, and streamed chunks carry each
-  choice's `index`. `stop` (OpenAI) / `stop_sequences`
+  choice's `index`. **Embeddings** (`/v1/embeddings`): the final-normed hidden
+  state of each input's last token, at unit length, the pooling decoder
+  embedding models (Qwen3-Embedding, gte-Qwen2) are trained for; `input` as
+  text or token ids, one or several, `encoding_format` `float` or `base64`,
+  and `dimensions` to keep the leading ones. A chat model's embeddings work
+  but are not tuned for retrieval. `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,

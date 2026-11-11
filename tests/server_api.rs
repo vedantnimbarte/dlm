@@ -1,7 +1,8 @@
 //! The OpenAI request fields beyond sampling: `logprobs` (each output token's
 //! log-probability and its most likely alternatives, in chat's and the legacy
 //! completions' shapes, streamed or not; asking for them must not change what
-//! is generated) and `n` (several completions of one prompt).
+//! is generated), `n` (several completions of one prompt), and the
+//! `/v1/embeddings` endpoint.
 
 use dlm::cache::KvCacheConfig;
 use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
@@ -363,5 +364,101 @@ fn n_out_of_range_is_refused() {
             &format!(r#"{{{CHAT},"n":{n}}}"#),
         );
         assert!(status.contains("400"), "n {n}: {status} {body}");
+    }
+}
+
+fn embeddings(addr: SocketAddr, body: &str) -> Vec<Vec<f32>> {
+    let (status, resp) = post(addr, "/v1/embeddings", body);
+    assert!(status.contains("200"), "{body}: {status} {resp}");
+    let r = json(&resp);
+    r["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            assert_eq!(d["index"], i as u64);
+            match &d["embedding"] {
+                Value::String(b64) => decode_f32s(b64),
+                v => v
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_f64().unwrap() as f32)
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// Little-endian f32s from standard base64.
+fn decode_f32s(b64: &str) -> Vec<f32> {
+    let val = |c: u8| {
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            .bytes()
+            .position(|x| x == c)
+            .unwrap() as u32
+    };
+    let mut bytes = Vec::new();
+    for chunk in b64.as_bytes().chunks(4) {
+        let pad = chunk.iter().filter(|&&c| c == b'=').count();
+        let n = chunk
+            .iter()
+            .fold(0u32, |n, &c| n << 6 | if c == b'=' { 0 } else { val(c) });
+        bytes.extend(&n.to_be_bytes()[1..4 - pad]);
+    }
+    bytes
+        .chunks(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+
+fn norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+#[test]
+fn embeddings_are_unit_vectors_of_the_hidden_size() {
+    let addr = start_server();
+    let vs = embeddings(
+        addr,
+        r#"{"input":["Hi there","Hi there","Something else!"]}"#,
+    );
+    assert_eq!(vs.len(), 3);
+    assert!(
+        vs.iter()
+            .all(|v| v.len() == 16 && (norm(v) - 1.0).abs() < 1e-4),
+        "{vs:?}"
+    );
+    assert_eq!(vs[0], vs[1], "the same text, the same vector");
+    assert_ne!(vs[0], vs[2]);
+    // A string, its token ids (bytes, for this tokenizer), and base64 agree.
+    let one = embeddings(addr, r#"{"input":"Hi"}"#);
+    let ids = embeddings(addr, r#"{"input":[72,105]}"#);
+    let b64 = embeddings(addr, r#"{"input":"Hi","encoding_format":"base64"}"#);
+    assert_eq!(one, ids);
+    assert_eq!(one, b64);
+    // Fewer dimensions: the leading ones, back at unit length.
+    let short = embeddings(addr, r#"{"input":"Hi","dimensions":4}"#);
+    assert_eq!(short[0].len(), 4);
+    assert!((norm(&short[0]) - 1.0).abs() < 1e-4);
+    let scale = one[0][0] / short[0][0];
+    assert!(one[0][..4]
+        .iter()
+        .zip(&short[0])
+        .all(|(a, b)| (a / b - scale).abs() < 1e-4));
+}
+
+#[test]
+fn bad_embedding_requests_are_refused() {
+    let addr = start_server();
+    for body in [
+        r#"{"input":[]}"#,
+        r#"{"input":"Hi","dimensions":17}"#,
+        r#"{"input":"Hi","encoding_format":"hex"}"#,
+        r#"{"input":[[300]]}"#,
+    ] {
+        let (status, resp) = post(addr, "/v1/embeddings", body);
+        assert!(status.contains("400"), "{body}: {status} {resp}");
     }
 }
