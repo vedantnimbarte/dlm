@@ -40,6 +40,42 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The GPU's KV cache is int8 by default** (`--kv-quant auto`): 56% of
+  fp16's memory, so 1.76x the tokens in the same VRAM, at the speed of fp16
+  (Qwen2.5-0.5B, 1,024-token prompts: batch 1 97-100 against 99-100 tok/s,
+  batch 16 390-398 against 381-387). The key balancing below is what made it
+  safe to: int8 now scores within 0.005 nats per token of fp16 on every model
+  measured. `--kv-quant f16` keeps the old cache; the CPU kernels keep f32
+  under `auto` as before. `dlm bench` follows the default too: compare against
+  a baseline saved before this with `--kv-quant f16`.
+
+- **A quantized KV cache no longer loses Qwen's small key channels.** A few
+  key channels on Qwen2.5 are a hundred times the rest (its `k_proj` bias puts
+  130-240 on them in layers 0-2 and 8, where others are 1-6), and an int8 cache
+  keeps one scale per 32 values, so each group holding one rounded its
+  neighbours to a step of ~2. Attention only uses `q . k`, so the loader now
+  divides each such pair of key channels by a power of two and multiplies the
+  matching query channels by it, in the projection weights and biases (in the
+  q/k norm weights where a model has them). Every weight scales exactly or is
+  left alone, so `q . k` is unchanged to the bit and an fp16 or f32 cache gives
+  the same output; no kernel changed. Channel sizes come from the weights
+  (`sqrt(bias^2 + |W_row * norm|^2)`); only pairs over 4x the layer's median
+  move, to between 2x and 4x. int8 KV's cost in mean NLL against fp16, decoding
+  ~1,150 tokens of two parts of this README (`dlm score --decode`):
+
+  | Model | before | after |
+  |---|---|---|
+  | Qwen2.5-0.5B bf16 | 0.022 / 0.011 | -0.000 / -0.005 |
+  | Qwen2.5-0.5B `Q4_K_M` | 0.030 / 0.018 | 0.002 / -0.005 |
+  | Qwen2.5-1.5B bf16 | 0.002 / 0.001 | 0.001 / -0.002 |
+  | Qwen2.5-1.5B `Q4_K_M` | 0.006 / 0.004 | 0.005 / 0.002 |
+  | Qwen3-0.6B (q/k norms) | 0.009 / 0.020 | 0.001 / -0.001 |
+  | SmolLM2-360M (Llama, no outliers) | -0.001 / 0.002 | -0.002 / 0.002 |
+
+  Rounding every pair to the median instead, the first version, made the
+  1.5B models slightly worse (0.002 -> 0.004): pairs near the median are not
+  the problem, and moving them only reshuffles groups.
+
 - **`--stream --device gpu` is no longer experimental.** Its banner said
   `[experimental]` and its code "unvalidated on hardware"; the checks it lacked
   are now in the suite. `streaming_gpu_soak_matches_resident` runs three

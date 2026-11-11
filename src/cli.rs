@@ -180,7 +180,11 @@ impl QuantArg {
 /// KV cache precision (`--kv-quant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum KvQuantArg {
-    /// Half precision (default): half the KV VRAM, near-exact. GPU only; the CPU
+    /// The default: `int8` on the GPU, `f16` elsewhere. With its key channels
+    /// balanced at load, int8 KV scored within 0.005 nats per token of fp16 on
+    /// Qwen2.5, Qwen3 and SmolLM2, for 56% of the memory.
+    Auto,
+    /// Half precision: half the KV VRAM of f32, near-exact. GPU only; the CPU
     /// kernels keep f32.
     F16,
     /// Exact f32 everywhere. `none` is accepted as an alias.
@@ -188,7 +192,7 @@ pub enum KvQuantArg {
     F32,
     /// int8 — about half the KV memory. On the GPU, int8 with a scale per 32
     /// values (1.125 bytes a value, 56% of fp16), or fp16 for models whose head
-    /// size is not a multiple of 32.
+    /// size is not a multiple of 32. The GPU's default.
     Int8,
     /// int4 — about a quarter of the KV memory, more error. On the GPU, held as
     /// int8 as for `int8`.
@@ -196,11 +200,21 @@ pub enum KvQuantArg {
 }
 
 impl KvQuantArg {
-    /// Map to the engine's [`KvQuant`](crate::forward::KvQuant).
+    /// What `Auto` means on this device: int8 on the GPU, f16 elsewhere.
+    pub fn resolve(self, gpu: bool) -> Self {
+        match self {
+            KvQuantArg::Auto if gpu => KvQuantArg::Int8,
+            KvQuantArg::Auto => KvQuantArg::F16,
+            other => other,
+        }
+    }
+
+    /// Map to the engine's [`KvQuant`](crate::forward::KvQuant). An unresolved
+    /// `Auto` is `f16`.
     pub fn to_kv_quant(self) -> crate::forward::KvQuant {
         match self {
             KvQuantArg::F32 => crate::forward::KvQuant::None,
-            KvQuantArg::F16 => crate::forward::KvQuant::F16,
+            KvQuantArg::F16 | KvQuantArg::Auto => crate::forward::KvQuant::F16,
             KvQuantArg::Int8 => crate::forward::KvQuant::Int8,
             KvQuantArg::Int4 => crate::forward::KvQuant::Int4,
         }
@@ -381,11 +395,12 @@ pub struct ServeArgs {
 
     /// KV cache precision. The KV cache can exceed the weights at long context,
     /// so a smaller one fits more context or a bigger batch in the same budget.
-    /// On the GPU: `f16` (default, half the memory), `f32` (exact), or `int8`
-    /// and `int4`, both stored as int8 there (56% of fp16, some accuracy cost;
-    /// fp16 for heads not a multiple of 32 wide). On the CPU kernels: `f32`,
-    /// `int8` (≈half memory) or `int4` (≈quarter, more error); `f16` stays f32.
-    #[arg(long, value_enum, default_value_t = KvQuantArg::F16)]
+    /// On the GPU: `int8` (the default through `auto`: 56% of fp16's memory,
+    /// within 0.005 nats per token of it on the models measured; fp16 for heads
+    /// not a multiple of 32 wide), `f16`, `f32` (exact), or `int4`, stored as
+    /// int8 there. On the CPU kernels: `f32` (what `auto` and `f16` give),
+    /// `int8` (≈half memory) or `int4` (≈quarter, more error).
+    #[arg(long, value_enum, default_value_t = KvQuantArg::Auto)]
     pub kv_quant: KvQuantArg,
 
     /// Hold the GPU's LM head in int4. The head is a large share of a small
@@ -783,7 +798,9 @@ mod tests {
         assert_eq!(a.draft_gamma, 4);
         assert!(a.multi_gpu_ids.is_empty());
         assert!(a.worker_nodes.is_empty());
-        assert_eq!(a.kv_quant, KvQuantArg::F16);
+        assert_eq!(a.kv_quant, KvQuantArg::Auto);
+        assert_eq!(a.kv_quant.resolve(true), KvQuantArg::Int8);
+        assert_eq!(a.kv_quant.resolve(false), KvQuantArg::F16);
         // `none` still means exact, as it did when it was the default.
         let cli = Cli::try_parse_from(["dlm", "serve", "--model-path", "/m", "--kv-quant", "none"])
             .unwrap();

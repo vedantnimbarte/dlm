@@ -900,15 +900,20 @@ inference engine):
 
   Two orthogonal memory knobs apply to any kernel:
   - `--quant {int4,int8}` — see [weight precision](#weight-precision---quant) below.
-  - `--kv-quant {f16,f32,int8,int4}` shrinks the KV cache, trading precision
-    for a longer context or a bigger batch in the same memory. It is independent
-    of `--quant`: one sizes the weights, the other the KV history.
-    - `f16` is the default. `f32` is exact (`none` is accepted as an alias).
-    - **On the GPU**, everything except `f32` stores the cache as fp16, half the
-      KV VRAM. On Qwen2.5-0.5B and Gemma 3 1B, greedy output was identical to
-      `f32` for 96 of 96 tokens, and decode speed is unchanged. The GPU kernels
-      have no int8/int4 format yet, so `int8` and `int4` also give fp16 there.
-      MLA models keep `f32`.
+  - `--kv-quant {auto,f16,f32,int8,int4}` shrinks the KV cache, trading
+    precision for a longer context or a bigger batch in the same memory. It is
+    independent of `--quant`: one sizes the weights, the other the KV history.
+    - `auto` is the default: `int8` on the GPU, `f16` elsewhere. `f32` is exact
+      (`none` is accepted as an alias).
+    - **On the GPU**, `int8` (and `int4`) keep a scale per 32 values and 32 int8
+      codes, 56% of fp16's memory, at fp16's speed; heads not a multiple of 32
+      wide keep fp16. The loader shrinks the few key channels that would set
+      those scales alone (Qwen's are a hundred times the rest) and grows the
+      matching query channels by the same power of two, which leaves `q . k`
+      unchanged to the bit; with it, int8 scored within 0.005 nats per token of
+      fp16 on Qwen2.5 0.5B/1.5B (bf16 and `Q4_K_M`), Qwen3-0.6B and
+      SmolLM2-360M. `f16` is half of f32's memory and near-exact. MLA models
+      keep `f32`.
     - **On the CPU kernels**, `int8` gives about half the memory and `int4`
       about a quarter, with more error. The CPU kernels have no fp16 store, so
       `f16` stays `f32` there.

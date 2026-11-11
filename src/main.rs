@@ -982,6 +982,7 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
             } else {
                 args.device
             };
+            args.kv_quant = args.kv_quant.resolve(device == Device::Gpu);
 
             // Prefix caching stores a KV *snapshot* taken from the host-side
             // KvLayerCache. On the GPU compute kernels the real K/V lives in VRAM
