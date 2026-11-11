@@ -105,7 +105,9 @@ trusting it.
 
 ## What the numbers say
 
-Each observation points at an item in the roadmap:
+What the 0.4.0 tables showed, each pointing at a roadmap item. All of them
+have since been worked on; `CHANGELOG.md` has the before and after, and
+"Against vLLM" below the current comparison.
 
 - **Batching adds no throughput.** Batch 4 decodes at the same total tok/s as
   batch 1, because the scheduler steps sessions one after another. Fusing the
@@ -129,21 +131,61 @@ Each observation points at an item in the roadmap:
 
 ## Against vLLM
 
-Measured 2026-11-10 on the machine above, dlm at commit `6b70197` against vLLM
-0.33.0 (torch 2.14+cu132) in WSL2 Ubuntu on the same card, run back to back.
-Qwen2.5-0.5B-Instruct, prompt 256 tokens, 128 generated, context 1024, greedy.
+Measured on the machine above against vLLM 0.33.0 (torch 2.14+cu132) in WSL2
+Ubuntu on the same card. Qwen2.5-0.5B-Instruct, prompt 256 tokens, 128
+generated, context 1024, greedy.
 
 ```sh
 dlm bench --model-path models/Qwen2.5-0.5B-Instruct --context-length 1024 \
           --prompt-len 256 --gen-len 128 --batch 1,4,8,16 --max-batch 16 --runs 3
 ```
 
-vLLM was driven through `LLM.generate` on random token ids with
-`ignore_eos=True` and prefix caching off, median of 3 after a warmup per shape.
+vLLM was driven by `bench/vllm_bench.py` (`python vllm_bench.py float16`, then
+`float32`, with the model at `~/models/Qwen2.5-0.5B-Instruct`): `LLM.generate`
+on random token ids with `ignore_eos=True` and prefix caching off, median of 3
+after a warmup per shape.
 Prefill is `batch * 256 / t(1 token)`; decode is `batch * 127 / (t(128) - t(1))`,
-so vLLM's prefill includes its per-call Python overhead. fp32 needed
-`max_num_seqs=16, max_num_batched_tokens=4096, gpu_memory_utilization=0.78` to
-fit beside the desktop.
+so vLLM's prefill includes its per-call Python overhead. Both precisions ran
+with `max_num_seqs=16, max_num_batched_tokens=4096, gpu_memory_utilization=0.78`
+(fp32 needs them to fit beside the desktop).
+
+### 2026-11-11: dlm `68bced0` (after the batched-decode, phase 1 and phase 2 work)
+
+Run back to back: vLLM fp16 and fp32, then dlm, then vLLM again (its batch 1
+repeated within 0.1 tok/s), with the card idle between workloads. dlm's ranges
+are this run and one more clean run earlier the same hour; a third, right
+after a build, ran a third slower across the board and is left out.
+
+| Decode tok/s | dlm bf16 | vLLM fp16 | vLLM fp32 |
+|---|---|---|---|
+| batch 1 | 100–105 | **108** | 58–61 |
+| batch 4 | **296–319** | 26 | 189–228 |
+| batch 8 | **363–378** | 44–47 | 297–316 |
+| batch 16 | **443–445** | 78–88 | 269–318 |
+| **Prefill tok/s** | ~1,530–1,615 | ~450–540 | **~1,570–1,765** |
+
+At batch 4-16, decode tok/s is the total over all sequences.
+
+- **Batched decode now leads**: 1.4–1.6x vLLM fp32 at batch 4 and 16, +20-27%
+  at batch 8, against the next-best vLLM precision. On 2026-11-10 dlm stopped
+  gaining after batch 4 (~175 tok/s) while vLLM fp32 reached ~285.
+- **Batch 1 is within 3-8% of vLLM fp16** (100–105 against 108). With n-gram
+  speculation (`--speculative auto`, on for the GPU since phase 2), a request
+  whose text repeats decodes at up to ~317 tok/s; this table is plain decoding.
+- **Prefill trails vLLM fp32 by 5-10%** at 256 tokens. dlm's tiled attention
+  gains on long prompts (`CHANGELOG.md`); a 256-token prompt is mostly the
+  GEMM.
+- **vLLM fp16 is crippled on this card by cuBLAS, not by vLLM.** An fp16
+  `F.linear` with 2+ rows runs 10-25x slower than with one row and ~4x slower
+  than fp32 (the LM head: 1.9 ms at M=1, 44 ms at M=4). Compare against vLLM
+  fp32 for batched decode and prefill, fp16 only for batch 1.
+- dlm's int4 and GGUF paths were not compared: vLLM has no Marlin kernels on
+  Turing, and its GGUF support is experimental. dlm's quantized formats decode
+  faster still (`CHANGELOG.md`: Q4_K_M ~660 tok/s at batch 16).
+
+### 2026-11-10: dlm `6b70197` (before that work)
+
+Run back to back, dlm then vLLM.
 
 | Decode tok/s | dlm bf16 | vLLM fp16 | vLLM fp32 |
 |---|---|---|---|
@@ -153,16 +195,5 @@ fit beside the desktop.
 | batch 16 | 173 | 89 | **286** |
 | **Prefill tok/s** | ~1,600 | ~450 | ~1,500–1,780 |
 
-At batch 4-16, decode tok/s is the total over all sequences.
-
-- **vLLM fp16 is crippled on this card by cuBLAS, not by vLLM.** An fp16
-  `F.linear` with 2+ rows runs 10-25x slower than with one row and ~4x slower
-  than fp32 (the LM head: 1.9 ms at M=1, 44 ms at M=4). Summed over the layers
-  that is the flat ~175 ms/step vLLM fp16 shows at any batch above 1. Compare
-  against vLLM fp32 for batched decode and prefill, fp16 only for batch 1.
-- **Batch 1 is within clock drift.** dlm ran 84 tok/s here against 108 in
-  `CHANGELOG.md` on another day; vLLM fp16's 101 sits between the two.
-- **Batched decode is the gap.** dlm stops gaining after batch 4; vLLM fp32
-  keeps scaling to ~285 tok/s while reading fp32 weights, twice dlm's bytes.
-- dlm's int4 and GGUF paths were not compared: vLLM has no Marlin kernels on
-  Turing, and its GGUF support is experimental.
+dlm ran 84 tok/s at batch 1 here against 108 in `CHANGELOG.md` on another day;
+the gap to vLLM fp16 was within clock drift.
