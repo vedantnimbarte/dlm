@@ -40,6 +40,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Streaming on the GPU is up to 20% faster: the copy engine no longer idles
+  under resident layers.** The prefetch worker was told "layer L + 1" as the
+  pass reached layer L, and with most of the model resident L + 1 usually
+  was, so the upload of the next streamed layer waited for the pass to get
+  next to it. It now loads the first layer from L + 1 on that is missing,
+  evicting only a layer the pass needs after that one, and a layer loaded
+  ahead is evicted last until the pass uses it. GTX 1650, Qwen2.5-7B-Instruct
+  `Q3_K_M` (19 of 28 layers resident), decode over six alternating runs:
+  6.0-7.0 -> 7.1-9.0 tok/s (median 6.3 -> 7.7; best step 142.7 -> 111.7 ms,
+  against ~108 ms of PCIe per token).
+
 - **A single-token layer's attention half takes fewer launches.** Two merges
   that need no grid-wide synchronization:
   - **RoPE and the K/V append run inside the attention kernel**

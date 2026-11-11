@@ -928,6 +928,36 @@ fn streaming_gpu_worker_prefetches() {
     );
 }
 
+/// The worker loads the next layer the pass is missing, not just the next
+/// layer: when that one is already resident, the copy engine has the time it
+/// takes to compute it to fetch a later one.
+///
+/// Layer 2 then layer 1 run cold, each a miss. After layer 1 the pass is about
+/// to run layer 2, which is resident (and 3, prefetched after layer 2), so the
+/// worker loads layer 0, and running it is a hit. Loading only "the next
+/// layer" left the worker idle there and layer 0 a miss.
+#[test]
+fn streaming_gpu_prefetches_past_resident_layers() {
+    let cfg = small_cfg();
+    let k =
+        StreamingGpuKernel::new(cfg, VecSource(random_layers(&cfg, 4, 5)), 64, 4, None).unwrap();
+    let mut h: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.01).collect();
+    let mut kv: Vec<KvLayerCache> = (0..4).map(|_| KvLayerCache::new(cfg.kv_dim())).collect();
+    let settle = |prefetched: u64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while k.stats().prefetched < prefetched && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    k.run_block(2, &mut h, &mut kv[2], 0).unwrap();
+    settle(1); // layer 3
+    k.run_block(1, &mut h, &mut kv[1], 0).unwrap();
+    settle(2); // layer 0, past the resident 2 and 3
+    k.run_block(0, &mut h, &mut kv[0], 0).unwrap();
+    let s = k.stats();
+    assert_eq!((s.misses, s.prefetched), (2, 2), "{s:?}");
+}
+
 // ── Mixture-of-Experts GPU parity ──
 //
 // The streaming GPU MoE path (dlm_moe_attn + router + per-expert dlm_apply_expert,
