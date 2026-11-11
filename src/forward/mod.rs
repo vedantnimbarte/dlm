@@ -9,6 +9,7 @@ pub mod cpu;
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub mod gpu;
 pub mod kernel;
+pub(crate) mod key_balance;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod kv_pool;
 pub mod multigpu;

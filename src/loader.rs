@@ -873,8 +873,37 @@ fn load_norm_optional(
 /// **core** (attention, norms, router, shared expert) — the routed experts are
 /// left out for the GPU streaming path to fetch per `(layer, expert)`. No effect
 /// on dense models, which have no separate experts.
+///
+/// Every layer leaves here with its key channels balanced
+/// ([`balance_keys`](crate::forward::key_balance::balance_keys)): exact, and
+/// what keeps a quantized KV cache from rounding small channels to nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_layer_tensors_opt(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    layer: u32,
+    num_layers: u32,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+    include_experts: bool,
+    norm_add_one: bool,
+) -> Result<LayerTensors> {
+    let mut t = load_layer_tensors_raw(
+        store,
+        cfg,
+        layer,
+        num_layers,
+        quant,
+        packed,
+        include_experts,
+        norm_add_one,
+    )?;
+    crate::forward::key_balance::balance_keys(&mut t, cfg);
+    Ok(t)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_layer_tensors_raw(
     store: &MmapStore,
     cfg: &BlockConfig,
     layer: u32,

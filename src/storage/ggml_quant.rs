@@ -173,6 +173,18 @@ impl GgmlKind {
         }
     }
 
+    /// Byte offsets of the f16 fields in a block that scale its weights (and
+    /// minimums): multiplying each by `x` multiplies every weight by `x`.
+    pub fn f16_scale_offsets(self) -> &'static [usize] {
+        match self {
+            GgmlKind::Q4_1 | GgmlKind::Q5_1 | GgmlKind::Q4K | GgmlKind::Q5K => &[0, 2],
+            GgmlKind::Q6K => &[208],
+            GgmlKind::Q2K => &[80, 82],
+            GgmlKind::Q3K => &[108],
+            _ => &[0],
+        }
+    }
+
     /// Bytes `elements` weights occupy in this type's blocks.
     pub fn byte_len(self, elements: usize) -> usize {
         elements.div_ceil(self.block_elems()) * self.block_bytes()
