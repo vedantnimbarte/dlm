@@ -140,8 +140,10 @@ dlm bench --model-path models/Qwen2.5-0.5B-Instruct --context-length 1024 \
           --prompt-len 256 --gen-len 128 --batch 1,4,8,16 --max-batch 16 --runs 3
 ```
 
-vLLM was driven through `LLM.generate` on random token ids with
-`ignore_eos=True` and prefix caching off, median of 3 after a warmup per shape.
+vLLM was driven by `bench/vllm_bench.py` (`python vllm_bench.py float16`, then
+`float32`, with the model at `~/models/Qwen2.5-0.5B-Instruct`): `LLM.generate`
+on random token ids with `ignore_eos=True` and prefix caching off, median of 3
+after a warmup per shape.
 Prefill is `batch * 256 / t(1 token)`; decode is `batch * 127 / (t(128) - t(1))`,
 so vLLM's prefill includes its per-call Python overhead. Both precisions ran
 with `max_num_seqs=16, max_num_batched_tokens=4096, gpu_memory_utilization=0.78`
