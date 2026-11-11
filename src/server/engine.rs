@@ -11,7 +11,7 @@
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
-use crate::generate::{Decoding, Dry, Generator, Penalties, Sampler};
+use crate::generate::{Decoding, Dry, Generator, Penalties, Sampler, TokenLogprobs};
 use crate::grammar::{Constraint, Grammar, TokenBytes};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// speculative acceptance stats when it was decoded speculatively (`None` on the
 /// plain path).
 pub enum TokenEvent {
-    Next(u32),
+    /// A token, with its log-probabilities when the request asked for them.
+    Next(u32, Option<TokenLogprobs>),
     Done(Option<AcceptanceStats>),
 }
 
@@ -360,13 +361,19 @@ fn engine_loop<K: ComputeKernel>(
             continue;
         }
         match sched.step() {
-            Ok(tick) => {
+            Ok(mut tick) => {
                 for (id, token) in tick.produced {
+                    // A request with log-probabilities makes one token a tick.
+                    let lp = tick
+                        .logprobs
+                        .iter()
+                        .position(|(lid, _)| *lid == id)
+                        .map(|i| tick.logprobs.swap_remove(i).1);
                     if let Some(s) = sinks.get(&id) {
                         // A failed send means the client dropped the receiver
                         // (disconnected or finished early); stop wasting compute
                         // on it by retiring the slot.
-                        if s.send(TokenEvent::Next(token)).is_err() {
+                        if s.send(TokenEvent::Next(token, lp)).is_err() {
                             sinks.remove(&id);
                             sched.abort(id);
                         }
@@ -506,6 +513,12 @@ struct ChatRequest {
     /// Stop sequence(s): generation is cut before the first occurrence.
     #[serde(default)]
     stop: Option<Stop>,
+    /// Return each output token's log-probability.
+    #[serde(default)]
+    logprobs: bool,
+    /// And this many of the most likely tokens at each position (0-20).
+    #[serde(default)]
+    top_logprobs: Option<usize>,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -562,10 +575,26 @@ const DRY_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
 /// An out-of-range value is a client error, not something to clamp quietly: a
 /// client that asked for it would otherwise get output it did not ask for and no
 /// sign why.
+/// Most alternatives a request may ask for per token, as OpenAI allows.
+const MAX_TOP_LOGPROBS: usize = 20;
+
+/// `top` alternatives per token when `wanted`, checked against the limit.
+fn logprobs_request(wanted: bool, top: Option<usize>) -> Result<Option<usize>, String> {
+    match (wanted, top) {
+        (_, Some(n)) if n > MAX_TOP_LOGPROBS => Err(format!(
+            "top_logprobs must be between 0 and {MAX_TOP_LOGPROBS}"
+        )),
+        (false, Some(n)) if n > 0 => Err("top_logprobs needs logprobs: true".into()),
+        (true, n) => Ok(Some(n.unwrap_or(0))),
+        (false, _) => Ok(None),
+    }
+}
+
 fn decoding(
     engine: &EngineService,
     sampler: Sampler,
     extra: ExtraSampling,
+    logprobs: Option<usize>,
 ) -> Result<Decoding, String> {
     let mut logit_bias = Vec::new();
     for (key, &bias) in extra.logit_bias.iter().flatten() {
@@ -597,6 +626,7 @@ fn decoding(
             dry: dry(engine, &extra)?,
         },
         grammar: constraint(engine, &extra)?,
+        logprobs,
     })
 }
 
@@ -717,6 +747,88 @@ struct Choice {
     index: usize,
     message: RespMessage,
     finish_reason: &'static str,
+    logprobs: Option<ChatLogprobs>,
+}
+
+/// Chat's `logprobs`: one entry per output token.
+#[derive(Serialize)]
+struct ChatLogprobs {
+    content: Vec<ChatTokenLogprob>,
+}
+#[derive(Serialize)]
+struct ChatTokenLogprob {
+    token: String,
+    logprob: f32,
+    /// The token's bytes: a byte-level token can be part of a character.
+    bytes: Vec<u8>,
+    top_logprobs: Vec<TopLogprob>,
+}
+#[derive(Serialize)]
+struct TopLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Vec<u8>,
+}
+
+/// A token's text (lossy where it is part of a character) and bytes.
+fn token_piece(engine: &EngineService, id: u32) -> (String, Vec<u8>) {
+    let bytes = engine.tokenizer.token_bytes(id).unwrap_or_default();
+    (String::from_utf8_lossy(&bytes).into_owned(), bytes)
+}
+
+/// Characters `ids` decode to: the offset of the token after them.
+fn sent_chars_of(engine: &EngineService, ids: &[u32]) -> usize {
+    engine
+        .tokenizer
+        .decode(ids)
+        .unwrap_or_default()
+        .chars()
+        .count()
+}
+
+fn chat_logprob(engine: &EngineService, id: u32, lp: &TokenLogprobs) -> ChatTokenLogprob {
+    let (token, bytes) = token_piece(engine, id);
+    ChatTokenLogprob {
+        token,
+        logprob: lp.logprob,
+        bytes,
+        top_logprobs: lp
+            .top
+            .iter()
+            .map(|&(t, logprob)| {
+                let (token, bytes) = token_piece(engine, t);
+                TopLogprob {
+                    token,
+                    logprob,
+                    bytes,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// The legacy completions `logprobs`: parallel lists, one entry per token.
+#[derive(Serialize, Default)]
+struct CompletionLogprobs {
+    tokens: Vec<String>,
+    token_logprobs: Vec<f32>,
+    top_logprobs: Vec<HashMap<String, f32>>,
+    /// Each token's character offset in the returned text.
+    text_offset: Vec<usize>,
+}
+
+impl CompletionLogprobs {
+    fn push(&mut self, engine: &EngineService, id: u32, lp: &TokenLogprobs, offset: usize) {
+        self.tokens.push(token_piece(engine, id).0);
+        self.token_logprobs.push(lp.logprob);
+        self.top_logprobs.push(
+            lp.top
+                .iter()
+                .map(|&(t, l)| (token_piece(engine, t).0, l))
+                .collect(),
+        );
+        self.text_offset.push(offset);
+    }
 }
 #[derive(Serialize)]
 struct Usage {
@@ -768,6 +880,9 @@ struct ChunkChoice {
     index: usize,
     delta: Delta,
     finish_reason: Option<&'static str>,
+    /// The log-probabilities of the tokens whose text this chunk carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<ChatLogprobs>,
 }
 #[derive(Serialize)]
 struct Chunk {
@@ -1306,6 +1421,9 @@ struct Generated {
     prompt_tokens: usize,
     completion_tokens: usize,
     spec: Option<AcceptanceStats>,
+    /// Each token of `text` with its log-probabilities and its character
+    /// offset in `text`, when the request asked for them.
+    logprobs: Vec<(u32, TokenLogprobs, usize)>,
 }
 
 /// Run one request to completion, ending at the EOS token, the first stop
@@ -1321,11 +1439,12 @@ fn collect_completion(
     let prompt_tokens = ids.len();
     let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
     let mut tokens = Vec::new();
+    let mut lps = Vec::new();
     let mut spec = None;
     let mut hit_eos = false;
     for ev in rx {
         match ev {
-            TokenEvent::Next(t) => {
+            TokenEvent::Next(t, lp) => {
                 // The scheduler emits EOS inclusively as the final token; drop it
                 // from the visible output and mark a natural stop.
                 if engine.eos_tokens.contains(&t) {
@@ -1333,6 +1452,7 @@ fn collect_completion(
                     break;
                 }
                 tokens.push(t);
+                lps.extend(lp);
                 if !stops.is_empty() {
                     let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
                     if earliest_stop(&so_far, stops).is_some() {
@@ -1361,12 +1481,30 @@ fn collect_completion(
         }
     };
     engine.record(prompt_tokens, completion_tokens);
+    // Each token's offset, keeping those that start inside the returned text
+    // (a stop sequence cuts the rest).
+    let mut logprobs = Vec::new();
+    if lps.len() == tokens.len() {
+        for (i, (&t, lp)) in tokens.iter().zip(lps).enumerate() {
+            let offset = engine
+                .tokenizer
+                .decode(&tokens[..i])
+                .unwrap_or_default()
+                .chars()
+                .count();
+            if offset >= text.chars().count() && i > 0 {
+                break;
+            }
+            logprobs.push((t, lp, offset));
+        }
+    }
     Generated {
         text,
         finish,
         prompt_tokens,
         completion_tokens,
         spec,
+        logprobs,
     }
 }
 
@@ -1389,7 +1527,11 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Err(e) => return Response::json(400, error_json(&e)),
     };
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
-    let decoding = match decoding(engine, sampler, parsed.extra) {
+    let logprobs = match logprobs_request(parsed.logprobs, parsed.top_logprobs) {
+        Ok(l) => l,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    let decoding = match decoding(engine, sampler, parsed.extra, logprobs) {
         Ok(d) => d,
         Err(e) => return Response::json(400, error_json(&e)),
     };
@@ -1415,6 +1557,13 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
                     Finish::Length => "length",
                     _ => "stop",
                 },
+                logprobs: logprobs.map(|_| ChatLogprobs {
+                    content: g
+                        .logprobs
+                        .iter()
+                        .map(|(t, lp, _)| chat_logprob(engine, *t, lp))
+                        .collect(),
+                }),
             }],
             usage: Usage {
                 prompt_tokens: g.prompt_tokens,
@@ -1454,6 +1603,9 @@ struct CompletionRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Option<Stop>,
+    /// Return each token's log-probability and this many alternatives (0-20).
+    #[serde(default)]
+    logprobs: Option<usize>,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -1463,8 +1615,7 @@ struct CompletionChoice {
     index: usize,
     text: String,
     finish_reason: &'static str,
-    /// Always null — dlm doesn't emit logprobs, but clients expect the field.
-    logprobs: Option<()>,
+    logprobs: Option<CompletionLogprobs>,
 }
 #[derive(Serialize)]
 struct CompletionResponse {
@@ -1480,6 +1631,8 @@ struct CompletionChunkChoice {
     index: usize,
     text: String,
     finish_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<CompletionLogprobs>,
 }
 #[derive(Serialize)]
 struct CompletionChunk {
@@ -1521,7 +1674,11 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
         },
         _ => Sampler::Greedy,
     };
-    let decoding = match decoding(engine, sampler, parsed.extra) {
+    let logprobs = match logprobs_request(parsed.logprobs.is_some(), parsed.logprobs) {
+        Ok(l) => l,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    let decoding = match decoding(engine, sampler, parsed.extra, logprobs) {
         Ok(d) => d,
         Err(e) => return Response::json(400, error_json(&e)),
     };
@@ -1544,7 +1701,13 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
                     Finish::Length => "length",
                     _ => "stop",
                 },
-                logprobs: None,
+                logprobs: logprobs.map(|_| {
+                    let mut out = CompletionLogprobs::default();
+                    for (t, lp, offset) in &g.logprobs {
+                        out.push(engine, *t, lp, *offset);
+                    }
+                    out
+                }),
             }],
             usage: Usage {
                 prompt_tokens: g.prompt_tokens,
@@ -1572,7 +1735,8 @@ fn stream_completion(
         let created = engine.created;
         let send_chunk = |w: &mut dyn std::io::Write,
                           text: String,
-                          finish: Option<&'static str>|
+                          finish: Option<&'static str>,
+                          logprobs: Option<CompletionLogprobs>|
          -> std::io::Result<()> {
             let chunk = CompletionChunk {
                 id: id.clone(),
@@ -1583,6 +1747,7 @@ fn stream_completion(
                     index: 0,
                     text,
                     finish_reason: finish,
+                    logprobs,
                 }],
                 usage: None,
             };
@@ -1597,15 +1762,21 @@ fn stream_completion(
         let mut acc_ids: Vec<u32> = Vec::new();
         let mut sent_chars = 0usize;
         let mut finish = "length";
+        // Tokens whose text has not gone out yet, with their offsets.
+        let mut pending: Option<CompletionLogprobs> =
+            decoding.logprobs.map(|_| CompletionLogprobs::default());
         let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
-                TokenEvent::Next(t) => {
+                TokenEvent::Next(t, lp) => {
                     if engine.eos_tokens.contains(&t) {
                         finish = "stop";
                         break;
                     }
                     completion_tokens += 1;
+                    if let (Some(p), Some(lp)) = (pending.as_mut(), lp.as_ref()) {
+                        p.push(&engine, t, lp, sent_chars_of(&engine, &acc_ids));
+                    }
                     // Always decode the accumulated ids, never the token alone.
                     // Byte-level BPE splits one UTF-8 character (emoji, CJK,
                     // accents) across several tokens, so decoding a fragment in
@@ -1620,7 +1791,8 @@ fn stream_completion(
                     if vis_chars > sent_chars {
                         let delta: String = visible.chars().skip(sent_chars).collect();
                         sent_chars = vis_chars;
-                        send_chunk(w, delta, None)?;
+                        let lps = pending.as_mut().map(std::mem::take);
+                        send_chunk(w, delta, None, lps)?;
                     }
                     if cut.is_some() {
                         finish = "stop";
@@ -1635,7 +1807,7 @@ fn stream_completion(
         }
         engine.record(prompt_tokens, completion_tokens);
 
-        send_chunk(w, String::new(), Some(finish))?;
+        send_chunk(w, String::new(), Some(finish), None)?;
 
         if let Some(stats) = spec {
             let chunk = CompletionChunk {
@@ -1955,7 +2127,7 @@ fn stream_messages(
         let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
-                TokenEvent::Next(t) => {
+                TokenEvent::Next(t, _) => {
                     // EOS is emitted inclusively; end the turn without showing it.
                     if engine.eos_tokens.contains(&t) {
                         stop_reason = "end_turn";
@@ -2034,7 +2206,8 @@ fn stream_chat(
         let created = engine.created;
         let send_chunk = |w: &mut dyn std::io::Write,
                           delta: Delta,
-                          finish: Option<&'static str>|
+                          finish: Option<&'static str>,
+                          logprobs: Option<ChatLogprobs>|
          -> std::io::Result<()> {
             let chunk = Chunk {
                 id: id.clone(),
@@ -2045,6 +2218,7 @@ fn stream_chat(
                     index: 0,
                     delta,
                     finish_reason: finish,
+                    logprobs,
                 }],
                 usage: None,
             };
@@ -2061,7 +2235,10 @@ fn stream_chat(
                 content: None,
             },
             None,
+            None,
         )?;
+        // Tokens whose text has not gone out yet.
+        let mut pending: Option<Vec<ChatTokenLogprob>> = decoding.logprobs.map(|_| Vec::new());
 
         let prompt_tokens = ids.len();
         let mut completion_tokens = 0usize;
@@ -2074,13 +2251,16 @@ fn stream_chat(
         let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
-                TokenEvent::Next(t) => {
+                TokenEvent::Next(t, lp) => {
                     // EOS is emitted inclusively; stop without showing it.
                     if engine.eos_tokens.contains(&t) {
                         finish = "stop";
                         break;
                     }
                     completion_tokens += 1;
+                    if let (Some(p), Some(lp)) = (pending.as_mut(), lp.as_ref()) {
+                        p.push(chat_logprob(&engine, t, lp));
+                    }
                     {
                         // Decode the accumulated run, never a lone token: byte-level
                         // BPE splits one UTF-8 character (emoji, CJK, accents) across
@@ -2095,6 +2275,9 @@ fn stream_chat(
                         if vis_chars > sent_chars {
                             let delta: String = visible.chars().skip(sent_chars).collect();
                             sent_chars = vis_chars;
+                            let lps = pending.as_mut().map(|p| ChatLogprobs {
+                                content: std::mem::take(p),
+                            });
                             send_chunk(
                                 w,
                                 Delta {
@@ -2102,6 +2285,7 @@ fn stream_chat(
                                     content: Some(delta),
                                 },
                                 None,
+                                lps,
                             )?;
                         }
                         if cut.is_some() {
@@ -2125,6 +2309,7 @@ fn stream_chat(
                 content: None,
             },
             Some(finish),
+            None,
         )?;
 
         // When speculating, a final usage-only chunk carries the acceptance

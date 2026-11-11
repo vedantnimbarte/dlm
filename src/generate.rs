@@ -384,6 +384,48 @@ pub struct Decoding {
     /// speculative rejection rule would need the draft constrained the same
     /// way, which it is not.
     pub grammar: Option<Constraint>,
+    /// Report each token's log-probability and this many of the most likely
+    /// alternatives ([`TokenLogprobs`]). Decoded on the plain path only.
+    pub logprobs: Option<usize>,
+}
+
+/// The model's log-probabilities at one generated token: the token's own, and
+/// the `top` most likely tokens at that step, most likely first. Taken from the
+/// model's distribution before sampling settings, penalties or a grammar
+/// reshape it, as OpenAI and vLLM report them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprobs {
+    pub logprob: f32,
+    pub top: Vec<(u32, f32)>,
+}
+
+impl TokenLogprobs {
+    /// `token`'s log-probability under `logits`, and the `top` most likely.
+    pub fn from_logits(logits: &[f32], token: u32, top: usize) -> Self {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let total: f64 = logits.iter().map(|&l| ((l - max) as f64).exp()).sum();
+        let lse = max as f64 + total.ln();
+        let lp = |t: u32| (logits[t as usize] as f64 - lse) as f32;
+        let mut order: Vec<u32> = (0..logits.len() as u32).collect();
+        let top = top.min(order.len());
+        if top > 0 {
+            // Most likely first; a tie goes to the lower id, as greedy picks.
+            let by_logit = |a: &u32, b: &u32| {
+                logits[*b as usize]
+                    .total_cmp(&logits[*a as usize])
+                    .then(a.cmp(b))
+            };
+            order.select_nth_unstable_by(top - 1, by_logit);
+            order.truncate(top);
+            order.sort_by(by_logit);
+        } else {
+            order.clear();
+        }
+        TokenLogprobs {
+            logprob: lp(token),
+            top: order.into_iter().map(|t| (t, lp(t))).collect(),
+        }
+    }
 }
 
 impl From<Sampler> for Decoding {
@@ -1333,6 +1375,11 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     /// Prompt tokens not yet run through the model (see
     /// [`prefill_some`](GenerationSession::prefill_some)).
     pending: Vec<u32>,
+    /// How many alternatives to report with each token, if any (see
+    /// [`Decoding::logprobs`]).
+    logprobs: Option<usize>,
+    /// The last token's, until [`take_logprobs`](Self::take_logprobs).
+    last_logprobs: Option<TokenLogprobs>,
 }
 
 impl<K: ComputeKernel> Generator<K> {
@@ -1373,6 +1420,8 @@ impl<K: ComputeKernel> Generator<K> {
             context: prompt.to_vec(),
             prompt_len: prompt.len(),
             grammar: None,
+            logprobs: None,
+            last_logprobs: None,
             pending: prompt.to_vec(),
         })
     }
@@ -1436,6 +1485,8 @@ impl<K: ComputeKernel> Generator<K> {
             context: prompt.to_vec(),
             prompt_len: prompt.len(),
             grammar: None,
+            logprobs: None,
+            last_logprobs: None,
             pending: suffix.to_vec(),
         })
     }
@@ -1488,6 +1539,19 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     pub fn with_grammar(mut self, grammar: Constraint) -> Self {
         self.grammar = Some(grammar);
         self
+    }
+
+    /// Record each token's log-probability and `top` alternatives (see
+    /// [`Decoding::logprobs`]). Such a session reads the whole row of logits
+    /// each step.
+    pub fn with_logprobs(mut self, top: Option<usize>) -> Self {
+        self.logprobs = top;
+        self
+    }
+
+    /// The log-probabilities recorded with the last token, if asked for.
+    pub fn take_logprobs(&mut self) -> Option<TokenLogprobs> {
+        self.last_logprobs.take()
     }
 
     /// The grammar is complete and admits nothing more. With an EOS token the
@@ -1569,7 +1633,7 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
                 "session has prompt tokens left to prefill".into(),
             ));
         }
-        let plain = self.penalties.is_noop() && self.grammar.is_none();
+        let plain = self.penalties.is_noop() && self.grammar.is_none() && self.logprobs.is_none();
         Ok((&self.last_hidden, self.generator.want(&self.sampler, plain)))
     }
 
@@ -1609,6 +1673,8 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
             Head::Token(token) => token,
             Head::Top(_) => unreachable!("resolved above"),
             Head::Logits(mut logits) => {
+                // The model's own distribution, before anything reshapes it.
+                let raw = self.logprobs.map(|_| logits.clone());
                 apply_repetition_penalty(
                     &mut logits,
                     &self.seen,
@@ -1616,14 +1682,18 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
                 );
                 self.penalties
                     .apply(&mut logits, &self.context, self.prompt_len);
-                match &mut self.grammar {
+                let next = match &mut self.grammar {
                     Some(g) => {
                         let next = g.pick(&self.sampler, &logits, &mut self.rng);
                         g.accept(next);
                         next
                     }
                     None => self.sampler.sample(&logits, &mut self.rng),
+                };
+                if let (Some(top), Some(raw)) = (self.logprobs, raw) {
+                    self.last_logprobs = Some(TokenLogprobs::from_logits(&raw, next, top));
                 }
+                next
             }
         };
         self.seen.insert(next);
@@ -1693,6 +1763,24 @@ mod tests {
     ///
     /// This is what `dlm score` reports and `tools/hf_parity.py` compares
     /// against transformers, so the two halves have to be the same forward pass.
+    /// A token's log-probability is its log-softmax over the whole row, and the
+    /// alternatives come most likely first, however many are asked for.
+    #[test]
+    fn token_logprobs_are_the_log_softmax() {
+        let logits = [1.0f32, 3.0, 2.0, 3.0_f32.ln() + 1.0];
+        let total: f64 = logits.iter().map(|&l| (l as f64).exp()).sum();
+        let lp = |i: usize| ((logits[i] as f64).exp() / total).ln() as f32;
+        let t = TokenLogprobs::from_logits(&logits, 2, 2);
+        assert!((t.logprob - lp(2)).abs() < 1e-6, "{t:?}");
+        assert_eq!(t.top.iter().map(|p| p.0).collect::<Vec<_>>(), vec![1, 3]);
+        assert!((t.top[0].1 - lp(1)).abs() < 1e-6 && t.top[0].1 >= t.top[1].1);
+        assert!(TokenLogprobs::from_logits(&logits, 0, 0).top.is_empty());
+        assert_eq!(TokenLogprobs::from_logits(&logits, 0, 9).top.len(), 4);
+        // Large logits do not overflow.
+        let big = TokenLogprobs::from_logits(&[1000.0, 1000.0], 0, 1);
+        assert!((big.logprob - 0.5f32.ln()).abs() < 1e-6, "{big:?}");
+    }
+
     #[test]
     fn the_next_distribution_scores_the_token_that_follows() {
         let g = counting_generator();

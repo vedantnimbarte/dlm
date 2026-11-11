@@ -846,7 +846,13 @@ inference engine):
   output** (OpenAI endpoints): `response_format` `json_object` or `json_schema`
   holds the output to JSON (of that schema), and `grammar` to a GBNF grammar,
   llama.cpp's format ([`src/grammar.rs`](src/grammar.rs) lists the supported
-  schema subset). `stop` (OpenAI) / `stop_sequences`
+  schema subset). **Log-probabilities** (OpenAI endpoints): chat's `logprobs`
+  and `top_logprobs` (0-20), and the completions endpoint's `logprobs` (0-20),
+  return each output token's log-probability and its most likely alternatives,
+  streamed or not, from the model's distribution before sampling settings
+  reshape it, as OpenAI and vLLM report them. A request asking for them
+  decodes plainly (no speculation) and reads the whole row of logits each
+  step. `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,

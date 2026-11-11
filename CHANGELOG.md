@@ -503,6 +503,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`logprobs` on the OpenAI endpoints.** `logprobs` was always `null`. Chat
+  now takes `logprobs: true` and `top_logprobs` (0-20) and returns
+  `choices[].logprobs.content[]` with each token's text, `logprob`, `bytes`
+  and most likely alternatives; `/v1/completions` takes `logprobs` (0-20) and
+  returns `tokens`, `token_logprobs`, `top_logprobs` and `text_offset`. Both
+  stream, each chunk carrying the tokens whose text it delivers. They come
+  from the model's distribution before temperature, penalties or a grammar
+  reshape it, as OpenAI and vLLM report them, and asking for them does not
+  change what is generated (`tests/server_logprobs.rs`). Such a request reads
+  its whole row of logits each step and does not speculate. Qwen2.5-0.5B on
+  the GPU: "Paris" at -0.098, then "L" at -2.8.
+
 - **A model too big for the card streams on its own.** On the GPU, with
   neither `--stream` nor `--gpu-layers`, a model whose weights did not fit was
   refused (by a KV-cache message that did not say why). Now it streams, and a

@@ -1,0 +1,262 @@
+//! `logprobs` on the OpenAI endpoints: each output token's log-probability and
+//! its most likely alternatives, in chat's and the legacy completions' shapes,
+//! streamed or not. Asking for them must not change what is generated.
+
+use dlm::cache::KvCacheConfig;
+use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
+use dlm::generate::Generator;
+use dlm::server::{engine::router, EngineService, HttpServer};
+use dlm::tokenizer::BpeTokenizer;
+use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+
+/// A byte model: 256 tokens, one zero layer, varied embedding and head.
+fn start_server() -> SocketAddr {
+    let (vocab, hidden) = (256usize, 16usize);
+    let cfg = BlockConfig {
+        hidden_size: hidden,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 4,
+        intermediate_size: 32,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        ..Default::default()
+    };
+    let kernel = CpuKernel::new(cfg, vec![LayerTensors::zeros(&cfg)]).unwrap();
+    // Varied weights, so tokens' logits differ and greedy has one answer.
+    let fill = |n: usize, off: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                ((i as u64 + off as u64).wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.0 - 0.5
+            })
+            .collect()
+    };
+    let generator = Generator::new(
+        kernel,
+        fill(vocab * hidden, 0),
+        vec![1.0; hidden],
+        fill(vocab * hidden, 5),
+        vocab,
+        1e-5,
+        KvCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 4,
+            block_size: 16,
+        },
+        64,
+    )
+    .unwrap();
+    let engine = EngineService::start(
+        generator,
+        BpeTokenizer::bytes_only(),
+        vocab,
+        "dlm",
+        8,
+        0,
+        8,
+        0,
+    );
+    let server = HttpServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || server.serve(router(engine)).unwrap());
+    addr
+}
+
+/// POST `body` to `path`: the status line and the body.
+fn post(addr: SocketAddr, path: &str, body: &str) -> (String, String) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let raw = format!(
+        "POST {path} HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(raw.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+    (head.lines().next().unwrap().to_string(), body.to_string())
+}
+
+fn json(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+}
+
+/// The `data:` payloads of an SSE body, chunked transfer encoding stripped by
+/// keeping only the lines that are events.
+fn events(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(json)
+        .collect()
+}
+
+const CHAT: &str = r#""messages":[{"role":"user","content":"Hi there"}],"max_tokens":6"#;
+
+#[test]
+fn chat_reports_each_tokens_logprob_and_alternatives() {
+    let addr = start_server();
+    let (status, body) = post(
+        addr,
+        "/v1/chat/completions",
+        &format!(r#"{{{CHAT},"logprobs":true,"top_logprobs":3}}"#),
+    );
+    assert!(status.contains("200"), "{status} {body}");
+    let r = json(&body);
+    let choice = &r["choices"][0];
+    let content = choice["logprobs"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 6, "one entry per token: {body}");
+    let mut text = String::new();
+    for entry in content {
+        let top = entry["top_logprobs"].as_array().unwrap();
+        assert_eq!(top.len(), 3, "{entry}");
+        let lps: Vec<f64> = top.iter().map(|t| t["logprob"].as_f64().unwrap()).collect();
+        assert!(
+            lps.windows(2).all(|w| w[0] >= w[1]),
+            "most likely first: {lps:?}"
+        );
+        assert!(lps.iter().map(|l| l.exp()).sum::<f64>() <= 1.0 + 1e-6);
+        // Greedy decoding picks the most likely token.
+        assert_eq!(entry["token"], top[0]["token"], "{entry}");
+        assert_eq!(entry["logprob"], top[0]["logprob"], "{entry}");
+        let bytes: Vec<u8> = entry["bytes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b.as_u64().unwrap() as u8)
+            .collect();
+        text.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    assert_eq!(text, choice["message"]["content"].as_str().unwrap());
+
+    // Without them: the same text, and `logprobs: null`.
+    let (_, plain) = post(addr, "/v1/chat/completions", &format!("{{{CHAT}}}"));
+    let plain = json(&plain);
+    assert_eq!(plain["choices"][0]["message"], choice["message"]);
+    assert!(plain["choices"][0]["logprobs"].is_null(), "{plain}");
+}
+
+#[test]
+fn sampled_chat_still_reports_the_sampled_token() {
+    let addr = start_server();
+    let body =
+        format!(r#"{{{CHAT},"temperature":1.5,"seed":7,"logprobs":true,"top_logprobs":20}}"#);
+    let (_, with) = post(addr, "/v1/chat/completions", &body);
+    let (_, without) = post(
+        addr,
+        "/v1/chat/completions",
+        &format!(r#"{{{CHAT},"temperature":1.5,"seed":7}}"#),
+    );
+    let (with, without) = (json(&with), json(&without));
+    assert_eq!(
+        with["choices"][0]["message"], without["choices"][0]["message"],
+        "the same seed draws the same tokens"
+    );
+    let content = with["choices"][0]["logprobs"]["content"]
+        .as_array()
+        .unwrap();
+    assert_eq!(content.len(), 6);
+    // The logprob is the drawn token's own: where the token is among the
+    // alternatives, it matches that entry.
+    let mut matched = 0;
+    for e in content {
+        let top = e["top_logprobs"].as_array().unwrap();
+        assert!(e["logprob"].as_f64().unwrap() <= top[0]["logprob"].as_f64().unwrap());
+        if let Some(t) = top.iter().find(|t| t["bytes"] == e["bytes"]) {
+            assert_eq!(t["logprob"], e["logprob"], "{e}");
+            matched += 1;
+        }
+    }
+    assert!(matched > 0, "no drawn token among its 20 alternatives");
+}
+
+#[test]
+fn streamed_chat_carries_the_same_logprobs() {
+    let addr = start_server();
+    let ask = format!(r#"{CHAT},"logprobs":true,"top_logprobs":2"#);
+    let (_, whole) = post(addr, "/v1/chat/completions", &format!("{{{ask}}}"));
+    let whole = json(&whole)["choices"][0]["logprobs"]["content"].clone();
+    let (_, stream) = post(
+        addr,
+        "/v1/chat/completions",
+        &format!(r#"{{{ask},"stream":true}}"#),
+    );
+    let streamed: Vec<Value> = events(&stream)
+        .iter()
+        .filter_map(|c| c["choices"][0]["logprobs"]["content"].as_array().cloned())
+        .flatten()
+        .collect();
+    assert_eq!(Value::Array(streamed), whole);
+}
+
+#[test]
+fn completions_report_tokens_offsets_and_alternatives() {
+    let addr = start_server();
+    let (status, body) = post(
+        addr,
+        "/v1/completions",
+        r#"{"prompt":"Hello","max_tokens":5,"logprobs":2}"#,
+    );
+    assert!(status.contains("200"), "{status} {body}");
+    let r = json(&body);
+    let choice = &r["choices"][0];
+    let lp = &choice["logprobs"];
+    let tokens: Vec<&str> = lp["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert_eq!(tokens.len(), 5, "{body}");
+    assert_eq!(lp["token_logprobs"].as_array().unwrap().len(), 5);
+    assert!(lp["top_logprobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m.as_object().unwrap().len() <= 2));
+    let offsets: Vec<u64> = lp["text_offset"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_u64().unwrap())
+        .collect();
+    assert_eq!(offsets[0], 0);
+    assert!(offsets.windows(2).all(|w| w[0] <= w[1]), "{offsets:?}");
+
+    // Streamed: the same tokens across the chunks.
+    let (_, stream) = post(
+        addr,
+        "/v1/completions",
+        r#"{"prompt":"Hello","max_tokens":5,"logprobs":2,"stream":true}"#,
+    );
+    let streamed: Vec<Value> = events(&stream)
+        .iter()
+        .filter_map(|c| c["choices"][0]["logprobs"]["tokens"].as_array().cloned())
+        .flatten()
+        .collect();
+    assert_eq!(Value::Array(streamed), lp["tokens"]);
+}
+
+#[test]
+fn bad_logprob_requests_are_refused() {
+    let addr = start_server();
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            format!(r#"{{{CHAT},"logprobs":true,"top_logprobs":21}}"#),
+        ),
+        (
+            "/v1/chat/completions",
+            format!(r#"{{{CHAT},"top_logprobs":2}}"#),
+        ),
+        (
+            "/v1/completions",
+            r#"{"prompt":"Hi","logprobs":21}"#.to_string(),
+        ),
+    ] {
+        let (status, resp) = post(addr, path, &body);
+        assert!(status.contains("400"), "{body}: {status} {resp}");
+    }
+}
