@@ -20,7 +20,7 @@
 
 use super::cpu::{bf16_to_f32, QuantLayout, Weights};
 use crate::storage::f16_to_f32;
-use crate::storage::ggml_quant::{k_scale_min, GgmlKind};
+use crate::storage::ggml_quant::{decode_block, k_scale_min, GgmlKind};
 
 /// The SIMD instruction set this CPU offers, if any.
 #[derive(Debug, Clone, Copy)]
@@ -413,6 +413,18 @@ unsafe fn ggml_row<S: Simd>(s: S, kind: GgmlKind, blob: &[u8], first: usize, x: 
                     }
                 }
             }
+            // Through the scalar decode: these formats are for VRAM, not the CPU.
+            _ => {
+                let a = decode_block(kind, b);
+                for c in 0..be / 32 {
+                    let at = c * 32;
+                    let (g0, g1) = (at / a.group, (at + 16) / a.group);
+                    let sc = [a.scales[g0], a.scales[g1]];
+                    let o = [a.offsets[g0], a.offsets[g1]];
+                    let codes = s.bytes(a.codes.as_ptr().add(at));
+                    s.fma_codes(&mut acc, codes, sc, o, xp.add(at));
+                }
+            }
         }
     }
     s.hsum(acc)
@@ -785,6 +797,8 @@ mod tests {
             GgmlKind::Q4K,
             GgmlKind::Q5K,
             GgmlKind::Q6K,
+            GgmlKind::Q2K,
+            GgmlKind::Q3K,
         ] {
             let (out_dim, in_dim) = (4, kind.block_elems() * 3);
             let n = out_dim * in_dim;
@@ -794,6 +808,8 @@ mod tests {
             let halves: &[usize] = match kind {
                 GgmlKind::Q4_0 | GgmlKind::Q5_0 | GgmlKind::Q8_0 => &[0],
                 GgmlKind::Q6K => &[208],
+                GgmlKind::Q2K => &[80, 82],
+                GgmlKind::Q3K => &[108],
                 _ => &[0, 2],
             };
             for block in blob.chunks_exact_mut(kind.block_bytes()) {

@@ -28,6 +28,8 @@ pub type hipEvent_t = *mut c_void;
 
 pub const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+/// Direction inferred from the pointers (unified addressing).
+pub const HIP_MEMCPY_DEFAULT: c_int = 4;
 
 pub const HIP_HOST_MALLOC_DEFAULT: c_uint = 0x00;
 pub const HIP_HOST_MALLOC_PORTABLE: c_uint = 0x01;
@@ -212,6 +214,42 @@ pub(super) fn device_free(ptr: *mut c_void) {
     unsafe {
         let _ = hipFree(ptr);
     }
+}
+
+/// Page-locked host memory the device reads and writes in place over the bus,
+/// at the same address on both sides (unified addressing). Freed with
+/// [`host_free`]. Uninitialized.
+pub(super) fn host_mapped_alloc(bytes: usize) -> Result<*mut c_void> {
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: valid out-pointer.
+    let code = unsafe {
+        hipHostMalloc(
+            &mut raw,
+            bytes.max(1),
+            HIP_HOST_MALLOC_PORTABLE | HIP_HOST_MALLOC_MAPPED,
+        )
+    };
+    if code != HIP_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "hipHostMalloc(mapped)",
+            code,
+        });
+    }
+    Ok(raw)
+}
+
+/// Synchronous copy between any two addresses the runtime knows, host or
+/// device: for buffers in [`host_mapped_alloc`] memory.
+pub(super) fn copy_any(dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+    // SAFETY: caller guarantees `bytes` valid on both sides.
+    let code = unsafe { hipMemcpy(dst, src, bytes, HIP_MEMCPY_DEFAULT) };
+    if code != HIP_SUCCESS {
+        return Err(DlmError::Gpu {
+            api: "hipMemcpy(default)",
+            code,
+        });
+    }
+    Ok(())
 }
 
 /// Synchronous host→device copy.

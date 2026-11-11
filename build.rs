@@ -49,11 +49,13 @@ fn main() {
     if std::env::var("CARGO_FEATURE_CUDA_KERNELS").is_ok() {
         compile_cuda_kernels();
         println!("cargo:rerun-if-changed=src/gpu/kernels.cu");
+        println!("cargo:rerun-if-changed=src/gpu/iq_grids.cuh");
     }
 
     if std::env::var("CARGO_FEATURE_ROCM_KERNELS").is_ok() {
         compile_hip_kernels();
         println!("cargo:rerun-if-changed=src/gpu/kernels.cu");
+        println!("cargo:rerun-if-changed=src/gpu/iq_grids.cuh");
     }
 
     println!("cargo:rerun-if-changed=build.rs");

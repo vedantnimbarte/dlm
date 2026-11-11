@@ -133,3 +133,63 @@ fn streamed_and_resident_agree() {
     let got = streamed.generate(&prompt, &gen).expect("streamed generate");
     assert_eq!(got, want, "streamed output differs from resident");
 }
+
+/// The same on the GPU: a model streamed through VRAM, two layers resident,
+/// scores text as the resident GPU kernel does, token by token as it decodes.
+///
+/// Log-probabilities within a tolerance rather than equal tokens: the streamed
+/// blocks stay as the file has them while the resident kernel re-packs them
+/// when they fit, and a format whose rows do not divide into its blocks then
+/// takes f32 activations on one side and int8 on the other. On Qwen2.5-0.5B
+/// `Q6_K` that flipped a 0.1-nat near-tie at the 14th greedy token. A layer
+/// streamed wrong moves log-probabilities by whole nats.
+#[cfg(feature = "cuda-kernels")]
+#[test]
+fn gpu_streamed_and_resident_agree() {
+    let Some(path) = env_path("DLM_TEST_GGUF") else {
+        eprintln!("skipping: set DLM_TEST_GGUF");
+        return;
+    };
+    let quant = dlm::model::QuantScheme::Fp16; // ignored: a GGUF carries its own
+    let (config, store) = dlm::loader::open_model(&path, quant).expect("open the model");
+    let prompt = [785u32, 6722, 315, 9625, 374]; // "The capital of France is"
+    let gen = dlm::generate::GenerationConfig {
+        max_new_tokens: 24,
+        eos_token: None,
+        sampler: dlm::generate::Sampler::Greedy,
+    };
+    let resident = dlm::loader::load_model_parts(&store, &config, 64)
+        .and_then(|p| p.into_gpu_generator())
+        .expect("resident GPU");
+    let mut text = prompt.to_vec();
+    text.extend(resident.generate(&prompt, &gen).expect("resident generate"));
+    let want = resident
+        .score_and_next_decoding(&text)
+        .expect("resident score")
+        .0;
+    drop(resident);
+    let streamed = dlm::loader::build_streaming_gpu_generator(
+        MmapStore::open_path(&path).expect("re-open"),
+        &config,
+        64,
+        2,
+        0,
+        0,
+        false,
+    )
+    .expect("streaming GPU generator");
+    let got = streamed
+        .score_and_next_decoding(&text)
+        .expect("streamed score")
+        .0;
+    let diffs: Vec<f32> = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).collect();
+    let (mean, max) = (
+        diffs.iter().sum::<f32>() / diffs.len() as f32,
+        diffs.iter().fold(0.0f32, |m, &d| m.max(d)),
+    );
+    eprintln!("streamed vs resident log-probabilities: mean diff {mean:.4}, max {max:.4}");
+    assert!(
+        mean < 0.1 && max < 1.0,
+        "GPU-streamed scores differ from resident: mean {mean}, max {max}"
+    );
+}

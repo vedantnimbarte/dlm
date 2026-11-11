@@ -1,3 +1,6 @@
 # Shell scripts are curl|sh'd by users; a CRLF checkout on Windows makes `sh`
 # choke on `set -eu\r`. Force LF regardless of the contributor's autocrlf.
 *.sh text eol=lf
+
+# Test fixtures are binary GGUF files; never touch their bytes.
+*.gguf binary

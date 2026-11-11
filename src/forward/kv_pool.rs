@@ -41,14 +41,19 @@ struct Blocks {
 }
 
 impl KvPool {
-    /// A pool of `blocks` blocks for K/V of width `kv_dim`, held as `elem`.
+    /// A pool of `blocks` blocks for K/V of width `kv_dim`, held as `elem`, in
+    /// VRAM or (`host`) in host RAM the kernels read over the bus.
     /// [`KvElem::I8`] needs `kv_dim` to be a whole number of groups.
-    pub fn new(blocks: u32, kv_dim: usize, elem: KvElem) -> Result<Self> {
+    pub fn new(blocks: u32, kv_dim: usize, elem: KvElem, host: bool) -> Result<Self> {
         let elems = blocks as usize * KV_BLOCK_ROWS * kv_dim;
         debug_assert!(elem != KvElem::I8 || kv_dim % I8_GROUP == 0);
-        let alloc = || match elem {
-            KvElem::F32 => DeviceBuffer::new(elems),
-            _ => DeviceBuffer::new_bytes(bytes_of(elem, elems), elems),
+        let bytes = bytes_of(elem, elems);
+        let alloc = || {
+            if host {
+                DeviceBuffer::new_host_mapped(bytes, elems)
+            } else {
+                DeviceBuffer::new_bytes(bytes, elems)
+            }
         };
         Ok(Self {
             keys: alloc()?,
@@ -340,6 +345,8 @@ pub struct KvPools {
     /// int8 groups fit inside heads (`head_dim % 32 == 0`); else int8 asks get
     /// fp16 pools.
     int8: bool,
+    /// Layers from this one on keep their KV in host RAM.
+    host_from: usize,
 }
 
 impl KvPools {
@@ -353,7 +360,22 @@ impl KvPools {
             blocks: tokens.div_ceil(KV_BLOCK_ROWS).max(1).min(u32::MAX as usize) as u32,
             kv_dim,
             int8: head_dim > 0 && head_dim % I8_GROUP == 0 && kv_dim % I8_GROUP == 0,
+            host_from: num_layers,
         }
+    }
+
+    /// Keep the KV of layers `from..` in host RAM rather than VRAM: what lets a
+    /// context too long for the card run at all. The kernels read those layers'
+    /// history over the bus, so each step is slower by the time it takes to
+    /// move it; layers before `from` stay in VRAM at full speed.
+    /// Takes effect for pools not yet allocated.
+    pub fn set_host_layers_from(&mut self, from: usize) {
+        self.host_from = from.min(self.layers.len());
+    }
+
+    /// The first layer whose KV is in host RAM (the layer count if none is).
+    pub fn host_from(&self) -> usize {
+        self.host_from
     }
 
     /// The element type a session asking for `elem` gets: int8 only where its
@@ -380,7 +402,8 @@ impl KvPools {
         if let Some(pool) = slot {
             return Ok(Arc::clone(pool));
         }
-        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dim, elem)?);
+        let host = layer >= self.host_from;
+        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dim, elem, host)?);
         *slot = Some(Arc::clone(&pool));
         Ok(pool)
     }

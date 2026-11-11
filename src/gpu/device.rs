@@ -19,6 +19,9 @@ pub struct DeviceBuffer {
     len: usize,
     /// Allocated size in bytes.
     bytes: usize,
+    /// In mapped host memory ([`new_host_mapped`](Self::new_host_mapped)), not
+    /// VRAM.
+    host: bool,
 }
 
 impl DeviceBuffer {
@@ -26,7 +29,12 @@ impl DeviceBuffer {
     pub fn new(len: usize) -> Result<Self> {
         let bytes = len * std::mem::size_of::<f32>();
         let ptr = backend::device_malloc(bytes)?;
-        Ok(Self { ptr, len, bytes })
+        Ok(Self {
+            ptr,
+            len,
+            bytes,
+            host: false,
+        })
     }
 
     /// Allocate and upload `data`.
@@ -60,7 +68,42 @@ impl DeviceBuffer {
             ptr,
             len,
             bytes: bytes.max(1),
+            host: false,
         })
+    }
+
+    /// [`new_bytes`](Self::new_bytes) in page-locked host RAM that kernels read
+    /// and write in place over the bus: slower to reach than VRAM, but host RAM
+    /// is many times larger. For a KV cache that does not fit the card.
+    pub fn new_host_mapped(bytes: usize, len: usize) -> Result<Self> {
+        let ptr = backend::host_mapped_alloc(bytes.max(1))?;
+        Ok(Self {
+            ptr,
+            len,
+            bytes: bytes.max(1),
+            host: true,
+        })
+    }
+
+    /// Whether this buffer is in host RAM.
+    pub fn is_host(&self) -> bool {
+        self.host
+    }
+
+    fn copy_in(&self, dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+        if self.host {
+            backend::copy_any(dst, src, bytes)
+        } else {
+            backend::copy_h2d(dst, src, bytes)
+        }
+    }
+
+    fn copy_out(&self, dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+        if self.host {
+            backend::copy_any(dst, src, bytes)
+        } else {
+            backend::copy_d2h(dst, src, bytes)
+        }
     }
 
     /// Allocated size in bytes.
@@ -80,7 +123,7 @@ impl DeviceBuffer {
 
     /// Copy `data` from host into this buffer.
     pub fn upload(&self, data: &[f32]) -> Result<()> {
-        backend::copy_h2d(
+        self.copy_in(
             self.ptr,
             data.as_ptr() as *const c_void,
             std::mem::size_of_val(data),
@@ -89,12 +132,12 @@ impl DeviceBuffer {
 
     /// Copy raw bytes from host into the start of this buffer.
     pub fn upload_bytes(&self, data: &[u8]) -> Result<()> {
-        backend::copy_h2d(self.ptr, data.as_ptr() as *const c_void, data.len())
+        self.copy_in(self.ptr, data.as_ptr() as *const c_void, data.len())
     }
 
     /// Copy the first `out.len()` bytes of this buffer to the host.
     pub fn download_bytes(&self, out: &mut [u8]) -> Result<()> {
-        backend::copy_d2h(out.as_mut_ptr() as *mut c_void, self.ptr, out.len())
+        self.copy_out(out.as_mut_ptr() as *mut c_void, self.ptr, out.len())
     }
 
     /// Copy raw bytes from host into this buffer starting at byte `offset`.
@@ -102,7 +145,7 @@ impl DeviceBuffer {
         self.check_range(offset, data.len())?;
         // SAFETY: `offset + data.len() <= self.bytes`, checked above.
         let dst = unsafe { (self.ptr as *mut u8).add(offset) } as *mut c_void;
-        backend::copy_h2d(dst, data.as_ptr() as *const c_void, data.len())
+        self.copy_in(dst, data.as_ptr() as *const c_void, data.len())
     }
 
     /// Copy `out.len()` bytes starting at byte `offset` of this buffer to the host.
@@ -110,7 +153,7 @@ impl DeviceBuffer {
         self.check_range(offset, out.len())?;
         // SAFETY: `offset + out.len() <= self.bytes`, checked above.
         let src = unsafe { (self.ptr as *mut u8).add(offset) } as *mut c_void;
-        backend::copy_d2h(out.as_mut_ptr() as *mut c_void, src, out.len())
+        self.copy_out(out.as_mut_ptr() as *mut c_void, src, out.len())
     }
 
     fn check_range(&self, offset: usize, len: usize) -> Result<()> {
@@ -125,7 +168,7 @@ impl DeviceBuffer {
 
     /// Copy this buffer's contents into `out` on the host.
     pub fn download(&self, out: &mut [f32]) -> Result<()> {
-        backend::copy_d2h(
+        self.copy_out(
             out.as_mut_ptr() as *mut c_void,
             self.ptr,
             std::mem::size_of_val(out),
@@ -145,7 +188,10 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        backend::device_free(self.ptr);
+        match std::ptr::NonNull::new(self.ptr as *mut u8) {
+            Some(p) if self.host => backend::host_free(p),
+            _ => backend::device_free(self.ptr),
+        }
     }
 }
 

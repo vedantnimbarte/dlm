@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod ggml_quant;
 pub mod gguf;
+mod iq_grids;
 pub mod mmap_store;
 pub mod safetensors;
 pub mod sha256;

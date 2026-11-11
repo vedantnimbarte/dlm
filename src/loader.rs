@@ -68,8 +68,14 @@ pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
         Dtype::F16 | Dtype::BF16 => Ok(QuantScheme::Fp16),
         // A GGUF file's weights are already quantized. Its blocks are decoded
         // into dlm's group-affine form, 4-bit or 8-bit depending on the type.
-        Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q4K => Ok(QuantScheme::Int4),
-        Dtype::Q5_0 | Dtype::Q5_1 | Dtype::Q8_0 | Dtype::Q5K | Dtype::Q6K => Ok(QuantScheme::Int8),
+        d if d.is_block_quantized() => {
+            let kind = crate::storage::ggml_quant::GgmlKind::from_dtype(d).unwrap();
+            Ok(if kind.four_bit() {
+                QuantScheme::Int4
+            } else {
+                QuantScheme::Int8
+            })
+        }
         other => Err(DlmError::UnsupportedQuant(format!(
             "checkpoint weights are {other:?}; dlm handles F32/F16/BF16"
         ))),
@@ -589,58 +595,7 @@ impl ModelParts {
     /// expanded; one that would stop fitting keeps ggml's blocks, which is also
     /// what the streaming path wants, since it moves those bytes every layer.
     fn expand_quantized_weights(&mut self, free_bytes: u64, reserved: u64) {
-        use crate::storage::ggml_quant;
-        let mut native = 0u64;
-        let mut expanded = 0u64;
-        for layer in &self.layers {
-            for w in layer.weights() {
-                if let Weights::Ggml {
-                    blob,
-                    kind,
-                    num_elements,
-                } = w
-                {
-                    native += blob.len() as u64;
-                    // Codes plus a scale and zero per group.
-                    let group = if *kind == crate::storage::ggml_quant::GgmlKind::Q6K {
-                        16
-                    } else {
-                        32
-                    };
-                    let four_bit = matches!(
-                        kind,
-                        ggml_quant::GgmlKind::Q4_0
-                            | ggml_quant::GgmlKind::Q4_1
-                            | ggml_quant::GgmlKind::Q4K
-                    );
-                    let codes = if four_bit {
-                        num_elements.div_ceil(2)
-                    } else {
-                        *num_elements
-                    };
-                    expanded += (codes.div_ceil(4) * 4 + num_elements.div_ceil(group) * 8) as u64;
-                }
-            }
-        }
-        if native == 0 {
-            return; // not a GGUF model
-        }
-        let grows_by = expanded.saturating_sub(native);
-        if reserved.saturating_add(grows_by) > free_bytes {
-            return;
-        }
-        for layer in &mut self.layers {
-            for w in layer.weights_mut() {
-                if let Weights::Ggml {
-                    blob,
-                    kind,
-                    num_elements,
-                } = w
-                {
-                    *w = ggml_quant::expand(*kind, blob, *num_elements);
-                }
-            }
-        }
+        expand_layers(&mut self.layers, free_bytes, reserved);
     }
 
     /// Upload every layer to VRAM and build a generator over the GPU kernel.
@@ -696,7 +651,16 @@ impl ModelParts {
         let head = self.head_quant();
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
-        let back = self.layers.split_off(gpu_layers);
+        let mut back = self.layers.split_off(gpu_layers);
+        // The CPU half reads dlm's int layouts with SIMD, ggml's blocks of the
+        // 2-3-bit formats only through a scalar decode: re-pack it where RAM
+        // allows, as the CPU generator does.
+        let back_bytes: u64 = back
+            .iter()
+            .map(|l| l.weights().map(|w| w.as_bytes().len() as u64).sum::<u64>())
+            .sum();
+        let ram = crate::memory::page::total_ram().unwrap_or(0);
+        expand_layers(&mut back, ram / 2, back_bytes);
         let kernel = crate::forward::SplitKernel::new(
             crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?,
             CpuKernel::for_layers(self.cfg, back, gpu_layers as u32)?,
@@ -1862,6 +1826,54 @@ pub fn load_model_parts(
         final_logit_softcap: config.final_logit_softcap,
         head_int4: false,
     })
+}
+
+/// Re-pack `layers`' ggml blocks into dlm's own quantized layout if the
+/// larger form fits in `free_bytes` beside `reserved`; see
+/// `ModelParts::expand_quantized_weights`.
+fn expand_layers(layers: &mut [LayerTensors], free_bytes: u64, reserved: u64) {
+    use crate::storage::ggml_quant;
+    let mut native = 0u64;
+    let mut expanded = 0u64;
+    for layer in layers.iter() {
+        for w in layer.weights() {
+            if let Weights::Ggml {
+                blob,
+                kind,
+                num_elements,
+            } = w
+            {
+                native += blob.len() as u64;
+                // Codes plus a scale and zero per group.
+                let group = kind.group();
+                let codes = if kind.expands_to_int4() {
+                    num_elements.div_ceil(2)
+                } else {
+                    *num_elements
+                };
+                expanded += (codes.div_ceil(4) * 4 + num_elements.div_ceil(group) * 8) as u64;
+            }
+        }
+    }
+    if native == 0 {
+        return; // not a GGUF model
+    }
+    let grows_by = expanded.saturating_sub(native);
+    if reserved.saturating_add(grows_by) > free_bytes {
+        return;
+    }
+    for layer in layers.iter_mut() {
+        for w in layer.weights_mut() {
+            if let Weights::Ggml {
+                blob,
+                kind,
+                num_elements,
+            } = w
+            {
+                *w = ggml_quant::expand(*kind, blob, *num_elements);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

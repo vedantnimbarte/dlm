@@ -1003,6 +1003,38 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
             // Baseline snapshot for a fully-resident run: every layer is held,
             // nothing streams. The streaming branch below replaces it with the
             // real window once the plan is known.
+            // Weights the card cannot hold stream: the fastest placement for
+            // them measured here. Qwen2.5-7B Q3_K_M on a GTX 1650 streams at 7-9
+            // tok/s, and runs at 3 with its back layers on the CPU
+            // (`--gpu-layers`), which is still there to ask for.
+            if device == Device::Gpu
+                && !args.stream
+                && args.gpu_layers.is_none()
+                && args.multi_gpu_ids.is_empty()
+                && args.draft_model_path.is_none()
+            {
+                let (free, _) = resolve_free_bytes(args.vram_budget_gb);
+                let safety = build_profiler(
+                    args.context_length,
+                    args.safety_margin_gb,
+                    args.max_batch as u32,
+                    dlm::forward::cpu::KvElem::for_quant(args.kv_quant.to_kv_quant()),
+                )
+                .safety_margin_bytes;
+                let weights = resident_weight_bytes(&config, config.num_layers);
+                if weights > free.saturating_sub(safety) {
+                    println!(
+                        "placement    : the weights (~{:.1} GiB) do not fit in the {:.1} GiB free \
+                         after the {:.1} GiB safety margin, so they stream (`--gpu-layers N` \
+                         runs the layers after N on the CPU instead)",
+                        weights as f64 / GIB as f64,
+                        free.saturating_sub(safety) as f64 / GIB as f64,
+                        safety as f64 / GIB as f64,
+                    );
+                    args.stream = true;
+                }
+            }
+
             if args.telemetry && !args.stream {
                 publish_telemetry_snapshot(&config, &store, config.num_layers, false, device);
             }
@@ -1039,7 +1071,11 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                     config.num_layers,
                 );
                 let depth = args.prefetch_depth.min(window.saturating_sub(1));
-                if args.auto_prefetch {
+                if device == Device::Gpu {
+                    // The GPU worker has no depth to set: it always loads the
+                    // next layer the pass is missing.
+                    println!("  prefetch   : the next streamed layer, under the compute before it");
+                } else if args.auto_prefetch {
                     println!(
                         "  prefetch   : auto (depth tuned from load vs compute, ≤ {})",
                         window.saturating_sub(1)
@@ -1387,36 +1423,68 @@ fn ensure_batch_kv_fits(
     Ok(())
 }
 
-/// Tokens of KV to pool for resident GPU serving: everything that fits in `free`
-/// after the safety margin and `weights`, at `per_token_bytes` (all layers), up
-/// to `max_batch` full contexts. Refuses when not even one full-context request
-/// fits, since such a request could never be admitted.
+/// VRAM the resident GPU kernel's weights take with `on_gpu` of the layers.
+fn resident_weight_bytes(config: &ModelConfig, on_gpu: u32) -> u64 {
+    (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64 * on_gpu as u64
+        / config.num_layers.max(1) as u64
+}
+
+/// The resident GPU's KV pool: `(tokens, host_from)`.
+///
+/// The pool takes whatever VRAM is left after the weights, up to `max_batch`
+/// full contexts. When not even one context fits, it holds one, and only its
+/// first `host_from` layers keep their KV in VRAM: the rest go to host RAM,
+/// which the kernels read over the bus. Each step then waits on that transfer,
+/// but a context the card cannot hold runs instead of being refused.
+/// `per_token_bytes` is for all `layers`. Refuses when the weights alone do not
+/// fit.
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels", test))]
 fn resident_kv_pool_tokens(
     free: u64,
     safety: u64,
     weights: u64,
     per_token_bytes: u64,
+    layers: u32,
     max_batch: usize,
     context: u32,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
+    let layers = layers.max(1) as u64;
+    let gib = |b: u64| b as f64 / GIB as f64;
+    if weights > free.saturating_sub(safety) {
+        return Err(DlmError::InvalidConfig(format!(
+            "the weights (~{:.1} GiB) do not fit in the {:.1} GiB of VRAM free after the \
+             {:.1} GiB safety margin. Stream them (--stream), run fewer layers on the GPU \
+             (--gpu-layers), or use a smaller model or quantization.",
+            gib(weights),
+            gib(free.saturating_sub(safety)),
+            gib(safety),
+        )));
+    }
     let budget = free.saturating_sub(safety).saturating_sub(weights);
     let want = max_batch.max(1) as u64 * context as u64;
     let tokens = want.min(budget / per_token_bytes.max(1));
-    if tokens < context as u64 {
-        let gib = |b: u64| b as f64 / GIB as f64;
+    if tokens >= context as u64 {
+        return Ok((tokens as usize, layers as usize));
+    }
+    let per_layer = (context as u64 * per_token_bytes / layers).max(1);
+    let in_vram = budget / per_layer;
+    let host = (layers - in_vram) * per_layer;
+    let ram = dlm::memory::page::total_ram().unwrap_or(u64::MAX);
+    if host > ram / 2 {
         return Err(DlmError::InvalidConfig(format!(
-            "one {context}-token request needs ~{:.2} GiB of KV, but only {:.2} GiB of VRAM is \
-             left after weights {:.1} + safety {:.1} (of {:.1} free). Lower --context-length, \
-             or use --quant / a smaller model.",
+            "one {context}-token request needs ~{:.2} GiB of KV: {:.2} GiB of VRAM is left \
+             after weights {:.1} + safety {:.1} (of {:.1} free), and the rest ({:.2} GiB) is \
+             over half the host's RAM. Lower --context-length, or use --kv-quant / a smaller \
+             model.",
             gib(context as u64 * per_token_bytes),
             gib(budget),
             gib(weights),
             gib(safety),
             gib(free),
+            gib(host),
         )));
     }
-    Ok(tokens as usize)
+    Ok((context as usize, in_vram as usize))
 }
 
 /// Serve a model split across `gpu_ids`. On a `cuda-kernels` build each device
@@ -1502,31 +1570,42 @@ fn serve_on_gpu(
         args.max_batch as u32,
         dlm::forward::cpu::KvElem::for_quant(args.kv_quant.to_kv_quant()),
     );
-    let weights = (config.estimated_total_params() as f64 * config.quant.bytes_per_param()) as u64
-        * on_gpu as u64
-        / config.num_layers.max(1) as u64;
+    let weights = resident_weight_bytes(config, on_gpu);
     // KV is paged from a shared pool, so concurrent requests only need VRAM for
     // the tokens they actually hold. Give the pool whatever fits after the
     // weights, up to --max-batch full contexts.
     let per_token =
         profiler.kv_bytes_per_layer(config) * on_gpu as u64 / args.context_length.max(1) as u64;
-    let pool = resident_kv_pool_tokens(
+    let (pool, host_from) = resident_kv_pool_tokens(
         free,
         profiler.safety_margin_bytes,
         weights,
         per_token,
+        on_gpu,
         args.max_batch,
         args.context_length,
     )?;
+    if host_from < on_gpu as usize {
+        println!(
+            "  kv offload : one {}-token context does not fit beside the weights: layers \
+             {host_from}..{on_gpu} keep their KV in host RAM ({:.2} GiB), read over PCIe each \
+             step",
+            args.context_length,
+            (on_gpu as usize - host_from) as f64 * pool as f64 * per_token as f64
+                / on_gpu as f64
+                / GIB as f64,
+        );
+    }
     let parts = ModelParts {
         head_int4: args.lm_head_int4,
         ..parts
     };
     if let Some(n) = gpu_layers {
         let generator = parts.into_split_generator(n as usize)?;
+        let generator = generator.with_kv_host_layers(host_from);
         return start_batched_server(generator, None, args, config, listen, Some(pool));
     }
-    let generator = parts.into_gpu_generator()?;
+    let generator = parts.into_gpu_generator()?.with_kv_host_layers(host_from);
     let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
     start_batched_server(generator, draft, args, config, listen, Some(pool))
 }
@@ -1543,7 +1622,7 @@ fn serve_on_gpu(
 }
 
 /// Serve with `--stream --device gpu`: stream a window of layer weights through
-/// VRAM (`StreamingGpuKernel`). Experimental — unvalidated on hardware.
+/// VRAM (`StreamingGpuKernel`).
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 #[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
@@ -1556,7 +1635,7 @@ fn serve_streaming_gpu(
     listen: &str,
 ) -> Result<()> {
     println!(
-        "device       : gpu ({}) — VRAM layer streaming [experimental]",
+        "device       : gpu ({}) — VRAM layer streaming",
         gpu::active_vendor().label()
     );
     let generator = dlm::loader::build_streaming_gpu_generator(
@@ -2482,14 +2561,24 @@ mod tests {
     fn resident_kv_pool_takes_what_fits_up_to_the_batch() {
         let mib = 1024 * 1024;
         // 1 MiB per token, 4 GiB free, 1 GiB weights, 0.5 GiB safety: 2.5 GiB left.
-        let pool = |batch, ctx| resident_kv_pool_tokens(4 * GIB, GIB / 2, GIB, mib, batch, ctx);
-        // The whole batch fits: exactly batch x context.
-        assert_eq!(pool(2, 1024).unwrap(), 2048);
+        // 10 layers, so 0.1 MiB per token per layer.
+        let pool = |batch, ctx| resident_kv_pool_tokens(4 * GIB, GIB / 2, GIB, mib, 10, batch, ctx);
+        // The whole batch fits: exactly batch x context, every layer in VRAM.
+        assert_eq!(pool(2, 1024).unwrap(), (2048, 10));
         // It does not: everything that fits (2560 tokens), not a refusal.
-        assert_eq!(pool(8, 1024).unwrap(), 2560);
-        // Not even one full context fits: refuse, naming the lever.
-        let err = pool(1, 4096).unwrap_err().to_string();
-        assert!(err.contains("--context-length"), "{err}");
+        assert_eq!(pool(8, 1024).unwrap(), (2560, 10));
+        // Not even one full context fits: one context, the first 6 layers in
+        // VRAM (409.6 MiB each of the 2.5 GiB left), the other 4 in host RAM.
+        assert_eq!(pool(1, 4096).unwrap(), (4096, 6));
+        // The weights alone do not fit: refuse, naming the ways out, rather
+        // than put every layer's KV in host RAM beside an overcommitted card.
+        let err = resident_kv_pool_tokens(4 * GIB, GIB, 3 * GIB + 1, mib, 10, 1, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--stream") && err.contains("--gpu-layers"),
+            "{err}"
+        );
     }
 
     #[test]

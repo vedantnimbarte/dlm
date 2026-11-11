@@ -27,9 +27,9 @@ streams and the slower it gets.
 So reach for [`--quant`](#weight-precision---quant) first. Quantizing the weights
 at load shrinks each layer 2–4x, which usually means **more of the model stays
 resident and streaming shrinks or stops entirely** — worth far more than any
-amount of making streaming itself faster. On a 4 GB card, a 3B model (which does
-not fit in 16-bit) goes from 0.024 tok/s streamed to **4.2 tok/s** fully resident
-at `--quant int4`. Streaming is the fallback for what still doesn't fit.
+amount of making streaming itself faster. On a 4 GB card, a 1.5B model (which
+does not fit in 16-bit) goes from 21–27 tok/s streamed to **79–87 tok/s** fully
+resident at `--quant int4`. Streaming is the fallback for what still doesn't fit.
 
 It's not a 16 GB tool. It's for **anyone the VRAM wall has been telling "no"** —
 the 4 GB laptop GPU, the 6 GB gaming card, the 8 GB workstation — giving each of
@@ -697,9 +697,17 @@ Everything else works as it does for a safetensors checkpoint — CPU or GPU,
 resident or `--stream`.
 
 **Quantization types read natively:** F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1,
-Q8_0, Q4_K, Q5_K, Q6_K. That covers the usual downloads (`Q4_K_M`, `Q5_K_M`,
-`Q8_0`). Q2_K, Q3_K and the IQ types are **refused by name** rather than
-mis-decoded.
+Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+IQ4_NL and IQ4_XS. That covers every download from `Q2_K` and `IQ2_XXS` up
+(`IQ2_M`, `IQ3_M`, `Q3_K_M`, `Q4_K_M`, ...). The 1.6-bit IQ1 types are **refused
+by name** rather than mis-decoded.
+
+The 2- and 3-bit files are for models that would not otherwise fit: a Qwen2.5-0.5B
+scored on the same passage costs, in nats per token, 3.31 as `Q4_K_M` (235 MiB
+of layers), 3.33 as `IQ3_XS` (179 MiB), 3.36 as `Q3_K_M` (195 MiB), 3.38 as
+`Q2_K` (179 MiB) and 3.57 as `IQ2_M` (169 MiB). Small models keep few of their
+tensors at the nominal type (a 0.5B `Q2_K` file is mostly `IQ4_NL`, because its
+896-wide rows do not divide into 256-weight blocks); a 7B is mostly what it says.
 
 `--quant` is refused for a GGUF file: its weights are already quantized, and
 dlm reads them at the precision they were saved in.
@@ -707,8 +715,11 @@ dlm reads them at the precision they were saved in.
 **Verified against llama.cpp**, which is the only reference that catches a
 misread scale — dlm would be consistent with itself either way. Every quantized
 tensor of a Qwen2.5-0.5B `Q4_K_M` decodes to within 4.8e-8 of llama.cpp's own
-dequantization, and a `Q8_0` one to the bit. `tools/llamacpp_parity.py` compares
-tokenization and greedy output against a running `llama-server` on the same file.
+dequantization, and a `Q8_0` one to the bit; so do the 2- and 3-bit `Q2_K` and
+`Q3_K_M` files. Every block type is also checked against llama.cpp's reference
+decoder on each `cargo test` (`tests/ggml_blocks.rs`, from a small fixture of
+random blocks). `tools/llamacpp_parity.py` compares tokenization and greedy
+output against a running `llama-server` on the same file.
 
 The kernels decode ggml's blocks directly, so a model that streams — or one that
 only just fits — costs exactly what the file does on disk. When there is VRAM to
@@ -744,14 +755,16 @@ silent no-op — `--quant` never describes weights that don't exist.
 **Quantizing is the lever that matters on a small card.** A smaller layer means
 more of the model stays resident and each streamed layer costs less to move —
 often it removes streaming entirely, which is worth more than making streaming
-faster. On a 4 GB GTX 1650, Llama-3.2-3B (5.6 GiB of bf16 layers, i.e. a model
-that does **not** fit):
+faster. On a 4 GB GTX 1650, Qwen2.5-1.5B (3.3 GiB of bf16 weights against
+3.2 GiB free, i.e. a model that does **not** fit), decoding at batch 1 with a
+256-token prompt and `--context-length 1024`, ranges over repeated runs
+(2026-11-11, commit `880a167`):
 
-| | layer | resident | tok/s |
-| --- | --- | --- | --- |
-| bf16, `--stream` | 192 MiB | 5 / 28 | 0.024 |
-| `--quant int8` | 96 MiB | all 28 (no streaming) | **3.0** |
-| `--quant int4` | 48 MiB | all 28 (no streaming) | **4.2** |
+| | resident | decode tok/s |
+| --- | --- | --- |
+| bf16, `--stream` | 27 / 28 | 21–27 |
+| `--quant int8` | all 28 (no streaming) | **64–65** |
+| `--quant int4` | all 28 (no streaming) | **79–87** |
 
 int4 is faster than int8 for the same reason it is smaller: the GEMV is
 bandwidth-bound, so halving the bytes read halves the work. Pick int8 when int4
@@ -875,7 +888,14 @@ inference engine):
     ([`src/forward/streaming_gpu.rs`](src/forward/streaming_gpu.rs)) while KV stays
     resident: run a model larger than VRAM on the GPU. Validated on hardware
     against the CPU oracle ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)); the
-    streamed window is bit-comparable to a fully-resident GPU run.
+    streamed window is bit-comparable to a fully-resident GPU run. **A model
+    whose weights do not fit streams without the flag**: the startup banner's
+    `placement` line says so. That is the fastest placement measured for one:
+    Qwen2.5-7B-Instruct `Q3_K_M` on a GTX 1650 streams at 7-9 tok/s, and runs
+    at about 3 with `--gpu-layers 19` (the other 9 layers on the CPU).
+  - `--gpu-layers N` — the first `N` layers in VRAM and the rest on the CPU
+    (llama.cpp's `-ngl`). The CPU half gets dlm's SIMD int layouts where RAM
+    allows, as the CPU kernel does.
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
 
   Two orthogonal memory knobs apply to any kernel:
@@ -935,8 +955,17 @@ inference engine):
     A request takes blocks as it grows and returns them when it ends, so it uses
     VRAM for the tokens it holds, not a full `--context-length`.
   - **Pool size:** `serve` gives the pool whatever VRAM fits after the weights,
-    up to `--max-batch` full contexts. It refuses to start only if one
-    full-context request would not fit.
+    up to `--max-batch` full contexts.
+  - **KV in host RAM:** when not even one full-context request fits, the pool
+    holds one, and only the layers that fit keep their KV in VRAM; the rest
+    keep it in page-locked host RAM, which the kernels read over PCIe. That is
+    slower per step, but a context the card cannot hold runs instead of being
+    refused (`kv offload` in the startup banner says which layers). Qwen2.5-1.5B
+    `Q8_0` on a GTX 1650 capped at 2.4 GB, 32k context, 4k-token history: 21 of
+    28 layers' KV in host RAM, decode 21 tok/s against 49 with it all in VRAM.
+    It refuses only if the host part would take over half the RAM. Resident
+    GPU only: when streaming, KV in VRAM costs a few streamed layers, which is
+    cheaper than reading it over the bus.
   - **Admission control:** a request starts only once the pool can hold its
     prompt plus `max_tokens` alongside the running requests. Otherwise it waits
     in the queue instead of failing mid-decode.

@@ -119,6 +119,12 @@ pub trait ComputeKernel {
     /// before the first session. A no-op elsewhere.
     fn set_kv_pool_tokens(&mut self, _tokens: usize) {}
 
+    /// Keep the KV of layers `from..` in host RAM rather than VRAM (see
+    /// `KvPools::set_host_layers_from`), for kernels whose KV pools are on a
+    /// GPU. Call before the first session, after `set_kv_pool_tokens`. A no-op
+    /// elsewhere.
+    fn set_kv_host_layers(&mut self, _from: usize) {}
+
     /// Layer-streaming cache stats, if this kernel streams weights. Resident
     /// kernels (everything held in memory) return `None`; the streaming kernel
     /// overrides it so the server can surface hit rate / prefetch effectiveness.

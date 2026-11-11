@@ -329,6 +329,17 @@ pub fn file_type_name(metadata: &BTreeMap<String, Value>) -> Option<&'static str
         16 => "Q5_K_S",
         17 => "Q5_K_M",
         18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "Q2_K_S",
+        22 => "IQ3_XS",
+        23 => "IQ3_XXS",
+        25 => "IQ4_NL",
+        26 => "IQ3_S",
+        27 => "IQ3_M",
+        28 => "IQ2_S",
+        29 => "IQ2_M",
+        30 => "IQ4_XS",
         32 => "BF16",
         _ => return None,
     })
@@ -347,23 +358,29 @@ fn dtype_of(kind: u32, name: &str) -> Result<Dtype> {
         12 => Dtype::Q4K,
         13 => Dtype::Q5K,
         14 => Dtype::Q6K,
+        10 => Dtype::Q2K,
+        11 => Dtype::Q3K,
+        16 => Dtype::IQ2XXS,
+        17 => Dtype::IQ2XS,
+        18 => Dtype::IQ3XXS,
+        20 => Dtype::IQ4NL,
+        21 => Dtype::IQ3S,
+        22 => Dtype::IQ2S,
+        23 => Dtype::IQ4XS,
         30 => Dtype::BF16,
         // Named rather than numbered, because "ggml type 19" tells a user nothing
         // about what to download instead.
         other => {
             let known = match other {
-                10 => "Q2_K",
-                11 => "Q3_K",
-                16..=23 | 29 => "an IQ (importance-matrix) type",
+                19 | 29 => "an IQ1 type",
                 34 | 35 => "a ternary (TQ) type",
                 _ => "an unrecognized type",
             };
             return Err(DlmError::UnsupportedQuant(format!(
                 "tensor {name:?} is {known} (ggml type {other}), which dlm does not decode. \
-                 It reads F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and \
-                 Q6_K -- a Q4_K_M, Q5_K_M, Q6_K or Q8_0 download is the usual choice. \
-                 (Q3_K and Q2_K files often store their embedding as an IQ type, so they \
-                 are refused here too.)"
+                 It reads F32, F16, BF16, Q4_0 to Q8_0, Q2_K to Q6_K, IQ2_XXS, IQ2_XS, \
+                 IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS: any download from Q2_K or \
+                 IQ2_XXS up, such as Q4_K_M or IQ3_M."
             )));
         }
     })
@@ -499,7 +516,7 @@ mod tests {
     fn unsupported_quant_types_are_named() {
         let err = dtype_of(19, "blk.0.ffn_down.weight").unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("IQ"), "{msg}");
+        assert!(msg.contains("IQ1"), "{msg}");
         assert!(msg.contains("Q4_K_M"), "{msg}");
     }
 

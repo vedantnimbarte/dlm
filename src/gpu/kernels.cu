@@ -215,6 +215,40 @@ __device__ __forceinline__ float load_w<DLM_W_INT8>(const void* W, long i, long 
 #define DLM_W_Q4_K 10
 #define DLM_W_Q5_K 11
 #define DLM_W_Q6_K 12
+#define DLM_W_Q2_K 13
+#define DLM_W_Q3_K 14
+#define DLM_W_IQ2_XXS 15
+#define DLM_W_IQ2_XS 16
+#define DLM_W_IQ2_S 17
+#define DLM_W_IQ3_XXS 18
+#define DLM_W_IQ3_S 19
+#define DLM_W_IQ4_NL 20
+#define DLM_W_IQ4_XS 21
+
+#include "iq_grids.cuh"
+
+// The formats whose blocks are 256 weights: a row must be whole blocks.
+__host__ __device__ constexpr bool dlm_super_block(int dt) {
+    return dt == DLM_W_Q4_K || dt == DLM_W_Q5_K || dt == DLM_W_Q6_K ||
+           (dt >= DLM_W_Q2_K && dt <= DLM_W_IQ3_S) || dt == DLM_W_IQ4_XS;
+}
+
+// Q2_K..IQ4_XS decode a 32-weight chunk at a time (`Dp4a<DT>::load`, below);
+// one weight on its own goes through the same decode.
+#define DLM_CODED_DTYPES(X) \
+    X(DLM_W_Q2_K)           \
+    X(DLM_W_Q3_K)           \
+    X(DLM_W_IQ2_XXS)        \
+    X(DLM_W_IQ2_XS)         \
+    X(DLM_W_IQ2_S)          \
+    X(DLM_W_IQ3_XXS)        \
+    X(DLM_W_IQ3_S)          \
+    X(DLM_W_IQ4_NL)         \
+    X(DLM_W_IQ4_XS)
+#define DLM_DECLARE_LOAD_W(D) \
+    template <> __device__ __forceinline__ float load_w<D>(const void* W, long i, long n, int gs);
+DLM_CODED_DTYPES(DLM_DECLARE_LOAD_W)
+#undef DLM_DECLARE_LOAD_W
 
 __device__ __forceinline__ float dlm_half(const unsigned char* p) {
     unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
@@ -342,7 +376,8 @@ __device__ __forceinline__ float load_w<DLM_W_Q6_K>(const void* W, long i, long,
     X(DLM_W_Q8_0)             \
     X(DLM_W_Q4_K)             \
     X(DLM_W_Q5_K)             \
-    X(DLM_W_Q6_K)
+    X(DLM_W_Q6_K)             \
+    DLM_CODED_DTYPES(X)
 
 // One thread's share of a row dot product: the sum over `i = start, start +
 // step, ... < in_dim` of `W[base + i] * x[i]`.
@@ -825,9 +860,7 @@ static inline bool chunk_fits(const void* W, const float* x, int in_dim, int gro
     const int N = Chunk<DT>::N;
     if (in_dim % N) return false;
     if ((DT == DLM_W_INT4 || DT == DLM_W_INT8) && (group_size <= 0 || group_size % N)) return false;
-    if (DT == DLM_W_Q4_K || DT == DLM_W_Q5_K || DT == DLM_W_Q6_K) {
-        if (in_dim % 256) return false;
-    }
+    if (dlm_super_block(DT) && in_dim % 256) return false;
     return ((unsigned long long)W % 16 == 0) && ((unsigned long long)x % 16 == 0);
 }
 
@@ -989,7 +1022,7 @@ __device__ __forceinline__ unsigned int ld_u32_2(const unsigned char* p) {
 // once per slot for all its rows.
 struct Q8Codes {
     int q[8];
-    float a0, a1, b;
+    float a0, a1, b, b1;
 };
 
 __device__ __forceinline__ void q8_half_sums(const int* xi, int& xs0, int& xs1) {
@@ -1000,7 +1033,9 @@ __device__ __forceinline__ void q8_half_sums(const int* xi, int& xs0, int& xs1) 
     for (int k = 4; k < 8; ++k) xs1 = dlm_dp4a(0x01010101, xi[k], xs1);
 }
 
-template <bool SPLIT>
+// SPLIT 0: one scale and offset, `a0 * q + b`. 1: Q6_K's two 16-weight
+// scales, `a * (q - 32)`. 2: two of each, `a0 * q + b` then `a1 * q + b1`.
+template <int SPLIT>
 __device__ __forceinline__ float q8_apply(const Q8Codes& c, const int* xi, float2 dx, int xs0,
                                           int xs1) {
     int s0 = 0, s1 = 0;
@@ -1008,7 +1043,9 @@ __device__ __forceinline__ float q8_apply(const Q8Codes& c, const int* xi, float
     for (int k = 0; k < 4; ++k) s0 = dlm_dp4a(c.q[k], xi[k], s0);
     #pragma unroll
     for (int k = 4; k < 8; ++k) s1 = dlm_dp4a(c.q[k], xi[k], s1);
-    if (SPLIT) return dx.x * (c.a0 * (float)(s0 - 32 * xs0) + c.a1 * (float)(s1 - 32 * xs1));
+    if (SPLIT == 1) return dx.x * (c.a0 * (float)(s0 - 32 * xs0) + c.a1 * (float)(s1 - 32 * xs1));
+    if (SPLIT == 2)
+        return dx.x * (c.a0 * (float)s0 + c.a1 * (float)s1 + c.b * (float)xs0 + c.b1 * (float)xs1);
     return c.a0 * dx.x * (float)(s0 + s1) + c.b * dx.y;
 }
 
@@ -1200,7 +1237,7 @@ __device__ __forceinline__ float dp4a_dot(const void* W, long e, long n, int gs,
     Dp4a<DT>::load(W, e, n, gs, c);
     int xs0 = 0, xs1 = 0;
     if (Dp4a<DT>::SPLIT) q8_half_sums(xi, xs0, xs1);
-    return q8_apply<(bool)Dp4a<DT>::SPLIT>(c, xi, dx, xs0, xs1);
+    return q8_apply<Dp4a<DT>::SPLIT>(c, xi, dx, xs0, xs1);
 }
 
 // Q6_K's single chunk keeps its decode and dot interleaved: through `Q8Codes`
@@ -1228,6 +1265,236 @@ __device__ __forceinline__ float dp4a_dot<DLM_W_Q6_K>(const void* W, long e, lon
     float s1 = d * (float)(signed char)b[192 + (within >> 4) + 1];
     return dx.x * (s0 * (float)(s[0] - 32 * xs[0]) + s1 * (float)(s[1] - 32 * xs[1]));
 }
+
+
+// ── Q2_K, Q3_K and the IQ formats ─────────────────────────────────────────
+//
+// Each decodes a 32-weight chunk into int8 codes with a scale and offset per
+// 16 weights, which is all three GEMV paths need: the dp4a dot product takes
+// the codes as they are, and `CodedChunk` / `load_w` turn them into floats.
+// The layouts mirror `decode_block` in src/storage/ggml_quant.rs, checked
+// against llama.cpp by tests/ggml_blocks.rs. Blocks of 74, 82, 98 and 110
+// bytes are only 2-byte aligned, hence the 2-byte loads.
+
+// Byte k of the result is 0xFF where bit k of `s` is set.
+__device__ __forceinline__ unsigned int sign_mask4(unsigned int s) {
+    return ((s & 1u) | ((s & 2u) << 7) | ((s & 4u) << 14) | ((s & 8u) << 21)) * 0xFFu;
+}
+// Four codebook magnitudes, byte k negated where bit k of `s` is set. Two's
+// complement per byte without a borrow: no magnitude is 0, so `~v + 1` never
+// carries into the next byte.
+__device__ __forceinline__ int iq_signed4(unsigned int mags, unsigned int s) {
+    unsigned int m = sign_mask4(s & 0xFu);
+    return (int)((mags ^ m) + (m & 0x01010101u));
+}
+// ggml's `ksigns_iq2xs`: 7 sign bits and an eighth making their parity even.
+__device__ __forceinline__ unsigned int iq_signs(unsigned int i) {
+    i &= 127u;
+    return i | ((__popc(i) & 1u) << 7);
+}
+// Four IQ4 nibbles (one per byte) as their int8 levels.
+__device__ __forceinline__ int iq4_levels(unsigned int nib) {
+    const unsigned int L0 = 0xBFAD9881u, L1 = 0xF6EADDCFu;   // -127 -104 -83 -65 | -49 -35 -22 -10
+    const unsigned int L2 = 0x26190D01u, L3 = 0x71594535u;   //    1   13  25  38 |  53  69  89 113
+    unsigned int t = nib & 0x07070707u;
+    t |= t >> 4;
+    unsigned int sel = (t & 0xFFu) | ((t >> 8) & 0xFF00u);
+    unsigned int lo = __byte_perm(L0, L1, sel), hi = __byte_perm(L2, L3, sel);
+    unsigned int m = ((nib >> 3) & 0x01010101u) * 0xFFu;
+    return (int)((lo & ~m) | (hi & m));
+}
+
+template <> struct Dp4a<DLM_W_Q2_K> {
+    enum { OK = 1, SPLIT = 2 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 84;
+        int within = (int)(e & 255), sh = 2 * ((within >> 5) & 3);
+        const unsigned char* qs = b + 16 + (within >> 7) * 32;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) c.q[k] = (int)((ld_u32_2(qs + 4 * k) >> sh) & 0x03030303u);
+        float d = dlm_half(b + 80), dmin = dlm_half(b + 82);
+        unsigned char s0 = b[within >> 4], s1 = b[(within >> 4) + 1];
+        c.a0 = d * (float)(s0 & 15);
+        c.a1 = d * (float)(s1 & 15);
+        c.b = -dmin * (float)(s0 >> 4);
+        c.b1 = -dmin * (float)(s1 >> 4);
+    }
+};
+template <> struct Dp4a<DLM_W_Q3_K> {
+    enum { OK = 1, SPLIT = 2 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 110;
+        int within = (int)(e & 255), field = within >> 5, sh = 2 * (field & 3);
+        const unsigned char* qs = b + 32 + (within >> 7) * 32;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k)
+            c.q[k] = (int)(((ld_u32_2(qs + 4 * k) >> sh) & 0x03030303u) |
+                           (((ld_u32_2(b + 4 * k) >> field) & 0x01010101u) << 2));
+        const unsigned char* s = b + 96;
+        float d = dlm_half(b + 108);
+        float a[2];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            int g = (within >> 4) + h;
+            int low = g < 8 ? (s[g] & 15) : (s[g - 8] >> 4);
+            int high = (s[8 + (g & 3)] >> (2 * (g >> 2))) & 3;
+            a[h] = d * (float)((low | (high << 4)) - 32);
+        }
+        c.a0 = a[0];
+        c.a1 = a[1];
+        c.b = -4.0f * a[0];
+        c.b1 = -4.0f * a[1];
+    }
+};
+template <> struct Dp4a<DLM_W_IQ4_NL> {
+    enum { OK = 1, SPLIT = 0 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 5) * 18;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int v = ld_u32_2(b + 2 + 4 * j);
+            c.q[j] = iq4_levels(v & 0x0F0F0F0Fu);
+            c.q[j + 4] = iq4_levels((v >> 4) & 0x0F0F0F0Fu);
+        }
+        c.a0 = c.a1 = dlm_half(b);
+        c.b = c.b1 = 0.0f;
+    }
+};
+template <> struct Dp4a<DLM_W_IQ4_XS> {
+    enum { OK = 1, SPLIT = 0 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 136;
+        int g = (int)(e & 255) >> 5;
+        const unsigned char* qs = b + 8 + 16 * g;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned int v = ld_u32_2(qs + 4 * j);
+            c.q[j] = iq4_levels(v & 0x0F0F0F0Fu);
+            c.q[j + 4] = iq4_levels((v >> 4) & 0x0F0F0F0Fu);
+        }
+        int low = (b[4 + (g >> 1)] >> (4 * (g & 1))) & 15;
+        int high = (ld_u16(b + 2) >> (2 * g)) & 3;
+        c.a0 = c.a1 = dlm_half(b) * (float)((low | (high << 4)) - 32);
+        c.b = c.b1 = 0.0f;
+    }
+};
+// Eight codebook bytes and their eight signs into two code words.
+__device__ __forceinline__ void iq_put8(unsigned long long entry, unsigned int signs, int* q) {
+    q[0] = iq_signed4((unsigned int)entry, signs);
+    q[1] = iq_signed4((unsigned int)(entry >> 32), signs >> 4);
+}
+template <> struct Dp4a<DLM_W_IQ2_XXS> {
+    enum { OK = 1, SPLIT = 0 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 66;
+        int g = (int)(e & 255) >> 5;
+        unsigned int idx = ld_u32_2(b + 2 + 8 * g), aux = ld_u32_2(b + 6 + 8 * g);
+        #pragma unroll
+        for (int l = 0; l < 4; ++l)
+            iq_put8(iq2xxs_grid[(idx >> (8 * l)) & 255u], iq_signs(aux >> (7 * l)), c.q + 2 * l);
+        c.a0 = c.a1 = dlm_half(b) * (0.5f + (float)(aux >> 28)) * 0.25f;
+        c.b = c.b1 = 0.0f;
+    }
+};
+template <> struct Dp4a<DLM_W_IQ2_XS> {
+    enum { OK = 1, SPLIT = 2 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 74;
+        int within = (int)(e & 255);
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            unsigned int q = ld_u16(b + 2 + 2 * ((within >> 3) + t));
+            iq_put8(iq2xs_grid[q & 511u], iq_signs(q >> 9), c.q + 2 * t);
+        }
+        float d = dlm_half(b) * 0.25f;
+        unsigned char sc = b[66 + (within >> 5)];
+        c.a0 = d * (0.5f + (float)(sc & 15));
+        c.a1 = d * (0.5f + (float)(sc >> 4));
+        c.b = c.b1 = 0.0f;
+    }
+};
+template <> struct Dp4a<DLM_W_IQ2_S> {
+    enum { OK = 1, SPLIT = 2 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 82;
+        int within = (int)(e & 255), k0 = within >> 3;
+        unsigned int qh = b[66 + (k0 >> 2)];   // a chunk's 4 entries share one qh byte
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            unsigned int idx = b[2 + k0 + t] | (((qh >> (2 * t)) & 3u) << 8);
+            iq_put8(iq2s_grid[idx], b[34 + k0 + t], c.q + 2 * t);
+        }
+        float d = dlm_half(b) * 0.25f;
+        unsigned char sc = b[74 + (within >> 5)];
+        c.a0 = d * (0.5f + (float)(sc & 15));
+        c.a1 = d * (0.5f + (float)(sc >> 4));
+        c.b = c.b1 = 0.0f;
+    }
+};
+template <> struct Dp4a<DLM_W_IQ3_XXS> {
+    enum { OK = 1, SPLIT = 0 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 98;
+        int g = (int)(e & 255) >> 5;
+        unsigned int aux = ld_u32_2(b + 66 + 4 * g);
+        const unsigned char* qs = b + 2 + 8 * g;
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            unsigned int signs = iq_signs(aux >> (7 * l));
+            c.q[2 * l] = iq_signed4(iq3xxs_grid[qs[2 * l]], signs);
+            c.q[2 * l + 1] = iq_signed4(iq3xxs_grid[qs[2 * l + 1]], signs >> 4);
+        }
+        c.a0 = c.a1 = dlm_half(b) * (0.5f + (float)(aux >> 28)) * 0.5f;
+        c.b = c.b1 = 0.0f;
+    }
+};
+template <> struct Dp4a<DLM_W_IQ3_S> {
+    enum { OK = 1, SPLIT = 0 };
+    __device__ static void load(const void* W, long e, long, int, Q8Codes& c) {
+        const unsigned char* b = (const unsigned char*)W + (e >> 8) * 110;
+        int g = (int)(e & 255) >> 5;
+        unsigned int qh = b[66 + g];           // a chunk's 8 entries share one qh byte
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            unsigned int idx = b[2 + 8 * g + t] | (((qh >> t) & 1u) << 8);
+            c.q[t] = iq_signed4(iq3s_grid[idx], b[74 + 4 * g + (t >> 1)] >> (4 * (t & 1)));
+        }
+        int sc = (b[106 + (g >> 1)] >> (4 * (g & 1))) & 15;
+        c.a0 = c.a1 = dlm_half(b) * (float)(1 + 2 * sc);
+        c.b = c.b1 = 0.0f;
+    }
+};
+
+// The f32 chunk the non-dp4a paths read, from the same codes.
+template <int DT> struct CodedChunk {
+    enum { N = 32 };
+    __device__ static void decode(const void* W, long e, long n, int gs, float* w) {
+        Q8Codes c;
+        Dp4a<DT>::load(W, e, n, gs, c);
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            float v = (float)(signed char)((unsigned int)c.q[i >> 2] >> (8 * (i & 3)));
+            w[i] = i < 16 ? c.a0 * v + c.b : c.a1 * v + c.b1;
+        }
+    }
+};
+#define DLM_CODED_CHUNK(D) template <> struct Chunk<D> : CodedChunk<D> {};
+DLM_CODED_DTYPES(DLM_CODED_CHUNK)
+#undef DLM_CODED_CHUNK
+
+// One weight on its own: decodes its whole chunk. Only the per-weight
+// fallbacks (and MoE/MLA's per-weight readers) take this.
+#define DLM_CODED_LOAD_W(D)                                                              \
+    template <>                                                                          \
+    __device__ __forceinline__ float load_w<D>(const void* W, long i, long n, int gs) {  \
+        float w[32];                                                                     \
+        CodedChunk<D>::decode(W, i & ~31L, n, gs, w);                                    \
+        float v = w[0];                                                                  \
+        _Pragma("unroll") for (int k = 1; k < 32; ++k) if ((i & 31) == k) v = w[k];      \
+        return v;                                                                        \
+    }
+DLM_CODED_DTYPES(DLM_CODED_LOAD_W)
+#undef DLM_CODED_LOAD_W
 
 // One row against the quantized activations, reduced across the warp.
 template <int DT>
@@ -1311,7 +1578,7 @@ static inline bool q8_fits(const void* W, const float* x, int in_dim, int group_
     if (!Dp4a<DT>::OK || gemv_exact()) return false;
     if (in_dim % 32 || (unsigned long long)W % 16) return false;
     if ((DT == DLM_W_INT4 || DT == DLM_W_INT8) && (group_size <= 0 || group_size % 32)) return false;
-    if ((DT == DLM_W_Q4_K || DT == DLM_W_Q5_K || DT == DLM_W_Q6_K) && in_dim % 256) return false;
+    if (dlm_super_block(DT) && in_dim % 256) return false;
     return true;
 }
 
@@ -3078,7 +3345,7 @@ matvec_q8_batched_rows_kernel(const void* __restrict__ W0, const void* __restric
                 if (Dp4a<DT>::SPLIT) q8_half_sums(xi, xs0, xs1);
                 #pragma unroll
                 for (int r = 0; r < R; ++r)
-                    acc[r][b] += q8_apply<(bool)Dp4a<DT>::SPLIT>(c[r], xi, dx, xs0, xs1);
+                    acc[r][b] += q8_apply<Dp4a<DT>::SPLIT>(c[r], xi, dx, xs0, xs1);
             }
         }
     }

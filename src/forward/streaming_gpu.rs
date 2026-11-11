@@ -20,10 +20,14 @@
 //! `mla` weights and the FFN on its `ffn`, independently, exactly as the CPU
 //! oracle's `decode_block_streaming_moe` does.
 //!
-//! Validated on-device against the CPU oracle by [`tests/gpu_parity.rs`]
-//! (`streaming_gpu_matches_resident` drives real evictions and asserts the output
-//! equals the fully-resident kernel's). CI has no GPU, so that check is manual —
-//! run the `cuda-kernels` suite on a real card before tagging a release.
+//! Validated on-device against the resident kernel by [`tests/gpu_parity.rs`]:
+//! `streaming_gpu_matches_resident` drives real evictions, and
+//! `streaming_gpu_soak_matches_resident` runs three batched sequences for 300
+//! steps through a 3-of-8 window, checking every step (it catches a buffer
+//! reused before the kernels reading it finish). `tests/gguf_model.rs`
+//! (`gpu_streamed_and_resident_agree`) scores a real GGUF file streamed against
+//! resident. CI has no GPU, so these run by hand: run the `cuda-kernels` suite
+//! on a real card before tagging a release.
 
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
@@ -408,7 +412,11 @@ impl WeightLru {
     /// policy would evict and what MRU picks. Keeping the layers *ahead* of the
     /// cursor turns the window back into a cache: misses drop to roughly
     /// `N - capacity` per token instead of `N`.
-    fn insert(&mut self, layer: u32, weights: Arc<GpuWeights>) {
+    ///
+    /// A layer loaded ahead of the pass (`ahead`) goes to the other end, where
+    /// it is evicted last: until the pass reaches it, it is needed sooner than
+    /// anything the pass has already used.
+    fn insert(&mut self, layer: u32, weights: Arc<GpuWeights>, ahead: bool) {
         while self.map.len() >= self.capacity {
             let Some(i) = evict_index(&self.order, layer) else {
                 break;
@@ -422,17 +430,22 @@ impl WeightLru {
             }
         }
         self.map.insert(layer, weights);
-        self.order.push_back(layer);
+        if ahead {
+            self.order.push_front(layer);
+        } else {
+            self.order.push_back(layer);
+        }
     }
 
     /// Evict, ahead of loading `layer`, the entry [`insert`](Self::insert)
     /// would evict for it (most recently used, not `layer`), provided no compute
-    /// call is holding it, and hand back its weights so their buffers can take
-    /// the new layer. `None` while the window still has room.
+    /// call is holding it and `keep` does not claim it, and hand back its
+    /// weights so their buffers can take the new layer. `None` while the window
+    /// still has room.
     ///
     /// Evicting before the upload rather than after also means the window never
     /// holds `capacity + 1` layers mid-load.
-    fn take_idle_victim(&mut self, layer: u32) -> Option<GpuWeights> {
+    fn take_idle_victim(&mut self, layer: u32, keep: impl Fn(u32) -> bool) -> Option<GpuWeights> {
         if self.map.len() < self.capacity {
             return None;
         }
@@ -440,7 +453,7 @@ impl WeightLru {
         // one here cannot rise before the entry is removed.
         let i = (0..self.order.len()).rev().find(|&i| {
             let l = self.order[i];
-            l != layer && self.map.get(&l).is_some_and(|w| Arc::strong_count(w) == 1)
+            l != layer && !keep(l) && self.map.get(&l).is_some_and(|w| Arc::strong_count(w) == 1)
         })?;
         let evicted = self.order.remove(i)?;
         let w = self.map.remove(&evicted)?;
@@ -611,26 +624,45 @@ struct GpuShared<S: LayerSource> {
 impl<S: LayerSource> GpuShared<S> {
     /// Ensure `layer`'s weights are VRAM-resident, loading (host) + uploading
     /// (VRAM) without holding the cache lock if absent. Same-layer callers
-    /// de-dupe on a `loading` set + condvar. `by_worker` tags a prefetch.
-    fn ensure(&self, layer: u32, by_worker: bool) -> Result<Arc<GpuWeights>> {
+    /// de-dupe on a `loading` set + condvar. `by_worker` tags a prefetch;
+    /// `ahead_of: Some(next)` is a dense prefetch for a pass about to run layer
+    /// `next`, which only evicts a layer the pass needs after `layer`, and
+    /// skips the load (`None`) when the window holds nothing it may evict.
+    fn ensure(
+        &self,
+        layer: u32,
+        by_worker: bool,
+        ahead_of: Option<u32>,
+    ) -> Result<Option<Arc<GpuWeights>>> {
         let mut cache = self.weights.lock().unwrap();
         loop {
             if let Some(w) = cache.map.get(&layer) {
                 let w = Arc::clone(w);
-                cache.touch(layer);
-                return Ok(w);
+                if ahead_of.is_none() {
+                    cache.touch(layer);
+                }
+                return Ok(Some(w));
             }
             if cache.loading.contains(&layer) {
                 cache = self.ready.wait(cache).unwrap();
                 continue;
             }
-            cache.loading.insert(layer);
             let dense = self.cfg.moe.is_none() && self.cfg.mla.is_none();
+            let n = self.source.num_layers();
             let victim = if dense {
-                cache.take_idle_victim(layer)
+                // How far the pass is from needing `l`: a prefetch keeps every
+                // layer needed before the one it loads.
+                let until = |next: u32, l: u32| (l + n - next) % n;
+                let keep =
+                    |l: u32| ahead_of.is_some_and(|next| until(next, l) <= until(next, layer));
+                cache.take_idle_victim(layer, keep)
             } else {
                 None
             };
+            if ahead_of.is_some() && victim.is_none() && cache.map.len() >= cache.capacity {
+                return Ok(None);
+            }
+            cache.loading.insert(layer);
             drop(cache);
             // Expensive part — host load (disk + dequant) then VRAM upload — runs
             // with the cache lock released, so it overlaps the compute thread. The
@@ -686,11 +718,11 @@ impl<S: LayerSource> GpuShared<S> {
             cache.loading.remove(&layer);
             self.ready.notify_all();
             let w = uploaded?;
-            cache.insert(layer, Arc::clone(&w));
+            cache.insert(layer, Arc::clone(&w), ahead_of.is_some());
             if by_worker {
                 cache.stats.prefetched += 1;
             }
-            return Ok(w);
+            return Ok(Some(w));
         }
     }
 
@@ -779,7 +811,33 @@ impl<S: LayerSource> GpuShared<S> {
             }
             cache.stats.misses += 1;
         }
-        self.ensure(layer, false)
+        self.ensure(layer, false, None)
+            .map(|w| w.expect("a compute fetch always loads"))
+    }
+
+    /// Prefetch for a pass about to run layer `next`.
+    ///
+    /// A dense model loads the first layer from `next` on that is neither
+    /// resident nor loading, rather than `next` itself: with part of the model
+    /// resident, `next` usually is, and the copy engine sat idle while the pass
+    /// computed it. Loading the next missing layer instead keeps the copy
+    /// running under the resident layers' compute. MoE and MLA layers keep
+    /// one layer ahead.
+    fn prefetch(&self, next: u32) {
+        if self.cfg.moe.is_some() || self.cfg.mla.is_some() {
+            let _ = self.ensure(next, true, None);
+            return;
+        }
+        let n = self.source.num_layers();
+        let target = {
+            let cache = self.weights.lock().unwrap();
+            (0..n)
+                .map(|k| (next + k) % n)
+                .find(|l| !cache.map.contains_key(l) && !cache.loading.contains(l))
+        };
+        if let Some(layer) = target {
+            let _ = self.ensure(layer, true, Some(next)); // best-effort
+        }
     }
 
     /// Ensure routed expert `(layer, expert)` is VRAM-resident, streaming it from
@@ -1006,13 +1064,17 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             let shared = Arc::clone(&shared);
             let stopped = Arc::clone(&stopped);
             std::thread::spawn(move || {
-                while let Ok(layer) = rx.recv() {
+                while let Ok(mut layer) = rx.recv() {
+                    // Only where the pass is now matters: skip to the latest.
+                    while let Ok(later) = rx.try_recv() {
+                        layer = later;
+                    }
                     if stopped.load(Ordering::Relaxed) {
                         break;
                     }
-                    let _ = shared.ensure(layer, true); // best-effort
-                                                        // Warm this layer's likely experts while it's still ahead of
-                                                        // compute; no-op for dense models and cold (unseen) layers.
+                    shared.prefetch(layer);
+                    // Warm this layer's likely experts while it's still ahead of
+                    // compute; no-op for dense models and cold (unseen) layers.
                     shared.prefetch_experts(layer);
                 }
             })
@@ -1368,12 +1430,18 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
     }
 
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
+        let host_from = self.kv_pools.host_from();
         self.kv_pools = crate::forward::kv_pool::KvPools::new(
             self.num_layers as usize,
             self.shared.cfg.kv_dim(),
             self.shared.cfg.head_dim,
             tokens,
         );
+        self.kv_pools.set_host_layers_from(host_from);
+    }
+
+    fn set_kv_host_layers(&mut self, from: usize) {
+        self.kv_pools.set_host_layers_from(from);
     }
 
     fn num_layers(&self) -> u32 {

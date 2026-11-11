@@ -368,11 +368,14 @@ pub struct ServeArgs {
     /// How many layers ahead to prefetch while streaming (`--stream`). Higher
     /// hides more load latency behind compute but needs a bigger
     /// `--resident-layers` window (clamped to window − 1). `0` disables prefetch.
+    /// The CPU path only: on the GPU (`--stream --device gpu`) the worker always
+    /// loads the next layer the pass is missing.
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub prefetch_depth: usize,
 
     /// Auto-tune the streaming prefetch depth from measured load-vs-compute time
     /// instead of a fixed `--prefetch-depth`. Adapts to the disk/model at runtime.
+    /// The CPU path only, as `--prefetch-depth`.
     #[arg(long, default_value_t = false)]
     pub auto_prefetch: bool,
 

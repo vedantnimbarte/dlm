@@ -16,6 +16,7 @@
 //! dequantization of the same file.
 
 use crate::error::{DlmError, Result};
+use crate::storage::iq_grids::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID};
 use crate::storage::safetensors::{f16_to_f32, Dtype};
 
 /// A ggml block-quantized weight type.
@@ -39,6 +40,28 @@ pub enum GgmlKind {
     /// 256 weights in sixteen 16-weight sub-blocks, 6-bit weights with an int8
     /// scale each. 210 bytes.
     Q6K,
+    /// 256 weights in sixteen 16-weight sub-blocks, 2-bit weights as
+    /// `d * sc * q - dmin * m` with a 4-bit sc and m each. 84 bytes.
+    Q2K,
+    /// 256 weights in sixteen 16-weight sub-blocks, 3-bit weights around 4 with
+    /// a signed 6-bit scale each. 110 bytes.
+    Q3K,
+    /// The importance-matrix quants. Each picks its weights from a codebook,
+    /// eight at a time (IQ2) or four (IQ3), each with its own sign, under a
+    /// 4-bit scale per 16 or 32 weights. 66 bytes per 256.
+    IQ2XXS,
+    /// 74 bytes per 256.
+    IQ2XS,
+    /// 82 bytes per 256.
+    IQ2S,
+    /// 98 bytes per 256.
+    IQ3XXS,
+    /// 110 bytes per 256.
+    IQ3S,
+    /// 32 weights as `d * K[q]`, `K` sixteen non-uniform levels. 18 bytes.
+    IQ4NL,
+    /// `IQ4_NL`'s levels with a 6-bit scale per 32 weights. 136 bytes per 256.
+    IQ4XS,
 }
 
 impl GgmlKind {
@@ -53,6 +76,15 @@ impl GgmlKind {
             Dtype::Q4K => GgmlKind::Q4K,
             Dtype::Q5K => GgmlKind::Q5K,
             Dtype::Q6K => GgmlKind::Q6K,
+            Dtype::Q2K => GgmlKind::Q2K,
+            Dtype::Q3K => GgmlKind::Q3K,
+            Dtype::IQ2XXS => GgmlKind::IQ2XXS,
+            Dtype::IQ2XS => GgmlKind::IQ2XS,
+            Dtype::IQ2S => GgmlKind::IQ2S,
+            Dtype::IQ3XXS => GgmlKind::IQ3XXS,
+            Dtype::IQ3S => GgmlKind::IQ3S,
+            Dtype::IQ4NL => GgmlKind::IQ4NL,
+            Dtype::IQ4XS => GgmlKind::IQ4XS,
             _ => return None,
         })
     }
@@ -60,9 +92,38 @@ impl GgmlKind {
     /// Weights per block.
     pub fn block_elems(self) -> usize {
         match self {
-            GgmlKind::Q4K | GgmlKind::Q5K | GgmlKind::Q6K => 256,
+            GgmlKind::Q4_0
+            | GgmlKind::Q4_1
+            | GgmlKind::Q5_0
+            | GgmlKind::Q5_1
+            | GgmlKind::Q8_0
+            | GgmlKind::IQ4NL => 32,
+            _ => 256,
+        }
+    }
+
+    /// Weights sharing one scale.
+    pub fn group(self) -> usize {
+        match self {
+            GgmlKind::Q6K | GgmlKind::Q2K | GgmlKind::Q3K | GgmlKind::IQ2XS | GgmlKind::IQ2S => 16,
             _ => 32,
         }
+    }
+
+    /// Whether every code fits in a nibble.
+    pub fn four_bit(self) -> bool {
+        matches!(
+            self,
+            GgmlKind::Q4_0 | GgmlKind::Q4_1 | GgmlKind::Q4K | GgmlKind::Q2K | GgmlKind::Q3K
+        )
+    }
+
+    /// Whether [`expand`] packs this kind as int4 rather than int8: codes that
+    /// fit a nibble, in 32-weight groups. The GPU reads int4 32 weights at a
+    /// time, so 16-weight groups (Q2_K, Q3_K) would miss its chunked kernels --
+    /// prefill on a Qwen2.5-0.5B `Q2_K` halved -- and go to int8 like Q6_K.
+    pub fn expands_to_int4(self) -> bool {
+        self.four_bit() && self.group() == 32
     }
 
     /// Bytes per block.
@@ -76,6 +137,15 @@ impl GgmlKind {
             GgmlKind::Q4K => 144,
             GgmlKind::Q5K => 176,
             GgmlKind::Q6K => 210,
+            GgmlKind::Q2K => 84,
+            GgmlKind::Q3K => 110,
+            GgmlKind::IQ2XXS => 66,
+            GgmlKind::IQ2XS => 74,
+            GgmlKind::IQ2S => 82,
+            GgmlKind::IQ3XXS => 98,
+            GgmlKind::IQ3S => 110,
+            GgmlKind::IQ4NL => 18,
+            GgmlKind::IQ4XS => 136,
         }
     }
 
@@ -91,6 +161,15 @@ impl GgmlKind {
             GgmlKind::Q4K => 10,
             GgmlKind::Q5K => 11,
             GgmlKind::Q6K => 12,
+            GgmlKind::Q2K => 13,
+            GgmlKind::Q3K => 14,
+            GgmlKind::IQ2XXS => 15,
+            GgmlKind::IQ2XS => 16,
+            GgmlKind::IQ2S => 17,
+            GgmlKind::IQ3XXS => 18,
+            GgmlKind::IQ3S => 19,
+            GgmlKind::IQ4NL => 20,
+            GgmlKind::IQ4XS => 21,
         }
     }
 
@@ -102,6 +181,41 @@ impl GgmlKind {
 
 fn half(b: &[u8]) -> f32 {
     f16_to_f32(u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn u16_at(b: &[u8], at: usize) -> u32 {
+    u16::from_le_bytes([b[at], b[at + 1]]) as u32
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+/// IQ4_NL's sixteen levels.
+pub(crate) const IQ4_LEVELS: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// Eight signs from a 7-bit index, the eighth chosen so the count of minus
+/// signs is even: ggml's `ksigns_iq2xs` table, computed.
+pub(crate) fn iq_signs(index: u32) -> u32 {
+    let i = index & 127;
+    i | ((i.count_ones() & 1) << 7)
+}
+
+/// `n` codebook magnitudes (the bytes of `entry`) for weights `at..at + n`,
+/// bit j of `signs` negating byte j, stored as `v + 128`.
+fn iq_put(codes: &mut [u8; 256], at: usize, entry: u64, n: usize, signs: u32) {
+    for j in 0..n {
+        let mag = (entry >> (8 * j)) as u8 as i16;
+        let v = if signs >> j & 1 != 0 { -mag } else { mag };
+        codes[at + j] = (v + 128) as u8;
+    }
+}
+
+/// An IQ4 nibble as a code.
+fn iq4_code(nibble: u8) -> u8 {
+    (IQ4_LEVELS[(nibble & 0x0F) as usize] as i16 + 128) as u8
 }
 
 /// A K-quant sub-block's 6-bit scale and minimum, unpacked from the 12 bytes
@@ -170,7 +284,7 @@ impl BlockAffine {
 /// ggml weight goes through it or mirrors it in a kernel.
 pub fn decode_block(kind: GgmlKind, bytes: &[u8]) -> BlockAffine {
     debug_assert!(bytes.len() >= kind.block_bytes());
-    let mut a = BlockAffine::new(if kind == GgmlKind::Q6K { 16 } else { 32 });
+    let mut a = BlockAffine::new(kind.group());
     match kind {
         // An f16 scale, then 16 bytes holding weight j in the low nibble and
         // weight j + 16 in the high one. Codes are 0..15 around 8.
@@ -269,6 +383,153 @@ pub fn decode_block(kind: GgmlKind, bytes: &[u8]) -> BlockAffine {
                 a.group(g, scale, 32.0 * scale);
             }
         }
+        // Q2_K and Q3_K share a weight order: each half block's 32 bytes of `qs`
+        // hold four 2-bit fields, field j giving weights j*32..j*32+32 of that
+        // half. Sub-block g is weights g*16..g*16+16.
+        GgmlKind::Q2K | GgmlKind::Q3K => {
+            let qs = if kind == GgmlKind::Q2K {
+                &bytes[16..80]
+            } else {
+                &bytes[32..96]
+            };
+            for i in 0..256 {
+                let (n, j, l) = (i / 128, (i / 32) % 4, i % 32);
+                a.codes[i] = (qs[n * 32 + l] >> (2 * j)) & 3;
+            }
+            if kind == GgmlKind::Q2K {
+                // 4-bit scale low, 4-bit minimum high, then `d` and `dmin`.
+                let (d, dmin) = (half(&bytes[80..]), half(&bytes[82..]));
+                for (g, &sc) in bytes[..16].iter().enumerate() {
+                    a.group(g, d * (sc & 0x0F) as f32, dmin * (sc >> 4) as f32);
+                }
+            } else {
+                // A third bit per weight in `hmask`: weight i takes bit i / 32 of
+                // byte i % 32, and codes run 0..7 around 4. The sixteen 6-bit
+                // scales are a nibble from the first 8 bytes of `scales` and two
+                // bits from the last 4, biased by 32.
+                let (hmask, s) = (&bytes[..32], &bytes[96..108]);
+                for (i, code) in a.codes.iter_mut().enumerate() {
+                    *code |= ((hmask[i % 32] >> (i / 32)) & 1) << 2;
+                }
+                let d = half(&bytes[108..]);
+                for g in 0..16 {
+                    let low = if g < 8 { s[g] & 0x0F } else { s[g - 8] >> 4 };
+                    let high = (s[8 + g % 4] >> (2 * (g / 4))) & 3;
+                    let scale = d * ((low | (high << 4)) as f32 - 32.0);
+                    a.group(g, scale, 4.0 * scale);
+                }
+            }
+        }
+        // The IQ formats store signed weights `db * v`; dlm's codes are `v + 128`
+        // with an offset of `128 * db`, as for Q8_0. Their layouts follow
+        // `dequantize_row_iq*` in ggml-quants.c.
+        GgmlKind::IQ4NL => {
+            for (j, &q) in bytes[2..18].iter().enumerate() {
+                a.codes[j] = iq4_code(q);
+                a.codes[j + 16] = iq4_code(q >> 4);
+            }
+            let d = half(bytes);
+            a.group(0, d, 128.0 * d);
+        }
+        // IQ4_NL per 32 weights, under a 6-bit scale: a nibble from
+        // `scales_l` and two bits from `scales_h`, biased by 32.
+        GgmlKind::IQ4XS => {
+            let d = half(bytes);
+            let high = u16_at(bytes, 2);
+            for g in 0..8 {
+                let low = (bytes[4 + g / 2] >> (4 * (g % 2))) as u32 & 0x0F;
+                let sc = (low | ((high >> (2 * g)) & 3) << 4) as f32 - 32.0;
+                a.group(g, d * sc, 128.0 * d * sc);
+                for (j, &q) in bytes[8 + 16 * g..][..16].iter().enumerate() {
+                    a.codes[g * 32 + j] = iq4_code(q);
+                    a.codes[g * 32 + j + 16] = iq4_code(q >> 4);
+                }
+            }
+        }
+        // Per 32 weights, two u32s: four 8-bit codebook indices, then four
+        // 7-bit sign indices with a 4-bit scale on top.
+        GgmlKind::IQ2XXS => {
+            let d = half(bytes);
+            for g in 0..8 {
+                let (idx, aux) = (u32_at(bytes, 2 + 8 * g), u32_at(bytes, 6 + 8 * g));
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+                a.group(g, db, 128.0 * db);
+                for l in 0..4 {
+                    let entry = IQ2XXS_GRID[(idx >> (8 * l) & 0xFF) as usize];
+                    iq_put(
+                        &mut a.codes,
+                        g * 32 + l * 8,
+                        entry,
+                        8,
+                        iq_signs(aux >> (7 * l)),
+                    );
+                }
+            }
+        }
+        // Per 8 weights, a u16: a 9-bit index and a 7-bit sign index. A 4-bit
+        // scale per 16.
+        GgmlKind::IQ2XS => {
+            let d = half(bytes);
+            for k in 0..32 {
+                let q = u16_at(bytes, 2 + 2 * k);
+                let entry = IQ2XS_GRID[(q & 511) as usize];
+                iq_put(&mut a.codes, k * 8, entry, 8, iq_signs(q >> 9));
+            }
+            for g in 0..16 {
+                let sc = (bytes[66 + g / 2] >> (4 * (g % 2))) & 0x0F;
+                let db = d * (0.5 + sc as f32) * 0.25;
+                a.group(g, db, 128.0 * db);
+            }
+        }
+        // Per 8 weights, an index byte plus two high bits from `qh`, and a byte
+        // of explicit signs. A 4-bit scale per 16.
+        GgmlKind::IQ2S => {
+            let d = half(bytes);
+            for k in 0..32 {
+                let high = (bytes[66 + k / 4] as usize >> (2 * (k % 4))) & 3;
+                let entry = IQ2S_GRID[bytes[2 + k] as usize | high << 8];
+                iq_put(&mut a.codes, k * 8, entry, 8, bytes[34 + k] as u32);
+            }
+            for g in 0..16 {
+                let sc = (bytes[74 + g / 2] >> (4 * (g % 2))) & 0x0F;
+                let db = d * (0.5 + sc as f32) * 0.25;
+                a.group(g, db, 128.0 * db);
+            }
+        }
+        // Per 4 weights an index byte; per 32, a u32 of four 7-bit sign indices
+        // (one per 8 weights) with a 4-bit scale on top.
+        GgmlKind::IQ3XXS => {
+            let d = half(bytes);
+            for g in 0..8 {
+                let aux = u32_at(bytes, 66 + 4 * g);
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+                a.group(g, db, 128.0 * db);
+                for l in 0..4 {
+                    let signs = iq_signs(aux >> (7 * l));
+                    for h in 0..2 {
+                        let entry = IQ3XXS_GRID[bytes[2 + 8 * g + 2 * l + h] as usize] as u64;
+                        let at = g * 32 + l * 8 + h * 4;
+                        iq_put(&mut a.codes, at, entry, 4, signs >> (4 * h));
+                    }
+                }
+            }
+        }
+        // Per 4 weights an index byte plus a high bit from `qh`; a sign bit per
+        // weight, and a 4-bit scale per 32.
+        GgmlKind::IQ3S => {
+            let d = half(bytes);
+            for k in 0..64 {
+                let high = (bytes[66 + k / 8] as usize >> (k % 8)) & 1;
+                let entry = IQ3S_GRID[bytes[2 + k] as usize | high << 8] as u64;
+                let signs = bytes[74 + k / 2] as u32 >> (4 * (k % 2));
+                iq_put(&mut a.codes, k * 4, entry, 4, signs);
+            }
+            for g in 0..8 {
+                let sc = (bytes[106 + g / 2] >> (4 * (g % 2))) & 0x0F;
+                let db = d * (1.0 + 2.0 * sc as f32);
+                a.group(g, db, 128.0 * db);
+            }
+        }
     }
     a
 }
@@ -316,8 +577,7 @@ pub fn expand(kind: GgmlKind, blob: &[u8], elements: usize) -> crate::forward::W
     use crate::forward::{QuantLayout, Weights};
     let elems = kind.block_elems();
     // Nibbles where every code fits in one, bytes otherwise.
-    let four_bit = matches!(kind, GgmlKind::Q4_0 | GgmlKind::Q4_1 | GgmlKind::Q4K);
-    let group = if kind == GgmlKind::Q6K { 16 } else { 32 };
+    let (four_bit, group) = (kind.expands_to_int4(), kind.group());
     let layout = if four_bit {
         QuantLayout::int4(elements, group)
     } else {
@@ -530,6 +790,41 @@ mod tests {
         assert!((got[0] - want).abs() < 1e-5, "{} vs {want}", got[0]);
     }
 
+    /// Q2_K: `d * sc * q - dmin * m`, sc and m the low and high nibble of the
+    /// sub-block's byte. Weight 32 + 17 sits in field 1 (bits 2-3) of `qs[17]`,
+    /// in sub-block 3.
+    #[test]
+    fn q2_k_matches_its_defining_formula() {
+        let mut block = vec![0u8; 84];
+        block[3] = 0x52; // sc 2, m 5
+        block[16 + 17] = 0b0000_1100; // code 3 in field 1
+        block[80..82].copy_from_slice(&h(0.5));
+        block[82..84].copy_from_slice(&h(0.25));
+        let got = to_f32(Dtype::Q2K, &block, 256).unwrap();
+        assert_eq!(got[49], 0.5 * 2.0 * 3.0 - 0.25 * 5.0);
+        assert_eq!(got[48], -0.25 * 5.0, "code 0 in the same sub-block");
+        assert_eq!(got[17], 0.0, "field 0 of the same byte, sub-block 1");
+    }
+
+    /// Q3_K: `d * (sc - 32) * (q - 4)`, q's third bit in `hmask` and the 6-bit
+    /// scale split across a nibble and a 2-bit field. Weight 200 is in the
+    /// second half block, field 2, so its high bit is bit 6 of `hmask[8]` and
+    /// its 2 low bits are bits 4-5 of `qs[32 + 8]`; sub-block 12 takes the high
+    /// nibble of `scales[4]` and bits 6-7 of `scales[8]`.
+    #[test]
+    fn q3_k_matches_its_defining_formula() {
+        let mut block = vec![0u8; 110];
+        block[8] = 1 << 6; // weight 200's third bit
+        block[32 + 32 + 8] = 0b0001_0000; // its low bits: 1
+        block[96 + 4] = 0x30; // sub-block 12, low nibble of its scale: 3
+        block[96 + 8] = 0b1000_0000; // and its top two bits: 2 -> 35
+        block[108..110].copy_from_slice(&h(0.5));
+        let got = to_f32(Dtype::Q3K, &block, 256).unwrap();
+        assert_eq!(got[200], 0.5 * (35.0 - 32.0) * (5.0 - 4.0));
+        // Sub-block 12's others have no third bit: code 0 is -4.
+        assert_eq!(got[201], 0.5 * 3.0 * -4.0);
+    }
+
     /// Expanding into dlm's layout must not change a single weight: it is the
     /// same codes and the same arithmetic, packed differently. A model is loaded
     /// one way or the other depending on what fits, so the two have to agree.
@@ -544,6 +839,8 @@ mod tests {
             (GgmlKind::Q4K, Dtype::Q4K),
             (GgmlKind::Q5K, Dtype::Q5K),
             (GgmlKind::Q6K, Dtype::Q6K),
+            (GgmlKind::Q2K, Dtype::Q2K),
+            (GgmlKind::Q3K, Dtype::Q3K),
         ] {
             // Two blocks of pseudo-random bytes: every field of the layout gets
             // some non-zero pattern, which is what catches a misplaced offset.

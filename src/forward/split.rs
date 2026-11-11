@@ -121,6 +121,10 @@ impl<F: ComputeKernel, B: ComputeKernel> ComputeKernel for SplitKernel<F, B> {
         self.back.set_kv_pool_tokens(tokens);
     }
 
+    fn set_kv_host_layers(&mut self, from: usize) {
+        self.front.set_kv_host_layers(from);
+    }
+
     fn stream_stats(&self) -> Option<crate::forward::streaming::StreamStats> {
         self.front
             .stream_stats()

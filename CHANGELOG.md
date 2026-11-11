@@ -40,6 +40,31 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--stream --device gpu` is no longer experimental.** Its banner said
+  `[experimental]` and its code "unvalidated on hardware"; the checks it lacked
+  are now in the suite. `streaming_gpu_soak_matches_resident` runs three
+  batched sequences for 300 steps through a window of 3 of 8 layers, then a
+  prefill beside them, and checks every step against the resident kernel; with
+  the wait before an evicted layer's buffers are reused taken out, it fails
+  within two steps, every run. `gpu_streamed_and_resident_agree`
+  (`tests/gguf_model.rs`) scores a real GGUF file streamed through a two-layer
+  window against resident: Qwen2.5-0.5B `Q2_K` to `Q8_0` and the IQ files, and
+  1.5B `Q4_K_M`, agree within 0.011-0.034 nats per token on average, where one
+  layer streamed wrong moves them by 0.47. The startup banner's prefetch line
+  now says what the GPU path does, and `--prefetch-depth` / `--auto-prefetch`
+  are documented as the CPU path's.
+
+- **Streaming on the GPU is up to 20% faster: the copy engine no longer idles
+  under resident layers.** The prefetch worker was told "layer L + 1" as the
+  pass reached layer L, and with most of the model resident L + 1 usually
+  was, so the upload of the next streamed layer waited for the pass to get
+  next to it. It now loads the first layer from L + 1 on that is missing,
+  evicting only a layer the pass needs after that one, and a layer loaded
+  ahead is evicted last until the pass uses it. GTX 1650, Qwen2.5-7B-Instruct
+  `Q3_K_M` (19 of 28 layers resident), decode over six alternating runs:
+  6.0-7.0 -> 7.1-9.0 tok/s (median 6.3 -> 7.7; best step 142.7 -> 111.7 ms,
+  against ~108 ms of PCIe per token).
+
 - **A single-token layer's attention half takes fewer launches.** Two merges
   that need no grid-wide synchronization:
   - **RoPE and the K/V append run inside the attention kernel**
@@ -441,6 +466,60 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     single-slot GEMV, and MoE decode does not use the batched block at all.
 
 ### Added
+
+- **A model too big for the card streams on its own.** On the GPU, with
+  neither `--stream` nor `--gpu-layers`, a model whose weights did not fit was
+  refused (by a KV-cache message that did not say why). Now it streams, and a
+  `placement` line says the weights did not fit and that `--gpu-layers` is
+  there instead. Streaming is the faster of the two measured: Qwen2.5-7B-
+  Instruct `Q3_K_M` on a GTX 1650 decodes at 7.6-8.4 tok/s streamed, 2.8-3.0
+  with `--gpu-layers 19` and 2.6-2.7 with 15. A resident request whose weights
+  do not fit, with `--gpu-layers` or a draft model, is still refused, now
+  naming `--stream` and `--gpu-layers`.
+  - **`--gpu-layers` is 2.5x faster on 2-3-bit GGUF files**: the CPU half now
+    re-packs ggml's blocks into dlm's int layouts where RAM allows, as the CPU
+    kernel did, instead of decoding Q2_K/Q3_K/IQ blocks through the scalar
+    path. Same 7B, `--gpu-layers 19`: 1.0-1.2 -> 2.8-3.0 tok/s.
+
+- **KV cache in host RAM for a context the card cannot hold.** A resident GPU
+  model whose one full-context request did not fit beside the weights was
+  refused at startup. Now the layers that fit keep their KV in VRAM and the
+  rest keep it in page-locked host RAM, mapped so the same kernels read and
+  write it over PCIe; the banner's `kv offload` line names the layers. Qwen2.5-
+  1.5B `Q8_0` on a GTX 1650 capped at 2.4 GB (`--vram-budget-gb 2.4
+  --safety-margin-gb 0.5`), 32k context, 4,096-token prompt: refused before;
+  now 21 of 28 layers' KV in host RAM, prefill 298 tok/s and decode 21 tok/s,
+  against 325 and 49 with a context that fits. Refused only if the host part
+  would take over half the RAM. Not when streaming, where KV in VRAM costs a
+  few more streamed layers, cheaper than reading it over the bus.
+  `tests/gpu_parity.rs` checks host-RAM KV decodes bit for bit like VRAM KV,
+  in fp16 and int8.
+
+- **2- and 3-bit GGUF files: Q2_K, Q3_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+  IQ3_S, IQ4_NL and IQ4_XS.** These were refused by name, which ruled out every
+  `Q2_K`, `Q3_K_*`, `IQ2_*`, `IQ3_*` and `IQ4_*` download, the files that make a
+  model fit a small card. They decode on the CPU and the GPU, in the GPU's
+  int8-activation GEMV, its f32 chunk path and its prefill GEMM, from one
+  decoder per format on each side; the IQ codebooks are ggml's (MIT), generated
+  from `ggml-common.h`. IQ1 is still refused.
+  - **Checked against llama.cpp**: `tests/ggml_blocks.rs` decodes random blocks of
+    every type against llama.cpp's reference decoder (a 55 KB fixture, so it runs
+    in CI), and Qwen2.5-0.5B `Q2_K` and `Q3_K_M` decode to llama.cpp's f32 copy
+    of every tensor. On the GPU, the identity matrix through the LM head returns
+    each decoded weight exactly as the CPU decodes it (`tests/gpu_parity.rs`).
+  - **Quality**, Qwen2.5-0.5B on one 228-token passage, nats per token (GPU; the
+    CPU agrees within 0.006): `Q4_K_M` 3.31, `IQ3_XS` 3.33, `IQ3_M` 3.35,
+    `Q3_K_M` 3.36, `Q2_K` 3.38, `IQ2_M` 3.57. Layer bytes 235, 179, 183, 195,
+    179 and 169 MiB.
+  - **Speed**, GTX 1650, Qwen2.5-0.5B, decode tok/s at batch 1 / 16: native
+    blocks `Q2_K` 107 / 616, `IQ3_XS` 99 / 608, `IQ2_M` 111 / 594. When the
+    model fits with VRAM to spare, the loader re-packs them into dlm's int
+    layout as it does for the other GGUF types, which is faster resident
+    (`Q2_K` 140-147 / 584-604, `IQ3_XS` 144-146 / 787-792) and three to four
+    times the bytes; a model that would not fit keeps the blocks. Q2_K and
+    Q3_K re-pack to int8, not int4: their 16-weight groups miss the GPU's
+    32-wide int4 chunks, which halved a `Q2_K` file's prefill (about 700
+    against 1,480-1,520 tok/s).
 
 - **`--lm-head-int4`: hold the GPU's LM head in int4.** The vocabulary-wide
   head is a large share of a small model's bytes per token (272 MB of

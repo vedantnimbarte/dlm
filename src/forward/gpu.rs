@@ -1580,12 +1580,18 @@ impl ComputeKernel for GpuKernel {
     }
 
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
+        let host_from = self.kv_pools.host_from();
         self.kv_pools = crate::forward::kv_pool::KvPools::new(
             self.layers.len(),
             self.cfg.kv_dim(),
             self.cfg.head_dim,
             tokens,
         );
+        self.kv_pools.set_host_layers_from(host_from);
+    }
+
+    fn set_kv_host_layers(&mut self, from: usize) {
+        self.kv_pools.set_host_layers_from(from);
     }
 
     fn num_layers(&self) -> u32 {

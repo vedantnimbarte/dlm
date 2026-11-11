@@ -702,7 +702,18 @@ fn gpu_matches_cpu_with_ggml_weights() {
         (GgmlKind::Q8_0, &[0], 0x1400), // 0.00098: its codes reach 127, not 15
         (GgmlKind::Q4K, &[0, 2], 0x0800), // 0.00012
         (GgmlKind::Q5K, &[0, 2], 0x0800),
-        (GgmlKind::Q6K, &[208], 0x0400), // 0.00006
+        (GgmlKind::Q6K, &[208], 0x0400),    // 0.00006
+        (GgmlKind::Q2K, &[80, 82], 0x1000), // 0.00049: d and dmin, so the minimums stay small
+        (GgmlKind::Q3K, &[108], 0x0C00),    // 0.00024
+        // The IQ codebooks reach 43 (IQ2), 62 (IQ3_XXS) and 15 (IQ3_S, under a
+        // larger scale); IQ4_XS's levels reach 127 under a 6-bit scale.
+        (GgmlKind::IQ2XXS, &[0], 0x0800),
+        (GgmlKind::IQ2XS, &[0], 0x0800),
+        (GgmlKind::IQ2S, &[0], 0x0800),
+        (GgmlKind::IQ3XXS, &[0], 0x0400),
+        (GgmlKind::IQ3S, &[0], 0x0400),
+        (GgmlKind::IQ4NL, &[0], 0x0C00),
+        (GgmlKind::IQ4XS, &[0], 0x0100), // 0.000015
     ];
     for (kind, f16_fields, scale) in kinds {
         let mut rng = Rng::new(0x6611 + kind.dtype_code() as u64);
@@ -915,6 +926,149 @@ fn streaming_gpu_worker_prefetches() {
         "GPU worker should prefetch a layer: {:?}",
         k.stats()
     );
+}
+
+/// A long streamed run against the resident kernel: three sequences decoding
+/// together for 300 steps through a window of 3 of 8 layers, so every step
+/// evicts, prefetches and reuses evicted buffers while each sequence's KV grows
+/// past many blocks; then a prompt prefilled beside them. Every step must match.
+#[test]
+fn streaming_gpu_soak_matches_resident() {
+    let cfg = small_cfg();
+    let num_layers = 8u32;
+    let layers = random_layers(&cfg, num_layers, 0x50A4);
+    let (seqs, steps, ctx) = (3usize, 300usize, 384usize);
+    let resident = GpuKernel::new(cfg, layers.clone(), ctx)
+        .unwrap()
+        .with_kv_pool_tokens((seqs + 1) * ctx);
+    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers), ctx, 3, None)
+        .unwrap()
+        .with_kv_pool_tokens((seqs + 1) * ctx);
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let quant = dlm::forward::KvQuant::None;
+    let blocks = (ctx / 16) as u32;
+    let mut res: Vec<_> = (0..seqs)
+        .map(|_| ForwardOrchestrator::new(&resident, PagedKvCache::new(kv_cfg, blocks), quant))
+        .collect();
+    let mut str: Vec<_> = (0..seqs)
+        .map(|_| ForwardOrchestrator::new(&streaming, PagedKvCache::new(kv_cfg, blocks), quant))
+        .collect();
+    let mut rng = Rng::new(0x50A5);
+    let close = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    for step in 0..steps {
+        // Fresh inputs every step, so the KV history does not settle.
+        let mut hr: Vec<Vec<f32>> = (0..seqs).map(|_| rng.vec(cfg.hidden_size, 0.5)).collect();
+        let mut hs = hr.clone();
+        let mut o: Vec<_> = res.iter_mut().collect();
+        let mut h: Vec<&mut [f32]> = hr.iter_mut().map(|h| h.as_mut_slice()).collect();
+        ForwardOrchestrator::decode_batch(&mut o, &mut h).unwrap();
+        let mut o: Vec<_> = str.iter_mut().collect();
+        let mut h: Vec<&mut [f32]> = hs.iter_mut().map(|h| h.as_mut_slice()).collect();
+        ForwardOrchestrator::decode_batch(&mut o, &mut h).unwrap();
+        for b in 0..seqs {
+            let d = close(&hr[b], &hs[b]);
+            assert!(
+                d < 1e-4,
+                "step {step}, sequence {b}: streamed diverged by {d}"
+            );
+        }
+    }
+    let prompt = rng.vec(40 * cfg.hidden_size, 0.5);
+    let (mut pr, mut ps) = (prompt.clone(), prompt);
+    ForwardOrchestrator::new(&resident, PagedKvCache::new(kv_cfg, blocks), quant)
+        .prefill(&mut pr)
+        .unwrap();
+    ForwardOrchestrator::new(&streaming, PagedKvCache::new(kv_cfg, blocks), quant)
+        .prefill(&mut ps)
+        .unwrap();
+    let d = close(&pr, &ps);
+    assert!(
+        d < 1e-4,
+        "prefill beside the streamed sequences diverged by {d}"
+    );
+    let s = streaming.stats();
+    assert!(s.misses > 0 && s.prefetched > 0 && s.evictions > 0, "{s:?}");
+}
+
+/// KV kept in host RAM for the layers that do not fit the card decodes exactly
+/// as KV in VRAM: the same kernels read the same values, only over the bus.
+/// Layers 1.. are in host RAM, across enough steps that attention reads a
+/// history of several blocks, in fp16 and int8.
+#[test]
+fn gpu_kv_in_host_ram_matches_vram() {
+    use dlm::forward::ComputeKernel;
+    // Heads of 32, so the int8 KV groups fit (else int8 asks get fp16).
+    let cfg = BlockConfig {
+        hidden_size: 64,
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 32,
+        ..small_cfg()
+    };
+    let num_layers = 3u32;
+    let layers = random_layers(&cfg, num_layers, 0x4057);
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::Int8] {
+        let orch = |host_from: usize| {
+            let mut k = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+            k.set_kv_host_layers(host_from);
+            ForwardOrchestrator::new(k, PagedKvCache::new(kv_cfg, 32), quant)
+        };
+        let (mut vram, mut host) = (orch(num_layers as usize), orch(1));
+        let mut rng = Rng::new(0x4058);
+        for step in 0..40 {
+            let mut a = rng.vec(cfg.hidden_size, 1.0);
+            let mut b = a.clone();
+            vram.decode_token(&mut a).unwrap();
+            host.decode_token(&mut b).unwrap();
+            assert_eq!(a, b, "{quant:?} step {step}: host-RAM KV diverged");
+        }
+    }
+}
+
+/// The worker loads the next layer the pass is missing, not just the next
+/// layer: when that one is already resident, the copy engine has the time it
+/// takes to compute it to fetch a later one.
+///
+/// Layer 2 then layer 1 run cold, each a miss. After layer 1 the pass is about
+/// to run layer 2, which is resident (and 3, prefetched after layer 2), so the
+/// worker loads layer 0, and running it is a hit. Loading only "the next
+/// layer" left the worker idle there and layer 0 a miss.
+#[test]
+fn streaming_gpu_prefetches_past_resident_layers() {
+    let cfg = small_cfg();
+    let k =
+        StreamingGpuKernel::new(cfg, VecSource(random_layers(&cfg, 4, 5)), 64, 4, None).unwrap();
+    let mut h: Vec<f32> = (0..cfg.hidden_size).map(|i| i as f32 * 0.01).collect();
+    let mut kv: Vec<KvLayerCache> = (0..4).map(|_| KvLayerCache::new(cfg.kv_dim())).collect();
+    let settle = |prefetched: u64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while k.stats().prefetched < prefetched && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    k.run_block(2, &mut h, &mut kv[2], 0).unwrap();
+    settle(1); // layer 3
+    k.run_block(1, &mut h, &mut kv[1], 0).unwrap();
+    settle(2); // layer 0, past the resident 2 and 3
+    k.run_block(0, &mut h, &mut kv[0], 0).unwrap();
+    let s = k.stats();
+    assert_eq!((s.misses, s.prefetched), (2, 2), "{s:?}");
 }
 
 // ── Mixture-of-Experts GPU parity ──
@@ -2158,8 +2312,14 @@ fn gpu_lm_head_batch_matches_rows_alone() {
         for block in blob.chunks_mut(kind.block_bytes()) {
             block[0..2].copy_from_slice(&0x1400u16.to_le_bytes()); // 0.00098
             block[2..4].copy_from_slice(&0x1000u16.to_le_bytes()); // 0.00049
-            if kind == GgmlKind::Q6K {
-                block[208..210].copy_from_slice(&0x1400u16.to_le_bytes());
+            let more: &[usize] = match kind {
+                GgmlKind::Q6K => &[208],
+                GgmlKind::Q2K => &[80, 82],
+                GgmlKind::Q3K => &[108],
+                _ => &[],
+            };
+            for &at in more {
+                block[at..at + 2].copy_from_slice(&0x1400u16.to_le_bytes());
             }
         }
         Weights::Ggml {
@@ -2185,6 +2345,15 @@ fn gpu_lm_head_batch_matches_rows_alone() {
         GgmlKind::Q4K,
         GgmlKind::Q5K,
         GgmlKind::Q6K,
+        GgmlKind::Q2K,
+        GgmlKind::Q3K,
+        GgmlKind::IQ2XXS,
+        GgmlKind::IQ2XS,
+        GgmlKind::IQ2S,
+        GgmlKind::IQ3XXS,
+        GgmlKind::IQ3S,
+        GgmlKind::IQ4NL,
+        GgmlKind::IQ4XS,
     ] {
         cases.push((format!("{kind:?}"), ggml(kind)));
     }
@@ -2209,6 +2378,69 @@ fn gpu_lm_head_batch_matches_rows_alone() {
                     tokens[r],
                     dlm::generate::argmax(got),
                     "{what}, {rows} rows: row {r}"
+                );
+            }
+        }
+    }
+}
+
+/// The device decodes every weight of every ggml format exactly as the CPU
+/// does. A one-hot activation quantizes to int8 without error, so the LM head
+/// of the identity matrix is the decoded weight matrix itself, and a misread
+/// field shows even where it moves a weight too little to fail a model-level
+/// comparison (an IQ4 level off by one in 127, say).
+#[test]
+fn gpu_ggml_decode_matches_cpu_exactly() {
+    use dlm::storage::ggml_quant::{self, GgmlKind};
+    let (vocab, hidden) = (64, 512);
+    let mut rng = Rng::new(0xdec0);
+    for (kind, f16_fields) in [
+        (GgmlKind::Q4_0, &[0usize][..]),
+        (GgmlKind::Q4_1, &[0, 2]),
+        (GgmlKind::Q5_0, &[0]),
+        (GgmlKind::Q5_1, &[0, 2]),
+        (GgmlKind::Q8_0, &[0]),
+        (GgmlKind::Q4K, &[0, 2]),
+        (GgmlKind::Q5K, &[0, 2]),
+        (GgmlKind::Q6K, &[208]),
+        (GgmlKind::Q2K, &[80, 82]),
+        (GgmlKind::Q3K, &[108]),
+        (GgmlKind::IQ2XXS, &[0]),
+        (GgmlKind::IQ2XS, &[0]),
+        (GgmlKind::IQ2S, &[0]),
+        (GgmlKind::IQ3XXS, &[0]),
+        (GgmlKind::IQ3S, &[0]),
+        (GgmlKind::IQ4NL, &[0]),
+        (GgmlKind::IQ4XS, &[0]),
+    ] {
+        let mut blob: Vec<u8> = (0..kind.byte_len(vocab * hidden))
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        for block in blob.chunks_mut(kind.block_bytes()) {
+            for &at in f16_fields {
+                block[at..at + 2].copy_from_slice(&0x2000u16.to_le_bytes()); // 0.0078
+            }
+        }
+        let want: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ggml_quant::get(kind, &blob, i))
+            .collect();
+        let w = Weights::Ggml {
+            blob,
+            kind,
+            num_elements: vocab * hidden,
+        };
+        let head = dlm::forward::GpuLmHead::new(&w, vocab, hidden, None).unwrap();
+        let mut identity = vec![0.0f32; hidden * hidden];
+        for j in 0..hidden {
+            identity[j * hidden + j] = 1.0;
+        }
+        let got = head.logits(&identity).unwrap();
+        for j in 0..hidden {
+            for o in 0..vocab {
+                let (g, w) = (got[j * vocab + o], want[o * hidden + j]);
+                assert!(
+                    (g - w).abs() <= 1e-5 * w.abs().max(1e-2),
+                    "{kind:?} weight ({o}, {j}): GPU {g}, CPU {w}"
                 );
             }
         }
