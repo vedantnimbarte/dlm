@@ -40,6 +40,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A single-token layer's attention half takes fewer launches.** Two merges
+  that need no grid-wide synchronization:
+  - **RoPE and the K/V append run inside the attention kernel**
+    (`attn_split_post_kernel`), removing `qk_post`'s launch. Each attention
+    block normalizes and rotates its own query heads in shared memory; the
+    block for the last chunk, the only one that reads the token's own row,
+    rotates its key and appends K and V before attending. Qwen2.5-0.5B batch
+    1: Q4_K_M 132 -> 137 tok/s, bf16 97 -> 103; Qwen2.5-1.5B unchanged (65.6
+    / 65.7 over six runs).
+  - **For int8 activations, the input and post-attention norms and their
+    quantization are one launch** (`rmsnorm_q8_kernel`), and the GEMVs that
+    read the row (Q/K/V; gate and up, which also stop quantizing it twice)
+    reuse its codes. Batch 1, four alternating pairs: Qwen2.5-0.5B Q8_0 129 ->
+    138 tok/s, int8 129 -> 145. Q4_K_M at 0.5B is unchanged: its 896-wide
+    rows do not take int8 activations.
+
+  A single kernel for the whole half would need a grid-wide sync between the
+  Q/K/V GEMV, attention and the output GEMV (a cooperative launch, which
+  limits the GEMVs' occupancy); these two cover the launches that need none.
+
 - **Single-request decode is 13-22% faster: the fused GEMV no longer spills
   to the stack.** The kernel that runs a layer's Q/K/V, output and down
   projections for one sequence found each row's matrix by indexing its

@@ -654,6 +654,12 @@ fn gpu_matches_cpu_with_int8_weights() {
                     f.up = q(&f.up);
                     f.down = q(&f.down);
                 }
+                // Norm weights other than 1: a single-token layer with int8
+                // activations applies them inside its norm-and-quantize kernel.
+                let n = cfg.hidden_size;
+                l.input_layernorm = (0..n).map(|i| 0.6 + 0.8 * (i % 7) as f32 / 7.0).collect();
+                l.post_attention_layernorm =
+                    (0..n).map(|i| 1.3 - 0.6 * (i % 5) as f32 / 5.0).collect();
                 l
             })
             .collect();

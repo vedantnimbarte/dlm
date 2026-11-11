@@ -918,6 +918,45 @@ __global__ void quantize_q8_kernel(const float* __restrict__ x, int n, signed ch
     if (lane == 0) ds[b] = make_float2(d, d * (float)sum);
 }
 
+// `rmsnorm_kernel` and `quantize_q8_kernel` in one launch, for a single-token
+// GEMV that takes int8 activations: `out` gets the normed row and `q`/`ds` its
+// codes and block scales. Every block sums the row's squares itself (one
+// hidden vector, a few KiB) rather than waiting on a separate norm launch.
+// <<<ceil(n / 32 / 8), dim3(32, 8)>>>, n % 32 == 0.
+__global__ void rmsnorm_q8_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                  float* __restrict__ out, int n, float eps,
+                                  signed char* __restrict__ q, float2* __restrict__ ds) {
+    __shared__ float red[8];
+    __shared__ float inv_rms;
+    const int lane = threadIdx.x, warp = threadIdx.y, t = warp * 32 + lane;
+    float ss = 0.0f;
+    for (int i = t; i < n; i += 256) ss += x[i] * x[i];
+    ss = warp_sum(ss);
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int k = 0; k < 8; ++k) s += red[k];
+        inv_rms = rsqrtf(s / (float)n + eps);
+    }
+    __syncthreads();
+    const int b = blockIdx.x * 8 + warp;
+    if (b * 32 >= n) return;
+    const int i = b * 32 + lane;
+    const float v = x[i] * inv_rms * w[i];
+    out[i] = v;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float d = amax / 127.0f;
+    const int qi = d == 0.0f ? 0 : __float2int_rn(v / d);
+    int sum = qi;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    q[i] = (signed char)qi;
+    if (lane == 0) ds[b] = make_float2(d, d * (float)sum);
+}
+
 // Four 4-bit codes, one per byte, from two bytes of dlm's int4 layout (weight
 // 2i in byte i's low nibble, 2i + 1 in its high one).
 __device__ __forceinline__ int nib4(unsigned int two) {
@@ -1645,17 +1684,51 @@ static cudaError_t scratch_ensure(int i, int n) {
     return e;
 }
 
+// The row whose int8 codes the activation scratch holds right now, put there by
+// `norm_q8` for the GEMVs that read it next; null otherwise. Its owner clears
+// it (`q8_done`) once they have run: the same buffer holds another row soon.
+static thread_local const float* g_q8_ready = 0;
+static thread_local int g_q8_ready_n = 0;
+
 static bool quantize_x(const float* x, int n, const signed char** xq, const float2** xds) {
     // Sizes are in floats: n codes take n / 4, n / 32 (scale, sum) pairs n / 16.
     if (scratch_ensure(Q8_XQ, (n + 3) / 4) != cudaSuccess) return false;
     if (scratch_ensure(Q8_XDS, n / 16 + 2) != cudaSuccess) return false;
     *xq = (const signed char*)g_scratch[Q8_XQ];
     *xds = (const float2*)g_scratch[Q8_XDS];
+    if (x == g_q8_ready && n == g_q8_ready_n) return true;   // already quantized
     int blocks = n / 32;
     quantize_q8_kernel<<<(blocks + 7) / 8, dim3(32, 8)>>>(x, n, (signed char*)g_scratch[Q8_XQ],
                                                           (float2*)g_scratch[Q8_XDS]);
     return true;
 }
+
+// The RMSNorm of `x` into `out` together with its int8 codes
+// (`rmsnorm_q8_kernel`), when the GEMV that reads `out` next -- weight `W` of
+// dtype `dt` -- takes int8 activations; false, launching nothing, otherwise.
+// After it, `quantize_x(out, n)` hands back those codes without a launch, for
+// every GEMV that reads `out`, until `q8_done`. Saves a single-token layer the
+// norm's launch twice and, for gate and up, a quantize.
+static bool norm_q8(const float* x, const float* w, float* out, int n, float eps, int dt,
+                    const void* W, int group_size) {
+    bool ok = false;
+    switch (dt) {
+#define DLM_Q8_OK(D) case D: ok = q8_fits<D>(W, out, n, group_size); break;
+        DLM_FOR_EACH_DTYPE(DLM_Q8_OK)
+#undef DLM_Q8_OK
+        default: ok = false;
+    }
+    if (!ok || n % 32) return false;
+    if (scratch_ensure(Q8_XQ, (n + 3) / 4) != cudaSuccess) return false;
+    if (scratch_ensure(Q8_XDS, n / 16 + 2) != cudaSuccess) return false;
+    rmsnorm_q8_kernel<<<(n / 32 + 7) / 8, dim3(32, 8)>>>(x, w, out, n, eps,
+                                                         (signed char*)g_scratch[Q8_XQ],
+                                                         (float2*)g_scratch[Q8_XDS]);
+    g_q8_ready = out;
+    g_q8_ready_n = n;
+    return true;
+}
+static void q8_done() { g_q8_ready = 0; }
 
 // Block shape beyond the Llama default, for the families that are not
 // Llama-descended. Passing NULL means the default: RMSNorm, gated MLP, RoPE,
@@ -1755,16 +1828,74 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+// The per-head work `qk_post_kernel` does between the Q/K/V projections and
+// attention, handed to a single-token attention block to do itself: the
+// token's raw K and V rows, Qwen3's per-head norms (null when absent), RoPE,
+// and the logical cache row the token appends to.
+typedef struct {
+    const float* k;
+    const float* v;
+    const float* q_norm;
+    const float* k_norm;
+    const float* inv_freq;
+    float mscale, eps;
+    int rope, position;
+    long row;
+} DlmQkPost;
+
+// Per-head norm and RoPE, in place, on `heads` rows of `head_dim` in shared
+// memory, by the whole block; `inv` is `heads` floats of shared scratch. What
+// `qk_post_body` does to one head with one warp.
+__device__ __forceinline__ void qk_rotate_shared(float* buf, int heads, int head_dim,
+                                                 const float* nw, const DlmQkPost& p, float* inv) {
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, warps = blockDim.x >> 5;
+    const int half = head_dim / 2;
+    if (nw) {
+        for (int h = warp; h < heads; h += warps) {
+            float ss = 0.0f;
+            for (int i = lane; i < head_dim; i += 32) ss += buf[h * head_dim + i] * buf[h * head_dim + i];
+            ss = warp_sum(ss);
+            if (lane == 0) inv[h] = rsqrtf(ss / (float)head_dim + p.eps);
+        }
+        __syncthreads();
+    }
+    for (int idx = t; idx < heads * half; idx += blockDim.x) {
+        const int h = idx / half, i = idx % half;
+        float* vec = buf + h * head_dim;
+        float a = vec[i], b = vec[i + half];
+        if (nw) {
+            a = a * inv[h] * nw[i];
+            b = b * inv[h] * nw[i + half];
+        }
+        if (p.rope) {
+            const float ang = (float)p.position * p.inv_freq[i];
+            const float sn = sinf(ang) * p.mscale, c = cosf(ang) * p.mscale;
+            const float ra = a * c - b * sn, rb = a * sn + b * c;
+            a = ra;
+            b = rb;
+        }
+        vec[i] = a;
+        vec[i + half] = b;
+    }
+    __syncthreads();
+}
+
 // Grid (num_kv_heads, splits), block C threads (C >= head_dim, a multiple of 32).
-// Shared: G*head_dim (queries) + G*C (scores) + 2G (max, sum) floats.
+// Shared: G*head_dim (queries) + G*C (scores) + 2G (max, sum) floats, and with
+// `post` another head_dim + FA_MAX_G.
 // `part` is [splits][num_heads][head_dim + 2]: output, then max and sum.
 // The body of `attn_split_kernel` for chunk `split` of the span; `alone` when
-// it is the only chunk.
+// it is the only chunk. With `post` (one token) the queries arrive raw: the
+// block normalizes and rotates its own G heads, and the last chunk's block --
+// the one that reads the token's own row -- rotates its key and appends the
+// key and value to the cache before attending. Earlier chunks never read that
+// row, so no other block waits on it, and `qk_post_kernel`'s launch is saved.
 template <int KT>
 __device__ __forceinline__ void
 attn_split_body(const float* __restrict__ q, const void* keys, const void* values, const int* table,
                 int shift, int num_heads, int num_kv_heads, int head_dim, int start, int span,
-                float scale, float softcap, float* part, float* ctx, int split, bool alone) {
+                float scale, float softcap, float* part, float* ctx, int split, bool alone,
+                const DlmQkPost* post = nullptr) {
     extern __shared__ float smem[];
     const int G = num_heads / num_kv_heads, kvh = blockIdx.x;
     const int C = blockDim.x, t = threadIdx.x;
@@ -1773,6 +1904,38 @@ attn_split_body(const float* __restrict__ q, const void* keys, const void* value
     float* ml = sc + G * C;
     for (int i = t; i < G * head_dim; i += C) qs[i] = q[(long)kvh * G * head_dim + i];
     __syncthreads();
+    if (post) {
+        float* kbuf = ml + 2 * G;          // head_dim floats
+        float* inv = kbuf + head_dim;      // FA_MAX_G floats
+        qk_rotate_shared(qs, G, head_dim, post->q_norm, *post, inv);
+        if (split == (int)gridDim.y - 1) {
+            for (int i = t; i < head_dim; i += C) kbuf[i] = post->k[(long)kvh * head_dim + i];
+            __syncthreads();
+            qk_rotate_shared(kbuf, 1, head_dim, post->k_norm, *post, inv);
+            const long kvd = (long)num_kv_heads * head_dim;
+            const long dst = kv_row(table, shift, post->row) * kvd + (long)kvh * head_dim;
+            const float* vh = post->v + (long)kvh * head_dim;
+            if (KT == DLM_KV_I8) {
+                if (t < 32)
+                    for (int g = 0; g < head_dim; g += 32) {
+                        kv_store_i8(kbuf[g + t], (void*)keys, dst + g);
+                        kv_store_i8(vh[g + t], (void*)values, dst + g);
+                    }
+            } else {
+                for (int i = t; i < head_dim; i += C) {
+                    if (KT == DLM_KV_F16) {
+                        ((__half*)keys)[dst + i] = __float2half(kbuf[i]);
+                        ((__half*)values)[dst + i] = __float2half(vh[i]);
+                    } else {
+                        ((float*)keys)[dst + i] = kbuf[i];
+                        ((float*)values)[dst + i] = vh[i];
+                    }
+                }
+            }
+            // The block's own reads of that row come after its writes.
+            __syncthreads();
+        }
+    }
 
     const int p0 = split * C, n = min(C, span - p0);
     const long kv_dim = (long)num_kv_heads * head_dim;
@@ -1868,6 +2031,20 @@ __global__ void attn_split_kernel(const float* __restrict__ q, const void* keys,
                                   float* part, float* ctx) {
     attn_split_body<KT>(q, keys, values, table, shift, num_heads, num_kv_heads, head_dim, start,
                         span, scale, softcap, part, ctx, blockIdx.y, gridDim.y == 1);
+}
+
+// `attn_split_kernel` for one token whose queries and key arrive raw: each block
+// does `qk_post`'s norm and RoPE itself, and the last chunk's block appends the
+// token's K/V (see `attn_split_body`). Shared as attn_split_kernel's plus
+// head_dim + FA_MAX_G floats.
+template <int KT>
+__global__ void attn_split_post_kernel(const float* __restrict__ q, const void* keys,
+                                       const void* values, const int* table, int shift,
+                                       int num_heads, int num_kv_heads, int head_dim, int start,
+                                       int span, float scale, float softcap, float* part,
+                                       float* ctx, DlmQkPost post) {
+    attn_split_body<KT>(q, keys, values, table, shift, num_heads, num_kv_heads, head_dim, start,
+                        span, scale, softcap, part, ctx, blockIdx.y, gridDim.y == 1, &post);
 }
 
 // The span a decode token at history length `num_positions` attends over.
@@ -1972,6 +2149,58 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
     attn_softmax_kernel<<<num_heads, SOFTMAX_THREADS>>>(scores, num_heads, span);
     DLM_KV_SWITCH(kv_half, attn_mix_kernel<KT_><<<grid_for(num_heads * head_dim, B), B>>>(
         scores, values, table, shift, ctx, num_heads, num_kv_heads, head_dim, start, span));
+    return cudaSuccess;
+}
+
+static void launch_qk_post(float* q, float* k, const float* v, const float* q_norm,
+                           const float* k_norm, int num_heads, int num_kv_heads, int head_dim,
+                           int position, const float* inv_freq, float mscale, int rope, float eps,
+                           void* keys, void* values, const int* table, int shift, long row,
+                           int kv_half, int tokens);
+
+// `launch_qk_post` then `launch_attention` for one token, in one launch where
+// the split kernel takes the heads (`attn_split_post_kernel`): the token's
+// norm, RoPE and K/V append happen inside the attention blocks.
+static cudaError_t launch_attention_post(float* q, float* k, const float* v, float* ctx,
+                                         const float* q_norm, const float* k_norm,
+                                         int num_heads, int num_kv_heads,
+                                         int head_dim, int position, const float* inv_freq,
+                                         float mscale, int rope, float eps, void* keys,
+                                         void* values, const int* table, int shift,
+                                         int num_positions, int sliding_window, float scale,
+                                         float softcap, int kv_half) {
+    const int G = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
+    const bool split_ok = G >= 1 && G <= FA_MAX_G && G * num_kv_heads == num_heads &&
+                          head_dim % 8 == 0 && head_dim <= 256 &&
+                          (kv_half != DLM_KV_I8 || head_dim % 32 == 0);
+    if (!split_ok) {
+        launch_qk_post(q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position,
+                       inv_freq, mscale, rope, eps, keys, values, table, shift, num_positions,
+                       kv_half, 1);
+        return launch_attention(q, keys, values, table, shift, ctx, num_heads,
+                                num_kv_heads, head_dim, num_positions + 1, sliding_window, scale,
+                                softcap, kv_half);
+    }
+    int start, span;
+    attn_span(num_positions, sliding_window, &start, &span);
+    const int C = head_dim > 128 ? 256 : 128;
+    const int rounded = (span + 1023) & ~1023;
+    const long part_need = (long)((rounded + C - 1) / C) * num_heads * (head_dim + 2);
+    const long need = (long)num_heads * rounded;
+    cudaError_t e = scratch_ensure(ATTN_SCORES, (int)(part_need > need ? part_need : need));
+    if (e != cudaSuccess) return e;
+    float* part = g_scratch[ATTN_SCORES];
+    const int splits = (span + C - 1) / C;
+    const size_t shmem =
+        (size_t)(G * head_dim + G * C + 2 * G + head_dim + FA_MAX_G) * sizeof(float);
+    const DlmQkPost post = {k, v, q_norm, k_norm, inv_freq, mscale, eps, rope, position,
+                            (long)num_positions};
+    dim3 grid(num_kv_heads, splits);
+    DLM_KV_SWITCH(kv_half, attn_split_post_kernel<KT_><<<grid, C, shmem>>>(
+        q, keys, values, table, shift, num_heads, num_kv_heads, head_dim, start, span, scale,
+        softcap, part, ctx, post));
+    if (splits > 1)
+        attn_combine_kernel<<<num_heads, 128>>>(part, ctx, num_heads, head_dim, splits);
     return cudaSuccess;
 }
 
@@ -2368,7 +2597,6 @@ extern "C" int dlm_decode_block(
 {
     DLM_ENTER
     const int B = 256;
-    int total_pos = num_positions + 1;
     const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
     #define DLM_NORM(src, w, bias, dst) { \
         if (o->layer_norm) layernorm_kernel<<<1, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
@@ -2405,8 +2633,12 @@ extern "C" int dlm_decode_block(
         const bool same_qkv = DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_K) && DLM_WDT(DLM_W_Q) == DLM_WDT(DLM_W_V) &&
                               DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_K) && DLM_WGRP(DLM_W_Q) == DLM_WGRP(DLM_W_V);
 
-        // Attention sublayer: Q/K/V in one grid.
-        DLM_NORM(x, in_norm, o->in_norm_bias, normed)
+        // Attention sublayer: Q/K/V in one grid. For int8 activations the norm
+        // and the quantize are one launch, and the GEMVs reuse its codes.
+        if (!(!o->layer_norm &&
+              norm_q8(x, in_norm, normed, hidden_size, rms_eps, DLM_WDT(DLM_W_Q), q_proj,
+                      DLM_WGRP(DLM_W_Q))))
+            DLM_NORM(x, in_norm, o->in_norm_bias, normed)
         DlmSegs qkv = {{q_proj, k_proj, v_proj}, {q_bias, k_bias, v_bias}, {q, k, v},
                        {q_dim, kv_dim, kv_dim}, 3};
         bool fused_qkv = same_qkv && launch_fused(FUSE_PLAIN, DLM_WDT(DLM_W_Q), DLM_WGRP(DLM_W_Q),
@@ -2416,14 +2648,15 @@ extern "C" int dlm_decode_block(
             launch_matvec(DLM_WDT(DLM_W_K), k_proj, normed, k_bias, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K));
             launch_matvec(DLM_WDT(DLM_W_V), v_proj, normed, v_bias, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V));
         }
+        q8_done();
         // Qwen3's per-head Q/K RMSNorm (when present), RoPE, and this token's K/V
         // appended into the persistent history at slot num_positions.
-        launch_qk_post(q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position, inv_freq,
-                       rope_mscale, o->rope, rms_eps, kv_keys, kv_values, o->kv_table,
-                       o->kv_block_shift, num_positions, o->kv_half);
-
-        // Attend over history + this token, reading the persistent buffers directly.
-        e = launch_attention(q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap, o->kv_half);
+        // Then attend over history + this token, reading the persistent buffers
+        // directly -- both in one launch where the split kernel takes the heads.
+        e = launch_attention_post(q, k, v, ctx, q_norm, k_norm, num_heads, num_kv_heads, head_dim,
+                                  position, inv_freq, rope_mscale, o->rope, rms_eps, kv_keys,
+                                  kv_values, o->kv_table, o->kv_block_shift, num_positions,
+                                  sliding_window, attn_scale, attn_softcap, o->kv_half);
         if (e != cudaSuccess) return (int)e;
         // Output projection straight into the residual. Gemma2 norms the
         // attention output first, and Falcon's parallel FFN needs the block input
@@ -2447,7 +2680,10 @@ extern "C" int dlm_decode_block(
         // `post_norm` was already spent on the attention output.
         if (!o->parallel) {
             if (gemma2) rmsnorm_kernel<<<1, RMS_THREADS>>>(x, pre_ffn_norm, normed2, hidden_size, rms_eps);
-            else DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
+            else if (!(!o->layer_norm &&
+                       norm_q8(x, post_norm, normed2, hidden_size, rms_eps, DLM_WDT(DLM_W_UP), up_proj,
+                               DLM_WGRP(DLM_W_UP))))
+                DLM_NORM(x, post_norm, o->post_norm_bias, normed2)
         }
         launch_matvec(DLM_WDT(DLM_W_UP), up_proj, normed2, o->up_bias, up, inter, hidden_size, DLM_WGRP(DLM_W_UP));
         if (o->gated) {
@@ -2456,6 +2692,7 @@ extern "C" int dlm_decode_block(
         } else {
             activate_kernel<<<grid_for(inter, B), B>>>(up, inter_buf, (long)inter, activation);
         }
+        q8_done();
         // Down projection straight into the residual, except where Gemma2 norms
         // the FFN output first.
         DlmSegs dseg = {{down_proj, 0, 0}, {o->down_bias, 0, 0}, {x, 0, 0}, {hidden_size, 0, 0}, 1};
