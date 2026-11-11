@@ -888,7 +888,14 @@ inference engine):
     ([`src/forward/streaming_gpu.rs`](src/forward/streaming_gpu.rs)) while KV stays
     resident: run a model larger than VRAM on the GPU. Validated on hardware
     against the CPU oracle ([`tests/gpu_parity.rs`](tests/gpu_parity.rs)); the
-    streamed window is bit-comparable to a fully-resident GPU run.
+    streamed window is bit-comparable to a fully-resident GPU run. **A model
+    whose weights do not fit streams without the flag**: the startup banner's
+    `placement` line says so. That is the fastest placement measured for one:
+    Qwen2.5-7B-Instruct `Q3_K_M` on a GTX 1650 streams at 7-9 tok/s, and runs
+    at about 3 with `--gpu-layers 19` (the other 9 layers on the CPU).
+  - `--gpu-layers N` — the first `N` layers in VRAM and the rest on the CPU
+    (llama.cpp's `-ngl`). The CPU half gets dlm's SIMD int layouts where RAM
+    allows, as the CPU kernel does.
   - `--multi-gpu-ids` — pipeline-parallel across local GPUs (below).
 
   Two orthogonal memory knobs apply to any kernel:

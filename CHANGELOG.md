@@ -453,6 +453,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A model too big for the card streams on its own.** On the GPU, with
+  neither `--stream` nor `--gpu-layers`, a model whose weights did not fit was
+  refused (by a KV-cache message that did not say why). Now it streams, and a
+  `placement` line says the weights did not fit and that `--gpu-layers` is
+  there instead. Streaming is the faster of the two measured: Qwen2.5-7B-
+  Instruct `Q3_K_M` on a GTX 1650 decodes at 7.6-8.4 tok/s streamed, 2.8-3.0
+  with `--gpu-layers 19` and 2.6-2.7 with 15. A resident request whose weights
+  do not fit, with `--gpu-layers` or a draft model, is still refused, now
+  naming `--stream` and `--gpu-layers`.
+  - **`--gpu-layers` is 2.5x faster on 2-3-bit GGUF files**: the CPU half now
+    re-packs ggml's blocks into dlm's int layouts where RAM allows, as the CPU
+    kernel did, instead of decoding Q2_K/Q3_K/IQ blocks through the scalar
+    path. Same 7B, `--gpu-layers 19`: 1.0-1.2 -> 2.8-3.0 tok/s.
+
 - **KV cache in host RAM for a context the card cannot hold.** A resident GPU
   model whose one full-context request did not fit beside the weights was
   refused at startup. Now the layers that fit keep their KV in VRAM and the
