@@ -20,10 +20,14 @@
 //! `mla` weights and the FFN on its `ffn`, independently, exactly as the CPU
 //! oracle's `decode_block_streaming_moe` does.
 //!
-//! Validated on-device against the CPU oracle by [`tests/gpu_parity.rs`]
-//! (`streaming_gpu_matches_resident` drives real evictions and asserts the output
-//! equals the fully-resident kernel's). CI has no GPU, so that check is manual —
-//! run the `cuda-kernels` suite on a real card before tagging a release.
+//! Validated on-device against the resident kernel by [`tests/gpu_parity.rs`]:
+//! `streaming_gpu_matches_resident` drives real evictions, and
+//! `streaming_gpu_soak_matches_resident` runs three batched sequences for 300
+//! steps through a 3-of-8 window, checking every step (it catches a buffer
+//! reused before the kernels reading it finish). `tests/gguf_model.rs`
+//! (`gpu_streamed_and_resident_agree`) scores a real GGUF file streamed against
+//! resident. CI has no GPU, so these run by hand: run the `cuda-kernels` suite
+//! on a real card before tagging a release.
 
 use crate::error::{DlmError, Result};
 use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};

@@ -1071,7 +1071,11 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                     config.num_layers,
                 );
                 let depth = args.prefetch_depth.min(window.saturating_sub(1));
-                if args.auto_prefetch {
+                if device == Device::Gpu {
+                    // The GPU worker has no depth to set: it always loads the
+                    // next layer the pass is missing.
+                    println!("  prefetch   : the next streamed layer, under the compute before it");
+                } else if args.auto_prefetch {
                     println!(
                         "  prefetch   : auto (depth tuned from load vs compute, ≤ {})",
                         window.saturating_sub(1)
@@ -1618,7 +1622,7 @@ fn serve_on_gpu(
 }
 
 /// Serve with `--stream --device gpu`: stream a window of layer weights through
-/// VRAM (`StreamingGpuKernel`). Experimental — unvalidated on hardware.
+/// VRAM (`StreamingGpuKernel`).
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 #[allow(clippy::too_many_arguments)]
 fn serve_streaming_gpu(
@@ -1631,7 +1635,7 @@ fn serve_streaming_gpu(
     listen: &str,
 ) -> Result<()> {
     println!(
-        "device       : gpu ({}) — VRAM layer streaming [experimental]",
+        "device       : gpu ({}) — VRAM layer streaming",
         gpu::active_vendor().label()
     );
     let generator = dlm::loader::build_streaming_gpu_generator(

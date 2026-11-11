@@ -25,6 +25,10 @@ On a machine with an NVIDIA GPU and the CUDA toolkit (nvcc):
 #    A silent layout drift between host and device corrupts weights rather than
 #    erroring, so this is the check that catches it.
 cargo test --release --features cuda-kernels
+#    The same on a real GGUF file: streamed through VRAM against resident, and
+#    (with llama.cpp's f32 copy of it) every block against llama.cpp's decode.
+#    Run it on a 2-3-bit file (Q2_K, IQ3_M) as well as a Q4_K_M.
+DLM_TEST_GGUF=models/gguf/<model>.gguf DLM_TEST_GGUF_F32=<its-f32-copy>.gguf   cargo test --release --features cuda-kernels --test gguf_model
 
 # 2. End-to-end on a real model, on the GPU. Tests can pass while the served
 #    engine emits nonsense; only reading the output catches that.
@@ -39,6 +43,9 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 cargo run --release --features cuda-kernels -- \
   serve --model-path models/<a-3B-or-larger> --device gpu --quant int4 --port 8000
 # expect: coherent output, and VRAM under the card's limit
+# And one whose weights do not fit at all, which streams without --stream:
+cargo run --release --features cuda-kernels --   serve --model-path models/gguf/<a-7B-Q3_K_M>.gguf --device gpu --port 8000
+# expect: a `placement` line saying it streams, then coherent output
 ```
 
 All three must pass on real hardware before tagging.
@@ -82,6 +89,10 @@ release is a claim, and these bound it.
   weight mapping is proven by a same-weights-twice equivalence test) or GPT-2
   (which answers correctly on the real checkpoint). Run check 2 against a Falcon
   before claiming it works.
+- **KV cache in host RAM** (a context the card cannot hold) has been run on
+  one model, Qwen2.5-1.5B `Q8_0` at a 4k-token history, on the resident GPU
+  kernel only. Its speed falls with the history it reads over PCIe each step;
+  nothing past 4k has been measured.
 - **Llama 2 is untested.** It shares Mistral's SentencePiece tokenizer shape,
   which is verified, so it is expected to work — expected, not demonstrated.
 

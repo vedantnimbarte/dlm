@@ -928,6 +928,78 @@ fn streaming_gpu_worker_prefetches() {
     );
 }
 
+/// A long streamed run against the resident kernel: three sequences decoding
+/// together for 300 steps through a window of 3 of 8 layers, so every step
+/// evicts, prefetches and reuses evicted buffers while each sequence's KV grows
+/// past many blocks; then a prompt prefilled beside them. Every step must match.
+#[test]
+fn streaming_gpu_soak_matches_resident() {
+    let cfg = small_cfg();
+    let num_layers = 8u32;
+    let layers = random_layers(&cfg, num_layers, 0x50A4);
+    let (seqs, steps, ctx) = (3usize, 300usize, 384usize);
+    let resident = GpuKernel::new(cfg, layers.clone(), ctx)
+        .unwrap()
+        .with_kv_pool_tokens((seqs + 1) * ctx);
+    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers), ctx, 3, None)
+        .unwrap()
+        .with_kv_pool_tokens((seqs + 1) * ctx);
+    let kv_cfg = KvCacheConfig {
+        num_layers,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let quant = dlm::forward::KvQuant::None;
+    let blocks = (ctx / 16) as u32;
+    let mut res: Vec<_> = (0..seqs)
+        .map(|_| ForwardOrchestrator::new(&resident, PagedKvCache::new(kv_cfg, blocks), quant))
+        .collect();
+    let mut str: Vec<_> = (0..seqs)
+        .map(|_| ForwardOrchestrator::new(&streaming, PagedKvCache::new(kv_cfg, blocks), quant))
+        .collect();
+    let mut rng = Rng::new(0x50A5);
+    let close = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    for step in 0..steps {
+        // Fresh inputs every step, so the KV history does not settle.
+        let mut hr: Vec<Vec<f32>> = (0..seqs).map(|_| rng.vec(cfg.hidden_size, 0.5)).collect();
+        let mut hs = hr.clone();
+        let mut o: Vec<_> = res.iter_mut().collect();
+        let mut h: Vec<&mut [f32]> = hr.iter_mut().map(|h| h.as_mut_slice()).collect();
+        ForwardOrchestrator::decode_batch(&mut o, &mut h).unwrap();
+        let mut o: Vec<_> = str.iter_mut().collect();
+        let mut h: Vec<&mut [f32]> = hs.iter_mut().map(|h| h.as_mut_slice()).collect();
+        ForwardOrchestrator::decode_batch(&mut o, &mut h).unwrap();
+        for b in 0..seqs {
+            let d = close(&hr[b], &hs[b]);
+            assert!(
+                d < 1e-4,
+                "step {step}, sequence {b}: streamed diverged by {d}"
+            );
+        }
+    }
+    let prompt = rng.vec(40 * cfg.hidden_size, 0.5);
+    let (mut pr, mut ps) = (prompt.clone(), prompt);
+    ForwardOrchestrator::new(&resident, PagedKvCache::new(kv_cfg, blocks), quant)
+        .prefill(&mut pr)
+        .unwrap();
+    ForwardOrchestrator::new(&streaming, PagedKvCache::new(kv_cfg, blocks), quant)
+        .prefill(&mut ps)
+        .unwrap();
+    let d = close(&pr, &ps);
+    assert!(
+        d < 1e-4,
+        "prefill beside the streamed sequences diverged by {d}"
+    );
+    let s = streaming.stats();
+    assert!(s.misses > 0 && s.prefetched > 0 && s.evictions > 0, "{s:?}");
+}
+
 /// KV kept in host RAM for the layers that do not fit the card decodes exactly
 /// as KV in VRAM: the same kernels read the same values, only over the bus.
 /// Layers 1.. are in host RAM, across enough steps that attention reads a

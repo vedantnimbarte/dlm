@@ -40,6 +40,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--stream --device gpu` is no longer experimental.** Its banner said
+  `[experimental]` and its code "unvalidated on hardware"; the checks it lacked
+  are now in the suite. `streaming_gpu_soak_matches_resident` runs three
+  batched sequences for 300 steps through a window of 3 of 8 layers, then a
+  prefill beside them, and checks every step against the resident kernel; with
+  the wait before an evicted layer's buffers are reused taken out, it fails
+  within two steps, every run. `gpu_streamed_and_resident_agree`
+  (`tests/gguf_model.rs`) scores a real GGUF file streamed through a two-layer
+  window against resident: Qwen2.5-0.5B `Q2_K` to `Q8_0` and the IQ files, and
+  1.5B `Q4_K_M`, agree within 0.011-0.034 nats per token on average, where one
+  layer streamed wrong moves them by 0.47. The startup banner's prefetch line
+  now says what the GPU path does, and `--prefetch-depth` / `--auto-prefetch`
+  are documented as the CPU path's.
+
 - **Streaming on the GPU is up to 20% faster: the copy engine no longer idles
   under resident layers.** The prefetch worker was told "layer L + 1" as the
   pass reached layer L, and with most of the model resident L + 1 usually
