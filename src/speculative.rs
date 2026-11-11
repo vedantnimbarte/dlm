@@ -395,39 +395,39 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
             &hiddens[at..at + h]
         };
 
-        // 3. Accept each proposal with probability min(1, p/q); on the first
-        //    rejection, draw the replacement from the residual and stop.
+        // 3. The target's distribution before each proposal and after the last,
+        //    every one from one LM-head call: position j's context is the
+        //    sequence plus the first j proposals. Then accept each proposal with
+        //    probability min(1, p/q); on the first rejection, draw the
+        //    replacement from the residual and stop.
         let mut context = self.seq.clone();
+        context.extend(&proposals);
+        let contexts: Vec<&[u32]> = (0..=gamma)
+            .map(|j| &context[..self.seq.len() + j])
+            .collect();
+        let rows: Vec<&[f32]> = (0..=gamma).map(target_hidden).collect();
+        let dists = self.target.distributions(
+            &rows,
+            &self.sampler,
+            &self.penalties,
+            &contexts,
+            self.prompt_len,
+        )?;
         let mut emitted = Vec::with_capacity(gamma + 1);
         let accepted_before = self.accepted;
-        for (j, (&x, q)) in proposals.iter().zip(&draft_dists).enumerate() {
-            let p = self.target.distribution(
-                target_hidden(j),
-                &self.sampler,
-                &self.penalties,
-                &context,
-                self.prompt_len,
-            )?;
-            let (token, kept) = judge(&p, q, x, &mut self.rng);
+        for ((&x, q), p) in proposals.iter().zip(&draft_dists).zip(&dists) {
+            let (token, kept) = judge(p, q, x, &mut self.rng);
             emitted.push(token);
             if !kept {
                 break;
             }
-            context.push(x);
             self.accepted += 1;
         }
         // Only when every proposal was accepted: a rejection at the last one
         // also leaves `gamma` tokens emitted, and must not draw a bonus.
         let all_accepted = self.accepted - accepted_before == gamma;
         if all_accepted && emitted.len() < budget {
-            let p = self.target.distribution(
-                target_hidden(gamma),
-                &self.sampler,
-                &self.penalties,
-                &context,
-                self.prompt_len,
-            )?;
-            emitted.push(sample_from(&p, &mut self.rng));
+            emitted.push(sample_from(&dists[gamma], &mut self.rng));
         }
 
         // 4. Commit, and roll both caches back to everything but the new pending
@@ -455,22 +455,38 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         let mut orchs: Vec<_> = sessions.iter_mut().map(|s| &mut s.target_kv).collect();
         let mut views: Vec<&mut [f32]> = hiddens.iter_mut().map(Vec::as_mut_slice).collect();
         ForwardOrchestrator::decode_batch(&mut orchs, &mut views)?;
-        sessions
+        // Sessions with the same sampler and penalties share one LM-head call;
+        // the rest take theirs one at a time.
+        let same = sessions.iter().all(|s| {
+            unseeded(s.sampler) == unseeded(sessions[0].sampler)
+                && s.penalties == sessions[0].penalties
+                && s.prompt_len == sessions[0].prompt_len
+        });
+        let dists = if same {
+            let rows: Vec<&[f32]> = hiddens.iter().map(Vec::as_slice).collect();
+            let contexts: Vec<&[u32]> = sessions.iter().map(|s| s.seq.as_slice()).collect();
+            let s0 = &sessions[0];
+            s0.target
+                .distributions(&rows, &s0.sampler, &s0.penalties, &contexts, s0.prompt_len)?
+        } else {
+            sessions
+                .iter()
+                .zip(&hiddens)
+                .map(|(s, hidden)| {
+                    s.target
+                        .distribution(hidden, &s.sampler, &s.penalties, &s.seq, s.prompt_len)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(sessions
             .iter_mut()
-            .zip(&hiddens)
-            .map(|(s, hidden)| {
-                let p = s.target.distribution(
-                    hidden,
-                    &s.sampler,
-                    &s.penalties,
-                    &s.seq,
-                    s.prompt_len,
-                )?;
+            .zip(dists)
+            .map(|(s, p)| {
                 let next = sample_from(&p, &mut s.rng);
                 s.seq.push(next);
-                Ok(next)
+                next
             })
-            .collect()
+            .collect())
     }
 
     /// KV rows the session holds in its larger cache (a draft model runs up to
@@ -500,6 +516,28 @@ fn judge(p: &[(u32, f32)], q: &[(u32, f32)], x: u32, rng: &mut SplitMix64) -> (u
         (x, true)
     } else {
         (sample_from(&residual(p, q), rng), false)
+    }
+}
+
+/// `s` without its seed, which shapes the draws but not the distribution.
+fn unseeded(s: Sampler) -> Sampler {
+    match s {
+        Sampler::TopPK {
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            ..
+        } => Sampler::TopPK {
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            seed: 0,
+        },
+        greedy => greedy,
     }
 }
 

@@ -825,14 +825,44 @@ impl<K: ComputeKernel> Generator<K> {
         context: &[u32],
         prompt_len: usize,
     ) -> Result<Vec<(u32, f32)>> {
-        let mut logits = self.logits(hidden)?;
-        let penalty = sampler.repetition_penalty();
-        if penalty != 1.0 {
-            let seen = context.iter().copied().collect();
-            apply_repetition_penalty(&mut logits, &seen, penalty);
-        }
-        penalties.apply(&mut logits, context, prompt_len);
-        Ok(sampler.distribution(&logits))
+        Ok(self
+            .distributions(&[hidden], sampler, penalties, &[context], prompt_len)?
+            .remove(0))
+    }
+
+    /// [`distribution`](Self::distribution) for several hidden states, row `j`
+    /// with its own `contexts[j]`, through one LM-head call: a speculative
+    /// verify scores every proposal at once, and called position by position it
+    /// read the head's weights and copied a row of logits to the host for each.
+    /// Plain greedy needs only each row's argmax, found on the device.
+    pub(crate) fn distributions(
+        &self,
+        hiddens: &[&[f32]],
+        sampler: &Sampler,
+        penalties: &Penalties,
+        contexts: &[&[u32]],
+        prompt_len: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        let greedy = matches!(sampler, Sampler::Greedy) && penalties.is_noop();
+        let want = if greedy { Want::Token } else { Want::Logits };
+        let rows: Vec<(&[f32], Want)> = hiddens.iter().map(|&h| (h, want)).collect();
+        self.heads(&rows)?
+            .into_iter()
+            .zip(contexts)
+            .map(|(head, context)| match head {
+                Head::Token(t) => Ok(vec![(t, 1.0)]),
+                Head::Logits(mut logits) => {
+                    let penalty = sampler.repetition_penalty();
+                    if penalty != 1.0 {
+                        let seen = context.iter().copied().collect();
+                        apply_repetition_penalty(&mut logits, &seen, penalty);
+                    }
+                    penalties.apply(&mut logits, context, prompt_len);
+                    Ok(sampler.distribution(&logits))
+                }
+                Head::Top(_) => unreachable!("asked for a token or the logits"),
+            })
+            .collect()
     }
 
     pub(crate) fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {

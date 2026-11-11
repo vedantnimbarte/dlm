@@ -2537,6 +2537,64 @@ fn gpu_sampled_sessions_match_host_head() {
     }
 }
 
+/// Greedy n-gram speculation on the GPU emits exactly what plain greedy decoding
+/// does. Its verify scores the pending token and the proposals as one short
+/// prefill (the batched decode block) and one LM-head call; plain decoding runs
+/// one token at a time through the single-sequence block. The prompt repeats,
+/// so lookup proposes every round, and the random model's continuation rejects
+/// some of what it proposes.
+#[test]
+fn gpu_ngram_speculation_matches_plain_greedy() {
+    use dlm::generate::{GenerationConfig, Generator, Sampler};
+    use dlm::speculative::SpeculativeSession;
+    let cfg = small_cfg();
+    let vocab = 300;
+    let layers = random_layers(&cfg, 2, 0x59EC);
+    let mut rng = Rng::new(0x59ED);
+    let embedding = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let head = rng.vec(vocab * cfg.hidden_size, 0.5);
+    let kv = KvCacheConfig {
+        num_layers: 2,
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        block_size: 16,
+    };
+    let mut g = Generator::new(
+        GpuKernel::new(cfg, layers, 128)
+            .unwrap()
+            .with_kv_pool_tokens(2 * 128),
+        embedding,
+        vec![1.0; cfg.hidden_size],
+        head,
+        vocab,
+        1e-5,
+        kv,
+        16,
+    )
+    .unwrap();
+    g.place_lm_head_on_gpu(false, Some(0)).unwrap();
+    let prompt: Vec<u32> = [5u32, 9, 13, 7].iter().copied().cycle().take(24).collect();
+    let want = g
+        .generate(
+            &prompt,
+            &GenerationConfig {
+                max_new_tokens: 40,
+                eos_token: None,
+                sampler: Sampler::Greedy,
+            },
+        )
+        .unwrap();
+    for gamma in [1, 4, 8] {
+        let mut s = SpeculativeSession::ngram(&g, gamma, &prompt, Sampler::Greedy).unwrap();
+        let mut got = Vec::new();
+        while got.len() < want.len() {
+            got.extend(s.step(want.len() - got.len()).unwrap());
+        }
+        assert_eq!(got, want, "gamma {gamma}");
+        assert!(s.proposed() > 0, "gamma {gamma}: lookup never proposed");
+    }
+}
+
 /// A multi-GPU pipeline's LM head lives on the last stage's GPU and must select
 /// that device itself: whichever stage ran last is current when logits run.
 /// With one GPU this can only check the wiring -- a pipeline over `[0, 0]` with

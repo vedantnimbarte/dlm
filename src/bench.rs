@@ -38,6 +38,9 @@ pub struct RunResult {
     /// mark, so it covers every run before it too).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_rss_bytes: Option<u64>,
+    /// Speculative runs: the share of proposed tokens the target accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_rate: Option<f64>,
 }
 
 /// What `--json` writes and `--compare` reads back: the runs, plus what was run
@@ -177,11 +180,15 @@ pub fn sampler(opts: &BenchOpts, seed: u64) -> Sampler {
 }
 
 /// Run every batch size in `opts.batch`, `opts.runs` times each, greedily or
-/// with the sampler `opts` asks for.
+/// with the sampler `opts` asks for. With `ngram_gamma`, a batch of one decodes
+/// speculatively, proposing that many tokens a round by n-gram lookup, as a
+/// lone served request does under `--speculative ngram`; larger batches decode
+/// plainly, as the scheduler runs them.
 pub fn run<K: ComputeKernel>(
     generator: &Generator<K>,
     prompt: &[u32],
     opts: &BenchOpts,
+    ngram_gamma: Option<usize>,
     mut on_result: impl FnMut(&RunResult, usize),
 ) -> Result<Vec<RunResult>> {
     if prompt.is_empty() || opts.gen_len == 0 || opts.runs == 0 {
@@ -196,14 +203,19 @@ pub fn run<K: ComputeKernel>(
         let mut results = Vec::new();
         for &batch in &opts.batch {
             for run in 0..opts.runs {
-                let r = run_once(
-                    generator,
-                    prompt,
-                    opts.gen_len,
-                    batch.max(1),
-                    opts.breakdown,
-                    |i| sampler(opts, i as u64 + 1),
-                )?;
+                let r = match ngram_gamma {
+                    Some(gamma) if batch <= 1 => {
+                        run_speculative(generator, prompt, opts.gen_len, gamma, sampler(opts, 1))?
+                    }
+                    _ => run_once(
+                        generator,
+                        prompt,
+                        opts.gen_len,
+                        batch.max(1),
+                        opts.breakdown,
+                        |i| sampler(opts, i as u64 + 1),
+                    )?,
+                };
                 on_result(&r, run);
                 results.push(r);
             }
@@ -273,6 +285,51 @@ fn run_once<K: ComputeKernel>(
             .collect(),
         vram_used_bytes,
         peak_rss_bytes: peak_rss_bytes(),
+        accept_rate: None,
+    })
+}
+
+/// One sequence decoded speculatively by n-gram lookup ([`SpeculativeSession`]):
+/// rounds until `gen_len` tokens are out. `ms_per_step` is per token, and
+/// `accept_rate` the share of proposals the target kept.
+///
+/// [`SpeculativeSession`]: crate::speculative::SpeculativeSession
+fn run_speculative<K: ComputeKernel>(
+    generator: &Generator<K>,
+    prompt: &[u32],
+    gen_len: usize,
+    gamma: usize,
+    sampler: Sampler,
+) -> Result<RunResult> {
+    let prefill_start = Instant::now();
+    let mut session =
+        crate::speculative::SpeculativeSession::ngram(generator, gamma, prompt, sampler)?;
+    let prefill = prefill_start.elapsed().as_secs_f64();
+    let decode_start = Instant::now();
+    let mut first_round = 0.0;
+    let mut produced = 0;
+    while produced < gen_len {
+        produced += session.step(gen_len - produced)?.len();
+        if first_round == 0.0 {
+            first_round = decode_start.elapsed().as_secs_f64();
+        }
+    }
+    let decode = decode_start.elapsed().as_secs_f64();
+    let vram_used_bytes = crate::gpu::mem_get_info().ok().map(|m| m.total - m.free);
+    Ok(RunResult {
+        batch: 1,
+        prefill_tok_s: prompt.len() as f64 / prefill,
+        ttft_ms: (prefill + first_round) * 1e3,
+        decode_tok_s: gen_len as f64 / decode,
+        ms_per_step: decode * 1e3 / gen_len as f64,
+        stage_ms_per_token: BTreeMap::new(),
+        vram_used_bytes,
+        peak_rss_bytes: peak_rss_bytes(),
+        accept_rate: Some(if session.proposed() == 0 {
+            0.0
+        } else {
+            session.accepted() as f64 / session.proposed() as f64
+        }),
     })
 }
 
@@ -308,6 +365,9 @@ pub fn summarize(results: &[RunResult]) -> Vec<RunResult> {
                 stage_ms_per_token: stages,
                 vram_used_bytes: runs.iter().filter_map(|r| r.vram_used_bytes).max(),
                 peak_rss_bytes: runs.iter().filter_map(|r| r.peak_rss_bytes).max(),
+                accept_rate: runs[0]
+                    .accept_rate
+                    .map(|_| med(&|r| r.accept_rate.unwrap_or(0.0))),
             }
         })
         .collect()
@@ -380,6 +440,7 @@ mod tests {
             stage_ms_per_token: BTreeMap::new(),
             vram_used_bytes: None,
             peak_rss_bytes: Some(1 << 30),
+            accept_rate: None,
         }
     }
 

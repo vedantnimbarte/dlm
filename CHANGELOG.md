@@ -40,6 +40,35 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **N-gram speculation now pays on the GPU, and `--speculative auto` turns it
+  on there.** A speculative round scores the pending token and its proposals
+  in one target pass, but on the GPU that pass went through the prefill GEMM,
+  which computes 64-token tiles, and each position then ran the LM head on its
+  own and copied its logits to the host. Verifying 5 tokens cost what decoding
+  them one by one did, so speculation could not win, and `auto` left it off for
+  resident models. Now a piece of 16 tokens or fewer goes through the batched
+  decode block (a verify, a short prompt, a long prompt's tail), and the verify
+  scores every position in one LM-head call (`Generator::distributions`), only
+  the argmax coming back under plain greedy. Batch 1 on a GTX 1650, n-gram
+  lookup proposing 4, decode tok/s (`dlm bench --speculative ngram`, which
+  now measures it):
+
+  | Model | Plain | Before | After | Accepted |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B bf16, greedy | 85 | 84 | 317 | 100% |
+  | Qwen2.5-0.5B Q4_K_M, greedy | 111 | 98 | 358 | 100% |
+  | Qwen2.5-1.5B Q4_K_M, greedy | 58 | 33 | 130 | 100% |
+  | Qwen2.5-0.5B Q4_K_M, temperature 1.2 | 71 | | 79 | 39% |
+  | Qwen2.5-1.5B Q4_K_M, temperature 1.2 | 52 | | 65 | 78% |
+
+  The bench prompt repeats, the case lookup is for, so the greedy rows are
+  its best case; real text proposes less often. A round whose every guess
+  misses costs about a third of a step more than a plain step (a 5-token
+  verify is 1.55x one). Several requests at once still decode plainly in one
+  batched pass, as before. Short prompts gain too: time to first token for 8
+  / 16 tokens 66 / 58 ms -> 30 / 39 ms. `--speculative off` restores plain
+  decoding; `dlm bench` stays plain unless asked.
+
 - **A batched decode layer launches Q/K/V as one GEMV and gate/up as
   another.** Each layer issued about 21 launches, and the host spent 5-8 ms
   of a batched step issuing them; on Qwen2.5-0.5B, K and V alone were 128 rows,
