@@ -2038,32 +2038,54 @@ __device__ __forceinline__ float fused_row_dot(const void* W, long base, long n,
     return warp_sum(s);
 }
 
+// Element `i` of a segment array, with constant indices: indexing the kernel's
+// parameter struct by a runtime value copies all of it to every thread's stack.
+template <typename T>
+__device__ __forceinline__ T seg_pick(const T (&a)[3], int i) {
+    return i == 0 ? a[0] : i == 1 ? a[1] : a[2];
+}
+// The segment holding row `o` of the concatenated rows, and its row within it.
+__device__ __forceinline__ int seg_row(const DlmSegs& s, int* o) {
+    if (s.nseg == 1 || *o < s.rows[0]) return 0;
+    *o -= s.rows[0];
+    if (s.nseg == 2 || *o < s.rows[1]) return 1;
+    *o -= s.rows[1];
+    return 2;
+}
+
 // Launch <<<ceil(total rows / MV_ROWS), 32 * MV_ROWS>>>; total rows is the sum
-// of the segments'.
+// of the segments'. The weights come in as their own read-only parameters as
+// well as in `s`, so their loads keep the read-only cache path. With the
+// segments read by runtime index the kernel carried an 88-byte stack and read
+// each row's weight pointer from it in the inner loop.
 template <int DT, int MODE>
 __global__ void __launch_bounds__(32 * MV_ROWS)
-matvec_fused_kernel(DlmSegs s, const float* __restrict__ x, const signed char* __restrict__ xq,
-                    const float2* __restrict__ xds, int in_dim, int group_size) {
+matvec_fused_kernel(const void* __restrict__ W0, const void* __restrict__ W1,
+                    const void* __restrict__ W2, DlmSegs s, const float* __restrict__ x,
+                    const signed char* __restrict__ xq, const float2* __restrict__ xds,
+                    int in_dim, int group_size) {
+    const void* const Ws[3] = {W0, W1, W2};
     int lane = threadIdx.x & 31;
+    const int total = s.rows[0] + (s.nseg > 1 ? s.rows[1] : 0) + (s.nseg > 2 ? s.rows[2] : 0);
     if (Dp4a<DT>::OK && xq) {
         // Q8Rows<DT>::R rows per warp, as `matvec_q8_kernel`; each row finds
         // its own segment, so a warp's rows may straddle Q, K and V.
         const int R = Q8Rows<DT>::R;
-        int total = 0;
-        for (int i = 0; i < s.nseg; ++i) total += s.rows[i];
         const int g0 = (blockIdx.x * MV_ROWS + (threadIdx.x >> 5)) * R;
         if (g0 >= total) return;
         int seg[R], row[R];
+        const void* W[R];
         long base[R], n[R];
         float acc[R];
         #pragma unroll
         for (int r = 0; r < R; ++r) {
-            int o = min(g0 + r, total - 1), sg = 0;   // a short tail repeats the last row
-            while (sg + 1 < s.nseg && o >= s.rows[sg]) o -= s.rows[sg++];
+            int o = min(g0 + r, total - 1);   // a short tail repeats the last row
+            const int sg = seg_row(s, &o);
             seg[r] = sg;
             row[r] = o;
+            W[r] = seg_pick(Ws, sg);
             base[r] = (long)o * in_dim;
-            n[r] = (long)s.rows[sg] * in_dim;
+            n[r] = (long)seg_pick(s.rows, sg) * in_dim;
             acc[r] = 0.0f;
         }
         for (int i = lane * 32; i < in_dim; i += 32 * 32) {
@@ -2071,29 +2093,32 @@ matvec_fused_kernel(DlmSegs s, const float* __restrict__ x, const signed char* _
             const float2 dx = xds[i >> 5];
             #pragma unroll
             for (int r = 0; r < R; ++r)
-                acc[r] += dp4a_dot<DT>(s.W[seg[r]], base[r] + i, n[r], group_size, xi, dx);
+                acc[r] += dp4a_dot<DT>(W[r], base[r] + i, n[r], group_size, xi, dx);
         }
         #pragma unroll
         for (int r = 0; r < R; ++r) {
             float v = warp_sum(acc[r]);
             if (lane != 0 || g0 + r >= total) continue;
-            if (s.bias[seg[r]]) v += s.bias[seg[r]][row[r]];
-            if (MODE == FUSE_RESID) s.out[seg[r]][row[r]] += v;
-            else s.out[seg[r]][row[r]] = v;
+            const float* bias = seg_pick(s.bias, seg[r]);
+            float* out = seg_pick(s.out, seg[r]);
+            if (bias) v += bias[row[r]];
+            if (MODE == FUSE_RESID) out[row[r]] += v;
+            else out[row[r]] = v;
         }
         return;
     }
     int o = blockIdx.x * MV_ROWS + (threadIdx.x >> 5);
-    int seg = 0;
-    while (seg + 1 < s.nseg && o >= s.rows[seg]) o -= s.rows[seg++];
-    if (o >= s.rows[seg]) return;
+    if (o >= total) return;
+    const int seg = seg_row(s, &o);
     long base = (long)o * in_dim;
-    long n = (long)s.rows[seg] * in_dim;
-    float v = fused_row_dot<DT>(s.W[seg], base, n, group_size, x, xq, xds, in_dim, lane);
-    if (s.bias[seg]) v += s.bias[seg][o];
+    long n = (long)seg_pick(s.rows, seg) * in_dim;
+    float v = fused_row_dot<DT>(seg_pick(Ws, seg), base, n, group_size, x, xq, xds, in_dim, lane);
+    const float* bias = seg_pick(s.bias, seg);
+    float* out = seg_pick(s.out, seg);
+    if (bias) v += bias[o];
     if (lane == 0) {
-        if (MODE == FUSE_RESID) s.out[seg][o] += v;
-        else s.out[seg][o] = v;
+        if (MODE == FUSE_RESID) out[o] += v;
+        else out[o] = v;
     }
 }
 
@@ -2118,9 +2143,9 @@ static bool launch_fused(int mode, int dt, int group_size, const DlmSegs& s, con
         const int per_block = (xq ? (int)Q8Rows<D>::R : 1) * MV_ROWS;               \
         dim3 grid((rows + per_block - 1) / per_block);                              \
         if (mode == FUSE_RESID)                                                     \
-            matvec_fused_kernel<D, FUSE_RESID><<<grid, block>>>(s, x, xq, xds, in_dim, group_size); \
+            matvec_fused_kernel<D, FUSE_RESID><<<grid, block>>>(s.W[0], s.W[1], s.W[2], s, x, xq, xds, in_dim, group_size); \
         else                                                                        \
-            matvec_fused_kernel<D, FUSE_PLAIN><<<grid, block>>>(s, x, xq, xds, in_dim, group_size); \
+            matvec_fused_kernel<D, FUSE_PLAIN><<<grid, block>>>(s.W[0], s.W[1], s.W[2], s, x, xq, xds, in_dim, group_size); \
         return true;                                                                \
     }
     switch (dt) {

@@ -40,6 +40,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Single-request decode is 13-22% faster: the fused GEMV no longer spills
+  to the stack.** The kernel that runs a layer's Q/K/V, output and down
+  projections for one sequence found each row's matrix by indexing its
+  segment struct with a runtime value, which copied all 88 bytes of it to
+  every thread's stack, and then read the row's weight pointer from that stack
+  inside its inner loop. It now selects with constant indices and takes the
+  weights as their own read-only parameters (`STACK:0`). Batch-1 decode,
+  GTX 1650, tok/s: Qwen2.5-0.5B bf16 85 -> 104, Q4_K_M 110 -> 133, Q8_0
+  109 -> 130, Qwen2.5-1.5B Q4_K_M 59 -> 67. bf16 batch 1 now matches the 101
+  tok/s vLLM (fp16) made on this card. Batched decode runs other kernels and
+  is unchanged.
+
 - **N-gram speculation now pays on the GPU, and `--speculative auto` turns it
   on there.** A speculative round scores the pending token and its proposals
   in one target pass, but on the GPU that pass went through the prefill GEMM,
