@@ -40,6 +40,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The GPU's KV cache is int8 by default** (`--kv-quant auto`): 56% of
+  fp16's memory, so 1.76x the tokens in the same VRAM, at the speed of fp16
+  (Qwen2.5-0.5B, 1,024-token prompts: batch 1 97-100 against 99-100 tok/s,
+  batch 16 390-398 against 381-387). The key balancing below is what made it
+  safe to: int8 now scores within 0.005 nats per token of fp16 on every model
+  measured. `--kv-quant f16` keeps the old cache; the CPU kernels keep f32
+  under `auto` as before. `dlm bench` follows the default too: compare against
+  a baseline saved before this with `--kv-quant f16`.
+
 - **A quantized KV cache no longer loses Qwen's small key channels.** A few
   key channels on Qwen2.5 are a hundred times the rest (its `k_proj` bias puts
   130-240 on them in layers 0-2 and 8, where others are 1-6), and an int8 cache
