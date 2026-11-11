@@ -519,6 +519,9 @@ struct ChatRequest {
     /// And this many of the most likely tokens at each position (0-20).
     #[serde(default)]
     top_logprobs: Option<usize>,
+    /// How many completions to generate for the prompt (1-16).
+    #[serde(default)]
+    n: Option<usize>,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -575,6 +578,27 @@ const DRY_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
 /// An out-of-range value is a client error, not something to clamp quietly: a
 /// client that asked for it would otherwise get output it did not ask for and no
 /// sign why.
+/// Most completions one request may ask for (`n`).
+const MAX_N: usize = 16;
+
+/// One [`Decoding`] per choice of a request asking for `n`: a sampled choice
+/// draws with its own seed, `seed + i`, so the choices differ.
+fn choices(decoding: Decoding, n: Option<usize>) -> Result<Vec<Decoding>, String> {
+    let n = n.unwrap_or(1);
+    if !(1..=MAX_N).contains(&n) {
+        return Err(format!("n must be between 1 and {MAX_N}"));
+    }
+    Ok((0..n as u64)
+        .map(|i| {
+            let mut d = decoding.clone();
+            if let Sampler::TopPK { seed, .. } = &mut d.sampler {
+                *seed = seed.wrapping_add(i);
+            }
+            d
+        })
+        .collect())
+}
+
 /// Most alternatives a request may ask for per token, as OpenAI allows.
 const MAX_TOP_LOGPROBS: usize = 20;
 
@@ -774,16 +798,6 @@ struct TopLogprob {
 fn token_piece(engine: &EngineService, id: u32) -> (String, Vec<u8>) {
     let bytes = engine.tokenizer.token_bytes(id).unwrap_or_default();
     (String::from_utf8_lossy(&bytes).into_owned(), bytes)
-}
-
-/// Characters `ids` decode to: the offset of the token after them.
-fn sent_chars_of(engine: &EngineService, ids: &[u32]) -> usize {
-    engine
-        .tokenizer
-        .decode(ids)
-        .unwrap_or_default()
-        .chars()
-        .count()
 }
 
 fn chat_logprob(engine: &EngineService, id: u32, lp: &TokenLogprobs) -> ChatTokenLogprob {
@@ -1436,8 +1450,39 @@ fn collect_completion(
     decoding: Decoding,
     stops: &[String],
 ) -> Generated {
+    collect_completions(engine, ids, max_tokens, vec![decoding], stops).remove(0)
+}
+
+/// [`collect_completion`] for several choices of one prompt: all are queued
+/// before any is read, so they decode in the same batch (and share the prompt's
+/// cached prefix). The prompt counts once.
+fn collect_completions(
+    engine: &Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    decodings: Vec<Decoding>,
+    stops: &[String],
+) -> Vec<Generated> {
     let prompt_tokens = ids.len();
-    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
+    let rxs: Vec<_> = decodings
+        .into_iter()
+        .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
+        .collect();
+    let out: Vec<Generated> = rxs
+        .into_iter()
+        .map(|rx| collect_from(engine, rx, prompt_tokens, stops))
+        .collect();
+    engine.record(prompt_tokens, out.iter().map(|g| g.completion_tokens).sum());
+    out
+}
+
+/// Read one choice's tokens to its end (see [`collect_completion`]).
+fn collect_from(
+    engine: &Arc<EngineService>,
+    rx: Receiver<TokenEvent>,
+    prompt_tokens: usize,
+    stops: &[String],
+) -> Generated {
     let mut tokens = Vec::new();
     let mut lps = Vec::new();
     let mut spec = None;
@@ -1480,7 +1525,6 @@ fn collect_completion(
             None => Finish::Length,
         }
     };
-    engine.record(prompt_tokens, completion_tokens);
     // Each token's offset, keeping those that start inside the returned text
     // (a stop sequence cuts the rest).
     let mut logprobs = Vec::new();
@@ -1508,6 +1552,113 @@ fn collect_completion(
     }
 }
 
+/// One choice of a streamed response: the tokens so far, the text sent, and
+/// how it ended. Shared by the chat and completions streams.
+struct Streamed {
+    /// `None` once the choice is over; dropping it ends its generation.
+    rx: Option<Receiver<TokenEvent>>,
+    ids: Vec<u32>,
+    /// Characters `ids` decode to.
+    chars: usize,
+    /// Characters sent.
+    sent: usize,
+    finish: &'static str,
+    spec: Option<AcceptanceStats>,
+    /// Tokens with log-probabilities whose text has not gone out, with their
+    /// character offsets.
+    pending: Vec<(u32, TokenLogprobs, usize)>,
+}
+
+impl Streamed {
+    fn new(rx: Receiver<TokenEvent>) -> Self {
+        Streamed {
+            rx: Some(rx),
+            ids: Vec::new(),
+            chars: 0,
+            sent: 0,
+            finish: "length",
+            spec: None,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Take one event: the text it completes, if any.
+    ///
+    /// Decodes the whole run, never a lone token: byte-level BPE splits one
+    /// UTF-8 character (emoji, CJK, accents) across several tokens, and a
+    /// fragment decoded alone renders as U+FFFD. Emitting the newly completed
+    /// characters is correct with or without stop sequences.
+    fn take(&mut self, engine: &EngineService, stops: &[String], ev: TokenEvent) -> Option<String> {
+        match ev {
+            TokenEvent::Next(t, lp) => {
+                // EOS is emitted inclusively; stop without showing it.
+                if engine.eos_tokens.contains(&t) {
+                    self.finish = "stop";
+                    self.rx = None;
+                    return None;
+                }
+                if let Some(lp) = lp {
+                    self.pending.push((t, lp, self.chars));
+                }
+                self.ids.push(t);
+                let full = engine.tokenizer.decode(&self.ids).unwrap_or_default();
+                self.chars = full.chars().count();
+                let cut = earliest_stop(&full, stops);
+                let visible = &full[..cut.unwrap_or(full.len())];
+                let shown = visible.chars().count();
+                let delta = (shown > self.sent).then(|| {
+                    let d: String = visible.chars().skip(self.sent).collect();
+                    self.sent = shown;
+                    d
+                });
+                if cut.is_some() {
+                    self.finish = "stop";
+                    self.rx = None;
+                }
+                delta
+            }
+            TokenEvent::Done(stats) => {
+                self.spec = stats;
+                self.rx = None;
+                None
+            }
+        }
+    }
+}
+
+/// Feed each choice its events until all are over, calling `send(index,
+/// choice, text)` for every piece of new text. One choice waits on its
+/// receiver; several take turns.
+fn stream_choices(
+    engine: &EngineService,
+    rxs: Vec<Receiver<TokenEvent>>,
+    stops: &[String],
+    mut send: impl FnMut(usize, &mut Streamed, String) -> std::io::Result<()>,
+) -> std::io::Result<Vec<Streamed>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut choices: Vec<Streamed> = rxs.into_iter().map(Streamed::new).collect();
+    let wait = if choices.len() == 1 {
+        std::time::Duration::from_secs(3600)
+    } else {
+        std::time::Duration::from_millis(1)
+    };
+    while choices.iter().any(|c| c.rx.is_some()) {
+        for (i, c) in choices.iter_mut().enumerate() {
+            let Some(rx) = &c.rx else { continue };
+            match rx.recv_timeout(wait) {
+                Ok(ev) => {
+                    if let Some(text) = c.take(engine, stops, ev) {
+                        send(i, c, text)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => c.rx = None,
+            }
+        }
+    }
+    Ok(choices)
+}
+
 fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let parsed: ChatRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
@@ -1531,7 +1682,9 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Ok(l) => l,
         Err(e) => return Response::json(400, error_json(&e)),
     };
-    let decoding = match decoding(engine, sampler, parsed.extra, logprobs) {
+    let decodings = match decoding(engine, sampler, parsed.extra, logprobs)
+        .and_then(|d| choices(d, parsed.n))
+    {
         Ok(d) => d,
         Err(e) => return Response::json(400, error_json(&e)),
     };
@@ -1539,37 +1692,44 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_chat(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
+        stream_chat(Arc::clone(engine), ids, max_tokens, model, decodings, stops)
     } else {
-        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
+        let prompt_tokens = ids.len();
+        let gs = collect_completions(engine, ids, max_tokens, decodings, &stops);
+        let completion_tokens = gs.iter().map(|g| g.completion_tokens).sum();
+        let spec = if gs.len() == 1 { gs[0].spec } else { None };
         let body = ChatResponse {
             id: format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed)),
             object: "chat.completion",
             created: engine.created,
             model,
-            choices: vec![Choice {
-                index: 0,
-                message: RespMessage {
-                    role: "assistant",
-                    content: g.text,
-                },
-                finish_reason: match g.finish {
-                    Finish::Length => "length",
-                    _ => "stop",
-                },
-                logprobs: logprobs.map(|_| ChatLogprobs {
-                    content: g
-                        .logprobs
-                        .iter()
-                        .map(|(t, lp, _)| chat_logprob(engine, *t, lp))
-                        .collect(),
-                }),
-            }],
+            choices: gs
+                .into_iter()
+                .enumerate()
+                .map(|(index, g)| Choice {
+                    index,
+                    finish_reason: match g.finish {
+                        Finish::Length => "length",
+                        _ => "stop",
+                    },
+                    logprobs: logprobs.map(|_| ChatLogprobs {
+                        content: g
+                            .logprobs
+                            .iter()
+                            .map(|(t, lp, _)| chat_logprob(engine, *t, lp))
+                            .collect(),
+                    }),
+                    message: RespMessage {
+                        role: "assistant",
+                        content: g.text,
+                    },
+                })
+                .collect(),
             usage: Usage {
-                prompt_tokens: g.prompt_tokens,
-                completion_tokens: g.completion_tokens,
-                total_tokens: g.prompt_tokens + g.completion_tokens,
-                speculative: g.spec.map(SpeculativeUsage::from),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                speculative: spec.map(SpeculativeUsage::from),
             },
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
@@ -1606,6 +1766,9 @@ struct CompletionRequest {
     /// Return each token's log-probability and this many alternatives (0-20).
     #[serde(default)]
     logprobs: Option<usize>,
+    /// How many completions to generate for the prompt (1-16).
+    #[serde(default)]
+    n: Option<usize>,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -1678,7 +1841,9 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
         Ok(l) => l,
         Err(e) => return Response::json(400, error_json(&e)),
     };
-    let decoding = match decoding(engine, sampler, parsed.extra, logprobs) {
+    let decodings = match decoding(engine, sampler, parsed.extra, logprobs)
+        .and_then(|d| choices(d, parsed.n))
+    {
         Ok(d) => d,
         Err(e) => return Response::json(400, error_json(&e)),
     };
@@ -1686,54 +1851,63 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_completion(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
+        stream_completion(Arc::clone(engine), ids, max_tokens, model, decodings, stops)
     } else {
-        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
+        let prompt_tokens = ids.len();
+        let gs = collect_completions(engine, ids, max_tokens, decodings, &stops);
+        let completion_tokens = gs.iter().map(|g| g.completion_tokens).sum();
+        let spec = if gs.len() == 1 { gs[0].spec } else { None };
         let body = CompletionResponse {
             id: format!("cmpl-{id}"),
             object: "text_completion",
             created: engine.created,
             model,
-            choices: vec![CompletionChoice {
-                index: 0,
-                text: g.text,
-                finish_reason: match g.finish {
-                    Finish::Length => "length",
-                    _ => "stop",
-                },
-                logprobs: logprobs.map(|_| {
-                    let mut out = CompletionLogprobs::default();
-                    for (t, lp, offset) in &g.logprobs {
-                        out.push(engine, *t, lp, *offset);
-                    }
-                    out
-                }),
-            }],
+            choices: gs
+                .into_iter()
+                .enumerate()
+                .map(|(index, g)| CompletionChoice {
+                    index,
+                    finish_reason: match g.finish {
+                        Finish::Length => "length",
+                        _ => "stop",
+                    },
+                    logprobs: logprobs.map(|_| {
+                        let mut out = CompletionLogprobs::default();
+                        for (t, lp, offset) in &g.logprobs {
+                            out.push(engine, *t, lp, *offset);
+                        }
+                        out
+                    }),
+                    text: g.text,
+                })
+                .collect(),
             usage: Usage {
-                prompt_tokens: g.prompt_tokens,
-                completion_tokens: g.completion_tokens,
-                total_tokens: g.prompt_tokens + g.completion_tokens,
-                speculative: g.spec.map(SpeculativeUsage::from),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                speculative: spec.map(SpeculativeUsage::from),
             },
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
     }
 }
 
-/// Stream a `/v1/completions` response as SSE `text_completion` chunks. Mirrors
-/// [`stream_chat`] but carries the token piece in `text` and has no role chunk.
+/// Stream a `/v1/completions` response as SSE `text_completion` chunks, each
+/// choice's under its `index`. Mirrors [`stream_chat`] but carries the text in
+/// `text` and has no role chunk.
 fn stream_completion(
     engine: Arc<EngineService>,
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    decoding: Decoding,
+    decodings: Vec<Decoding>,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("cmpl-{}", engine.next_id.load(Ordering::Relaxed));
         let created = engine.created;
         let send_chunk = |w: &mut dyn std::io::Write,
+                          index: usize,
                           text: String,
                           finish: Option<&'static str>,
                           logprobs: Option<CompletionLogprobs>|
@@ -1744,7 +1918,7 @@ fn stream_completion(
                 created,
                 model: model.clone(),
                 choices: vec![CompletionChunkChoice {
-                    index: 0,
+                    index,
                     text,
                     finish_reason: finish,
                     logprobs,
@@ -1757,59 +1931,31 @@ fn stream_completion(
         };
 
         let prompt_tokens = ids.len();
-        let mut completion_tokens = 0usize;
-        let mut spec = None;
-        let mut acc_ids: Vec<u32> = Vec::new();
-        let mut sent_chars = 0usize;
-        let mut finish = "length";
-        // Tokens whose text has not gone out yet, with their offsets.
-        let mut pending: Option<CompletionLogprobs> =
-            decoding.logprobs.map(|_| CompletionLogprobs::default());
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
-        for ev in rx {
-            match ev {
-                TokenEvent::Next(t, lp) => {
-                    if engine.eos_tokens.contains(&t) {
-                        finish = "stop";
-                        break;
-                    }
-                    completion_tokens += 1;
-                    if let (Some(p), Some(lp)) = (pending.as_mut(), lp.as_ref()) {
-                        p.push(&engine, t, lp, sent_chars_of(&engine, &acc_ids));
-                    }
-                    // Always decode the accumulated ids, never the token alone.
-                    // Byte-level BPE splits one UTF-8 character (emoji, CJK,
-                    // accents) across several tokens, so decoding a fragment in
-                    // isolation lossily renders it as U+FFFD. Decoding the run
-                    // and emitting the newly-completed characters is correct for
-                    // both the stop-sequence and the no-stop case.
-                    acc_ids.push(t);
-                    let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
-                    let cut = earliest_stop(&full, &stops);
-                    let visible = &full[..cut.unwrap_or(full.len())];
-                    let vis_chars = visible.chars().count();
-                    if vis_chars > sent_chars {
-                        let delta: String = visible.chars().skip(sent_chars).collect();
-                        sent_chars = vis_chars;
-                        let lps = pending.as_mut().map(std::mem::take);
-                        send_chunk(w, delta, None, lps)?;
-                    }
-                    if cut.is_some() {
-                        finish = "stop";
-                        break;
-                    }
+        let logprobs = decodings[0].logprobs.is_some();
+        let rxs = decodings
+            .into_iter()
+            .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
+            .collect();
+        let choices = stream_choices(&engine, rxs, &stops, |i, c, text| {
+            let lps = logprobs.then(|| {
+                let mut out = CompletionLogprobs::default();
+                for (t, lp, offset) in std::mem::take(&mut c.pending) {
+                    out.push(&engine, t, &lp, offset);
                 }
-                TokenEvent::Done(stats) => {
-                    spec = stats;
-                    break;
-                }
-            }
-        }
+                out
+            });
+            send_chunk(w, i, text, None, lps)
+        })?;
+        let completion_tokens = choices.iter().map(|c| c.ids.len()).sum();
         engine.record(prompt_tokens, completion_tokens);
+        for (i, c) in choices.iter().enumerate() {
+            send_chunk(w, i, String::new(), Some(c.finish), None)?;
+        }
 
-        send_chunk(w, String::new(), Some(finish), None)?;
-
-        if let Some(stats) = spec {
+        if let [Streamed {
+            spec: Some(stats), ..
+        }] = choices.as_slice()
+        {
             let chunk = CompletionChunk {
                 id: id.clone(),
                 object: "text_completion",
@@ -1820,7 +1966,7 @@ fn stream_completion(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
-                    speculative: Some(stats.into()),
+                    speculative: Some((*stats).into()),
                 }),
             };
             let json = serde_json::to_string(&chunk).unwrap_or_default();
@@ -2192,19 +2338,23 @@ fn stream_messages(
     })
 }
 
-/// Stream a chat completion as Server-Sent Events.
+/// Stream a chat completion as SSE `chat.completion.chunk`s, each choice's
+/// under its `index`: a role chunk, the text as it completes (with the
+/// log-probabilities of the tokens behind it when asked for), and a final
+/// chunk with the finish reason.
 fn stream_chat(
     engine: Arc<EngineService>,
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    decoding: Decoding,
+    decodings: Vec<Decoding>,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed));
         let created = engine.created;
         let send_chunk = |w: &mut dyn std::io::Write,
+                          index: usize,
                           delta: Delta,
                           finish: Option<&'static str>,
                           logprobs: Option<ChatLogprobs>|
@@ -2215,7 +2365,7 @@ fn stream_chat(
                 created,
                 model: model.clone(),
                 choices: vec![ChunkChoice {
-                    index: 0,
+                    index,
                     delta,
                     finish_reason: finish,
                     logprobs,
@@ -2227,94 +2377,50 @@ fn stream_chat(
             w.flush()
         };
 
-        // First chunk announces the assistant role.
-        send_chunk(
-            w,
-            Delta {
+        // First, each choice announces the assistant role.
+        for i in 0..decodings.len() {
+            let role = Delta {
                 role: Some("assistant"),
                 content: None,
-            },
-            None,
-            None,
-        )?;
-        // Tokens whose text has not gone out yet.
-        let mut pending: Option<Vec<ChatTokenLogprob>> = decoding.logprobs.map(|_| Vec::new());
+            };
+            send_chunk(w, i, role, None, None)?;
+        }
 
         let prompt_tokens = ids.len();
-        let mut completion_tokens = 0usize;
-        let mut spec = None;
-        // Only needed with stop sequences: accumulate ids and re-decode so a stop
-        // spanning multiple tokens is detected and the visible text truncated.
-        let mut acc_ids: Vec<u32> = Vec::new();
-        let mut sent_chars = 0usize;
-        let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
-        for ev in rx {
-            match ev {
-                TokenEvent::Next(t, lp) => {
-                    // EOS is emitted inclusively; stop without showing it.
-                    if engine.eos_tokens.contains(&t) {
-                        finish = "stop";
-                        break;
-                    }
-                    completion_tokens += 1;
-                    if let (Some(p), Some(lp)) = (pending.as_mut(), lp.as_ref()) {
-                        p.push(chat_logprob(&engine, t, lp));
-                    }
-                    {
-                        // Decode the accumulated run, never a lone token: byte-level
-                        // BPE splits one UTF-8 character (emoji, CJK, accents) across
-                        // several tokens, and decoding a fragment by itself renders it
-                        // as U+FFFD. Emitting newly-completed characters from the full
-                        // decode is correct with or without stop sequences.
-                        acc_ids.push(t);
-                        let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
-                        let cut = earliest_stop(&full, &stops);
-                        let visible = &full[..cut.unwrap_or(full.len())];
-                        let vis_chars = visible.chars().count();
-                        if vis_chars > sent_chars {
-                            let delta: String = visible.chars().skip(sent_chars).collect();
-                            sent_chars = vis_chars;
-                            let lps = pending.as_mut().map(|p| ChatLogprobs {
-                                content: std::mem::take(p),
-                            });
-                            send_chunk(
-                                w,
-                                Delta {
-                                    role: None,
-                                    content: Some(delta),
-                                },
-                                None,
-                                lps,
-                            )?;
-                        }
-                        if cut.is_some() {
-                            finish = "stop";
-                            break;
-                        }
-                    }
-                }
-                TokenEvent::Done(stats) => {
-                    spec = stats;
-                    break;
-                }
-            }
-        }
+        let logprobs = decodings[0].logprobs.is_some();
+        let rxs = decodings
+            .into_iter()
+            .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
+            .collect();
+        let choices = stream_choices(&engine, rxs, &stops, |i, c, text| {
+            let lps = logprobs.then(|| ChatLogprobs {
+                content: std::mem::take(&mut c.pending)
+                    .iter()
+                    .map(|(t, lp, _)| chat_logprob(&engine, *t, lp))
+                    .collect(),
+            });
+            let delta = Delta {
+                role: None,
+                content: Some(text),
+            };
+            send_chunk(w, i, delta, None, lps)
+        })?;
+        let completion_tokens = choices.iter().map(|c| c.ids.len()).sum();
         engine.record(prompt_tokens, completion_tokens);
-
-        send_chunk(
-            w,
-            Delta {
+        for (i, c) in choices.iter().enumerate() {
+            let end = Delta {
                 role: None,
                 content: None,
-            },
-            Some(finish),
-            None,
-        )?;
+            };
+            send_chunk(w, i, end, Some(c.finish), None)?;
+        }
 
         // When speculating, a final usage-only chunk carries the acceptance
         // stats (OpenAI-style: empty choices + a `usage` object).
-        if let Some(stats) = spec {
+        if let [Streamed {
+            spec: Some(stats), ..
+        }] = choices.as_slice()
+        {
             let chunk = Chunk {
                 id: id.clone(),
                 object: "chat.completion.chunk",
@@ -2325,7 +2431,7 @@ fn stream_chat(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
-                    speculative: Some(stats.into()),
+                    speculative: Some((*stats).into()),
                 }),
             };
             let json = serde_json::to_string(&chunk).unwrap_or_default();

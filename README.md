@@ -852,7 +852,10 @@ inference engine):
   streamed or not, from the model's distribution before sampling settings
   reshape it, as OpenAI and vLLM report them. A request asking for them
   decodes plainly (no speculation) and reads the whole row of logits each
-  step. `stop` (OpenAI) / `stop_sequences`
+  step. **`n`** (1-16, both OpenAI endpoints) returns that many completions of
+  the prompt, decoded together in one batch; a sampled choice `i` draws with
+  seed `seed + i`, so the choices differ, and streamed chunks carry each
+  choice's `index`. `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,

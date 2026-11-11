@@ -1,6 +1,7 @@
-//! `logprobs` on the OpenAI endpoints: each output token's log-probability and
-//! its most likely alternatives, in chat's and the legacy completions' shapes,
-//! streamed or not. Asking for them must not change what is generated.
+//! The OpenAI request fields beyond sampling: `logprobs` (each output token's
+//! log-probability and its most likely alternatives, in chat's and the legacy
+//! completions' shapes, streamed or not; asking for them must not change what
+//! is generated) and `n` (several completions of one prompt).
 
 use dlm::cache::KvCacheConfig;
 use dlm::forward::{BlockConfig, CpuKernel, LayerTensors};
@@ -258,5 +259,109 @@ fn bad_logprob_requests_are_refused() {
     ] {
         let (status, resp) = post(addr, path, &body);
         assert!(status.contains("400"), "{body}: {status} {resp}");
+    }
+}
+
+fn contents(r: &Value) -> Vec<String> {
+    r["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["message"]["content"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn n_samples_several_choices_each_with_its_own_seed() {
+    let addr = start_server();
+    let ask = |extra: &str| {
+        let (status, body) = post(
+            addr,
+            "/v1/chat/completions",
+            &format!(r#"{{{CHAT},"temperature":1.5,{extra}}}"#),
+        );
+        assert!(status.contains("200"), "{status} {body}");
+        json(&body)
+    };
+    let r = ask(r#""seed":40,"n":3"#);
+    let indexes: Vec<u64> = r["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["index"].as_u64().unwrap())
+        .collect();
+    assert_eq!(indexes, vec![0, 1, 2]);
+    // Choice i draws as a lone request seeded `seed + i` does.
+    let got = contents(&r);
+    for (i, text) in got.iter().enumerate() {
+        let alone = ask(&format!(r#""seed":{}"#, 40 + i));
+        assert_eq!(&contents(&alone)[0], text, "choice {i}");
+    }
+    assert!(
+        got[0] != got[1] || got[1] != got[2],
+        "three seeds, one text: {got:?}"
+    );
+    // The prompt counts once; the completions add up.
+    let usage = &r["usage"];
+    let prompt = usage["prompt_tokens"].as_u64().unwrap();
+    assert_eq!(usage["completion_tokens"].as_u64().unwrap(), 18);
+    assert_eq!(usage["total_tokens"].as_u64().unwrap(), prompt + 18);
+}
+
+#[test]
+fn n_streams_each_choice_under_its_index() {
+    let addr = start_server();
+    let ask = format!(r#"{CHAT},"temperature":1.5,"seed":9,"n":2"#);
+    let (_, whole) = post(addr, "/v1/chat/completions", &format!("{{{ask}}}"));
+    let want = contents(&json(&whole));
+    let (_, stream) = post(
+        addr,
+        "/v1/chat/completions",
+        &format!(r#"{{{ask},"stream":true}}"#),
+    );
+    let mut text = vec![String::new(); 2];
+    let mut finished = [0; 2];
+    for e in events(&stream) {
+        let c = &e["choices"][0];
+        let i = c["index"].as_u64().unwrap() as usize;
+        text[i] += c["delta"]["content"].as_str().unwrap_or("");
+        if !c["finish_reason"].is_null() {
+            finished[i] += 1;
+        }
+    }
+    assert_eq!(text, want);
+    assert_eq!(finished, [1, 1]);
+}
+
+#[test]
+fn completions_take_n_too() {
+    let addr = start_server();
+    let (_, body) = post(
+        addr,
+        "/v1/completions",
+        r#"{"prompt":"Hello","max_tokens":4,"n":2,"logprobs":1}"#,
+    );
+    let r = json(&body);
+    let choices = r["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 2, "{body}");
+    // Greedy: both choices are the one most likely text.
+    assert_eq!(choices[0]["text"], choices[1]["text"]);
+    assert_eq!(choices[1]["index"], 1);
+    assert_eq!(
+        choices[1]["logprobs"]["tokens"].as_array().unwrap().len(),
+        4
+    );
+}
+
+#[test]
+fn n_out_of_range_is_refused() {
+    let addr = start_server();
+    for n in [0, 17] {
+        let (status, body) = post(
+            addr,
+            "/v1/chat/completions",
+            &format!(r#"{{{CHAT},"n":{n}}}"#),
+        );
+        assert!(status.contains("400"), "n {n}: {status} {body}");
     }
 }

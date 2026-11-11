@@ -503,6 +503,15 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`n` on the OpenAI endpoints: several completions of one prompt.** It was
+  ignored. Chat and `/v1/completions` now return `n` choices (1-16), queued
+  together so they decode in one batch and share the prompt's cached prefix;
+  sampled choice `i` draws with seed `seed + i`, so the choices differ and each
+  can be reproduced alone. Streamed, every chunk carries its choice's `index`,
+  and each choice ends with its own finish reason. Usage counts the prompt
+  once. The chat and completions streams now share one per-choice decoder
+  (`Streamed`), where they had a copy each.
+
 - **`logprobs` on the OpenAI endpoints.** `logprobs` was always `null`. Chat
   now takes `logprobs: true` and `top_logprobs` (0-20) and returns
   `choices[].logprobs.content[]` with each token's text, `logprob`, `bytes`
