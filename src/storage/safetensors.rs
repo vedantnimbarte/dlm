@@ -12,6 +12,7 @@
 //! straight out of the memory map (see [`crate::storage::MmapStore`]).
 
 use crate::error::{DlmError, Result};
+use crate::storage::ggml_quant::GgmlKind;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -61,6 +62,29 @@ pub enum Dtype {
     /// ggml `Q6_K`: 256 weights in sixteen 16-weight sub-blocks, 6-bit weights
     /// with an int8 scale each. 210 bytes.
     Q6K,
+    /// ggml `Q2_K`: 256 weights in sixteen 16-weight sub-blocks, 2-bit weights
+    /// with a 4-bit scale and minimum each. 84 bytes.
+    Q2K,
+    /// ggml `Q3_K`: 256 weights in sixteen 16-weight sub-blocks, 3-bit weights
+    /// with a 6-bit signed scale each. 110 bytes.
+    Q3K,
+    /// ggml's importance-matrix quants: weights picked from a fixed codebook of
+    /// 8 (IQ2) or 4 (IQ3) at a time, with signs and a scale per 16 or 32.
+    /// `IQ2_XXS`, 66 bytes per 256 weights.
+    IQ2XXS,
+    /// `IQ2_XS`, 74 bytes per 256 weights.
+    IQ2XS,
+    /// `IQ2_S`, 82 bytes per 256 weights.
+    IQ2S,
+    /// `IQ3_XXS`, 98 bytes per 256 weights.
+    IQ3XXS,
+    /// `IQ3_S`, 110 bytes per 256 weights.
+    IQ3S,
+    /// `IQ4_NL`: `Q4_0` with its 16 levels spaced non-linearly. 18 bytes per 32.
+    IQ4NL,
+    /// `IQ4_XS`: `IQ4_NL` levels with a 6-bit scale per 32 weights. 136 bytes
+    /// per 256.
+    IQ4XS,
 }
 
 impl Dtype {
@@ -72,42 +96,22 @@ impl Dtype {
             Dtype::I16 | Dtype::U16 | Dtype::F16 | Dtype::BF16 => 2,
             Dtype::I32 | Dtype::U32 | Dtype::F32 => 4,
             Dtype::I64 | Dtype::U64 | Dtype::F64 => 8,
-            // Not element-addressable. Callers that can meet a block type use
-            // `byte_len`; the safetensors parser, the only caller of this, cannot
-            // see one, since no safetensors dtype tag maps to these.
-            Dtype::Q4_0
-            | Dtype::Q4_1
-            | Dtype::Q5_0
-            | Dtype::Q5_1
-            | Dtype::Q8_0
-            | Dtype::Q4K
-            | Dtype::Q5K
-            | Dtype::Q6K => 0,
+            // The ggml block types are not element-addressable. Callers that
+            // can meet one use `byte_len`; the safetensors parser, the only
+            // caller of this, cannot see one, since no safetensors dtype tag
+            // maps to these.
+            _ => 0,
         }
     }
 
     /// Weights per storage block: 1 for every dtype that stores them one by one.
     pub fn block_elems(self) -> usize {
-        match self {
-            Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q5_0 | Dtype::Q5_1 | Dtype::Q8_0 => 32,
-            Dtype::Q4K | Dtype::Q5K | Dtype::Q6K => 256,
-            _ => 1,
-        }
+        GgmlKind::from_dtype(self).map_or(1, GgmlKind::block_elems)
     }
 
     /// Bytes per storage block.
     pub fn block_bytes(self) -> usize {
-        match self {
-            Dtype::Q4_0 => 18,
-            Dtype::Q4_1 => 20,
-            Dtype::Q5_0 => 22,
-            Dtype::Q5_1 => 24,
-            Dtype::Q8_0 => 34,
-            Dtype::Q4K => 144,
-            Dtype::Q5K => 176,
-            Dtype::Q6K => 210,
-            other => other.size_in_bytes(),
-        }
+        GgmlKind::from_dtype(self).map_or(self.size_in_bytes(), GgmlKind::block_bytes)
     }
 
     /// Bytes `elements` weights of this dtype occupy.

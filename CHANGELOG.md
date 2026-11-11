@@ -442,6 +442,32 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **2- and 3-bit GGUF files: Q2_K, Q3_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+  IQ3_S, IQ4_NL and IQ4_XS.** These were refused by name, which ruled out every
+  `Q2_K`, `Q3_K_*`, `IQ2_*`, `IQ3_*` and `IQ4_*` download, the files that make a
+  model fit a small card. They decode on the CPU and the GPU, in the GPU's
+  int8-activation GEMV, its f32 chunk path and its prefill GEMM, from one
+  decoder per format on each side; the IQ codebooks are ggml's (MIT), generated
+  from `ggml-common.h`. IQ1 is still refused.
+  - **Checked against llama.cpp**: `tests/ggml_blocks.rs` decodes random blocks of
+    every type against llama.cpp's reference decoder (a 55 KB fixture, so it runs
+    in CI), and Qwen2.5-0.5B `Q2_K` and `Q3_K_M` decode to llama.cpp's f32 copy
+    of every tensor. On the GPU, the identity matrix through the LM head returns
+    each decoded weight exactly as the CPU decodes it (`tests/gpu_parity.rs`).
+  - **Quality**, Qwen2.5-0.5B on one 228-token passage, nats per token (GPU; the
+    CPU agrees within 0.006): `Q4_K_M` 3.31, `IQ3_XS` 3.33, `IQ3_M` 3.35,
+    `Q3_K_M` 3.36, `Q2_K` 3.38, `IQ2_M` 3.57. Layer bytes 235, 179, 183, 195,
+    179 and 169 MiB.
+  - **Speed**, GTX 1650, Qwen2.5-0.5B, decode tok/s at batch 1 / 16: native
+    blocks `Q2_K` 107 / 616, `IQ3_XS` 99 / 608, `IQ2_M` 111 / 594. When the
+    model fits with VRAM to spare, the loader re-packs them into dlm's int
+    layout as it does for the other GGUF types, which is faster resident
+    (`Q2_K` 140-147 / 584-604, `IQ3_XS` 144-146 / 787-792) and three to four
+    times the bytes; a model that would not fit keeps the blocks. Q2_K and
+    Q3_K re-pack to int8, not int4: their 16-weight groups miss the GPU's
+    32-wide int4 chunks, which halved a `Q2_K` file's prefill (about 700
+    against 1,480-1,520 tok/s).
+
 - **`--lm-head-int4`: hold the GPU's LM head in int4.** The vocabulary-wide
   head is a large share of a small model's bytes per token (272 MB of
   Qwen2.5-0.5B bf16's ~1 GB). Opt-in, since it costs accuracy; without it the

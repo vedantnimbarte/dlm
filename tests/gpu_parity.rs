@@ -702,7 +702,18 @@ fn gpu_matches_cpu_with_ggml_weights() {
         (GgmlKind::Q8_0, &[0], 0x1400), // 0.00098: its codes reach 127, not 15
         (GgmlKind::Q4K, &[0, 2], 0x0800), // 0.00012
         (GgmlKind::Q5K, &[0, 2], 0x0800),
-        (GgmlKind::Q6K, &[208], 0x0400), // 0.00006
+        (GgmlKind::Q6K, &[208], 0x0400),    // 0.00006
+        (GgmlKind::Q2K, &[80, 82], 0x1000), // 0.00049: d and dmin, so the minimums stay small
+        (GgmlKind::Q3K, &[108], 0x0C00),    // 0.00024
+        // The IQ codebooks reach 43 (IQ2), 62 (IQ3_XXS) and 15 (IQ3_S, under a
+        // larger scale); IQ4_XS's levels reach 127 under a 6-bit scale.
+        (GgmlKind::IQ2XXS, &[0], 0x0800),
+        (GgmlKind::IQ2XS, &[0], 0x0800),
+        (GgmlKind::IQ2S, &[0], 0x0800),
+        (GgmlKind::IQ3XXS, &[0], 0x0400),
+        (GgmlKind::IQ3S, &[0], 0x0400),
+        (GgmlKind::IQ4NL, &[0], 0x0C00),
+        (GgmlKind::IQ4XS, &[0], 0x0100), // 0.000015
     ];
     for (kind, f16_fields, scale) in kinds {
         let mut rng = Rng::new(0x6611 + kind.dtype_code() as u64);
@@ -2158,8 +2169,14 @@ fn gpu_lm_head_batch_matches_rows_alone() {
         for block in blob.chunks_mut(kind.block_bytes()) {
             block[0..2].copy_from_slice(&0x1400u16.to_le_bytes()); // 0.00098
             block[2..4].copy_from_slice(&0x1000u16.to_le_bytes()); // 0.00049
-            if kind == GgmlKind::Q6K {
-                block[208..210].copy_from_slice(&0x1400u16.to_le_bytes());
+            let more: &[usize] = match kind {
+                GgmlKind::Q6K => &[208],
+                GgmlKind::Q2K => &[80, 82],
+                GgmlKind::Q3K => &[108],
+                _ => &[],
+            };
+            for &at in more {
+                block[at..at + 2].copy_from_slice(&0x1400u16.to_le_bytes());
             }
         }
         Weights::Ggml {
@@ -2185,6 +2202,15 @@ fn gpu_lm_head_batch_matches_rows_alone() {
         GgmlKind::Q4K,
         GgmlKind::Q5K,
         GgmlKind::Q6K,
+        GgmlKind::Q2K,
+        GgmlKind::Q3K,
+        GgmlKind::IQ2XXS,
+        GgmlKind::IQ2XS,
+        GgmlKind::IQ2S,
+        GgmlKind::IQ3XXS,
+        GgmlKind::IQ3S,
+        GgmlKind::IQ4NL,
+        GgmlKind::IQ4XS,
     ] {
         cases.push((format!("{kind:?}"), ggml(kind)));
     }
@@ -2209,6 +2235,69 @@ fn gpu_lm_head_batch_matches_rows_alone() {
                     tokens[r],
                     dlm::generate::argmax(got),
                     "{what}, {rows} rows: row {r}"
+                );
+            }
+        }
+    }
+}
+
+/// The device decodes every weight of every ggml format exactly as the CPU
+/// does. A one-hot activation quantizes to int8 without error, so the LM head
+/// of the identity matrix is the decoded weight matrix itself, and a misread
+/// field shows even where it moves a weight too little to fail a model-level
+/// comparison (an IQ4 level off by one in 127, say).
+#[test]
+fn gpu_ggml_decode_matches_cpu_exactly() {
+    use dlm::storage::ggml_quant::{self, GgmlKind};
+    let (vocab, hidden) = (64, 512);
+    let mut rng = Rng::new(0xdec0);
+    for (kind, f16_fields) in [
+        (GgmlKind::Q4_0, &[0usize][..]),
+        (GgmlKind::Q4_1, &[0, 2]),
+        (GgmlKind::Q5_0, &[0]),
+        (GgmlKind::Q5_1, &[0, 2]),
+        (GgmlKind::Q8_0, &[0]),
+        (GgmlKind::Q4K, &[0, 2]),
+        (GgmlKind::Q5K, &[0, 2]),
+        (GgmlKind::Q6K, &[208]),
+        (GgmlKind::Q2K, &[80, 82]),
+        (GgmlKind::Q3K, &[108]),
+        (GgmlKind::IQ2XXS, &[0]),
+        (GgmlKind::IQ2XS, &[0]),
+        (GgmlKind::IQ2S, &[0]),
+        (GgmlKind::IQ3XXS, &[0]),
+        (GgmlKind::IQ3S, &[0]),
+        (GgmlKind::IQ4NL, &[0]),
+        (GgmlKind::IQ4XS, &[0]),
+    ] {
+        let mut blob: Vec<u8> = (0..kind.byte_len(vocab * hidden))
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        for block in blob.chunks_mut(kind.block_bytes()) {
+            for &at in f16_fields {
+                block[at..at + 2].copy_from_slice(&0x2000u16.to_le_bytes()); // 0.0078
+            }
+        }
+        let want: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ggml_quant::get(kind, &blob, i))
+            .collect();
+        let w = Weights::Ggml {
+            blob,
+            kind,
+            num_elements: vocab * hidden,
+        };
+        let head = dlm::forward::GpuLmHead::new(&w, vocab, hidden, None).unwrap();
+        let mut identity = vec![0.0f32; hidden * hidden];
+        for j in 0..hidden {
+            identity[j * hidden + j] = 1.0;
+        }
+        let got = head.logits(&identity).unwrap();
+        for j in 0..hidden {
+            for o in 0..vocab {
+                let (g, w) = (got[j * vocab + o], want[o * hidden + j]);
+                assert!(
+                    (g - w).abs() <= 1e-5 * w.abs().max(1e-2),
+                    "{kind:?} weight ({o}, {j}): GPU {g}, CPU {w}"
                 );
             }
         }

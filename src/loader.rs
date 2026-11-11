@@ -68,8 +68,14 @@ pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
         Dtype::F16 | Dtype::BF16 => Ok(QuantScheme::Fp16),
         // A GGUF file's weights are already quantized. Its blocks are decoded
         // into dlm's group-affine form, 4-bit or 8-bit depending on the type.
-        Dtype::Q4_0 | Dtype::Q4_1 | Dtype::Q4K => Ok(QuantScheme::Int4),
-        Dtype::Q5_0 | Dtype::Q5_1 | Dtype::Q8_0 | Dtype::Q5K | Dtype::Q6K => Ok(QuantScheme::Int8),
+        d if d.is_block_quantized() => {
+            let kind = crate::storage::ggml_quant::GgmlKind::from_dtype(d).unwrap();
+            Ok(if kind.four_bit() {
+                QuantScheme::Int4
+            } else {
+                QuantScheme::Int8
+            })
+        }
         other => Err(DlmError::UnsupportedQuant(format!(
             "checkpoint weights are {other:?}; dlm handles F32/F16/BF16"
         ))),
@@ -602,18 +608,8 @@ impl ModelParts {
                 {
                     native += blob.len() as u64;
                     // Codes plus a scale and zero per group.
-                    let group = if *kind == crate::storage::ggml_quant::GgmlKind::Q6K {
-                        16
-                    } else {
-                        32
-                    };
-                    let four_bit = matches!(
-                        kind,
-                        ggml_quant::GgmlKind::Q4_0
-                            | ggml_quant::GgmlKind::Q4_1
-                            | ggml_quant::GgmlKind::Q4K
-                    );
-                    let codes = if four_bit {
+                    let group = kind.group();
+                    let codes = if kind.expands_to_int4() {
                         num_elements.div_ceil(2)
                     } else {
                         *num_elements
