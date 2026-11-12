@@ -41,12 +41,12 @@ struct HfTokenizer {
     pre_tokenizer: serde_json::Value,
 }
 
+/// One of `added_tokens`. Its `special` flag does not matter: every added
+/// token is registered (see `from_hf_json`).
 #[derive(Deserialize)]
 struct HfAddedToken {
     id: u32,
     content: String,
-    #[serde(default)]
-    special: bool,
 }
 
 #[derive(Deserialize)]
@@ -323,7 +323,7 @@ impl BpeTokenizer {
 
     /// Load a HuggingFace `tokenizer.json` (the single-file "fast tokenizer"
     /// format modern models ship). Reads the BPE `model.vocab` + `model.merges`
-    /// and registers `added_tokens` marked `special` (so chat-template control
+    /// and registers every one of `added_tokens` (so chat-template control
     /// tokens like `<|eot_id|>` encode to their own id). Only BPE-model
     /// tokenizers are supported — SentencePiece/Unigram checkpoints are not.
     pub fn from_hf_json(path: &Path) -> Result<Self> {
@@ -335,10 +335,13 @@ impl BpeTokenizer {
             context: "tokenizer.json".to_string(),
             source,
         })?;
+        // Every added token, `special` or not: transformers matches each whole
+        // when encoding and writes it out as its text when decoding. Qwen3 marks
+        // `<think>` and `</think>` not special, and with them left out its
+        // replies, which open with `<think>`, decoded to nothing.
         let specials: Vec<(String, u32)> = hf
             .added_tokens
             .into_iter()
-            .filter(|t| t.special)
             .map(|t| (t.content, t.id))
             .collect();
 
@@ -1426,6 +1429,25 @@ mod tests {
         // "ab" merges to id 2; the special token becomes id 5.
         assert_eq!(tok.encode("ab<|end|>").unwrap(), vec![2, 5]);
         assert_eq!(tok.decode(&[2, 5]).unwrap(), "ab<|end|>");
+    }
+
+    /// An added token not marked special (Qwen3's `<think>`) is still one
+    /// token, both ways.
+    #[test]
+    fn loads_added_tokens_that_are_not_special() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "added_tokens": [{"id": 6, "content": "<think>", "special": false}],
+                "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2}, "merges": ["a b"]}
+            }"#,
+        )
+        .unwrap();
+        let tok = BpeTokenizer::from_hf_json(&path).unwrap();
+        assert_eq!(tok.encode("<think>ab").unwrap(), vec![6, 2]);
+        assert_eq!(tok.decode(&[6, 2]).unwrap(), "<think>ab");
     }
 
     /// A `"type": "BPE"` model whose pre-tokenizer is `Metaspace` (Mistral,

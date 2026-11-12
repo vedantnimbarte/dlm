@@ -11,7 +11,7 @@
 
 use crate::batching::{AcceptanceStats, BatchScheduler};
 use crate::forward::ComputeKernel;
-use crate::generate::{Decoding, Dry, Generator, Penalties, Sampler};
+use crate::generate::{Decoding, Dry, Generator, Penalties, Sampler, TokenLogprobs};
 use crate::grammar::{Constraint, Grammar, TokenBytes};
 use crate::server::http::{Handler, Request, Response};
 use crate::tokenizer::BpeTokenizer;
@@ -25,8 +25,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// speculative acceptance stats when it was decoded speculatively (`None` on the
 /// plain path).
 pub enum TokenEvent {
-    Next(u32),
+    /// A token, with its log-probabilities when the request asked for them.
+    Next(u32, Option<TokenLogprobs>),
     Done(Option<AcceptanceStats>),
+}
+
+/// What the engine thread is asked to do: generate, or embed a text (run
+/// between decode steps, on its own KV).
+enum Work {
+    Generate(Box<Job>),
+    Embed {
+        tokens: Vec<u32>,
+        reply: Sender<Result<Vec<f32>, String>>,
+    },
 }
 
 struct Job {
@@ -80,7 +91,7 @@ impl StreamMetrics {
 
 /// A handle to the background batching engine.
 pub struct EngineService {
-    job_tx: Mutex<Sender<Job>>,
+    job_tx: Mutex<Sender<Work>>,
     next_id: AtomicU64,
     tokenizer: BpeTokenizer,
     vocab_size: usize,
@@ -202,7 +213,7 @@ impl EngineService {
         max_batch: usize,
         prefix_cache_size: usize,
     ) -> Arc<Self> {
-        let (job_tx, job_rx) = channel::<Job>();
+        let (job_tx, job_rx) = channel::<Work>();
         let stream = Arc::new(StreamMetrics::default());
         let stream_loop = Arc::clone(&stream);
         std::thread::spawn(move || {
@@ -298,15 +309,28 @@ impl EngineService {
             .job_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send(Job {
+            .send(Work::Generate(Box::new(Job {
                 id,
                 prompt,
                 max_new,
                 eos,
                 decoding,
                 sink,
-            });
+            })));
         out
+    }
+
+    /// `tokens`' embedding (see [`Generator::embedding`]), computed on the
+    /// engine thread between decode steps.
+    fn embed(&self, tokens: Vec<u32>) -> Result<Vec<f32>, String> {
+        let (reply, out) = channel();
+        self.job_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(Work::Embed { tokens, reply })
+            .map_err(|_| "the engine has stopped".to_string())?;
+        out.recv()
+            .map_err(|_| "the engine has stopped".to_string())?
     }
 
     /// Encode a prompt string to token ids, validating against the vocabulary.
@@ -332,7 +356,7 @@ fn engine_loop<K: ComputeKernel>(
     generator: Generator<K>,
     draft: Option<Generator<K>>,
     gamma: usize,
-    job_rx: Receiver<Job>,
+    job_rx: Receiver<Work>,
     max_batch: usize,
     prefix_cache_size: usize,
     stream: Arc<StreamMetrics>,
@@ -347,26 +371,38 @@ fn engine_loop<K: ComputeKernel>(
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
 
     loop {
+        let mut take = |work: Work, sched: &mut BatchScheduler<'_, K>| match work {
+            Work::Generate(job) => enqueue(sched, &mut sinks, *job),
+            Work::Embed { tokens, reply } => {
+                let _ = reply.send(generator.embedding(&tokens).map_err(|e| e.to_string()));
+            }
+        };
         if !sched.has_work() {
             match job_rx.recv() {
-                Ok(job) => enqueue(&mut sched, &mut sinks, job),
+                Ok(work) => take(work, &mut sched),
                 Err(_) => break, // all handles dropped
             }
         }
-        while let Ok(job) = job_rx.try_recv() {
-            enqueue(&mut sched, &mut sinks, job);
+        while let Ok(work) = job_rx.try_recv() {
+            take(work, &mut sched);
         }
         if !sched.has_work() {
             continue;
         }
         match sched.step() {
-            Ok(tick) => {
+            Ok(mut tick) => {
                 for (id, token) in tick.produced {
+                    // A request with log-probabilities makes one token a tick.
+                    let lp = tick
+                        .logprobs
+                        .iter()
+                        .position(|(lid, _)| *lid == id)
+                        .map(|i| tick.logprobs.swap_remove(i).1);
                     if let Some(s) = sinks.get(&id) {
                         // A failed send means the client dropped the receiver
                         // (disconnected or finished early); stop wasting compute
                         // on it by retiring the slot.
-                        if s.send(TokenEvent::Next(token)).is_err() {
+                        if s.send(TokenEvent::Next(token, lp)).is_err() {
                             sinks.remove(&id);
                             sched.abort(id);
                         }
@@ -419,12 +455,159 @@ fn enqueue<K: ComputeKernel>(
 // ── OpenAI request/response shapes ──────────────────────────────────────────
 
 /// A chat message (`role` + `content`), shared by the local and distributed
-/// serving paths.
-#[derive(Deserialize)]
+/// serving paths. An assistant message may carry the tool calls it made, and a
+/// `tool` message is a call's result.
+#[derive(Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(deserialize_with = "content_text")]
     pub content: String,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCallIn>>,
+}
+
+/// JSON as Hugging Face chat templates' `tojson` writes it: `", "` and `": "`
+/// between items, non-ASCII as is.
+fn tojson(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Array(a) => format!("[{}]", a.iter().map(tojson).collect::<Vec<_>>().join(", ")),
+        Value::Object(m) => format!(
+            "{{{}}}",
+            m.iter()
+                .map(|(k, v)| format!("{}: {}", Value::String(k.clone()), tojson(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// ChatML, with Qwen's tool calling (its Jinja template, followed to the
+/// character): the tools in the system turn, an assistant's calls as
+/// `<tool_call>` blocks, and consecutive `tool` results in one user turn as
+/// `<tool_response>` blocks. Without tools or tool turns it is plain ChatML.
+fn chatml(messages: &[ChatMessage], tools: &[serde_json::Value]) -> String {
+    let mut p = String::new();
+    let mut rest = messages;
+    if !tools.is_empty() {
+        p.push_str("<|im_start|>system\n");
+        if let Some(system) = messages.first().filter(|m| m.role == "system") {
+            p.push_str(&system.content);
+            p.push_str("\n\n");
+            rest = &messages[1..];
+        }
+        p.push_str(
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+             You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+        );
+        for tool in tools {
+            p.push('\n');
+            p.push_str(&tojson(tool));
+        }
+        p.push_str(
+            "\n</tools>\n\nFor each function call, return a json object with function name and \
+             arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\
+             {\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
+        );
+    }
+    for (i, m) in rest.iter().enumerate() {
+        let calls = m.tool_calls.as_deref().unwrap_or_default();
+        match m.role.as_str() {
+            "assistant" if !calls.is_empty() => {
+                p.push_str("<|im_start|>assistant");
+                if !m.content.is_empty() {
+                    p.push('\n');
+                    p.push_str(&m.content);
+                }
+                for c in calls {
+                    // Arguments arrive as a JSON string; the model saw an object.
+                    let args = match &c.function.arguments {
+                        serde_json::Value::String(s) => serde_json::from_str(s)
+                            .map(|v| tojson(&v))
+                            .unwrap_or_else(|_| s.clone()),
+                        v => tojson(v),
+                    };
+                    p.push_str(&format!(
+                        "\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {args}}}\n</tool_call>",
+                        c.function.name
+                    ));
+                }
+                p.push_str("<|im_end|>\n");
+            }
+            "tool" => {
+                if i == 0 || rest[i - 1].role != "tool" {
+                    p.push_str("<|im_start|>user");
+                }
+                p.push_str("\n<tool_response>\n");
+                p.push_str(&m.content);
+                p.push_str("\n</tool_response>");
+                if rest.get(i + 1).is_none_or(|n| n.role != "tool") {
+                    p.push_str("<|im_end|>\n");
+                }
+            }
+            role => p.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", m.content)),
+        }
+    }
+    p.push_str("<|im_start|>assistant\n");
+    p
+}
+
+/// Where a tool call starts in a ChatML reply.
+const TOOL_OPEN: &str = "<tool_call>";
+
+/// A reply's text before its first `<tool_call>`, and each call's name and
+/// arguments (a JSON string). A reply whose blocks do not hold a call's JSON
+/// is left as text, with no calls.
+fn split_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
+    const CLOSE: &str = "</tool_call>";
+    let Some(start) = text.find(TOOL_OPEN) else {
+        return (text.to_string(), Vec::new());
+    };
+    let mut calls = Vec::new();
+    let mut rest = &text[start..];
+    while let Some(open) = rest.find(TOOL_OPEN) {
+        let body = &rest[open + TOOL_OPEN.len()..];
+        let end = body.find(CLOSE);
+        let call: Option<serde_json::Value> =
+            serde_json::from_str(body[..end.unwrap_or(body.len())].trim()).ok();
+        let Some(name) = call.as_ref().and_then(|c| c["name"].as_str()) else {
+            return (text.to_string(), Vec::new());
+        };
+        let arguments = match call.as_ref().and_then(|c| c.get("arguments")) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(v) => v.to_string(),
+            None => "{}".to_string(),
+        };
+        calls.push((name.to_string(), arguments));
+        rest = end.map_or("", |e| &body[e + CLOSE.len()..]);
+    }
+    (text[..start].trim_end().to_string(), calls)
+}
+
+/// How many of `text`'s last bytes could begin `marker`, which then cannot be
+/// shown yet.
+fn partial_marker(text: &str, marker: &str) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|&k| text.ends_with(&marker[..k]))
+        .unwrap_or(0)
+}
+
+/// A tool call in an assistant message, as OpenAI sends it back.
+#[derive(Deserialize, Default)]
+pub struct ToolCallIn {
+    #[serde(default)]
+    pub function: FunctionCallIn,
+}
+
+#[derive(Deserialize, Default)]
+pub struct FunctionCallIn {
+    #[serde(default)]
+    pub name: String,
+    /// A JSON string, as OpenAI sends it, or the object itself.
+    #[serde(default)]
+    pub arguments: serde_json::Value,
 }
 
 /// OpenAI's `content`: a string, or a list of typed parts.
@@ -506,6 +689,21 @@ struct ChatRequest {
     /// Stop sequence(s): generation is cut before the first occurrence.
     #[serde(default)]
     stop: Option<Stop>,
+    /// Return each output token's log-probability.
+    #[serde(default)]
+    logprobs: bool,
+    /// And this many of the most likely tokens at each position (0-20).
+    #[serde(default)]
+    top_logprobs: Option<usize>,
+    /// How many completions to generate for the prompt (1-16).
+    #[serde(default)]
+    n: Option<usize>,
+    /// Functions the model may call (`{"type": "function", "function": ...}`).
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    /// `auto` (the default with tools) or `none`.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -562,10 +760,47 @@ const DRY_BREAKERS: [&str; 4] = ["\n", ":", "\"", "*"];
 /// An out-of-range value is a client error, not something to clamp quietly: a
 /// client that asked for it would otherwise get output it did not ask for and no
 /// sign why.
+/// Most completions one request may ask for (`n`).
+const MAX_N: usize = 16;
+
+/// One [`Decoding`] per choice of a request asking for `n`: a sampled choice
+/// draws with its own seed, `seed + i`, so the choices differ.
+fn choices(decoding: Decoding, n: Option<usize>) -> Result<Vec<Decoding>, String> {
+    let n = n.unwrap_or(1);
+    if !(1..=MAX_N).contains(&n) {
+        return Err(format!("n must be between 1 and {MAX_N}"));
+    }
+    Ok((0..n as u64)
+        .map(|i| {
+            let mut d = decoding.clone();
+            if let Sampler::TopPK { seed, .. } = &mut d.sampler {
+                *seed = seed.wrapping_add(i);
+            }
+            d
+        })
+        .collect())
+}
+
+/// Most alternatives a request may ask for per token, as OpenAI allows.
+const MAX_TOP_LOGPROBS: usize = 20;
+
+/// `top` alternatives per token when `wanted`, checked against the limit.
+fn logprobs_request(wanted: bool, top: Option<usize>) -> Result<Option<usize>, String> {
+    match (wanted, top) {
+        (_, Some(n)) if n > MAX_TOP_LOGPROBS => Err(format!(
+            "top_logprobs must be between 0 and {MAX_TOP_LOGPROBS}"
+        )),
+        (false, Some(n)) if n > 0 => Err("top_logprobs needs logprobs: true".into()),
+        (true, n) => Ok(Some(n.unwrap_or(0))),
+        (false, _) => Ok(None),
+    }
+}
+
 fn decoding(
     engine: &EngineService,
     sampler: Sampler,
     extra: ExtraSampling,
+    logprobs: Option<usize>,
 ) -> Result<Decoding, String> {
     let mut logit_bias = Vec::new();
     for (key, &bias) in extra.logit_bias.iter().flatten() {
@@ -597,6 +832,7 @@ fn decoding(
             dry: dry(engine, &extra)?,
         },
         grammar: constraint(engine, &extra)?,
+        logprobs,
     })
 }
 
@@ -710,13 +946,121 @@ fn sampler_from_request(req: &ChatRequest, id: u64) -> Sampler {
 #[derive(Serialize)]
 struct RespMessage {
     role: &'static str,
-    content: String,
+    /// `null` when the reply is only tool calls.
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ToolCallOut>,
+}
+
+/// A tool call the model made, in OpenAI's shape: `arguments` is a JSON
+/// string. In a streamed delta it also carries its `index`.
+#[derive(Serialize)]
+struct ToolCallOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: FunctionCallOut,
+}
+
+#[derive(Serialize)]
+struct FunctionCallOut {
+    name: String,
+    arguments: String,
+}
+
+/// `calls` in OpenAI's shape, numbered for request `request`. `index` marks
+/// each with its position, for a streamed delta.
+fn tool_calls_out(calls: Vec<(String, String)>, request: u64, index: bool) -> Vec<ToolCallOut> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, arguments))| ToolCallOut {
+            index: index.then_some(i),
+            id: format!("call_{request}_{i}"),
+            kind: "function",
+            function: FunctionCallOut { name, arguments },
+        })
+        .collect()
 }
 #[derive(Serialize)]
 struct Choice {
     index: usize,
     message: RespMessage,
     finish_reason: &'static str,
+    logprobs: Option<ChatLogprobs>,
+}
+
+/// Chat's `logprobs`: one entry per output token.
+#[derive(Serialize)]
+struct ChatLogprobs {
+    content: Vec<ChatTokenLogprob>,
+}
+#[derive(Serialize)]
+struct ChatTokenLogprob {
+    token: String,
+    logprob: f32,
+    /// The token's bytes: a byte-level token can be part of a character.
+    bytes: Vec<u8>,
+    top_logprobs: Vec<TopLogprob>,
+}
+#[derive(Serialize)]
+struct TopLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Vec<u8>,
+}
+
+/// A token's text (lossy where it is part of a character) and bytes.
+fn token_piece(engine: &EngineService, id: u32) -> (String, Vec<u8>) {
+    let bytes = engine.tokenizer.token_bytes(id).unwrap_or_default();
+    (String::from_utf8_lossy(&bytes).into_owned(), bytes)
+}
+
+fn chat_logprob(engine: &EngineService, id: u32, lp: &TokenLogprobs) -> ChatTokenLogprob {
+    let (token, bytes) = token_piece(engine, id);
+    ChatTokenLogprob {
+        token,
+        logprob: lp.logprob,
+        bytes,
+        top_logprobs: lp
+            .top
+            .iter()
+            .map(|&(t, logprob)| {
+                let (token, bytes) = token_piece(engine, t);
+                TopLogprob {
+                    token,
+                    logprob,
+                    bytes,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// The legacy completions `logprobs`: parallel lists, one entry per token.
+#[derive(Serialize, Default)]
+struct CompletionLogprobs {
+    tokens: Vec<String>,
+    token_logprobs: Vec<f32>,
+    top_logprobs: Vec<HashMap<String, f32>>,
+    /// Each token's character offset in the returned text.
+    text_offset: Vec<usize>,
+}
+
+impl CompletionLogprobs {
+    fn push(&mut self, engine: &EngineService, id: u32, lp: &TokenLogprobs, offset: usize) {
+        self.tokens.push(token_piece(engine, id).0);
+        self.token_logprobs.push(lp.logprob);
+        self.top_logprobs.push(
+            lp.top
+                .iter()
+                .map(|&(t, l)| (token_piece(engine, t).0, l))
+                .collect(),
+        );
+        self.text_offset.push(offset);
+    }
 }
 #[derive(Serialize)]
 struct Usage {
@@ -762,12 +1106,17 @@ struct Delta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallOut>>,
 }
 #[derive(Serialize)]
 struct ChunkChoice {
     index: usize,
     delta: Delta,
     finish_reason: Option<&'static str>,
+    /// The log-probabilities of the tokens whose text this chunk carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<ChatLogprobs>,
 }
 #[derive(Serialize)]
 struct Chunk {
@@ -920,6 +1269,24 @@ impl ChatTemplate {
     /// Render `messages` into the prompt string for this template. BOS is left
     /// to the tokenizer (`add_bos_token`), which skips it when the text already
     /// starts with it.
+    /// [`apply`](Self::apply), with `tools` the model may call. Only ChatML has a
+    /// tool format dlm writes (Qwen's: the tools in the system turn, calls in
+    /// `<tool_call>` tags); any other template refuses them.
+    pub fn apply_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> Result<String, String> {
+        match self {
+            _ if tools.is_empty() => Ok(self.apply(messages)),
+            ChatTemplate::ChatMl => Ok(chatml(messages, tools)),
+            other => Err(format!(
+                "tools need the chatml chat template (Qwen); this model's is {}",
+                other.name()
+            )),
+        }
+    }
+
     pub fn apply(&self, messages: &[ChatMessage]) -> String {
         let mut p = String::new();
         match self {
@@ -932,15 +1299,7 @@ impl ChatTemplate {
                 }
                 p.push_str("assistant:");
             }
-            ChatTemplate::ChatMl => {
-                for m in messages {
-                    p.push_str(&format!(
-                        "<|im_start|>{}\n{}<|im_end|>\n",
-                        m.role, m.content
-                    ));
-                }
-                p.push_str("<|im_start|>assistant\n");
-            }
+            ChatTemplate::ChatMl => p = chatml(messages, &[]),
             ChatTemplate::Llama3 => {
                 p.push_str("<|begin_of_text|>");
                 for m in messages {
@@ -1245,6 +1604,7 @@ pub fn router(engine: Arc<EngineService>) -> Handler {
             }
             ("POST", "/v1/chat/completions") => handle_chat(&engine, req),
             ("POST", "/v1/completions") => handle_completion(&engine, req),
+            ("POST", "/v1/embeddings") => handle_embeddings(&engine, req),
             ("POST", "/v1/messages") => handle_messages(&engine, req),
             ("POST", "/v1/messages/count_tokens") => handle_count_tokens(&engine, req),
             ("GET", _) | ("POST", _) => Response::json(404, error_json("no such endpoint")),
@@ -1306,6 +1666,9 @@ struct Generated {
     prompt_tokens: usize,
     completion_tokens: usize,
     spec: Option<AcceptanceStats>,
+    /// Each token of `text` with its log-probabilities and its character
+    /// offset in `text`, when the request asked for them.
+    logprobs: Vec<(u32, TokenLogprobs, usize)>,
 }
 
 /// Run one request to completion, ending at the EOS token, the first stop
@@ -1318,14 +1681,46 @@ fn collect_completion(
     decoding: Decoding,
     stops: &[String],
 ) -> Generated {
+    collect_completions(engine, ids, max_tokens, vec![decoding], stops).remove(0)
+}
+
+/// [`collect_completion`] for several choices of one prompt: all are queued
+/// before any is read, so they decode in the same batch (and share the prompt's
+/// cached prefix). The prompt counts once.
+fn collect_completions(
+    engine: &Arc<EngineService>,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    decodings: Vec<Decoding>,
+    stops: &[String],
+) -> Vec<Generated> {
     let prompt_tokens = ids.len();
-    let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
+    let rxs: Vec<_> = decodings
+        .into_iter()
+        .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
+        .collect();
+    let out: Vec<Generated> = rxs
+        .into_iter()
+        .map(|rx| collect_from(engine, rx, prompt_tokens, stops))
+        .collect();
+    engine.record(prompt_tokens, out.iter().map(|g| g.completion_tokens).sum());
+    out
+}
+
+/// Read one choice's tokens to its end (see [`collect_completion`]).
+fn collect_from(
+    engine: &Arc<EngineService>,
+    rx: Receiver<TokenEvent>,
+    prompt_tokens: usize,
+    stops: &[String],
+) -> Generated {
     let mut tokens = Vec::new();
+    let mut lps = Vec::new();
     let mut spec = None;
     let mut hit_eos = false;
     for ev in rx {
         match ev {
-            TokenEvent::Next(t) => {
+            TokenEvent::Next(t, lp) => {
                 // The scheduler emits EOS inclusively as the final token; drop it
                 // from the visible output and mark a natural stop.
                 if engine.eos_tokens.contains(&t) {
@@ -1333,6 +1728,7 @@ fn collect_completion(
                     break;
                 }
                 tokens.push(t);
+                lps.extend(lp);
                 if !stops.is_empty() {
                     let so_far = engine.tokenizer.decode(&tokens).unwrap_or_default();
                     if earliest_stop(&so_far, stops).is_some() {
@@ -1360,25 +1756,185 @@ fn collect_completion(
             None => Finish::Length,
         }
     };
-    engine.record(prompt_tokens, completion_tokens);
+    // Each token's offset, keeping those that start inside the returned text
+    // (a stop sequence cuts the rest).
+    let mut logprobs = Vec::new();
+    if lps.len() == tokens.len() {
+        for (i, (&t, lp)) in tokens.iter().zip(lps).enumerate() {
+            let offset = engine
+                .tokenizer
+                .decode(&tokens[..i])
+                .unwrap_or_default()
+                .chars()
+                .count();
+            if offset >= text.chars().count() && i > 0 {
+                break;
+            }
+            logprobs.push((t, lp, offset));
+        }
+    }
     Generated {
         text,
         finish,
         prompt_tokens,
         completion_tokens,
         spec,
+        logprobs,
     }
 }
 
+/// One choice of a streamed response: the tokens so far, the text sent, and
+/// how it ended. Shared by the chat and completions streams.
+struct Streamed {
+    /// `None` once the choice is over; dropping it ends its generation.
+    rx: Option<Receiver<TokenEvent>>,
+    ids: Vec<u32>,
+    /// Characters `ids` decode to.
+    chars: usize,
+    /// Characters sent.
+    sent: usize,
+    finish: &'static str,
+    spec: Option<AcceptanceStats>,
+    /// Tokens with log-probabilities whose text has not gone out, with their
+    /// character offsets.
+    pending: Vec<(u32, TokenLogprobs, usize)>,
+    /// Hold back text from the first `<tool_call>` on: the request has tools,
+    /// and calls go out whole at the end.
+    hold_tools: bool,
+}
+
+impl Streamed {
+    fn new(rx: Receiver<TokenEvent>) -> Self {
+        Streamed {
+            rx: Some(rx),
+            ids: Vec::new(),
+            chars: 0,
+            sent: 0,
+            finish: "length",
+            spec: None,
+            pending: Vec::new(),
+            hold_tools: false,
+        }
+    }
+
+    /// Take one event: the text it completes, if any.
+    ///
+    /// Decodes the whole run, never a lone token: byte-level BPE splits one
+    /// UTF-8 character (emoji, CJK, accents) across several tokens, and a
+    /// fragment decoded alone renders as U+FFFD. Emitting the newly completed
+    /// characters is correct with or without stop sequences.
+    fn take(&mut self, engine: &EngineService, stops: &[String], ev: TokenEvent) -> Option<String> {
+        match ev {
+            TokenEvent::Next(t, lp) => {
+                // EOS is emitted inclusively; stop without showing it.
+                if engine.eos_tokens.contains(&t) {
+                    self.finish = "stop";
+                    self.rx = None;
+                    return None;
+                }
+                if let Some(lp) = lp {
+                    self.pending.push((t, lp, self.chars));
+                }
+                self.ids.push(t);
+                let full = engine.tokenizer.decode(&self.ids).unwrap_or_default();
+                self.chars = full.chars().count();
+                let cut = earliest_stop(&full, stops);
+                let mut end = cut.unwrap_or(full.len());
+                if self.hold_tools {
+                    end = match full[..end].find(TOOL_OPEN) {
+                        Some(at) => at,
+                        None => end - partial_marker(&full[..end], TOOL_OPEN),
+                    };
+                }
+                let visible = &full[..end];
+                let shown = visible.chars().count();
+                let delta = (shown > self.sent).then(|| {
+                    let d: String = visible.chars().skip(self.sent).collect();
+                    self.sent = shown;
+                    d
+                });
+                if cut.is_some() {
+                    self.finish = "stop";
+                    self.rx = None;
+                }
+                delta
+            }
+            TokenEvent::Done(stats) => {
+                self.spec = stats;
+                self.rx = None;
+                None
+            }
+        }
+    }
+}
+
+/// Feed each choice its events until all are over, calling `send(index,
+/// choice, text)` for every piece of new text. One choice waits on its
+/// receiver; several take turns.
+fn stream_choices(
+    engine: &EngineService,
+    rxs: Vec<Receiver<TokenEvent>>,
+    stops: &[String],
+    hold_tools: bool,
+    mut send: impl FnMut(usize, &mut Streamed, String) -> std::io::Result<()>,
+) -> std::io::Result<Vec<Streamed>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut choices: Vec<Streamed> = rxs
+        .into_iter()
+        .map(|rx| Streamed {
+            hold_tools,
+            ..Streamed::new(rx)
+        })
+        .collect();
+    let wait = if choices.len() == 1 {
+        std::time::Duration::from_secs(3600)
+    } else {
+        std::time::Duration::from_millis(1)
+    };
+    while choices.iter().any(|c| c.rx.is_some()) {
+        for (i, c) in choices.iter_mut().enumerate() {
+            let Some(rx) = &c.rx else { continue };
+            match rx.recv_timeout(wait) {
+                Ok(ev) => {
+                    if let Some(text) = c.take(engine, stops, ev) {
+                        send(i, c, text)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => c.rx = None,
+            }
+        }
+    }
+    Ok(choices)
+}
+
 fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
-    let parsed: ChatRequest = match serde_json::from_slice(&req.body) {
+    let mut parsed: ChatRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
         Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
     };
     if parsed.messages.is_empty() {
         return Response::json(400, error_json("messages must not be empty"));
     }
-    let prompt = engine.chat_template.apply(&parsed.messages);
+    // `tool_choice: none` keeps the tools out of the prompt; a forced call
+    // would need the output constrained, which is not done.
+    let tools = match parsed.tool_choice.as_ref().map(|c| c.as_str()) {
+        None | Some(Some("auto")) => parsed.tools.take().unwrap_or_default(),
+        Some(Some("none")) => Vec::new(),
+        _ => {
+            return Response::json(
+                400,
+                error_json("tool_choice must be auto or none; dlm does not force a tool call"),
+            )
+        }
+    };
+    let prompt = match engine
+        .chat_template
+        .apply_with_tools(&parsed.messages, &tools)
+    {
+        Ok(p) => p,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let ids = match engine.encode_prompt(&prompt) {
         Ok(ids) => ids,
         Err(e) => return Response::json(400, error_json(&e)),
@@ -1389,7 +1945,13 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Err(e) => return Response::json(400, error_json(&e)),
     };
     let sampler = sampler_from_request(&parsed, engine.next_id.load(Ordering::Relaxed));
-    let decoding = match decoding(engine, sampler, parsed.extra) {
+    let logprobs = match logprobs_request(parsed.logprobs, parsed.top_logprobs) {
+        Ok(l) => l,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    let decodings = match decoding(engine, sampler, parsed.extra, logprobs)
+        .and_then(|d| choices(d, parsed.n))
+    {
         Ok(d) => d,
         Err(e) => return Response::json(400, error_json(&e)),
     };
@@ -1397,34 +1959,233 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_chat(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
+        let tools = !tools.is_empty();
+        stream_chat(
+            Arc::clone(engine),
+            ids,
+            max_tokens,
+            model,
+            decodings,
+            stops,
+            tools,
+        )
     } else {
-        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
+        let request = engine.next_id.load(Ordering::Relaxed);
+        let prompt_tokens = ids.len();
+        let gs = collect_completions(engine, ids, max_tokens, decodings, &stops);
+        let completion_tokens = gs.iter().map(|g| g.completion_tokens).sum();
+        let spec = if gs.len() == 1 { gs[0].spec } else { None };
         let body = ChatResponse {
             id: format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed)),
             object: "chat.completion",
             created: engine.created,
             model,
-            choices: vec![Choice {
-                index: 0,
-                message: RespMessage {
-                    role: "assistant",
-                    content: g.text,
-                },
-                finish_reason: match g.finish {
-                    Finish::Length => "length",
-                    _ => "stop",
-                },
-            }],
+            choices: gs
+                .into_iter()
+                .enumerate()
+                .map(|(index, g)| {
+                    let (content, calls) = if tools.is_empty() {
+                        (g.text, Vec::new())
+                    } else {
+                        split_tool_calls(&g.text)
+                    };
+                    Choice {
+                        index,
+                        finish_reason: match g.finish {
+                            _ if !calls.is_empty() => "tool_calls",
+                            Finish::Length => "length",
+                            _ => "stop",
+                        },
+                        logprobs: logprobs.map(|_| ChatLogprobs {
+                            content: g
+                                .logprobs
+                                .iter()
+                                .map(|(t, lp, _)| chat_logprob(engine, *t, lp))
+                                .collect(),
+                        }),
+                        message: RespMessage {
+                            role: "assistant",
+                            content: (!content.is_empty() || calls.is_empty()).then_some(content),
+                            tool_calls: tool_calls_out(calls, request, false),
+                        },
+                    }
+                })
+                .collect(),
             usage: Usage {
-                prompt_tokens: g.prompt_tokens,
-                completion_tokens: g.completion_tokens,
-                total_tokens: g.prompt_tokens + g.completion_tokens,
-                speculative: g.spec.map(SpeculativeUsage::from),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                speculative: spec.map(SpeculativeUsage::from),
             },
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
     }
+}
+
+// ── OpenAI embeddings (`POST /v1/embeddings`) ───────────────────────────────
+
+/// `input`: one text or several, each as a string or as token ids.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Text(String),
+    Texts(Vec<String>),
+    Ids(Vec<u32>),
+    IdLists(Vec<Vec<u32>>),
+}
+
+#[derive(Deserialize)]
+struct EmbeddingRequest {
+    #[serde(default)]
+    model: Option<String>,
+    input: EmbeddingInput,
+    /// `float` (the default) or `base64`, the little-endian f32 bytes, which
+    /// the OpenAI Python SDK asks for unless told otherwise.
+    #[serde(default)]
+    encoding_format: Option<String>,
+    /// Keep the first this many dimensions, scaled back to unit length.
+    #[serde(default)]
+    dimensions: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum EmbeddingVector {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+#[derive(Serialize)]
+struct EmbeddingData {
+    object: &'static str,
+    index: usize,
+    embedding: EmbeddingVector,
+}
+
+#[derive(Serialize)]
+struct EmbeddingUsage {
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct EmbeddingResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: String,
+    usage: EmbeddingUsage,
+}
+
+/// Standard base64 (RFC 4648, padded).
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for k in 0..4 {
+            if k <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * k) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn handle_embeddings(engine: &Arc<EngineService>, req: &Request) -> Response {
+    let parsed: EmbeddingRequest = match serde_json::from_slice(&req.body) {
+        Ok(r) => r,
+        Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
+    };
+    let base64_out = match parsed.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return Response::json(
+                400,
+                error_json(&format!(
+                    "encoding_format must be float or base64, not {other}"
+                )),
+            )
+        }
+    };
+    let texts: Result<Vec<Vec<u32>>, String> = match parsed.input {
+        EmbeddingInput::Text(t) => engine.encode_prompt(&t).map(|ids| vec![ids]),
+        EmbeddingInput::Texts(ts) => ts.iter().map(|t| engine.encode_prompt(t)).collect(),
+        EmbeddingInput::Ids(ids) => Ok(vec![ids]),
+        EmbeddingInput::IdLists(lists) => Ok(lists),
+    };
+    let texts = match texts {
+        Ok(t) if !t.is_empty() => t,
+        Ok(_) => return Response::json(400, error_json("input must not be empty")),
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    for ids in &texts {
+        let bad = ids.iter().any(|&t| t as usize >= engine.vocab_size);
+        if ids.is_empty() || bad || ids.len() > engine.max_context {
+            return Response::json(
+                400,
+                error_json(&format!(
+                    "each input must be 1 to {} tokens of the model's vocabulary",
+                    engine.max_context
+                )),
+            );
+        }
+    }
+    let mut data = Vec::with_capacity(texts.len());
+    let mut tokens = 0;
+    for (index, ids) in texts.into_iter().enumerate() {
+        tokens += ids.len();
+        let mut v = match engine.embed(ids) {
+            Ok(v) => v,
+            Err(e) => return Response::json(500, error_json(&format!("embedding failed: {e}"))),
+        };
+        if let Some(d) = parsed.dimensions {
+            if d == 0 || d > v.len() {
+                return Response::json(
+                    400,
+                    error_json(&format!("dimensions must be between 1 and {}", v.len())),
+                );
+            }
+            v.truncate(d);
+            let norm = v
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>()
+                .sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x = (*x as f64 / norm) as f32);
+            }
+        }
+        let embedding = if base64_out {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            EmbeddingVector::Base64(base64(&bytes))
+        } else {
+            EmbeddingVector::Float(v)
+        };
+        data.push(EmbeddingData {
+            object: "embedding",
+            index,
+            embedding,
+        });
+    }
+    engine.record(tokens, 0);
+    let body = EmbeddingResponse {
+        object: "list",
+        data,
+        model: parsed.model.unwrap_or_else(|| engine.model_id.clone()),
+        usage: EmbeddingUsage {
+            prompt_tokens: tokens,
+            total_tokens: tokens,
+        },
+    };
+    Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
 }
 
 // ── OpenAI legacy completions (`POST /v1/completions`) ──────────────────────
@@ -1454,6 +2215,12 @@ struct CompletionRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Option<Stop>,
+    /// Return each token's log-probability and this many alternatives (0-20).
+    #[serde(default)]
+    logprobs: Option<usize>,
+    /// How many completions to generate for the prompt (1-16).
+    #[serde(default)]
+    n: Option<usize>,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -1463,8 +2230,7 @@ struct CompletionChoice {
     index: usize,
     text: String,
     finish_reason: &'static str,
-    /// Always null — dlm doesn't emit logprobs, but clients expect the field.
-    logprobs: Option<()>,
+    logprobs: Option<CompletionLogprobs>,
 }
 #[derive(Serialize)]
 struct CompletionResponse {
@@ -1480,6 +2246,8 @@ struct CompletionChunkChoice {
     index: usize,
     text: String,
     finish_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<CompletionLogprobs>,
 }
 #[derive(Serialize)]
 struct CompletionChunk {
@@ -1521,7 +2289,13 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
         },
         _ => Sampler::Greedy,
     };
-    let decoding = match decoding(engine, sampler, parsed.extra) {
+    let logprobs = match logprobs_request(parsed.logprobs.is_some(), parsed.logprobs) {
+        Ok(l) => l,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
+    let decodings = match decoding(engine, sampler, parsed.extra, logprobs)
+        .and_then(|d| choices(d, parsed.n))
+    {
         Ok(d) => d,
         Err(e) => return Response::json(400, error_json(&e)),
     };
@@ -1529,50 +2303,66 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_completion(Arc::clone(engine), ids, max_tokens, model, decoding, stops)
+        stream_completion(Arc::clone(engine), ids, max_tokens, model, decodings, stops)
     } else {
-        let g = collect_completion(engine, ids, max_tokens, decoding, &stops);
+        let prompt_tokens = ids.len();
+        let gs = collect_completions(engine, ids, max_tokens, decodings, &stops);
+        let completion_tokens = gs.iter().map(|g| g.completion_tokens).sum();
+        let spec = if gs.len() == 1 { gs[0].spec } else { None };
         let body = CompletionResponse {
             id: format!("cmpl-{id}"),
             object: "text_completion",
             created: engine.created,
             model,
-            choices: vec![CompletionChoice {
-                index: 0,
-                text: g.text,
-                finish_reason: match g.finish {
-                    Finish::Length => "length",
-                    _ => "stop",
-                },
-                logprobs: None,
-            }],
+            choices: gs
+                .into_iter()
+                .enumerate()
+                .map(|(index, g)| CompletionChoice {
+                    index,
+                    finish_reason: match g.finish {
+                        Finish::Length => "length",
+                        _ => "stop",
+                    },
+                    logprobs: logprobs.map(|_| {
+                        let mut out = CompletionLogprobs::default();
+                        for (t, lp, offset) in &g.logprobs {
+                            out.push(engine, *t, lp, *offset);
+                        }
+                        out
+                    }),
+                    text: g.text,
+                })
+                .collect(),
             usage: Usage {
-                prompt_tokens: g.prompt_tokens,
-                completion_tokens: g.completion_tokens,
-                total_tokens: g.prompt_tokens + g.completion_tokens,
-                speculative: g.spec.map(SpeculativeUsage::from),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                speculative: spec.map(SpeculativeUsage::from),
             },
         };
         Response::json(200, serde_json::to_vec(&body).unwrap_or_default())
     }
 }
 
-/// Stream a `/v1/completions` response as SSE `text_completion` chunks. Mirrors
-/// [`stream_chat`] but carries the token piece in `text` and has no role chunk.
+/// Stream a `/v1/completions` response as SSE `text_completion` chunks, each
+/// choice's under its `index`. Mirrors [`stream_chat`] but carries the text in
+/// `text` and has no role chunk.
 fn stream_completion(
     engine: Arc<EngineService>,
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    decoding: Decoding,
+    decodings: Vec<Decoding>,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("cmpl-{}", engine.next_id.load(Ordering::Relaxed));
         let created = engine.created;
         let send_chunk = |w: &mut dyn std::io::Write,
+                          index: usize,
                           text: String,
-                          finish: Option<&'static str>|
+                          finish: Option<&'static str>,
+                          logprobs: Option<CompletionLogprobs>|
          -> std::io::Result<()> {
             let chunk = CompletionChunk {
                 id: id.clone(),
@@ -1580,9 +2370,10 @@ fn stream_completion(
                 created,
                 model: model.clone(),
                 choices: vec![CompletionChunkChoice {
-                    index: 0,
+                    index,
                     text,
                     finish_reason: finish,
+                    logprobs,
                 }],
                 usage: None,
             };
@@ -1592,52 +2383,31 @@ fn stream_completion(
         };
 
         let prompt_tokens = ids.len();
-        let mut completion_tokens = 0usize;
-        let mut spec = None;
-        let mut acc_ids: Vec<u32> = Vec::new();
-        let mut sent_chars = 0usize;
-        let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
-        for ev in rx {
-            match ev {
-                TokenEvent::Next(t) => {
-                    if engine.eos_tokens.contains(&t) {
-                        finish = "stop";
-                        break;
-                    }
-                    completion_tokens += 1;
-                    // Always decode the accumulated ids, never the token alone.
-                    // Byte-level BPE splits one UTF-8 character (emoji, CJK,
-                    // accents) across several tokens, so decoding a fragment in
-                    // isolation lossily renders it as U+FFFD. Decoding the run
-                    // and emitting the newly-completed characters is correct for
-                    // both the stop-sequence and the no-stop case.
-                    acc_ids.push(t);
-                    let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
-                    let cut = earliest_stop(&full, &stops);
-                    let visible = &full[..cut.unwrap_or(full.len())];
-                    let vis_chars = visible.chars().count();
-                    if vis_chars > sent_chars {
-                        let delta: String = visible.chars().skip(sent_chars).collect();
-                        sent_chars = vis_chars;
-                        send_chunk(w, delta, None)?;
-                    }
-                    if cut.is_some() {
-                        finish = "stop";
-                        break;
-                    }
+        let logprobs = decodings[0].logprobs.is_some();
+        let rxs = decodings
+            .into_iter()
+            .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
+            .collect();
+        let choices = stream_choices(&engine, rxs, &stops, false, |i, c, text| {
+            let lps = logprobs.then(|| {
+                let mut out = CompletionLogprobs::default();
+                for (t, lp, offset) in std::mem::take(&mut c.pending) {
+                    out.push(&engine, t, &lp, offset);
                 }
-                TokenEvent::Done(stats) => {
-                    spec = stats;
-                    break;
-                }
-            }
-        }
+                out
+            });
+            send_chunk(w, i, text, None, lps)
+        })?;
+        let completion_tokens = choices.iter().map(|c| c.ids.len()).sum();
         engine.record(prompt_tokens, completion_tokens);
+        for (i, c) in choices.iter().enumerate() {
+            send_chunk(w, i, String::new(), Some(c.finish), None)?;
+        }
 
-        send_chunk(w, String::new(), Some(finish))?;
-
-        if let Some(stats) = spec {
+        if let [Streamed {
+            spec: Some(stats), ..
+        }] = choices.as_slice()
+        {
             let chunk = CompletionChunk {
                 id: id.clone(),
                 object: "text_completion",
@@ -1648,7 +2418,7 @@ fn stream_completion(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
-                    speculative: Some(stats.into()),
+                    speculative: Some((*stats).into()),
                 }),
             };
             let json = serde_json::to_string(&chunk).unwrap_or_default();
@@ -1772,6 +2542,7 @@ fn anthropic_prompt(
             messages.push(ChatMessage {
                 role: "system".into(),
                 content: text,
+                ..Default::default()
             });
         }
     }
@@ -1779,6 +2550,7 @@ fn anthropic_prompt(
         messages.push(ChatMessage {
             role: m.role.clone(),
             content: m.content.to_text(),
+            ..Default::default()
         });
     }
     engine.chat_template.apply(&messages)
@@ -1955,7 +2727,7 @@ fn stream_messages(
         let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
         for ev in rx {
             match ev {
-                TokenEvent::Next(t) => {
+                TokenEvent::Next(t, _) => {
                     // EOS is emitted inclusively; end the turn without showing it.
                     if engine.eos_tokens.contains(&t) {
                         stop_reason = "end_turn";
@@ -2020,21 +2792,28 @@ fn stream_messages(
     })
 }
 
-/// Stream a chat completion as Server-Sent Events.
+/// Stream a chat completion as SSE `chat.completion.chunk`s, each choice's
+/// under its `index`: a role chunk, the text as it completes (with the
+/// log-probabilities of the tokens behind it when asked for), and a final
+/// chunk with the finish reason.
+#[allow(clippy::too_many_arguments)]
 fn stream_chat(
     engine: Arc<EngineService>,
     ids: Vec<u32>,
     max_tokens: usize,
     model: String,
-    decoding: Decoding,
+    decodings: Vec<Decoding>,
     stops: Vec<String>,
+    tools: bool,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed));
         let created = engine.created;
         let send_chunk = |w: &mut dyn std::io::Write,
+                          index: usize,
                           delta: Delta,
-                          finish: Option<&'static str>|
+                          finish: Option<&'static str>,
+                          logprobs: Option<ChatLogprobs>|
          -> std::io::Result<()> {
             let chunk = Chunk {
                 id: id.clone(),
@@ -2042,9 +2821,10 @@ fn stream_chat(
                 created,
                 model: model.clone(),
                 choices: vec![ChunkChoice {
-                    index: 0,
+                    index,
                     delta,
                     finish_reason: finish,
+                    logprobs,
                 }],
                 usage: None,
             };
@@ -2053,83 +2833,82 @@ fn stream_chat(
             w.flush()
         };
 
-        // First chunk announces the assistant role.
-        send_chunk(
-            w,
-            Delta {
+        // First, each choice announces the assistant role.
+        for i in 0..decodings.len() {
+            let role = Delta {
                 role: Some("assistant"),
                 content: None,
-            },
-            None,
-        )?;
+                tool_calls: None,
+            };
+            send_chunk(w, i, role, None, None)?;
+        }
 
         let prompt_tokens = ids.len();
-        let mut completion_tokens = 0usize;
-        let mut spec = None;
-        // Only needed with stop sequences: accumulate ids and re-decode so a stop
-        // spanning multiple tokens is detected and the visible text truncated.
-        let mut acc_ids: Vec<u32> = Vec::new();
-        let mut sent_chars = 0usize;
-        let mut finish = "length";
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
-        for ev in rx {
-            match ev {
-                TokenEvent::Next(t) => {
-                    // EOS is emitted inclusively; stop without showing it.
-                    if engine.eos_tokens.contains(&t) {
-                        finish = "stop";
-                        break;
+        let logprobs = decodings[0].logprobs.is_some();
+        let rxs = decodings
+            .into_iter()
+            .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
+            .collect();
+        let request = engine.next_id.load(Ordering::Relaxed);
+        let mut choices = stream_choices(&engine, rxs, &stops, tools, |i, c, text| {
+            let lps = logprobs.then(|| ChatLogprobs {
+                content: std::mem::take(&mut c.pending)
+                    .iter()
+                    .map(|(t, lp, _)| chat_logprob(&engine, *t, lp))
+                    .collect(),
+            });
+            let delta = Delta {
+                role: None,
+                content: Some(text),
+                tool_calls: None,
+            };
+            send_chunk(w, i, delta, None, lps)
+        })?;
+        let completion_tokens = choices.iter().map(|c| c.ids.len()).sum();
+        engine.record(prompt_tokens, completion_tokens);
+        // What was held back: the calls, whole, or (when the blocks held no
+        // call) the rest of the text after all.
+        if tools {
+            for (i, c) in choices.iter_mut().enumerate() {
+                let full = engine.tokenizer.decode(&c.ids).unwrap_or_default();
+                let full = &full[..earliest_stop(&full, &stops).unwrap_or(full.len())];
+                let (_, calls) = split_tool_calls(full);
+                let delta = if calls.is_empty() {
+                    let rest: String = full.chars().skip(c.sent).collect();
+                    if rest.is_empty() {
+                        continue;
                     }
-                    completion_tokens += 1;
-                    {
-                        // Decode the accumulated run, never a lone token: byte-level
-                        // BPE splits one UTF-8 character (emoji, CJK, accents) across
-                        // several tokens, and decoding a fragment by itself renders it
-                        // as U+FFFD. Emitting newly-completed characters from the full
-                        // decode is correct with or without stop sequences.
-                        acc_ids.push(t);
-                        let full = engine.tokenizer.decode(&acc_ids).unwrap_or_default();
-                        let cut = earliest_stop(&full, &stops);
-                        let visible = &full[..cut.unwrap_or(full.len())];
-                        let vis_chars = visible.chars().count();
-                        if vis_chars > sent_chars {
-                            let delta: String = visible.chars().skip(sent_chars).collect();
-                            sent_chars = vis_chars;
-                            send_chunk(
-                                w,
-                                Delta {
-                                    role: None,
-                                    content: Some(delta),
-                                },
-                                None,
-                            )?;
-                        }
-                        if cut.is_some() {
-                            finish = "stop";
-                            break;
-                        }
+                    Delta {
+                        role: None,
+                        content: Some(rest),
+                        tool_calls: None,
                     }
-                }
-                TokenEvent::Done(stats) => {
-                    spec = stats;
-                    break;
-                }
+                } else {
+                    c.finish = "tool_calls";
+                    Delta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(tool_calls_out(calls, request, true)),
+                    }
+                };
+                send_chunk(w, i, delta, None, None)?;
             }
         }
-        engine.record(prompt_tokens, completion_tokens);
-
-        send_chunk(
-            w,
-            Delta {
+        for (i, c) in choices.iter().enumerate() {
+            let end = Delta {
                 role: None,
                 content: None,
-            },
-            Some(finish),
-        )?;
+                tool_calls: None,
+            };
+            send_chunk(w, i, end, Some(c.finish), None)?;
+        }
 
         // When speculating, a final usage-only chunk carries the acceptance
         // stats (OpenAI-style: empty choices + a `usage` object).
-        if let Some(stats) = spec {
+        if let [Streamed {
+            spec: Some(stats), ..
+        }] = choices.as_slice()
+        {
             let chunk = Chunk {
                 id: id.clone(),
                 object: "chat.completion.chunk",
@@ -2140,7 +2919,7 @@ fn stream_chat(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
-                    speculative: Some(stats.into()),
+                    speculative: Some((*stats).into()),
                 }),
             };
             let json = serde_json::to_string(&chunk).unwrap_or_default();
@@ -2156,6 +2935,105 @@ fn stream_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tools render exactly as Qwen3's own Jinja template renders them
+    /// (`transformers`' `apply_chat_template` on Qwen3-0.6B gave the string
+    /// below), from the request as an OpenAI client sends it: arguments as a
+    /// JSON string, consecutive tool results.
+    #[test]
+    fn tools_render_as_qwens_template_does() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Weather in Paris and Rome?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}},
+                    {"id": "b", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Rome\"}"}}]},
+                {"role": "tool", "tool_call_id": "a", "content": "18C"},
+                {"role": "tool", "tool_call_id": "b", "content": "24C"}],
+              "tools": [{"type": "function", "function": {"name": "get_weather",
+                "description": "Weather for a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                               "required": ["city"]}}}]}"#,
+        )
+        .unwrap();
+        let tools = req.tools.unwrap();
+        let want: String = serde_json::from_str(r#""<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Weather for a city\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n24C\n</tool_response><|im_end|>\n<|im_start|>assistant\n""#).unwrap();
+        assert_eq!(
+            ChatTemplate::ChatMl
+                .apply_with_tools(&req.messages, &tools)
+                .unwrap(),
+            want
+        );
+        assert!(ChatTemplate::Llama3
+            .apply_with_tools(&req.messages, &tools)
+            .is_err());
+        // Without tools, ChatML is as it was.
+        assert_eq!(
+            ChatTemplate::ChatMl
+                .apply_with_tools(&req.messages[..2], &[])
+                .unwrap(),
+            "<|im_start|>system
+You are terse.<|im_end|>
+<|im_start|>user
+Weather in Paris and Rome?<|im_end|>
+<|im_start|>assistant
+"
+        );
+    }
+
+    #[test]
+    fn tool_calls_are_read_out_of_the_reply() {
+        let reply = "Checking.
+<tool_call>
+{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}
+</tool_call>
+<tool_call>
+{\"name\": \"now\"}
+</tool_call>";
+        let (text, calls) = split_tool_calls(reply);
+        assert_eq!(text, "Checking.");
+        assert_eq!(
+            calls,
+            vec![
+                ("get_weather".to_string(), r#"{"city":"Paris"}"#.to_string()),
+                ("now".to_string(), "{}".to_string())
+            ]
+        );
+        // No call, or a block that holds none: all text.
+        assert_eq!(split_tool_calls("plain"), ("plain".to_string(), vec![]));
+        let broken = "x <tool_call>not json</tool_call>";
+        assert_eq!(split_tool_calls(broken), (broken.to_string(), vec![]));
+        // A call cut off at the length limit is not a call.
+        assert!(split_tool_calls(
+            "<tool_call>
+{\"name\": \"f\", \"argu"
+        )
+        .1
+        .is_empty());
+    }
+
+    #[test]
+    fn a_stream_holds_back_what_may_start_a_tool_call() {
+        assert_eq!(partial_marker("Sure <tool", TOOL_OPEN), 5);
+        assert_eq!(partial_marker("Sure <", TOOL_OPEN), 1);
+        assert_eq!(partial_marker("Sure", TOOL_OPEN), 0);
+        assert_eq!(partial_marker("a <b", TOOL_OPEN), 0);
+    }
+
+    /// RFC 4648's own examples, every padding case.
+    #[test]
+    fn base64_matches_the_rfc() {
+        for (raw, enc) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(raw.as_bytes()), enc, "{raw:?}");
+        }
+    }
 
     /// OpenAI's `content` arrives as a string from some clients and as a list of
     /// parts from others — the SDKs and anything that can attach an image. Both
@@ -2204,6 +3082,7 @@ mod tests {
         let msgs = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            ..Default::default()
         }];
 
         let cm = ChatTemplate::ChatMl.apply(&msgs);
@@ -2232,6 +3111,7 @@ mod tests {
         let msg = |role: &str, content: &str| ChatMessage {
             role: role.into(),
             content: content.into(),
+            ..Default::default()
         };
         let convo = vec![
             msg("system", "Be brief."),
@@ -2331,12 +3211,14 @@ mod tests {
             messages.push(ChatMessage {
                 role: "system".into(),
                 content: sys.to_text(),
+                ..Default::default()
             });
         }
         for m in &req.messages {
             messages.push(ChatMessage {
                 role: m.role.clone(),
                 content: m.content.to_text(),
+                ..Default::default()
             });
         }
         let prompt = ChatTemplate::Plain.apply(&messages);

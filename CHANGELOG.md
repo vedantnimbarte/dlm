@@ -14,6 +14,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Qwen3's replies decoded to nothing.** A `tokenizer.json`'s added tokens
+  were registered only when marked `special`, and Qwen3 marks `<think>` and
+  `</think>` not special. Every Qwen3 chat reply opens with `<think>`, so its
+  ids could not be decoded and the server returned an empty message. All
+  added tokens are registered now, as transformers does: each is one token
+  when encoding and its text when decoding.
+
 - **API compatibility: four things that turned working clients away.**
   - **Every model was called `dlm`.** The id in each response and in
     `/v1/models` is now the checkpoint's own name (`qwen2.5-0.5b`, or a GGUF
@@ -502,6 +509,61 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     single-slot GEMV, and MoE decode does not use the batched block at all.
 
 ### Added
+
+- **`--lora`: serve a model with a PEFT LoRA adapter merged in.** `serve`,
+  `bench` and `score` take an adapter directory and merge `(alpha / r) * B @ A`
+  (`alpha / sqrt(r)` with rsLoRA) into each weight as the loader reads it,
+  before `--quant` or the round back to the checkpoint's dtype, so resident,
+  streamed and split models all run it at the base model's speed and size.
+  Plain LoRA on a decoder layer's seven projections of a safetensors model;
+  DoRA, adapter biases, `modules_to_save`, fused projections, GPTQ and GGUF are
+  refused when it is attached, not skipped. A rank-16 Python adapter on
+  Qwen2.5-0.5B-Instruct: within 2e-5 per token of the same adapter merged by
+  torch, GPU and CPU; mean NLL on Python code 0.3745 -> 0.3669.
+
+- **Tool calling on chat, for ChatML models (Qwen2.5, Qwen3).** `tools` were
+  ignored. They now go into the system turn exactly as Qwen's Jinja template
+  writes them (checked against `transformers`' rendering of Qwen3-0.6B's,
+  byte for byte), and the reply's `<tool_call>` blocks come back as OpenAI
+  `tool_calls` (`arguments` a JSON string, `content` null when there is no
+  text) with `finish_reason: "tool_calls"`. Streamed, text goes out until a
+  call starts and the calls follow whole in one delta. An assistant message's
+  `tool_calls` and the `tool` results render back in for the next turn.
+  `tool_choice` takes `auto` or `none`; forcing a call would need constrained
+  output and is refused. Other templates refuse `tools`. On the GPU,
+  Qwen2.5-1.5B calls `get_weather` for "What's the weather in Paris?" and
+  answers from the result; so does Qwen3-0.6B, its reasoning left in
+  `content`. Qwen2.5-0.5B answers without calling.
+
+- **`/v1/embeddings`.** Each input's embedding is the final-normed hidden
+  state of its last token, at unit length: the pooling decoder embedding
+  models (Qwen3-Embedding, gte-Qwen2) are trained for. `input` takes a string,
+  strings, token ids or lists of them; `encoding_format` `float` or `base64`
+  (what the OpenAI Python SDK asks for by default); `dimensions` keeps the
+  leading ones, back at unit length. It runs on the engine thread between
+  decode steps, on its own KV. Qwen2.5-0.5B (a chat model) on the GPU: two
+  paraphrases at cosine 0.885, each against an unrelated sentence 0.76-0.80.
+
+- **`n` on the OpenAI endpoints: several completions of one prompt.** It was
+  ignored. Chat and `/v1/completions` now return `n` choices (1-16), queued
+  together so they decode in one batch and share the prompt's cached prefix;
+  sampled choice `i` draws with seed `seed + i`, so the choices differ and each
+  can be reproduced alone. Streamed, every chunk carries its choice's `index`,
+  and each choice ends with its own finish reason. Usage counts the prompt
+  once. The chat and completions streams now share one per-choice decoder
+  (`Streamed`), where they had a copy each.
+
+- **`logprobs` on the OpenAI endpoints.** `logprobs` was always `null`. Chat
+  now takes `logprobs: true` and `top_logprobs` (0-20) and returns
+  `choices[].logprobs.content[]` with each token's text, `logprob`, `bytes`
+  and most likely alternatives; `/v1/completions` takes `logprobs` (0-20) and
+  returns `tokens`, `token_logprobs`, `top_logprobs` and `text_offset`. Both
+  stream, each chunk carrying the tokens whose text it delivers. They come
+  from the model's distribution before temperature, penalties or a grammar
+  reshape it, as OpenAI and vLLM report them, and asking for them does not
+  change what is generated (`tests/server_logprobs.rs`). Such a request reads
+  its whole row of logits each step and does not speculate. Qwen2.5-0.5B on
+  the GPU: "Paris" at -0.098, then "L" at -2.8.
 
 - **A model too big for the card streams on its own.** On the GPU, with
   neither `--stream` nor `--gpu-layers`, a model whose weights did not fit was

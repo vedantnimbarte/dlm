@@ -32,7 +32,7 @@
 
 use crate::error::Result;
 use crate::forward::{ComputeKernel, KvSnapshot};
-use crate::generate::{Decoding, GenerationSession, Generator, Sampler};
+use crate::generate::{Decoding, GenerationSession, Generator, Sampler, TokenLogprobs};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -208,6 +208,10 @@ impl AcceptanceStats {
 #[derive(Debug, Clone, Default)]
 pub struct Tick {
     pub produced: Vec<(u64, u32)>,
+    /// The log-probabilities of this tick's token for each request that asked
+    /// for them (see [`Decoding::logprobs`]); such a request makes one token a
+    /// tick.
+    pub logprobs: Vec<(u64, TokenLogprobs)>,
     pub finished: Vec<u64>,
     pub finished_stats: Vec<(u64, AcceptanceStats)>,
 }
@@ -459,12 +463,14 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 sampler,
                 penalties,
                 grammar,
+                logprobs,
             } = p.decoding;
-            // A constrained request decodes plainly even when speculating: see
-            // `Decoding::grammar`.
-            let ngram = self.draft.is_none() && self.gamma > 0 && grammar.is_none();
+            // A constrained request decodes plainly even when speculating, and
+            // so does one that reports log-probabilities: see `Decoding`.
+            let plain_only = grammar.is_some() || logprobs.is_some();
+            let ngram = self.draft.is_none() && self.gamma > 0 && !plain_only;
             let decoder = match self.draft {
-                Some(draft) if grammar.is_none() => Decoder::Speculative(
+                Some(draft) if !plain_only => Decoder::Speculative(
                     SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
                         .with_penalties(penalties),
                 ),
@@ -492,7 +498,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         }
                         None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    let session = session.with_penalties(penalties);
+                    let session = session.with_penalties(penalties).with_logprobs(logprobs);
                     Decoder::Plain(match grammar {
                         Some(g) => session.with_grammar(g),
                         None => session,
@@ -627,7 +633,10 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     a.decoder = Decoder::Speculative(s);
                     vec![first]
                 }
-                Decoder::Plain(s) => {
+                Decoder::Plain(mut s) => {
+                    if let Some(lp) = s.take_logprobs() {
+                        tick.logprobs.push((a.id, lp));
+                    }
                     a.decoder = Decoder::Plain(s);
                     vec![plain_tokens.next().expect("one token per plain slot")]
                 }

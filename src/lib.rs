@@ -16,6 +16,7 @@ pub mod gpu;
 pub mod grammar;
 pub mod hub;
 pub mod loader;
+pub mod lora;
 pub mod memory;
 pub mod model;
 pub mod pipeline;

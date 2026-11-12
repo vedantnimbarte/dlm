@@ -731,6 +731,23 @@ resident (the other way round when streaming: 19 against 16).
 **Not yet:** MoE `.gguf` files, whose experts are stacked into one tensor per
 layer.
 
+## LoRA adapters (`--lora`)
+
+`dlm serve --model-path <base> --lora <adapter-dir>` (and `bench`, `score`)
+merges a PEFT adapter (`adapter_config.json` + `adapter_model.safetensors`)
+into the weights as they load: `W + (alpha / r) * B @ A` (`alpha / sqrt(r)`
+with rsLoRA), before `--quant` or the round back to the checkpoint's dtype, so
+the adapted model runs at the base model's speed and size on every path. One
+adapter per process; it cannot be swapped per request.
+
+Plain LoRA on a decoder layer's seven projections (`q/k/v/o_proj`,
+`gate/up/down_proj`) of a safetensors checkpoint. Everything else is refused
+when the adapter is attached, not skipped: DoRA, adapter biases,
+`modules_to_save`, fused projections, GPTQ and GGUF weights. Checked against an
+independent merge: a rank-16 Python adapter on Qwen2.5-0.5B-Instruct, merged
+by torch and saved, scores within 2e-5 per token of `--lora` on the GPU and
+CPU, and lowers mean NLL on Python code from 0.3745 to 0.3669.
+
 ## Weight precision (`--quant`)
 
 **Omit it and dlm computes in the checkpoint's own precision** — it reads the
@@ -832,7 +849,7 @@ inference engine):
 
 - **OpenAI- and Anthropic-compatible server** ([`src/server`](src/server)) — a
   dependency-free HTTP/1.1 server exposing `/v1/chat/completions`,
-  `/v1/completions` and `/v1/models` (OpenAI) plus `/v1/messages` and
+  `/v1/completions`, `/v1/embeddings` and `/v1/models` (OpenAI) plus `/v1/messages` and
   `/v1/messages/count_tokens` (Anthropic), both dialects with `stream: true` SSE.
   Behind it, an `EngineService` runs a background
   batching thread so concurrent requests are **continuously batched** and each can
@@ -846,7 +863,29 @@ inference engine):
   output** (OpenAI endpoints): `response_format` `json_object` or `json_schema`
   holds the output to JSON (of that schema), and `grammar` to a GBNF grammar,
   llama.cpp's format ([`src/grammar.rs`](src/grammar.rs) lists the supported
-  schema subset). `stop` (OpenAI) / `stop_sequences`
+  schema subset). **Log-probabilities** (OpenAI endpoints): chat's `logprobs`
+  and `top_logprobs` (0-20), and the completions endpoint's `logprobs` (0-20),
+  return each output token's log-probability and its most likely alternatives,
+  streamed or not, from the model's distribution before sampling settings
+  reshape it, as OpenAI and vLLM report them. A request asking for them
+  decodes plainly (no speculation) and reads the whole row of logits each
+  step. **`n`** (1-16, both OpenAI endpoints) returns that many completions of
+  the prompt, decoded together in one batch; a sampled choice `i` draws with
+  seed `seed + i`, so the choices differ, and streamed chunks carry each
+  choice's `index`. **Embeddings** (`/v1/embeddings`): the final-normed hidden
+  state of each input's last token, at unit length, the pooling decoder
+  embedding models (Qwen3-Embedding, gte-Qwen2) are trained for; `input` as
+  text or token ids, one or several, `encoding_format` `float` or `base64`,
+  and `dimensions` to keep the leading ones. A chat model's embeddings work
+  but are not tuned for retrieval. **Tool calling** (chat, ChatML models such
+  as Qwen2.5 and Qwen3): `tools` go into the prompt exactly as Qwen's own
+  template writes them, and the reply's `<tool_call>` blocks come back as
+  `tool_calls` with `finish_reason: "tool_calls"`, streamed as one delta at the
+  end; an assistant message's `tool_calls` and `tool` results render back in
+  for the next turn. `tool_choice` takes `auto` or `none`. Other templates
+  refuse `tools`, as dlm has no prompt format for them. Whether a model calls
+  well is the model's: Qwen2.5-1.5B and Qwen3-0.6B do, Qwen2.5-0.5B tends to
+  answer instead. `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,
