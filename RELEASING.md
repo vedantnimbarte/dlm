@@ -111,10 +111,46 @@ release is a claim, and these bound it.
 ```sh
 # 1. Bump `version` in Cargo.toml, refresh Cargo.lock (`cargo build`), commit.
 # 2. Run the manual GPU checks above.
-# 3. Then:
+# 3. Check the release runners (below) are still the ones release.yml names.
+# 4. Then:
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-Watch the release run: a failed `build-cuda-static` leg leaves the CPU assets
-published and the GPU ones missing, and `install.sh` will then hand NVIDIA users
-a CPU build without saying why.
+Watch the release run to the end. Every job must be green and every asset
+attached. A failed leg doesn't stop the others: the release still publishes,
+missing that asset, and is marked Latest. `install.sh` then 404s on a missing
+Apple Silicon build, and on Linux it falls back from a missing CUDA build to
+the CPU one.
+
+## Release runners: CI cannot see them
+
+**The release builds run on runner images that nothing else exercises.** CI
+never runs `release.yml`, so a green `main` says nothing about them, and
+GitHub changes them on its own schedule. v0.4.0 is the example. Not a line of
+code had changed since CI passed, and the release still went out without two
+of its six builds:
+
+- `macos-14` had been retired. The Apple Silicon job was cancelled before it
+  ran a step ("The configuration … is not supported").
+- `ubuntu-latest` had moved to Ubuntu 26.04, and NVIDIA's 26.04 repo has no
+  `cuda-13-2`. The Linux CUDA job failed installing the toolkit.
+
+So `release.yml` now pins the runner each job depends on, in the way that
+fits that job:
+
+| Job | Runner | Why |
+|---|---|---|
+| Linux CUDA static | `ubuntu-24.04` | The toolkit comes from NVIDIA's per-Ubuntu repo, so the Ubuntu version matters. Move it on once that repo has the pinned CUDA. |
+| Apple Silicon | `macos-latest` | Rust's deployment target (11.0) decides which Macs the binary runs on, not the runner's macOS, so following the image costs nothing and survives retirements. |
+| Linux CPU | `ubuntu-latest` | Safe to float. The binary's glibc floor comes from the symbols it uses: 2.39 on x86_64 and 2.18 on aarch64 at 0.4.1. A newer image could raise it, so check if Linux users report load errors. |
+
+**Before tagging**, check
+[actions/runner-images](https://github.com/actions/runner-images) for images
+being retired, and for `-latest` labels that have moved since the last release.
+A label moving is as much a change to the release as a commit is.
+
+**If a release run fails anyway,** don't re-run the failed jobs. A re-run uses
+`release.yml` as it was at the tag, so it hits the same broken runner. Fix the
+workflow, ship a patch release with the same code (0.4.0 → 0.4.1), and mark
+the incomplete release as a pre-release with a note pointing to its
+replacement. Don't move the tag: by then people may have downloaded its assets.
