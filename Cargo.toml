@@ -58,7 +58,7 @@ memmap2 = "0.9"
 # clears comfortably — so this pin is no longer load-bearing and can be relaxed
 # to "0.14" whenever someone wants the newer patch releases. Left exact here
 # only to keep a formatting-and-CI branch from moving dependency versions.
-prost = "=0.14.1"
+prost = "=0.14.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
