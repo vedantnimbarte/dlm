@@ -1948,7 +1948,7 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         );
     }
     if args.api_key.is_some() {
-        println!("  auth       : bearer token required on /v1/*");
+        println!("  auth       : API key required on every route but /, /health, /healthz");
     }
     let router = dlm::server::engine::secured_router(engine, args.api_key.clone());
     let router = match &args.cors_origin {

@@ -346,9 +346,9 @@ pub struct ServeArgs {
 
     /// Speculative decoding: propose several tokens, verify them in one pass.
     /// `auto` uses the draft model when `--draft-model-path` is given, else
-    /// n-gram lookup when the model is streamed (`--stream` with layers left out
-    /// of the resident window; on the CPU, also more than `--ram-cache-gb`
-    /// holds), else nothing. Output is unchanged: greedy is
+    /// n-gram lookup on the GPU (resident or streamed) or on a CPU model streamed
+    /// from disk (layers left out of the window that `--ram-cache-gb` cannot
+    /// hold), else nothing. Output is unchanged: greedy is
     /// exactly greedy, and sampling follows the model's own distribution.
     #[arg(long, value_enum, default_value_t = Speculative::Auto)]
     pub speculative: Speculative,
@@ -442,7 +442,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "SECRET")]
     pub cluster_secret: Option<String>,
 
-    /// Require this bearer token on `/v1/*` requests (`Authorization: Bearer …`).
+    /// Require this key on every route except `/`, `/health` and `/healthz`
+    /// (`Authorization: Bearer …` or `x-api-key: …`), `/metrics` included.
     /// Omit to leave the API open (localhost default).
     #[arg(long, value_name = "KEY")]
     pub api_key: Option<String>,

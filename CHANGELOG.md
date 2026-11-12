@@ -14,6 +14,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A streamed `/v1/messages` request past `--queue-timeout` got a 200.** The
+  Anthropic stream queued its request only after the response had started, so
+  one the queue turned away came back as an empty stream ending in
+  `stop_reason: max_tokens`. It now waits for admission first, like the OpenAI
+  endpoints, and gets `503` with `Retry-After`. `--api-key`'s help and startup
+  banner also said it guarded `/v1/*` only; it guards every route but `/`,
+  `/health` and `/healthz`, and they say so.
+
 - **Qwen3's replies decoded to nothing.** A `tokenizer.json`'s added tokens
   were registered only when marked `special`, and Qwen3 marks `<think>` and
   `</think>` not special. Every Qwen3 chat reply opens with `<think>`, so its

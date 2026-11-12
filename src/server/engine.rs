@@ -324,18 +324,8 @@ impl EngineService {
         self
     }
 
-    /// Submit a request; returns a channel that yields its tokens then `Done`.
-    fn submit(
-        &self,
-        prompt: Vec<u32>,
-        max_new: usize,
-        eos: Vec<u32>,
-        decoding: Decoding,
-    ) -> Receiver<TokenEvent> {
-        self.submit_at(prompt, max_new, eos, decoding, 0)
-    }
-
-    /// [`submit`](Self::submit) at `priority` (lower is admitted first).
+    /// Submit a request at `priority` (lower is admitted first); returns a
+    /// channel that yields its tokens then `Done`.
     fn submit_at(
         &self,
         prompt: Vec<u32>,
@@ -2801,14 +2791,14 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        return stream_messages(
-            Arc::clone(engine),
-            ids,
-            max_tokens,
-            model,
-            sampler.into(),
-            stops,
-        );
+        // Queue before the stream opens, so a request `--queue-timeout` turns
+        // away gets a real `503` rather than a 200 stream that ends empty.
+        let started = match start_choices(engine, &ids, max_tokens, vec![sampler.into()], 0) {
+            Ok(s) => s,
+            Err(why) => return busy(anthropic_error_json(&why)),
+        };
+        let (first, rx) = started.into_iter().next().expect("one choice");
+        return stream_messages(Arc::clone(engine), ids.len(), first, rx, model, stops);
     }
 
     let g = match collect_completion(engine, ids, max_tokens, sampler.into(), &stops) {
@@ -2847,15 +2837,14 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
 /// `content_block_stop`, `message_delta` (with `stop_reason`), `message_stop`.
 fn stream_messages(
     engine: Arc<EngineService>,
-    ids: Vec<u32>,
-    max_tokens: usize,
+    prompt_tokens: usize,
+    first: TokenEvent,
+    rx: Receiver<TokenEvent>,
     model: String,
-    decoding: Decoding,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("msg-{}", engine.next_id.load(Ordering::Relaxed));
-        let prompt_tokens = ids.len();
         // Anthropic frames carry both an `event:` line and a `data:` line.
         let send = |w: &mut dyn std::io::Write,
                     event: &str,
@@ -2900,8 +2889,7 @@ fn stream_messages(
         let mut sent_chars = 0usize;
         let mut stop_reason = "max_tokens";
         let mut stop_sequence: Option<String> = None;
-        let rx = engine.submit(ids, max_tokens, engine.eos_tokens.clone(), decoding);
-        for ev in rx {
+        for ev in std::iter::once(first).chain(rx) {
             match ev {
                 TokenEvent::Next(t, _) => {
                     // EOS is emitted inclusively; end the turn without showing it.
