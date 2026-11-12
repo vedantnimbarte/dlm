@@ -3,6 +3,12 @@
 Prefill tok/s = batch * PROMPT / t(1 token); decode tok/s = batch * (GEN - 1)
 / (t(GEN) - t(1)). Random token ids per sequence, greedy, ignore_eos, prefix
 caching off; median of RUNS after one warm-up per shape.
+
+    python vllm_bench.py float32 [4,8,16]
+
+The optional second argument picks the batch sizes. Each batch's work starts
+with a `BEGIN batch N` line, which `bench/power.py` uses to time it; a
+final `BEGIN shutdown` keeps teardown out of the last batch's window.
 """
 import os
 import random
@@ -19,6 +25,7 @@ def main():
     from vllm.inputs import TokensPrompt
 
     dtype = sys.argv[1]
+    batches = [int(b) for b in sys.argv[2].split(",")] if len(sys.argv) > 2 else BATCHES
     llm = LLM(
         model=os.path.expanduser("~/models/Qwen2.5-0.5B-Instruct"),
         dtype=dtype,
@@ -40,7 +47,8 @@ def main():
         llm.generate(prompts, sp, use_tqdm=False)
         return time.perf_counter() - t
 
-    for batch in BATCHES:
+    for batch in batches:
+        print(f"BEGIN batch {batch}", flush=True)
         timed(batch, 1)
         timed(batch, GEN)
         t1 = statistics.median(timed(batch, 1) for _ in range(RUNS))
@@ -50,6 +58,7 @@ def main():
             f"decode {batch * (GEN - 1) / (tg - t1):.1f} tok/s",
             flush=True,
         )
+    print("BEGIN shutdown", flush=True)  # closes the last batch's window
 
 
 if __name__ == "__main__":
