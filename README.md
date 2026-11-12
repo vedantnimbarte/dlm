@@ -900,8 +900,9 @@ inference engine):
   token counts. Send it as either `Authorization: Bearer <key>` (OpenAI) or
   `x-api-key: <key>` (Anthropic), so either SDK authenticates unchanged. The
   request body is size-capped.
-  `GET /metrics` exposes Prometheus counters
-  (requests, prompt/completion tokens, and — when streaming — layer cache
+  `GET /metrics` exposes Prometheus counters and gauges
+  (requests, prompt/completion tokens, requests running and waiting, free KV
+  tokens where the GPU pages KV, and — when streaming — layer cache
   hits/misses/evictions/prefetches and live prefetch depth). The engine picks its
   compute kernel from flags:
   - `--stream [--resident-layers N]` — **layer streaming**

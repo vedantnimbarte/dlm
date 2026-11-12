@@ -415,6 +415,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         !self.pending.is_empty() || !self.active.is_empty()
     }
 
+    /// Requests queued for a slot.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// In-flight request count.
     pub fn active_len(&self) -> usize {
         self.active.len()

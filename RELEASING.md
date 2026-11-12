@@ -30,6 +30,10 @@ cargo test --release --features cuda-kernels
 #    Run it on a 2-3-bit file (Q2_K, IQ3_M) as well as a Q4_K_M.
 DLM_TEST_GGUF=models/gguf/<model>.gguf DLM_TEST_GGUF_F32=<its-f32-copy>.gguf   cargo test --release --features cuda-kernels --test gguf_model
 
+#    And a soak through the HTTP server: many clients, every request kind,
+#    abandoned streams; nothing may leak or cross between batched requests.
+DLM_SOAK_ROUNDS=300 cargo test --release --features cuda-kernels --test server_soak
+
 # 2. End-to-end on a real model, on the GPU. Tests can pass while the served
 #    engine emits nonsense; only reading the output catches that.
 cargo run --release --features cuda-kernels -- \

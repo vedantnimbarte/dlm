@@ -510,6 +510,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Load gauges on `/metrics`, and a load and soak test.** `/metrics` had
+  only counters; it now also has `dlm_requests_running`,
+  `dlm_requests_waiting` and, where the GPU pages KV, `dlm_kv_free_tokens`,
+  as of the scheduler's latest step: what to alert or scale on.
+  `tests/server_soak.rs` sends 192 requests from 16 clients at four batch
+  slots, of every kind (greedy and streamed chat, `n` with `logprobs`,
+  embeddings, stop sequences, and clients that hang up mid-stream), and checks
+  every greedy answer matches the one given alone (no cross-talk between
+  batched requests' KV), then that the server drains to idle, the GPU's KV pool
+  is as full as it started, and it still answers. `DLM_SOAK_ROUNDS` repeats
+  the load: 57,600 requests over two minutes on a GTX 1650 came back clean.
+  With blocks no longer returned on drop, the GPU run fails.
+
 - **`--queue-timeout` and request `priority`: a bounded, ordered queue.** A
   request waited for a batch slot as long as it took, and in arrival order.
   `--queue-timeout SECS` now turns away one that has waited that long with

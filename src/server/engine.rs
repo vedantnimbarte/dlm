@@ -77,6 +77,12 @@ struct StreamMetrics {
     expert_hits: AtomicU64,
     expert_misses: AtomicU64,
     expert_evictions: AtomicU64,
+    /// The scheduler after its latest step, whatever the kernel: requests
+    /// decoding, requests queued, and (where the kernel pages KV) free KV
+    /// tokens, `u64::MAX` when there is no pool to count.
+    running: AtomicU64,
+    waiting: AtomicU64,
+    kv_free: AtomicU64,
 }
 
 impl StreamMetrics {
@@ -406,6 +412,9 @@ fn engine_loop<K: ComputeKernel>(
         None => BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size),
     };
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
+    // The gauges hold from the start, not only after the first request.
+    let free = generator.kv_free_tokens().map_or(u64::MAX, |t| t as u64);
+    stream.kv_free.store(free, Ordering::Relaxed);
 
     loop {
         let mut take = |work: Work, sched: &mut BatchScheduler<'_, K>| match work {
@@ -482,6 +491,14 @@ fn engine_loop<K: ComputeKernel>(
         if let Some(s) = generator.stream_stats() {
             stream.publish(s);
         }
+        stream
+            .running
+            .store(sched.active_len() as u64, Ordering::Relaxed);
+        stream
+            .waiting
+            .store(sched.pending_len() as u64, Ordering::Relaxed);
+        let free = generator.kv_free_tokens().map_or(u64::MAX, |t| t as u64);
+        stream.kv_free.store(free, Ordering::Relaxed);
     }
 }
 
@@ -1584,6 +1601,26 @@ fn metrics_text(engine: &EngineService) -> String {
         m.prompt_tokens.load(Ordering::Relaxed),
         m.completion_tokens.load(Ordering::Relaxed),
     );
+    // Load, as of the scheduler's latest step: what to alert or scale on.
+    let s = &engine.stream;
+    out.push_str(&format!(
+        "# HELP dlm_requests_running Requests decoding now.\n\
+         # TYPE dlm_requests_running gauge\n\
+         dlm_requests_running {}\n\
+         # HELP dlm_requests_waiting Requests queued for a batch slot.\n\
+         # TYPE dlm_requests_waiting gauge\n\
+         dlm_requests_waiting {}\n",
+        s.running.load(Ordering::Relaxed),
+        s.waiting.load(Ordering::Relaxed),
+    ));
+    let kv_free = s.kv_free.load(Ordering::Relaxed);
+    if kv_free != u64::MAX {
+        out.push_str(&format!(
+            "# HELP dlm_kv_free_tokens KV cache tokens free in the pool.\n\
+             # TYPE dlm_kv_free_tokens gauge\n\
+             dlm_kv_free_tokens {kv_free}\n"
+        ));
+    }
     // Layer-streaming cache stats — present only when streaming weights, so a
     // scraper can see the hit rate / prefetch effectiveness and tune the window
     // and --prefetch-depth.
