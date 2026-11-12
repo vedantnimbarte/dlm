@@ -12,509 +12,41 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
+## [0.4.0] - 2026-11-12
 
-- **A streamed `/v1/messages` request past `--queue-timeout` got a 200.** The
-  Anthropic stream queued its request only after the response had started, so
-  one the queue turned away came back as an empty stream ending in
-  `stop_reason: max_tokens`. It now waits for admission first, like the OpenAI
-  endpoints, and gets `503` with `Retry-After`. `--api-key`'s help and startup
-  banner also said it guarded `/v1/*` only; it guards every route but `/`,
-  `/health` and `/healthz`, and they say so.
+### Verified
 
-- **Qwen3's replies decoded to nothing.** A `tokenizer.json`'s added tokens
-  were registered only when marked `special`, and Qwen3 marks `<think>` and
-  `</think>` not special. Every Qwen3 chat reply opens with `<think>`, so its
-  ids could not be decoded and the server returned an empty message. All
-  added tokens are registered now, as transformers does: each is one token
-  when encoding and its text when decoding.
+Three model families landed and they are **not** equally proven; `RELEASING.md`
+carries the full ledger:
 
-- **API compatibility: four things that turned working clients away.**
-  - **Every model was called `dlm`.** The id in each response and in
-    `/v1/models` is now the checkpoint's own name (`qwen2.5-0.5b`, or a GGUF
-    file's). A client picking from the model list, routing between instances, or
-    checking a reply against what it asked for had nothing to go on.
-  - **`content` as an array of parts is accepted**, not only as a string. The
-    OpenAI SDKs and anything that can attach an image send the array form, and
-    dlm answered 400. Parts it cannot serve (an image) are dropped rather than
-    refused, and `content: null` reads as empty.
-  - **A request without `max_tokens` now runs to EOS**, instead of stopping at
-    128 tokens with `finish_reason: length`. It is still clamped to what is left
-    of the context window, which is the cap that matters.
-  - **`--cors-origin`** answers browser preflights and tags replies, so a browser
-    UI can reach the API. Without it the request succeeds and the browser
-    discards the answer, with nothing in the log. Off by default: a server on a
-    shared network should not hand its answers to any page that asks.
-- **A K-quant sub-block with a zero scale decoded to zero on the CPU.** ggml
-  decodes it as `-dmin * m`, and so do the GPU kernels; the CPU reference and
-  the expanded (int4/int8) layout dropped the minimum. Both now keep it.
-- **The end-to-end server test drove an engine nothing served.**
-  `tests/server.rs` exercised a second, older OpenAI router that only the test
-  referenced, so its checks said nothing about the server `dlm serve` runs. It
-  now drives `EngineService`, and the dead router is gone.
+- **Phi-3** — weight mapping proven by a same-weights-twice equivalence test,
+  confirmed by mutation.
+- **GPT-2** — answers correctly on the real `openai-community/gpt2`.
+- **Falcon** — **config-verified only.** No runnable checkpoint exists: the
+  smallest `alibi: false` variant is 14 GB, and the 1B `falcon-rw` uses ALiBi,
+  which dlm refuses. Not yet output-verified.
 
-### Changed
+Each entry below names what it was checked against. All GPU work remains
+verified only on Turing (GTX 1650); CI has no GPU and never executes a device
+kernel.
 
-- **The GPU's KV cache is int8 by default** (`--kv-quant auto`): 56% of
-  fp16's memory, so 1.76x the tokens in the same VRAM, at the speed of fp16
-  (Qwen2.5-0.5B, 1,024-token prompts: batch 1 97-100 against 99-100 tok/s,
-  batch 16 390-398 against 381-387). The key balancing below is what made it
-  safe to: int8 now scores within 0.005 nats per token of fp16 on every model
-  measured. `--kv-quant f16` keeps the old cache; the CPU kernels keep f32
-  under `auto` as before. `dlm bench` follows the default too: compare against
-  a baseline saved before this with `--kv-quant f16`.
+### Known gaps
 
-- **A quantized KV cache no longer loses Qwen's small key channels.** A few
-  key channels on Qwen2.5 are a hundred times the rest (its `k_proj` bias puts
-  130-240 on them in layers 0-2 and 8, where others are 1-6), and an int8 cache
-  keeps one scale per 32 values, so each group holding one rounded its
-  neighbours to a step of ~2. Attention only uses `q . k`, so the loader now
-  divides each such pair of key channels by a power of two and multiplies the
-  matching query channels by it, in the projection weights and biases (in the
-  q/k norm weights where a model has them). Every weight scales exactly or is
-  left alone, so `q . k` is unchanged to the bit and an fp16 or f32 cache gives
-  the same output; no kernel changed. Channel sizes come from the weights
-  (`sqrt(bias^2 + |W_row * norm|^2)`); only pairs over 4x the layer's median
-  move, to between 2x and 4x. int8 KV's cost in mean NLL against fp16, decoding
-  ~1,150 tokens of two parts of this README (`dlm score --decode`):
+Tracked in full in `RELEASING.md`:
 
-  | Model | before | after |
-  |---|---|---|
-  | Qwen2.5-0.5B bf16 | 0.022 / 0.011 | -0.000 / -0.005 |
-  | Qwen2.5-0.5B `Q4_K_M` | 0.030 / 0.018 | 0.002 / -0.005 |
-  | Qwen2.5-1.5B bf16 | 0.002 / 0.001 | 0.001 / -0.002 |
-  | Qwen2.5-1.5B `Q4_K_M` | 0.006 / 0.004 | 0.005 / 0.002 |
-  | Qwen3-0.6B (q/k norms) | 0.009 / 0.020 | 0.001 / -0.001 |
-  | SmolLM2-360M (Llama, no outliers) | -0.001 / 0.002 | -0.002 / 0.002 |
-
-  Rounding every pair to the median instead, the first version, made the
-  1.5B models slightly worse (0.002 -> 0.004): pairs near the median are not
-  the problem, and moving them only reshuffles groups.
-
-- **`--stream --device gpu` is no longer experimental.** Its banner said
-  `[experimental]` and its code "unvalidated on hardware"; the checks it lacked
-  are now in the suite. `streaming_gpu_soak_matches_resident` runs three
-  batched sequences for 300 steps through a window of 3 of 8 layers, then a
-  prefill beside them, and checks every step against the resident kernel; with
-  the wait before an evicted layer's buffers are reused taken out, it fails
-  within two steps, every run. `gpu_streamed_and_resident_agree`
-  (`tests/gguf_model.rs`) scores a real GGUF file streamed through a two-layer
-  window against resident: Qwen2.5-0.5B `Q2_K` to `Q8_0` and the IQ files, and
-  1.5B `Q4_K_M`, agree within 0.011-0.034 nats per token on average, where one
-  layer streamed wrong moves them by 0.47. The startup banner's prefetch line
-  now says what the GPU path does, and `--prefetch-depth` / `--auto-prefetch`
-  are documented as the CPU path's.
-
-- **Streaming on the GPU is up to 20% faster: the copy engine no longer idles
-  under resident layers.** The prefetch worker was told "layer L + 1" as the
-  pass reached layer L, and with most of the model resident L + 1 usually
-  was, so the upload of the next streamed layer waited for the pass to get
-  next to it. It now loads the first layer from L + 1 on that is missing,
-  evicting only a layer the pass needs after that one, and a layer loaded
-  ahead is evicted last until the pass uses it. GTX 1650, Qwen2.5-7B-Instruct
-  `Q3_K_M` (19 of 28 layers resident), decode over six alternating runs:
-  6.0-7.0 -> 7.1-9.0 tok/s (median 6.3 -> 7.7; best step 142.7 -> 111.7 ms,
-  against ~108 ms of PCIe per token).
-
-- **A single-token layer's attention half takes fewer launches.** Two merges
-  that need no grid-wide synchronization:
-  - **RoPE and the K/V append run inside the attention kernel**
-    (`attn_split_post_kernel`), removing `qk_post`'s launch. Each attention
-    block normalizes and rotates its own query heads in shared memory; the
-    block for the last chunk, the only one that reads the token's own row,
-    rotates its key and appends K and V before attending. Qwen2.5-0.5B batch
-    1: Q4_K_M 132 -> 137 tok/s, bf16 97 -> 103; Qwen2.5-1.5B unchanged (65.6
-    / 65.7 over six runs).
-  - **For int8 activations, the input and post-attention norms and their
-    quantization are one launch** (`rmsnorm_q8_kernel`), and the GEMVs that
-    read the row (Q/K/V; gate and up, which also stop quantizing it twice)
-    reuse its codes. Batch 1, four alternating pairs: Qwen2.5-0.5B Q8_0 129 ->
-    138 tok/s, int8 129 -> 145. Q4_K_M at 0.5B is unchanged: its 896-wide
-    rows do not take int8 activations.
-
-  A single kernel for the whole half would need a grid-wide sync between the
-  Q/K/V GEMV, attention and the output GEMV (a cooperative launch, which
-  limits the GEMVs' occupancy); these two cover the launches that need none.
-
-- **Single-request decode is 13-22% faster: the fused GEMV no longer spills
-  to the stack.** The kernel that runs a layer's Q/K/V, output and down
-  projections for one sequence found each row's matrix by indexing its
-  segment struct with a runtime value, which copied all 88 bytes of it to
-  every thread's stack, and then read the row's weight pointer from that stack
-  inside its inner loop. It now selects with constant indices and takes the
-  weights as their own read-only parameters (`STACK:0`). Batch-1 decode,
-  GTX 1650, tok/s: Qwen2.5-0.5B bf16 85 -> 104, Q4_K_M 110 -> 133, Q8_0
-  109 -> 130, Qwen2.5-1.5B Q4_K_M 59 -> 67. bf16 batch 1 now matches the 101
-  tok/s vLLM (fp16) made on this card. Batched decode runs other kernels and
-  is unchanged.
-
-- **N-gram speculation now pays on the GPU, and `--speculative auto` turns it
-  on there.** A speculative round scores the pending token and its proposals
-  in one target pass, but on the GPU that pass went through the prefill GEMM,
-  which computes 64-token tiles, and each position then ran the LM head on its
-  own and copied its logits to the host. Verifying 5 tokens cost what decoding
-  them one by one did, so speculation could not win, and `auto` left it off for
-  resident models. Now a piece of 16 tokens or fewer goes through the batched
-  decode block (a verify, a short prompt, a long prompt's tail), and the verify
-  scores every position in one LM-head call (`Generator::distributions`), only
-  the argmax coming back under plain greedy. Batch 1 on a GTX 1650, n-gram
-  lookup proposing 4, decode tok/s (`dlm bench --speculative ngram`, which
-  now measures it):
-
-  | Model | Plain | Before | After | Accepted |
-  |---|---|---|---|---|
-  | Qwen2.5-0.5B bf16, greedy | 85 | 84 | 317 | 100% |
-  | Qwen2.5-0.5B Q4_K_M, greedy | 111 | 98 | 358 | 100% |
-  | Qwen2.5-1.5B Q4_K_M, greedy | 58 | 33 | 130 | 100% |
-  | Qwen2.5-0.5B Q4_K_M, temperature 1.2 | 71 | | 79 | 39% |
-  | Qwen2.5-1.5B Q4_K_M, temperature 1.2 | 52 | | 65 | 78% |
-
-  The bench prompt repeats, the case lookup is for, so the greedy rows are
-  its best case; real text proposes less often. A round whose every guess
-  misses costs about a third of a step more than a plain step (a 5-token
-  verify is 1.55x one). Several requests at once still decode plainly in one
-  batched pass, as before. Short prompts gain too: time to first token for 8
-  / 16 tokens 66 / 58 ms -> 30 / 39 ms. `--speculative off` restores plain
-  decoding; `dlm bench` stays plain unless asked.
-
-- **A batched decode layer launches Q/K/V as one GEMV and gate/up as
-  another.** Each layer issued about 21 launches, and the host spent 5-8 ms
-  of a batched step issuing them; on Qwen2.5-0.5B, K and V alone were 128 rows,
-  8 blocks each on a 14-SM card. Matrices that share a dtype now go through
-  one launch over their row segments, with the activations quantized once.
-  GTX 1650, Qwen2.5-0.5B, decode tok/s at batch 4 / 8 / 16, the previous commit
-  and this one alternately: bf16 311 / 410 / 473 -> 328 / 408 / 487, Q8_0
-  435 / 654 / 760 -> 480 / 637 / 798. A GGUF layer whose V is Q6_K beside
-  Q4_K Q and K keeps three launches.
-
-- **Long-prompt prefill is up to 1.6x faster: attention is tiled over
-  queries.** Prefill attention gave each prompt token its own block, which read
-  the whole history, so a 512-token chunk at 8k positions read about 2 GB of
-  K/V per layer. A block now takes a tile of tokens (times the query heads
-  sharing a KV head) and streams the history through shared memory once for
-  all of them, with a running softmax. Heads 64 and 128 wide (Qwen, Llama,
-  Mistral); others keep the per-token kernel. GTX 1650, prefill tok/s, per-
-  token and tiled kernels alternately:
-
-  | Prompt | Qwen2.5-0.5B bf16 | Qwen2.5-1.5B Q4_K_M |
-  |---|---|---|
-  | 512 | 1,350 -> 1,490 (noise) | 486 -> 489 |
-  | 2,048 | 1,218 -> 1,447 | 397 -> 435 |
-  | 8,000 | 651 -> 1,018 | 234 -> 303 |
-
-- **`--kv-quant int8` (and `int4`) now keeps the GPU KV cache in int8: 1.76x
-  or more the tokens in the same VRAM.** Both used to mean fp16 on the GPU.
-  Each 32 values are now a float scale and 32 int8 codes, 1.125 bytes a value
-  against fp16's 2; models whose heads are not a multiple of 32 wide keep
-  fp16. The pool sizing and the fit check count it, and the server prints the
-  pool (`kv cache : N tokens`). On a GTX 1650, Qwen2.5-1.5B Q4_K_M at
-  `--context-length 32768` with four requests: 74,608 tokens of fp16 KV fit
-  beside the weights, against all 131,072 in int8. Decode and prefill speed
-  are within a few percent of fp16 (0.5B Q4_K_M, 3,000-token prompt: batch 8
-  decode 354 -> 365 tok/s, prefill 1,130 -> 1,090).
-
-  **It costs accuracy, so fp16 stays the default.** Scoring 833 tokens of
-  this README through the decode kernels (`dlm score --decode`) on
-  Qwen2.5-0.5B: mean NLL 2.841 with fp16 KV, 2.901 with int8 (the CPU's int8
-  store, the same scheme: 2.878). Qwen's keys have a few channels far larger
-  than the rest, and a 32-value group holding one quantizes its neighbours
-  coarsely; per-channel key scales are the known fix. The GPU's int8 agrees
-  with the CPU's to 1e-7 on the same inputs.
-
-- **Sampled decode is 4-8x faster at batch 16: candidates are found on the
-  GPU.** A temperature/top-k/top-p step copied each sequence's whole row of
-  logits to the host (600 KB on Qwen2.5) and found the softmax total and the
-  top candidates there, one sequence at a time; at batch 16 that took several
-  times as long as the model. The device head now returns each row's largest
-  logit, its softmax total and its largest logits sorted (4 KB for top-k 40),
-  and the host draws from those with the same arithmetic. A draw they cannot
-  decide exactly still takes the logits: a top-p nucleus wider than 1,024
-  tokens, pure temperature with neither top-k nor top-p, a repetition or
-  frequency penalty, a grammar, or a final logit softcap. The draws match the
-  host sampler's for a seed, except that the vocabulary total is summed in
-  another order and can differ in its last bit. GTX 1650, Qwen2.5-0.5B Q4_K_M,
-  temperature 0.8, decode tok/s:
-
-  | Sampler | Batch 1 | Batch 4 | Batch 16 |
-  |---|---|---|---|
-  | top-p 0.95 | 33 -> 120 | 57 -> 340 | 83 -> 673 |
-  | top-k 40 | 36 -> 115 | 106 -> 345 | 153 -> 678 |
-  | greedy, for reference | 115-128 | 341-367 | 712-722 |
-
-  `dlm bench` takes `--temperature`, `--top-p` and `--top-k` to measure it,
-  and records the sampler in its JSON.
-
-- **Batched decode of quantized models is 2-3x faster at batch 8-16.** The
-  int8-activation GEMV that every quantized format (int8, int4 and the GGUF
-  types) takes in a batch gave each warp one weight row and decoded each
-  32-weight chunk again for every sequence. Past batch 4 that decoding, not
-  memory, set its speed: about 250 tok/s on Qwen2.5-0.5B in any quantized
-  format, barely above batch 4. Each format's chunk decode is now separate
-  from its dot product, so a warp decodes four rows' chunks once and dots them
-  with every sequence's activations. The previous commit and this one
-  alternately on a GTX 1650, decode tok/s:
-
-  | Model | Batch 1 | Batch 4 | Batch 8 | Batch 16 |
-  |---|---|---|---|---|
-  | 0.5B Q4_K_M | 125 -> 124 | 197 -> 335 | 211 -> 513 | 237 -> 658 |
-  | 0.5B int4 | 117 -> 124 | 196 -> 413 | 217 -> 615 | 236 -> 672 |
-  | 0.5B Q6_K | 95 -> 95 | 121 -> 215 | 181 -> 340 | 226 -> 500 |
-  | 1.5B Q8_0 | 42 -> 41 | 72 -> 148 | 76 -> 223 | 76 -> 247 |
-
-  The Q6_K runs drifted widely (batch 1 from 55 to 118 tok/s on either build):
-  its batch 4-16 figures are medians of three, its batch 1 the one pair run
-  back to back on a steady card. Q6_K's one-sequence dot keeps its old fused
-  form: through the split decode it ran 5-10% slower at batch 1.
-
-- **Batched f32/bf16/f16 projections take four weight rows per warp.** At
-  batch 8-16 the batched GEMV was bound by loads, not memory: it re-read
-  every sequence's activations for each weight row, eight floats for eight
-  multiply-adds. A warp now decodes four rows' chunks and multiplies each
-  activation chunk it loads into all four, with the batch size fixed at
-  compile time (4, 8 or 16) so the accumulators stay in registers. The
-  quantized formats keep their int8-activation kernel. The previous commit
-  and this one alternately, twice, same setup as below:
-
-  | Batch | Before | After |
-  |---|---|---|
-  | 4 | 270 | 310 |
-  | 8 | 291 | 419 |
-  | 16 | 324 | 496 |
-
-  Batch 1 and prefill take other kernels and measured the same once the run
-  order was reversed (the card runs warmer later in a series).
-
-- **Batched attention runs in three launches for the whole batch.** The fused
-  batched block read each weight once for all sequences, but still launched
-  Q/K norm, RoPE, the K/V append and split-K attention slot by slot: 2-3 small
-  launches per sequence per layer, about 1.5 ms a sequence per step on
-  Qwen2.5-0.5B. Now each launch covers every slot, which reads its own cache,
-  block table and history length. Shapes the split kernel cannot take still go
-  slot by slot. Same setup as the LM-head entry below, three builds run
-  alternately twice (the first `main` run was throttled and is left out):
-
-  | Batch | Before both | LM head shared | Plus this |
-  |---|---|---|---|
-  | 4 | 166 | 217 | 249 |
-  | 8 | 178 | 228 | 276 |
-  | 16 | 180 | 238 | 300 |
-
-  vLLM 0.33 in fp32 on the same card made 200 / 281 / 286 tok/s at these batch
-  sizes (`bench/BASELINES.md`).
-
-- **Batched decode is about 30% faster: the batch shares one LM-head pass.**
-  Each session used to run the vocabulary-wide LM head on its own, reading
-  its weights once per sequence: on Qwen2.5-0.5B at batch 16 that was 36 ms of
-  a 90 ms step. `step_sessions` (the server's scheduler and `dlm bench`) now
-  sends every session's hidden state through one call, which reads the weights
-  once per 16 rows; greedy rows still get only their argmax back. GTX 1650,
-  Qwen2.5-0.5B bf16, `--prompt-len 256 --gen-len 64`, `main` and this change
-  run alternately four times, median decode tok/s (batch 1 is the same
-  single-row path, run twice each, so its range is shown):
-
-  | Batch | Before | After |
-  |---|---|---|
-  | 1 | 85-89 | 79-88 |
-  | 4 | 153 | 203 |
-  | 8 | 165 | 218 |
-  | 16 | 181 | 235 |
-
-- **GPU prefill is 4.6-6x faster and decode up to 1.7x.** Measured on a GTX
-  1650 (4 GB), `dlm bench --context-length 2048 --prompt-len 512 --gen-len 128
-  --batch 1,8`, the 0.4.x build and this one run alternately, best of three:
-
-  | Model | Decode, batch 1 | Decode, batch 8 (total) | Prefill |
-  |---|---|---|---|
-  | Qwen2.5-0.5B Q4_K_M GGUF | 80.6 → **116.6** tok/s | 112 → **180** | 268 → **1614** |
-  | Qwen2.5-0.5B bf16 | 79.3 → **89.0** | 112 → **185** | 266 → **1575** |
-  | Qwen2.5-1.5B `--quant int4` | 34.1 → **59.2** | 49.8 → **64.1** | 106 → **484** |
-
-  - **GEMV:** a warp per output row, each lane decoding an aligned chunk of
-    weights with wide loads. Quantized formats dot int8-quantized activations
-    with `dp4a`, as llama.cpp does: their GEMVs had been bound by decoding at
-    16-40 GB/s, not by memory. Rounding the activations to 8 bits costs at
-    most 0.003 nats of NLL on any weight type measured (see the table below);
-    `DLM_GEMV_EXACT=1` keeps the f32 path.
-  - **Fewer launches:** Q, K and V in one grid; the output and down
-    projections add straight into the residual; one warp per head does
-    Qwen3's head norm, RoPE and the KV append (six launches before). Fusing
-    gate, up and SwiGLU was tried and dropped: it never beat three launches.
-  - **Attention** splits the cache into chunks, reads each key once per KV head
-    instead of once per query head, and merges long contexts' chunks in a
-    second launch.
-  - **Prefill** takes up to 512 prompt tokens through a layer at once as tiled
-    GEMMs, with one attention launch for every query, instead of the decode
-    block 16 tokens at a time. Cards with tensor cores multiply on them (bf16
-    from Ampere, fp16 with per-row scaling on Volta/Turing RTX); GTX cards use
-    the f32 kernel. `DLM_GEMM=simt|tc` overrides the choice.
-  - **Greedy decoding** takes the LM head's argmax on the device, copying four
-    bytes back instead of the vocabulary's logits.
-  - **Batched decode of MoE models** reads each attention matrix once per
-    batch instead of once per sequence.
-  - `build.rs` builds the kernels for sm_75, 80, 86 and 89 plus PTX, so Ampere
-    and newer run their own code (bf16 tensor cores need it).
-    `DLM_CUDA_ARCHS=75` narrows a local build.
-- **Every weight type, measured.** The same GTX 1650, `--context-length 1024
-  --prompt-len 256 --gen-len 128`, the 0.4.x build against this one, run
-  alternately, best of two. Decode tok/s (batch 8 is the total over the batch),
-  and mean NLL over ~1,300 tokens of text scored the way generation decodes
-  (`dlm score --decode`), with the int8-activation GEMVs and with
-  `DLM_GEMV_EXACT=1` (noise is about 0.002):
-
-  | Model | Decode, batch 1 | Decode, batch 4 | Decode, batch 8 | Prefill | NLL (exact → dp4a) |
-  |---|---|---|---|---|---|
-  | 0.5B bf16 | 96.9 → **107.9** | 108.5 → **199.2** | 138.6 → **204.4** | 290 → **1727** | 2.7265 (no change) |
-  | 0.5B `--quant int8` | 89.6 → **137.7** | 100.2 → **197.5** | 130.2 → **205.4** | 293 → **1725** | 2.7298 → 2.7285 |
-  | 0.5B Q8_0 GGUF | 88.2 → **135.5** | 99.9 → **200.3** | 131.6 → **208.8** | 292 → **1704** | 2.7516 → 2.7531 |
-  | 0.5B Q6_K GGUF | 88.6 → **132.6** | 100.6 → **170.4** | 131.5 → **197.7** | 287 → **1732** | 2.7508 → 2.7507 |
-  | 0.5B Q5_K_M GGUF | 88.5 → **133.4** | 100.9 → **183.9** | 131.9 → **202.8** | 302 → **1696** | 2.7537 → 2.7561 |
-  | 0.5B Q4_K_M GGUF | 88.6 → **137.3** | 100.8 → **184.8** | 131.8 → **203.7** | 298 → **1720** | 2.7769 → 2.7793 |
-  | 0.5B `--quant int4` | 90.2 → **183.1** | 101.0 → **210.4** | 132.9 → **220.4** | 308 → **1785** | 2.8669 → 2.8676 |
-  | 1.5B `--quant int8` | 37.5 → **58.4** | 38.9 → **75.9** | 56.1 → **77.1** | 116 → **504** | 2.3285 → 2.3305 |
-  | 1.5B Q8_0 GGUF | 36.7 → **55.7** | 38.9 → **75.5** | 55.9 → **76.9** | 116 → **499** | 2.3408 → 2.3428 |
-  | 1.5B Q4_K_M GGUF | 36.2 → **72.8** | 39.1 → **72.3** | 56.7 → **79.4** | 117 → **504** | 2.3773 → 2.3764 |
-  | 1.5B `--quant int4` | 38.0 → **86.3** | 39.5 → **82.8** | 58.0 → **84.2** | 119 → **531** | 2.4183 → 2.4211 |
-  | 1.5B bf16, `--stream` | 18.8 → 18.3 | 33.6 → **50.8** | 49.3 → **64.6** | 116 → **124** | |
-
-  The batch-4/8 figures include the batched int8-activation GEMV below. A
-  streamed model is bound by PCIe at batch 1, so it moves little there.
-- **A batch of quantized sequences decodes through the int8-activation GEMV**
-  too. It used to decode weights to f32 element by element, so on Qwen2.5-1.5B
-  (int8, Q8_0, Q4_K_M, int4) four sequences together made fewer tokens a second
-  than one alone. Now batch 4 runs 72-83 tok/s, against 44 on the same build
-  without this kernel. At batch 4-8, int4 and Q4_K_M still only about match one
-  stream: each slot re-decodes the weights, which is compute-bound there.
-- **`--quant int4` decodes 20-27% faster on the GPU.** On short rows a
-  quantized GEMV was bound by latency, not bandwidth: a 32-weight chunk is a few
-  bytes, so a warp issued one load per row, waited, and reduced with nothing in
-  flight (int4 reached 60-65% of the bandwidth bf16 does, at full occupancy).
-  Each warp now interleaves two rows (int4, Q4_K) or four (Q4_0-Q8_0, Q6_K),
-  in the plain and the fused Q/K/V GEMVs. Every row sums in the same order as
-  before, so outputs are bit-identical. GTX 1650, batch-1 decode:
-
-  | Model | Before | After |
-  |---|---|---|
-  | Qwen2.5-1.5B `--quant int4` | 66.9 tok/s | **85.1** |
-  | Qwen2.5-0.5B `--quant int4` | 151.6 | **182.2** |
-  | Qwen2.5-0.5B Q4_K_M GGUF | 135.0 | 136.9 |
-
-  The GGUF barely moves because a model that fits is expanded to dlm's int8,
-  which was already at bandwidth; GGUF blocks read natively (a model too large
-  to expand) go 1.3-1.75x faster per GEMV.
-- **The quantized KV cache keeps a scale per 32 values, not per token.** One
-  scale across a token's whole K or V vector let a few large key channels set
-  the range for every head. Qwen2.5-0.5B, mean NLL over 415 tokens (3.644 with
-  an exact cache): int8 3.750 → 3.685, int4 6.266 → 5.312. int4 KV is still
-  far from exact; prefer int8. `dlm score --kv-quant` measures it.
-- **CPU decode is 2.5x faster on a bf16 model and 4.5x on a GGUF one.** The
-  CPU matvec summed one weight at a time (an f32 `sum()` that LLVM may not
-  reorder) and decoded every quantized weight on its own. Measured on a Ryzen 5
-  5600GT with Qwen2.5-0.5B, `dlm bench --device cpu --prompt-len 128
-  --gen-len 16`, old and new binaries run alternately, two rounds of three runs
-  each (medians per round; the machine was shared with other benchmarks, which
-  the spread shows):
-
-  | Model | Workload | Before | After |
-  |---|---|---|---|
-  | bf16 safetensors | Decode | 3.8–3.9 tok/s (runs 3.7–4.4) | **9.3–11.0 tok/s** (runs 4.4–11.5) |
-  | bf16 safetensors | Prefill | 4.9 tok/s | **6.3–12.9 tok/s** |
-  | Q4_K_M GGUF | Decode | 1.7–2.1 tok/s (runs 1.3–2.2) | **8.9–9.1 tok/s** (runs 8.5–10.0) |
-  | Q4_K_M GGUF | Prefill | 2.0–2.2 tok/s | **16.1–17.8 tok/s** |
-
-  - **SIMD kernels for every weight dtype**: f32, bf16, f16, dlm int4/int8, and
-    ggml's Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and Q6_K. AVX2+FMA+F16C on
-    x86_64, picked at run time so the same binary still runs the scalar code on
-    a CPU without them; NEON on aarch64. Each format's decoding is written once
-    against a small set of vector operations that both instruction sets
-    implement. The scalar code stays as the reference, and a test checks every
-    dtype against it on random data. Activations stay f32: llama.cpp's int8
-    activations would be faster for 4-bit weights, but this path is the oracle
-    the GPU kernels are checked against at 2e-3, and an int8 activation's error
-    is a few times that.
-  - **The thread pool no longer waits for its slowest worker to wake.** Each
-    GEMV dealt one fixed slice per thread and waited for every thread, so on a
-    loaded machine one descheduled worker stalled the whole step. Rows now go
-    out in small chunks claimed by whichever threads are running, and a worker
-    that wakes after the last chunk is taken skips the call. On the shared
-    machine above, a 4864×896 bf16 GEMV went from 1.7 ms to 0.18 ms (median).
-  - The attention projections (896×896) now run on the pool too, and attention
-    dots each query head with its keys eight lanes at a time.
-  - **The CPU's LM head is held in bf16 when that is lossless** (any bf16
-    checkpoint): the vocabulary-wide GEMV reads half the bytes, and steady-state
-    memory drops by 272 MB on Qwen2.5-0.5B. The load-time peak RSS is ~0.2 GB
-    higher (2.86 vs 2.67 GiB), since the bf16 copy is made from the f32 one the
-    loader hands over.
-  - Decode is now bound by memory bandwidth, not arithmetic. A GGUF model's LM
-    head is still decoded to f32 on the CPU, and is over half of each token's
-    bytes there; keeping it in its ggml blocks is the next step.
-
-- **`--quant int4` chooses each group's scale and zero to fit the group, not
-  just to span it.** Spanning min..max gives the two extreme weights exact
-  codes and rounds the other 126 on a coarser grid than they need. Each group of
-  128 now tries 21 grids around min..max and solves the least-squares scale and
-  zero for each one's codes (llama.cpp's `make_qkx2_quants`, the search behind
-  its K-quants, without calibration data), keeping the best. The min..max fit is
-  one of the candidates, so no group gets worse; synthetic groups lose 12–15% of
-  their squared error, and 35% when a few weights are outliers. The storage
-  layout and kernels are unchanged. `dlm score --device cpu` on a 404-token
-  text, mean NLL in nats (bf16 is the floor):
-
-  | Model | bf16 | int4 before | int4 after | int8 | int8 with the search |
-  |---|---|---|---|---|---|
-  | Qwen2.5-0.5B | 2.8421 | 3.0509 | **2.9932** | 2.8426 | 2.8434 |
-  | Qwen2.5-1.5B | 2.2849 | 2.4217 | **2.3847** | 2.2861 | 2.2869 |
-
-  That is 27–28% of int4's loss gone. int8 keeps plain rounding: it is already
-  within noise of bf16, and the search changed nothing measurable but doubled
-  its load time. The groups are fitted on every core, so loading costs about
-  2–3 s more on 0.5B and 10 s more on 1.5B (median of three, 6-core CPU); int8
-  loads no slower, and on 1.5B a little faster.
-- **`--quant int4` keeps `v_proj` and `down_proj` at int8 in the first and last
-  eighth of the layers**, the core of llama.cpp's Q4_K_M rule: those two write
-  straight into the residual stream, and the ends of the network are where it
-  is least forgiving. The embedding and LM head were never int4 (f32 on the CPU,
-  int8 on the GPU), so they needed nothing. Same text and setup as above, on
-  top of the fitted groups:
-
-  | Model | int4, all 4-bit | ends at int8 (kept) | + every 3rd layer (Q4_K_M) | all `v`/`down` int8 |
-  |---|---|---|---|---|
-  | Qwen2.5-0.5B, NLL | 2.9932 | **2.9689** | 2.9448 | 2.9121 |
-  | layer weights | 192.0 MiB | 204.8 MiB | 217.5 MiB | 243.1 MiB |
-  | Qwen2.5-1.5B, NLL | 2.3847 | **2.3564** | 2.3576 | |
-  | layer weights | 702.8 MiB | 756.8 MiB | 797.3 MiB | |
-
-  On 0.5B each extra int8 byte buys about the same, wherever it goes; on 1.5B
-  the middle layers bought nothing. So dlm takes the ends only: 7% larger, and
-  with the fitted groups, int4's loss against bf16 falls from 0.209 to 0.127
-  nats on 0.5B and from 0.137 to 0.072 on 1.5B. MLA layers (DeepSeek) are left
-  alone, since the GPU runs their dense FFN at a single dtype.
-- **The GPU's batched GEMV read every weight once per sequence instead of once
-  per batch, and both GEMVs spent a third of their time in barriers.** Fixing
-  the two, measured on Qwen2.5-0.5B by running the old and new binaries
-  alternately on the same machine:
-
-  | Workload | Before | After |
-  |---|---|---|
-  | Prefill (resident) | 116–152 tok/s | **251–268 tok/s** |
-  | Prefill (streamed int4, 1.5B) | 40–43 tok/s | **95–106 tok/s** |
-  | Decode, batch 8 | 107–109 tok/s | **131–136 tok/s** |
-  | Decode, batch 1 | 74–83 tok/s | **79–87 tok/s** |
-
-  - **One read per batch.** `matvec_batched_kernel`'s comment claimed it held a
-    row across the batch loop; the code re-read the whole row from global memory
-    for every slot. It now keeps one accumulator per slot in registers and
-    multiplies each weight element into all of them as it is read. Prefill feeds
-    a chunk of tokens through this kernel, which is why it gains most.
-  - **Warp-shuffle reductions.** Both GEMVs reduced through shared memory, one
-    barrier per tree level — and the batched one did that per slot, so a 896-wide
-    projection cost 48 barrier rounds against 14 rows of work. They now reduce
-    inside each warp by shuffle and combine the warps once.
-  - Summation order within a row is unchanged; the order the partial sums combine
-    in is not, which moves results within float rounding. Verified against
-    Hugging Face transformers after the change: Qwen2.5-0.5B, Gemma 3 1B and a
-    Qwen2-MoE all still agree to 0.0001, and the 46 GPU parity tests pass.
-  - MoE gains little (~2%): its expert FFN runs per token through the
-    single-slot GEMV, and MoE decode does not use the batched block at all.
+- Only Turing-class hardware (GTX 1650, 4 GB) has run the GPU code. The
+  Ampere-and-newer kernels are compiled and never executed.
+- The ROCm/HIP compute path has never executed on an AMD card, so it is not
+  shipped prebuilt.
+- Multi-GPU and distributed serving are untested on real hardware.
+- No context near the 8192 default has been decoded on Gemma2, whose sliding
+  window is only reachable past 4096 tokens.
+- DeepSeek-V2/V3 (MLA + MoE) has run only on the CPU path, not the streaming GPU
+  path the README advertises.
+- Falcon is config-verified, not output-verified; Llama 2 is untested.
+- KV cache in host RAM has been run on one model, to a 4k-token history.
+- Tool calling has a prompt format only for ChatML and was checked on two Qwen
+  models; `--lora` on one adapter; `/v1/embeddings` pools the last token.
 
 ### Added
 
@@ -873,187 +405,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the same Qwen2.5-0.5B that matches float32 to 0.0001 differs from bfloat16
     by up to 0.49.
 
-### Fixed
-
-- **Byte-level tokenizers split text differently from the models' own
-  tokenizers.**
-  - **Cause:** dlm's pre-tokenizer only split before spaces. GPT-2, Llama 3 and
-    Qwen split with a regex: whitespace runs become their own token, line breaks
-    end a piece, contractions and digits split off.
-  - **Effect:** prompts with code indentation, repeated spaces, newlines or
-    digits reached the model as token sequences it was never trained on. On 411
-    mixed strings, dlm matched Hugging Face `tokenizers` for only 58% (Qwen2.5),
-    54% (Llama 3) and 71% (GPT-2) of them.
-  - **Fix:** the pre-tokenizer implements each family's regex exactly (Qwen2 and
-    Qwen3, Llama 3, GPT-2), chosen from `tokenizer.json`. `\p{L}` and `\p{N}`
-    use generated Unicode 16 category tables, not `is_alphabetic`, which counts
-    Indic combining marks as letters.
-  - **Result:** all 411 strings now match for Qwen2.5, Qwen3, Llama 3 and GPT-2.
-  - **Not covered yet:** Falcon and DeepSeek chain splits of their own and get
-    the GPT-2 rule, which is much closer than splitting at spaces but not exact.
-    Unicode NFC normalization (Qwen's normalizer) is not applied.
-
-- **Config keys that change the model's behavior were read past in silence.**
-  Each one now takes effect, or is refused by name when dlm does not implement
-  it — a refusal is the only safe answer, since routing or positioning a model
-  wrongly reads as fluent, wrong output rather than an error.
-  - `use_sliding_window: false` (every Qwen2/2.5 config, next to a 32k
-    `sliding_window`) now means full attention. dlm had been windowing
-    attention the model expects whole, visible only past 32k tokens.
-  - `tie_word_embeddings: true` now reads the LM head from the embedding matrix
-    even when the checkpoint also ships an `lm_head.weight`, as transformers
-    does. Only a *missing* `lm_head.weight` used to tie them.
-  - Refused: `partial_rotary_factor` below 1.0 (Phi, GPT-NeoX, GLM rotate part
-    of each head; dlm rotates all of it), `max_window_layers` when it windows
-    only part of the model, and DeepSeek-V3's router (`scoring_func: sigmoid`,
-    `topk_method: noaux_tc`, `n_group`/`topk_group`, `routed_scaling_factor`).
-    DeepSeek-V2, whose routing dlm does implement, still loads.
-- **`dlm pull` downloaded Mistral weights twice.** Those repos ship the same
-  tensors as sharded files with an index and again as
-  `consolidated.safetensors`. dlm loads the sharded copy, so the second one is
-  now skipped — for multi-gigabyte repos it had doubled the download, the disk
-  use, and the address space mapped at load.
-- **Streamed GPU decode could read weights while they were being overwritten.**
-  A layer evicted from the VRAM window could get the next layer uploaded into
-  its buffers while kernels launched on the evicted layer were still queued.
-  Output was then wrong, and different from run to run. Uploads now wait for
-  the default stream first.
-- **`GpuKernel::run_block_batched` corrupted all but the last sequence** when it
-  fell back to one sequence at a time (more than 16 slots, or MLA).
-  `generate_batch` reached that path.
-- **One failed scheduler tick left the server spinning.** The engine closed every
-  client's stream but kept their requests in the scheduler, which failed again
-  on every tick after. It now aborts them as well.
-- **The VRAM planner sized the KV cache at half its real size.**
-  - **Cause:** it assumed 2 bytes per element, as for an fp16 cache, but the
-    device KV cache is f32. `--kv-quant` changes only the host-side stores.
-  - **Effect:** a plan that claimed to fit could run out of VRAM once the cache
-    filled. The fit checks for `serve` and `bench` now reserve the real amount.
-  - **Unchanged:** the paged pool's token capacity. Its budget comes from the
-    same plan, so the pool gets the same number of tokens.
-- **Multi-GPU stages shared one device's scratch memory.** The CUDA kernels'
-  scratch buffers were kept per thread, on the assumption that a multi-GPU
-  pipeline runs one thread per device. It does not: every stage runs on the
-  inference thread, switching devices per layer, so later stages were handed
-  buffers allocated on the first stage's GPU. Scratch is now kept per thread and
-  per device. Untested across two real GPUs.
-- **Host `--stream` ignored per-layer attention windows.** The streamed CPU
-  kernel handed every layer the model-wide config, so Gemma 2's global layers
-  were windowed too — invisible until a context passed 4,096 tokens.
-- **GPT-2 with `--stream` produced garbage** (`" labor labor labor…"`), and
-  Falcon's streamed and GPU generators had the wrong final norm. Only the CPU
-  resident builder attached GPT-2's learned position embeddings and the
-  LayerNorm head (with its bias); every other generator ran without position
-  information and with an RMSNorm head. All builders now load and attach them.
-- **`dlm pull` failed on every repo.** Since 0.4.0 moved the token out of
-  `argv`, curl was spawned with its output inherited rather than captured, so
-  the model-info request returned an empty body and the pull stopped with
-  "could not read model info … private/gated?".
-
-### Changed
-
-- **Long prompts no longer stall other requests' streams.**
-  - **Before:** a request's prompt was prefilled whole when it was admitted,
-    and every running stream waited for it.
-  - **Now:** admitted prompts are fed in 16 tokens at a time, and a tick stops
-    after 200 ms while other requests are decoding. With nothing decoding,
-    prompts still go in whole.
-  - **Identical output:** the GPU kernels prefill in groups of 16, so pieces of
-    that size leave the output bit-identical.
-  - **Prefix sharing in bursts:** a request that shares at least a KV block of
-    its opening with a prompt still being prefilled waits for that prompt to be
-    cached, so a burst with one system prompt computes it once.
-  - **Measured, GTX 1650, Qwen2.5-0.5B:** a stream decoding while a 1,590-token
-    request arrived used to pause for 13.9 s. Now its longest gap is 0.41 s. The
-    long request itself takes 17.7 s instead of 13.9 s.
-
-- **Streamed batches load each layer once, not once per request.** The
-  streaming GPU kernel now runs every sequence of a dense model through a
-  layer's weights in one fused block call before fetching the next layer. It
-  used to run each sequence through the whole stack in turn, streaming every
-  non-resident layer once per sequence, so batch 4 decoded slower in total than
-  batch 1.
-  - **Measured, GTX 1650:** Qwen2.5-1.5B bf16 at a 4k context with 17 of 28
-    layers resident. Total decode at batch 4 went from 6.7 to 24.5 tok/s, and at
-    batch 8 from 6.9 to 34.9 tok/s.
-  - **Unchanged:** MoE and MLA models keep the one-sequence-at-a-time path.
-
-- **Streamed dense layers upload straight from pinned memory.**
-  - **Before:** each upload first copied the layer's weights into a pinned
-    staging buffer, which was the larger half of a streamed step.
-  - **Now:** the GPU streaming kernel keeps dense layers staged in pinned buffers
-    (an LRU, budgeted by the RAM cache size, which it replaces for these models),
-    so a hit copies straight to the device.
-  - **Measured, GTX 1650:** Qwen2.5-1.5B bf16 with 14 of 28 layers resident went
-    from 3.2-3.5 to 7.5-7.6 tok/s. Gemma 3 4B int4 with 9 of 34 resident went
-    from 2.8 to 5.6 tok/s on a quiet machine. Peak RSS is unchanged.
-  - **Unchanged:** MoE and MLA layers keep the RAM cache and staging buffer.
-- **The default VRAM safety margin scales with the card.** It is a tenth of
-  total VRAM, between 256 MiB and 1.5 GiB. It was 1.5 GiB on every card, which
-  held back nearly half of a 4 GB card's free VRAM for transient allocations
-  that take tens of MiB.
-  - **Qwen2.5-1.5B bf16, streamed:** 14 to 27 of 28 layers resident, and decode
-    from 7.5 to 27 tok/s together with the pinned cache.
-  - **Gemma 3 4B int4:** now runs resident at a 2k context without
-    `--safety-margin-gb`, at 13.2 tok/s.
-  - **Unchanged:** cards of 16 GB and up keep 1.5 GiB, and `--safety-margin-gb`
-    still overrides it.
-
-- **GPU decode and prefill are 1.3-1.9x faster.** All on a GTX 1650, prompt
-  512, 64 generated, from four kernel changes:
-
-  | Model | Decode tok/s | Prefill tok/s |
-  |---|---|---|
-  | Qwen2.5-0.5B (bf16) | 38.8 -> 49.3 | 77.7 -> 104.4 |
-  | Qwen2.5-0.5B int4 | 35.6 -> 79.2 | 70.1 -> 130.7 |
-  | Qwen2.5-1.5B int4 | 14.4 -> 33.5 | 22.4 -> 42.9 |
-  | Gemma 3 4B int4 | 6.8 -> 14.8 | 10.2 -> 19.1 |
-
-  At a 2k-token context, Qwen2.5-0.5B int4 decode went from 36.0 to 56.4 tok/s.
-  - **GEMV reduction:** 64 threads per block instead of 256. Every doubling
-    adds a barrier to each row's reduction, and 64 won on every model and width
-    measured.
-  - **Quantized GEMV:** scales and zeros are found once per row instead of once
-    per weight, which removes three integer divisions per weight element.
-    Results are bit-identical.
-  - **Attention softmax:** runs across each head's row instead of walking it
-    serially. At 2k context that took one token's softmax from 10.8 ms to
-    0.7 ms.
-  - **Device lookup:** each kernel call asks for the current device once,
-    instead of about 30 times per layer.
-- **CPU matmuls reuse a persistent thread pool.** Large GEMVs (MLP projections,
-  the LM head) used to start a fresh OS thread per chunk on every call. On
-  Qwen2.5-0.5B on CPU, measured against the previous binary back to back,
-  decode went from 7.38 to 8.28 tok/s and prefill from 9.1 to 10.8 tok/s.
-- **Sampling no longer sorts the whole vocabulary.**
-  - **`top_k`:** only the best k tokens are put in order.
-  - **Default `top_k = 0` with `top_p < 1`:** the nucleus is selected before it
-    is sorted.
-  - **Speed:** one sampled token from Qwen's 152k vocabulary took about 7 ms and
-    now takes 1.7 ms on peaked logits (0.7 ms with top-k 40).
-  - **Same output:** the distribution is identical to a full sort, and a test
-    pins it. Tied logits now order by token id, so a seed draws the same token
-    every run.
-- **Streamed layers are uploaded into the evicted layer's VRAM buffers.** The
-  eviction happens before the upload, not after, and a steady-state miss
-  allocates and frees nothing.
-  - **Allocations:** over a streamed Qwen2.5-1.5B run, `cudaMalloc` calls
-    dropped from 2,296 to 181 and time spent in `cudaMalloc` from 419 to 53 ms.
-  - **Peak VRAM:** the window no longer holds an extra layer while one loads.
-- **GPU paths no longer mirror the KV cache on the host.** Each layer and token
-  appended a zero-filled host row that nothing read. Now only a count is kept.
-  At the contexts measured this was tens of MiB, so peak RSS did not move.
-  Peak RSS on GPU runs comes from loading, not decode.
-- **`--stream` caches layers in host RAM by default, quantized or not**, when the
-  whole layer set (plus 25%) fits under a quarter of physical RAM. It was on
-  only with `--quant`; unquantized streaming re-read every layer from the mmap on
-  every window miss, which took streamed Gemma 3 1B from 46 s to 268 s on a
-  1,500-token prompt. When the set does not fit, the cache is now off rather
-  than partial (a smaller LRU never hits on a cyclic scan), and serve says so.
-  `--ram-cache-gb` still overrides either way.
-
-### Added
-
 - **Requests that repeat an earlier prompt's opening reuse its KV on the GPU.**
   This covers a shared system prompt, or a chat whose history grows each turn.
   - **How:** the prefix cache holds prompts cut back to whole KV blocks, and a
@@ -1216,47 +567,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `hub::pull_with_progress`, reporting download and SHA-256 verification
   progress to a callback.
 
-## [0.4.0] - 2026-07-31
-
-### Verified
-
-Three model families landed and they are **not** equally proven; `RELEASING.md`
-carries the full ledger:
-
-- **Phi-3** — weight mapping proven by a same-weights-twice equivalence test,
-  confirmed by mutation.
-- **GPT-2** — answers correctly on the real `openai-community/gpt2`.
-- **Falcon** — **config-verified only.** No runnable checkpoint exists: the
-  smallest `alibi: false` variant is 14 GB, and the 1B `falcon-rw` uses ALiBi,
-  which dlm refuses. Not yet output-verified.
-
-GPU paths are unchanged and remain verified only on Turing (GTX 1650); CI has no
-GPU and never executes a device kernel.
-
-
-### Fixed
-
-- **A panicking request handler leaked a connection slot permanently.** The live
-  connection counter was decremented on the last line of the connection thread,
-  which a panic unwinds past. After 256 cumulative panics the server shed every
-  connection forever, with no log line and a process that still looked healthy.
-- **`/healthz` was exempt from authentication but routed nowhere**, so a
-  Kubernetes liveness probe pointed at it got a 404 and restarted a healthy
-  process. Fixed on both the batched and distributed routers.
-- **Query strings broke routing and the auth exemption.** `/health?probe=1` was
-  not recognised as the health route and returned `401` under `--api-key`;
-  `/v1/models?limit=1` returned `404`.
-- **The Hugging Face token was passed to `curl` in `argv`**, where
-  `/proc/<pid>/cmdline` exposed it to any local user for the duration of a pull.
-  It now goes through a curl config file on stdin.
-- **`dlm pull` did not validate the repo id**, only counted its segments, so
-  `a/..` resolved the download directory to the *parent* of the intended one.
-- Connections past the concurrency cap are now refused with `503` and a
-  `Retry-After` instead of being dropped silently, which was indistinguishable
-  from a crashed server.
-
-### Added
-
 - **HTTP keep-alive.** Responses with a `Content-Length` now leave the connection
   open, so the pooling OpenAI and Anthropic SDKs stop paying a TCP handshake per
   request. `Connection: close` is honoured, HTTP/1.0 defaults to closing,
@@ -1288,6 +598,696 @@ GPU and never executes a device kernel.
   had been exercised.
 - `cargo-deny` in CI (advisories, licenses, sources) plus a weekly schedule, and
   Dependabot for `cargo` and `github-actions`.
+
+### Changed
+
+- **The GPU's KV cache is int8 by default** (`--kv-quant auto`): 56% of
+  fp16's memory, so 1.76x the tokens in the same VRAM, at the speed of fp16
+  (Qwen2.5-0.5B, 1,024-token prompts: batch 1 97-100 against 99-100 tok/s,
+  batch 16 390-398 against 381-387). The key balancing below is what made it
+  safe to: int8 now scores within 0.005 nats per token of fp16 on every model
+  measured. `--kv-quant f16` keeps the old cache; the CPU kernels keep f32
+  under `auto` as before. `dlm bench` follows the default too: compare against
+  a baseline saved before this with `--kv-quant f16`.
+
+- **A quantized KV cache no longer loses Qwen's small key channels.** A few
+  key channels on Qwen2.5 are a hundred times the rest (its `k_proj` bias puts
+  130-240 on them in layers 0-2 and 8, where others are 1-6), and an int8 cache
+  keeps one scale per 32 values, so each group holding one rounded its
+  neighbours to a step of ~2. Attention only uses `q . k`, so the loader now
+  divides each such pair of key channels by a power of two and multiplies the
+  matching query channels by it, in the projection weights and biases (in the
+  q/k norm weights where a model has them). Every weight scales exactly or is
+  left alone, so `q . k` is unchanged to the bit and an fp16 or f32 cache gives
+  the same output; no kernel changed. Channel sizes come from the weights
+  (`sqrt(bias^2 + |W_row * norm|^2)`); only pairs over 4x the layer's median
+  move, to between 2x and 4x. int8 KV's cost in mean NLL against fp16, decoding
+  ~1,150 tokens of two parts of this README (`dlm score --decode`):
+
+  | Model | before | after |
+  |---|---|---|
+  | Qwen2.5-0.5B bf16 | 0.022 / 0.011 | -0.000 / -0.005 |
+  | Qwen2.5-0.5B `Q4_K_M` | 0.030 / 0.018 | 0.002 / -0.005 |
+  | Qwen2.5-1.5B bf16 | 0.002 / 0.001 | 0.001 / -0.002 |
+  | Qwen2.5-1.5B `Q4_K_M` | 0.006 / 0.004 | 0.005 / 0.002 |
+  | Qwen3-0.6B (q/k norms) | 0.009 / 0.020 | 0.001 / -0.001 |
+  | SmolLM2-360M (Llama, no outliers) | -0.001 / 0.002 | -0.002 / 0.002 |
+
+  Rounding every pair to the median instead, the first version, made the
+  1.5B models slightly worse (0.002 -> 0.004): pairs near the median are not
+  the problem, and moving them only reshuffles groups.
+
+- **`--stream --device gpu` is no longer experimental.** Its banner said
+  `[experimental]` and its code "unvalidated on hardware"; the checks it lacked
+  are now in the suite. `streaming_gpu_soak_matches_resident` runs three
+  batched sequences for 300 steps through a window of 3 of 8 layers, then a
+  prefill beside them, and checks every step against the resident kernel; with
+  the wait before an evicted layer's buffers are reused taken out, it fails
+  within two steps, every run. `gpu_streamed_and_resident_agree`
+  (`tests/gguf_model.rs`) scores a real GGUF file streamed through a two-layer
+  window against resident: Qwen2.5-0.5B `Q2_K` to `Q8_0` and the IQ files, and
+  1.5B `Q4_K_M`, agree within 0.011-0.034 nats per token on average, where one
+  layer streamed wrong moves them by 0.47. The startup banner's prefetch line
+  now says what the GPU path does, and `--prefetch-depth` / `--auto-prefetch`
+  are documented as the CPU path's.
+
+- **Streaming on the GPU is up to 20% faster: the copy engine no longer idles
+  under resident layers.** The prefetch worker was told "layer L + 1" as the
+  pass reached layer L, and with most of the model resident L + 1 usually
+  was, so the upload of the next streamed layer waited for the pass to get
+  next to it. It now loads the first layer from L + 1 on that is missing,
+  evicting only a layer the pass needs after that one, and a layer loaded
+  ahead is evicted last until the pass uses it. GTX 1650, Qwen2.5-7B-Instruct
+  `Q3_K_M` (19 of 28 layers resident), decode over six alternating runs:
+  6.0-7.0 -> 7.1-9.0 tok/s (median 6.3 -> 7.7; best step 142.7 -> 111.7 ms,
+  against ~108 ms of PCIe per token).
+
+- **A single-token layer's attention half takes fewer launches.** Two merges
+  that need no grid-wide synchronization:
+  - **RoPE and the K/V append run inside the attention kernel**
+    (`attn_split_post_kernel`), removing `qk_post`'s launch. Each attention
+    block normalizes and rotates its own query heads in shared memory; the
+    block for the last chunk, the only one that reads the token's own row,
+    rotates its key and appends K and V before attending. Qwen2.5-0.5B batch
+    1: Q4_K_M 132 -> 137 tok/s, bf16 97 -> 103; Qwen2.5-1.5B unchanged (65.6
+    / 65.7 over six runs).
+  - **For int8 activations, the input and post-attention norms and their
+    quantization are one launch** (`rmsnorm_q8_kernel`), and the GEMVs that
+    read the row (Q/K/V; gate and up, which also stop quantizing it twice)
+    reuse its codes. Batch 1, four alternating pairs: Qwen2.5-0.5B Q8_0 129 ->
+    138 tok/s, int8 129 -> 145. Q4_K_M at 0.5B is unchanged: its 896-wide
+    rows do not take int8 activations.
+
+  A single kernel for the whole half would need a grid-wide sync between the
+  Q/K/V GEMV, attention and the output GEMV (a cooperative launch, which
+  limits the GEMVs' occupancy); these two cover the launches that need none.
+
+- **Single-request decode is 13-22% faster: the fused GEMV no longer spills
+  to the stack.** The kernel that runs a layer's Q/K/V, output and down
+  projections for one sequence found each row's matrix by indexing its
+  segment struct with a runtime value, which copied all 88 bytes of it to
+  every thread's stack, and then read the row's weight pointer from that stack
+  inside its inner loop. It now selects with constant indices and takes the
+  weights as their own read-only parameters (`STACK:0`). Batch-1 decode,
+  GTX 1650, tok/s: Qwen2.5-0.5B bf16 85 -> 104, Q4_K_M 110 -> 133, Q8_0
+  109 -> 130, Qwen2.5-1.5B Q4_K_M 59 -> 67. bf16 batch 1 now matches the 101
+  tok/s vLLM (fp16) made on this card. Batched decode runs other kernels and
+  is unchanged.
+
+- **N-gram speculation now pays on the GPU, and `--speculative auto` turns it
+  on there.** A speculative round scores the pending token and its proposals
+  in one target pass, but on the GPU that pass went through the prefill GEMM,
+  which computes 64-token tiles, and each position then ran the LM head on its
+  own and copied its logits to the host. Verifying 5 tokens cost what decoding
+  them one by one did, so speculation could not win, and `auto` left it off for
+  resident models. Now a piece of 16 tokens or fewer goes through the batched
+  decode block (a verify, a short prompt, a long prompt's tail), and the verify
+  scores every position in one LM-head call (`Generator::distributions`), only
+  the argmax coming back under plain greedy. Batch 1 on a GTX 1650, n-gram
+  lookup proposing 4, decode tok/s (`dlm bench --speculative ngram`, which
+  now measures it):
+
+  | Model | Plain | Before | After | Accepted |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B bf16, greedy | 85 | 84 | 317 | 100% |
+  | Qwen2.5-0.5B Q4_K_M, greedy | 111 | 98 | 358 | 100% |
+  | Qwen2.5-1.5B Q4_K_M, greedy | 58 | 33 | 130 | 100% |
+  | Qwen2.5-0.5B Q4_K_M, temperature 1.2 | 71 | | 79 | 39% |
+  | Qwen2.5-1.5B Q4_K_M, temperature 1.2 | 52 | | 65 | 78% |
+
+  The bench prompt repeats, the case lookup is for, so the greedy rows are
+  its best case; real text proposes less often. A round whose every guess
+  misses costs about a third of a step more than a plain step (a 5-token
+  verify is 1.55x one). Several requests at once still decode plainly in one
+  batched pass, as before. Short prompts gain too: time to first token for 8
+  / 16 tokens 66 / 58 ms -> 30 / 39 ms. `--speculative off` restores plain
+  decoding; `dlm bench` stays plain unless asked.
+
+- **A batched decode layer launches Q/K/V as one GEMV and gate/up as
+  another.** Each layer issued about 21 launches, and the host spent 5-8 ms
+  of a batched step issuing them; on Qwen2.5-0.5B, K and V alone were 128 rows,
+  8 blocks each on a 14-SM card. Matrices that share a dtype now go through
+  one launch over their row segments, with the activations quantized once.
+  GTX 1650, Qwen2.5-0.5B, decode tok/s at batch 4 / 8 / 16, the previous commit
+  and this one alternately: bf16 311 / 410 / 473 -> 328 / 408 / 487, Q8_0
+  435 / 654 / 760 -> 480 / 637 / 798. A GGUF layer whose V is Q6_K beside
+  Q4_K Q and K keeps three launches.
+
+- **Long-prompt prefill is up to 1.6x faster: attention is tiled over
+  queries.** Prefill attention gave each prompt token its own block, which read
+  the whole history, so a 512-token chunk at 8k positions read about 2 GB of
+  K/V per layer. A block now takes a tile of tokens (times the query heads
+  sharing a KV head) and streams the history through shared memory once for
+  all of them, with a running softmax. Heads 64 and 128 wide (Qwen, Llama,
+  Mistral); others keep the per-token kernel. GTX 1650, prefill tok/s, per-
+  token and tiled kernels alternately:
+
+  | Prompt | Qwen2.5-0.5B bf16 | Qwen2.5-1.5B Q4_K_M |
+  |---|---|---|
+  | 512 | 1,350 -> 1,490 (noise) | 486 -> 489 |
+  | 2,048 | 1,218 -> 1,447 | 397 -> 435 |
+  | 8,000 | 651 -> 1,018 | 234 -> 303 |
+
+- **`--kv-quant int8` (and `int4`) now keeps the GPU KV cache in int8: 1.76x
+  or more the tokens in the same VRAM.** Both used to mean fp16 on the GPU.
+  Each 32 values are now a float scale and 32 int8 codes, 1.125 bytes a value
+  against fp16's 2; models whose heads are not a multiple of 32 wide keep
+  fp16. The pool sizing and the fit check count it, and the server prints the
+  pool (`kv cache : N tokens`). On a GTX 1650, Qwen2.5-1.5B Q4_K_M at
+  `--context-length 32768` with four requests: 74,608 tokens of fp16 KV fit
+  beside the weights, against all 131,072 in int8. Decode and prefill speed
+  are within a few percent of fp16 (0.5B Q4_K_M, 3,000-token prompt: batch 8
+  decode 354 -> 365 tok/s, prefill 1,130 -> 1,090).
+
+  **It costs accuracy, so fp16 stays the default.** Scoring 833 tokens of
+  this README through the decode kernels (`dlm score --decode`) on
+  Qwen2.5-0.5B: mean NLL 2.841 with fp16 KV, 2.901 with int8 (the CPU's int8
+  store, the same scheme: 2.878). Qwen's keys have a few channels far larger
+  than the rest, and a 32-value group holding one quantizes its neighbours
+  coarsely; per-channel key scales are the known fix. The GPU's int8 agrees
+  with the CPU's to 1e-7 on the same inputs.
+
+- **Sampled decode is 4-8x faster at batch 16: candidates are found on the
+  GPU.** A temperature/top-k/top-p step copied each sequence's whole row of
+  logits to the host (600 KB on Qwen2.5) and found the softmax total and the
+  top candidates there, one sequence at a time; at batch 16 that took several
+  times as long as the model. The device head now returns each row's largest
+  logit, its softmax total and its largest logits sorted (4 KB for top-k 40),
+  and the host draws from those with the same arithmetic. A draw they cannot
+  decide exactly still takes the logits: a top-p nucleus wider than 1,024
+  tokens, pure temperature with neither top-k nor top-p, a repetition or
+  frequency penalty, a grammar, or a final logit softcap. The draws match the
+  host sampler's for a seed, except that the vocabulary total is summed in
+  another order and can differ in its last bit. GTX 1650, Qwen2.5-0.5B Q4_K_M,
+  temperature 0.8, decode tok/s:
+
+  | Sampler | Batch 1 | Batch 4 | Batch 16 |
+  |---|---|---|---|
+  | top-p 0.95 | 33 -> 120 | 57 -> 340 | 83 -> 673 |
+  | top-k 40 | 36 -> 115 | 106 -> 345 | 153 -> 678 |
+  | greedy, for reference | 115-128 | 341-367 | 712-722 |
+
+  `dlm bench` takes `--temperature`, `--top-p` and `--top-k` to measure it,
+  and records the sampler in its JSON.
+
+- **Batched decode of quantized models is 2-3x faster at batch 8-16.** The
+  int8-activation GEMV that every quantized format (int8, int4 and the GGUF
+  types) takes in a batch gave each warp one weight row and decoded each
+  32-weight chunk again for every sequence. Past batch 4 that decoding, not
+  memory, set its speed: about 250 tok/s on Qwen2.5-0.5B in any quantized
+  format, barely above batch 4. Each format's chunk decode is now separate
+  from its dot product, so a warp decodes four rows' chunks once and dots them
+  with every sequence's activations. The previous commit and this one
+  alternately on a GTX 1650, decode tok/s:
+
+  | Model | Batch 1 | Batch 4 | Batch 8 | Batch 16 |
+  |---|---|---|---|---|
+  | 0.5B Q4_K_M | 125 -> 124 | 197 -> 335 | 211 -> 513 | 237 -> 658 |
+  | 0.5B int4 | 117 -> 124 | 196 -> 413 | 217 -> 615 | 236 -> 672 |
+  | 0.5B Q6_K | 95 -> 95 | 121 -> 215 | 181 -> 340 | 226 -> 500 |
+  | 1.5B Q8_0 | 42 -> 41 | 72 -> 148 | 76 -> 223 | 76 -> 247 |
+
+  The Q6_K runs drifted widely (batch 1 from 55 to 118 tok/s on either build):
+  its batch 4-16 figures are medians of three, its batch 1 the one pair run
+  back to back on a steady card. Q6_K's one-sequence dot keeps its old fused
+  form: through the split decode it ran 5-10% slower at batch 1.
+
+- **Batched f32/bf16/f16 projections take four weight rows per warp.** At
+  batch 8-16 the batched GEMV was bound by loads, not memory: it re-read
+  every sequence's activations for each weight row, eight floats for eight
+  multiply-adds. A warp now decodes four rows' chunks and multiplies each
+  activation chunk it loads into all four, with the batch size fixed at
+  compile time (4, 8 or 16) so the accumulators stay in registers. The
+  quantized formats keep their int8-activation kernel. The previous commit
+  and this one alternately, twice, same setup as below:
+
+  | Batch | Before | After |
+  |---|---|---|
+  | 4 | 270 | 310 |
+  | 8 | 291 | 419 |
+  | 16 | 324 | 496 |
+
+  Batch 1 and prefill take other kernels and measured the same once the run
+  order was reversed (the card runs warmer later in a series).
+
+- **Batched attention runs in three launches for the whole batch.** The fused
+  batched block read each weight once for all sequences, but still launched
+  Q/K norm, RoPE, the K/V append and split-K attention slot by slot: 2-3 small
+  launches per sequence per layer, about 1.5 ms a sequence per step on
+  Qwen2.5-0.5B. Now each launch covers every slot, which reads its own cache,
+  block table and history length. Shapes the split kernel cannot take still go
+  slot by slot. Same setup as the LM-head entry below, three builds run
+  alternately twice (the first `main` run was throttled and is left out):
+
+  | Batch | Before both | LM head shared | Plus this |
+  |---|---|---|---|
+  | 4 | 166 | 217 | 249 |
+  | 8 | 178 | 228 | 276 |
+  | 16 | 180 | 238 | 300 |
+
+  vLLM 0.33 in fp32 on the same card made 200 / 281 / 286 tok/s at these batch
+  sizes (`bench/BASELINES.md`).
+
+- **Batched decode is about 30% faster: the batch shares one LM-head pass.**
+  Each session used to run the vocabulary-wide LM head on its own, reading
+  its weights once per sequence: on Qwen2.5-0.5B at batch 16 that was 36 ms of
+  a 90 ms step. `step_sessions` (the server's scheduler and `dlm bench`) now
+  sends every session's hidden state through one call, which reads the weights
+  once per 16 rows; greedy rows still get only their argmax back. GTX 1650,
+  Qwen2.5-0.5B bf16, `--prompt-len 256 --gen-len 64`, `main` and this change
+  run alternately four times, median decode tok/s (batch 1 is the same
+  single-row path, run twice each, so its range is shown):
+
+  | Batch | Before | After |
+  |---|---|---|
+  | 1 | 85-89 | 79-88 |
+  | 4 | 153 | 203 |
+  | 8 | 165 | 218 |
+  | 16 | 181 | 235 |
+
+- **GPU prefill is 4.6-6x faster and decode up to 1.7x.** Measured on a GTX
+  1650 (4 GB), `dlm bench --context-length 2048 --prompt-len 512 --gen-len 128
+  --batch 1,8`, the July 31 development build and this one run alternately,
+  best of three:
+
+  | Model | Decode, batch 1 | Decode, batch 8 (total) | Prefill |
+  |---|---|---|---|
+  | Qwen2.5-0.5B Q4_K_M GGUF | 80.6 → **116.6** tok/s | 112 → **180** | 268 → **1614** |
+  | Qwen2.5-0.5B bf16 | 79.3 → **89.0** | 112 → **185** | 266 → **1575** |
+  | Qwen2.5-1.5B `--quant int4` | 34.1 → **59.2** | 49.8 → **64.1** | 106 → **484** |
+
+  - **GEMV:** a warp per output row, each lane decoding an aligned chunk of
+    weights with wide loads. Quantized formats dot int8-quantized activations
+    with `dp4a`, as llama.cpp does: their GEMVs had been bound by decoding at
+    16-40 GB/s, not by memory. Rounding the activations to 8 bits costs at
+    most 0.003 nats of NLL on any weight type measured (see the table below);
+    `DLM_GEMV_EXACT=1` keeps the f32 path.
+  - **Fewer launches:** Q, K and V in one grid; the output and down
+    projections add straight into the residual; one warp per head does
+    Qwen3's head norm, RoPE and the KV append (six launches before). Fusing
+    gate, up and SwiGLU was tried and dropped: it never beat three launches.
+  - **Attention** splits the cache into chunks, reads each key once per KV head
+    instead of once per query head, and merges long contexts' chunks in a
+    second launch.
+  - **Prefill** takes up to 512 prompt tokens through a layer at once as tiled
+    GEMMs, with one attention launch for every query, instead of the decode
+    block 16 tokens at a time. Cards with tensor cores multiply on them (bf16
+    from Ampere, fp16 with per-row scaling on Volta/Turing RTX); GTX cards use
+    the f32 kernel. `DLM_GEMM=simt|tc` overrides the choice.
+  - **Greedy decoding** takes the LM head's argmax on the device, copying four
+    bytes back instead of the vocabulary's logits.
+  - **Batched decode of MoE models** reads each attention matrix once per
+    batch instead of once per sequence.
+  - `build.rs` builds the kernels for sm_75, 80, 86 and 89 plus PTX, so Ampere
+    and newer run their own code (bf16 tensor cores need it).
+    `DLM_CUDA_ARCHS=75` narrows a local build.
+- **Every weight type, measured.** The same GTX 1650, `--context-length 1024
+  --prompt-len 256 --gen-len 128`, the July 31 development build against this
+  one, run alternately, best of two. Decode tok/s (batch 8 is the total over the batch),
+  and mean NLL over ~1,300 tokens of text scored the way generation decodes
+  (`dlm score --decode`), with the int8-activation GEMVs and with
+  `DLM_GEMV_EXACT=1` (noise is about 0.002):
+
+  | Model | Decode, batch 1 | Decode, batch 4 | Decode, batch 8 | Prefill | NLL (exact → dp4a) |
+  |---|---|---|---|---|---|
+  | 0.5B bf16 | 96.9 → **107.9** | 108.5 → **199.2** | 138.6 → **204.4** | 290 → **1727** | 2.7265 (no change) |
+  | 0.5B `--quant int8` | 89.6 → **137.7** | 100.2 → **197.5** | 130.2 → **205.4** | 293 → **1725** | 2.7298 → 2.7285 |
+  | 0.5B Q8_0 GGUF | 88.2 → **135.5** | 99.9 → **200.3** | 131.6 → **208.8** | 292 → **1704** | 2.7516 → 2.7531 |
+  | 0.5B Q6_K GGUF | 88.6 → **132.6** | 100.6 → **170.4** | 131.5 → **197.7** | 287 → **1732** | 2.7508 → 2.7507 |
+  | 0.5B Q5_K_M GGUF | 88.5 → **133.4** | 100.9 → **183.9** | 131.9 → **202.8** | 302 → **1696** | 2.7537 → 2.7561 |
+  | 0.5B Q4_K_M GGUF | 88.6 → **137.3** | 100.8 → **184.8** | 131.8 → **203.7** | 298 → **1720** | 2.7769 → 2.7793 |
+  | 0.5B `--quant int4` | 90.2 → **183.1** | 101.0 → **210.4** | 132.9 → **220.4** | 308 → **1785** | 2.8669 → 2.8676 |
+  | 1.5B `--quant int8` | 37.5 → **58.4** | 38.9 → **75.9** | 56.1 → **77.1** | 116 → **504** | 2.3285 → 2.3305 |
+  | 1.5B Q8_0 GGUF | 36.7 → **55.7** | 38.9 → **75.5** | 55.9 → **76.9** | 116 → **499** | 2.3408 → 2.3428 |
+  | 1.5B Q4_K_M GGUF | 36.2 → **72.8** | 39.1 → **72.3** | 56.7 → **79.4** | 117 → **504** | 2.3773 → 2.3764 |
+  | 1.5B `--quant int4` | 38.0 → **86.3** | 39.5 → **82.8** | 58.0 → **84.2** | 119 → **531** | 2.4183 → 2.4211 |
+  | 1.5B bf16, `--stream` | 18.8 → 18.3 | 33.6 → **50.8** | 49.3 → **64.6** | 116 → **124** | |
+
+  The batch-4/8 figures include the batched int8-activation GEMV below. A
+  streamed model is bound by PCIe at batch 1, so it moves little there.
+- **A batch of quantized sequences decodes through the int8-activation GEMV**
+  too. It used to decode weights to f32 element by element, so on Qwen2.5-1.5B
+  (int8, Q8_0, Q4_K_M, int4) four sequences together made fewer tokens a second
+  than one alone. Now batch 4 runs 72-83 tok/s, against 44 on the same build
+  without this kernel. At batch 4-8, int4 and Q4_K_M still only about match one
+  stream: each slot re-decodes the weights, which is compute-bound there.
+- **`--quant int4` decodes 20-27% faster on the GPU.** On short rows a
+  quantized GEMV was bound by latency, not bandwidth: a 32-weight chunk is a few
+  bytes, so a warp issued one load per row, waited, and reduced with nothing in
+  flight (int4 reached 60-65% of the bandwidth bf16 does, at full occupancy).
+  Each warp now interleaves two rows (int4, Q4_K) or four (Q4_0-Q8_0, Q6_K),
+  in the plain and the fused Q/K/V GEMVs. Every row sums in the same order as
+  before, so outputs are bit-identical. GTX 1650, batch-1 decode:
+
+  | Model | Before | After |
+  |---|---|---|
+  | Qwen2.5-1.5B `--quant int4` | 66.9 tok/s | **85.1** |
+  | Qwen2.5-0.5B `--quant int4` | 151.6 | **182.2** |
+  | Qwen2.5-0.5B Q4_K_M GGUF | 135.0 | 136.9 |
+
+  The GGUF barely moves because a model that fits is expanded to dlm's int8,
+  which was already at bandwidth; GGUF blocks read natively (a model too large
+  to expand) go 1.3-1.75x faster per GEMV.
+- **The quantized KV cache keeps a scale per 32 values, not per token.** One
+  scale across a token's whole K or V vector let a few large key channels set
+  the range for every head. Qwen2.5-0.5B, mean NLL over 415 tokens (3.644 with
+  an exact cache): int8 3.750 → 3.685, int4 6.266 → 5.312. int4 KV is still
+  far from exact; prefer int8. `dlm score --kv-quant` measures it.
+- **CPU decode is 2.5x faster on a bf16 model and 4.5x on a GGUF one.** The
+  CPU matvec summed one weight at a time (an f32 `sum()` that LLVM may not
+  reorder) and decoded every quantized weight on its own. Measured on a Ryzen 5
+  5600GT with Qwen2.5-0.5B, `dlm bench --device cpu --prompt-len 128
+  --gen-len 16`, old and new binaries run alternately, two rounds of three runs
+  each (medians per round; the machine was shared with other benchmarks, which
+  the spread shows):
+
+  | Model | Workload | Before | After |
+  |---|---|---|---|
+  | bf16 safetensors | Decode | 3.8–3.9 tok/s (runs 3.7–4.4) | **9.3–11.0 tok/s** (runs 4.4–11.5) |
+  | bf16 safetensors | Prefill | 4.9 tok/s | **6.3–12.9 tok/s** |
+  | Q4_K_M GGUF | Decode | 1.7–2.1 tok/s (runs 1.3–2.2) | **8.9–9.1 tok/s** (runs 8.5–10.0) |
+  | Q4_K_M GGUF | Prefill | 2.0–2.2 tok/s | **16.1–17.8 tok/s** |
+
+  - **SIMD kernels for every weight dtype**: f32, bf16, f16, dlm int4/int8, and
+    ggml's Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K and Q6_K. AVX2+FMA+F16C on
+    x86_64, picked at run time so the same binary still runs the scalar code on
+    a CPU without them; NEON on aarch64. Each format's decoding is written once
+    against a small set of vector operations that both instruction sets
+    implement. The scalar code stays as the reference, and a test checks every
+    dtype against it on random data. Activations stay f32: llama.cpp's int8
+    activations would be faster for 4-bit weights, but this path is the oracle
+    the GPU kernels are checked against at 2e-3, and an int8 activation's error
+    is a few times that.
+  - **The thread pool no longer waits for its slowest worker to wake.** Each
+    GEMV dealt one fixed slice per thread and waited for every thread, so on a
+    loaded machine one descheduled worker stalled the whole step. Rows now go
+    out in small chunks claimed by whichever threads are running, and a worker
+    that wakes after the last chunk is taken skips the call. On the shared
+    machine above, a 4864×896 bf16 GEMV went from 1.7 ms to 0.18 ms (median).
+  - The attention projections (896×896) now run on the pool too, and attention
+    dots each query head with its keys eight lanes at a time.
+  - **The CPU's LM head is held in bf16 when that is lossless** (any bf16
+    checkpoint): the vocabulary-wide GEMV reads half the bytes, and steady-state
+    memory drops by 272 MB on Qwen2.5-0.5B. The load-time peak RSS is ~0.2 GB
+    higher (2.86 vs 2.67 GiB), since the bf16 copy is made from the f32 one the
+    loader hands over.
+  - Decode is now bound by memory bandwidth, not arithmetic. A GGUF model's LM
+    head is still decoded to f32 on the CPU, and is over half of each token's
+    bytes there; keeping it in its ggml blocks is the next step.
+
+- **`--quant int4` chooses each group's scale and zero to fit the group, not
+  just to span it.** Spanning min..max gives the two extreme weights exact
+  codes and rounds the other 126 on a coarser grid than they need. Each group of
+  128 now tries 21 grids around min..max and solves the least-squares scale and
+  zero for each one's codes (llama.cpp's `make_qkx2_quants`, the search behind
+  its K-quants, without calibration data), keeping the best. The min..max fit is
+  one of the candidates, so no group gets worse; synthetic groups lose 12–15% of
+  their squared error, and 35% when a few weights are outliers. The storage
+  layout and kernels are unchanged. `dlm score --device cpu` on a 404-token
+  text, mean NLL in nats (bf16 is the floor):
+
+  | Model | bf16 | int4 before | int4 after | int8 | int8 with the search |
+  |---|---|---|---|---|---|
+  | Qwen2.5-0.5B | 2.8421 | 3.0509 | **2.9932** | 2.8426 | 2.8434 |
+  | Qwen2.5-1.5B | 2.2849 | 2.4217 | **2.3847** | 2.2861 | 2.2869 |
+
+  That is 27–28% of int4's loss gone. int8 keeps plain rounding: it is already
+  within noise of bf16, and the search changed nothing measurable but doubled
+  its load time. The groups are fitted on every core, so loading costs about
+  2–3 s more on 0.5B and 10 s more on 1.5B (median of three, 6-core CPU); int8
+  loads no slower, and on 1.5B a little faster.
+- **`--quant int4` keeps `v_proj` and `down_proj` at int8 in the first and last
+  eighth of the layers**, the core of llama.cpp's Q4_K_M rule: those two write
+  straight into the residual stream, and the ends of the network are where it
+  is least forgiving. The embedding and LM head were never int4 (f32 on the CPU,
+  int8 on the GPU), so they needed nothing. Same text and setup as above, on
+  top of the fitted groups:
+
+  | Model | int4, all 4-bit | ends at int8 (kept) | + every 3rd layer (Q4_K_M) | all `v`/`down` int8 |
+  |---|---|---|---|---|
+  | Qwen2.5-0.5B, NLL | 2.9932 | **2.9689** | 2.9448 | 2.9121 |
+  | layer weights | 192.0 MiB | 204.8 MiB | 217.5 MiB | 243.1 MiB |
+  | Qwen2.5-1.5B, NLL | 2.3847 | **2.3564** | 2.3576 | |
+  | layer weights | 702.8 MiB | 756.8 MiB | 797.3 MiB | |
+
+  On 0.5B each extra int8 byte buys about the same, wherever it goes; on 1.5B
+  the middle layers bought nothing. So dlm takes the ends only: 7% larger, and
+  with the fitted groups, int4's loss against bf16 falls from 0.209 to 0.127
+  nats on 0.5B and from 0.137 to 0.072 on 1.5B. MLA layers (DeepSeek) are left
+  alone, since the GPU runs their dense FFN at a single dtype.
+- **The GPU's batched GEMV read every weight once per sequence instead of once
+  per batch, and both GEMVs spent a third of their time in barriers.** Fixing
+  the two, measured on Qwen2.5-0.5B by running the old and new binaries
+  alternately on the same machine:
+
+  | Workload | Before | After |
+  |---|---|---|
+  | Prefill (resident) | 116–152 tok/s | **251–268 tok/s** |
+  | Prefill (streamed int4, 1.5B) | 40–43 tok/s | **95–106 tok/s** |
+  | Decode, batch 8 | 107–109 tok/s | **131–136 tok/s** |
+  | Decode, batch 1 | 74–83 tok/s | **79–87 tok/s** |
+
+  - **One read per batch.** `matvec_batched_kernel`'s comment claimed it held a
+    row across the batch loop; the code re-read the whole row from global memory
+    for every slot. It now keeps one accumulator per slot in registers and
+    multiplies each weight element into all of them as it is read. Prefill feeds
+    a chunk of tokens through this kernel, which is why it gains most.
+  - **Warp-shuffle reductions.** Both GEMVs reduced through shared memory, one
+    barrier per tree level — and the batched one did that per slot, so a 896-wide
+    projection cost 48 barrier rounds against 14 rows of work. They now reduce
+    inside each warp by shuffle and combine the warps once.
+  - Summation order within a row is unchanged; the order the partial sums combine
+    in is not, which moves results within float rounding. Verified against
+    Hugging Face transformers after the change: Qwen2.5-0.5B, Gemma 3 1B and a
+    Qwen2-MoE all still agree to 0.0001, and the 46 GPU parity tests pass.
+  - MoE gains little (~2%): its expert FFN runs per token through the
+    single-slot GEMV, and MoE decode does not use the batched block at all.
+
+- **Long prompts no longer stall other requests' streams.**
+  - **Before:** a request's prompt was prefilled whole when it was admitted,
+    and every running stream waited for it.
+  - **Now:** admitted prompts are fed in 16 tokens at a time, and a tick stops
+    after 200 ms while other requests are decoding. With nothing decoding,
+    prompts still go in whole.
+  - **Identical output:** the GPU kernels prefill in groups of 16, so pieces of
+    that size leave the output bit-identical.
+  - **Prefix sharing in bursts:** a request that shares at least a KV block of
+    its opening with a prompt still being prefilled waits for that prompt to be
+    cached, so a burst with one system prompt computes it once.
+  - **Measured, GTX 1650, Qwen2.5-0.5B:** a stream decoding while a 1,590-token
+    request arrived used to pause for 13.9 s. Now its longest gap is 0.41 s. The
+    long request itself takes 17.7 s instead of 13.9 s.
+
+- **Streamed batches load each layer once, not once per request.** The
+  streaming GPU kernel now runs every sequence of a dense model through a
+  layer's weights in one fused block call before fetching the next layer. It
+  used to run each sequence through the whole stack in turn, streaming every
+  non-resident layer once per sequence, so batch 4 decoded slower in total than
+  batch 1.
+  - **Measured, GTX 1650:** Qwen2.5-1.5B bf16 at a 4k context with 17 of 28
+    layers resident. Total decode at batch 4 went from 6.7 to 24.5 tok/s, and at
+    batch 8 from 6.9 to 34.9 tok/s.
+  - **Unchanged:** MoE and MLA models keep the one-sequence-at-a-time path.
+
+- **Streamed dense layers upload straight from pinned memory.**
+  - **Before:** each upload first copied the layer's weights into a pinned
+    staging buffer, which was the larger half of a streamed step.
+  - **Now:** the GPU streaming kernel keeps dense layers staged in pinned buffers
+    (an LRU, budgeted by the RAM cache size, which it replaces for these models),
+    so a hit copies straight to the device.
+  - **Measured, GTX 1650:** Qwen2.5-1.5B bf16 with 14 of 28 layers resident went
+    from 3.2-3.5 to 7.5-7.6 tok/s. Gemma 3 4B int4 with 9 of 34 resident went
+    from 2.8 to 5.6 tok/s on a quiet machine. Peak RSS is unchanged.
+  - **Unchanged:** MoE and MLA layers keep the RAM cache and staging buffer.
+- **The default VRAM safety margin scales with the card.** It is a tenth of
+  total VRAM, between 256 MiB and 1.5 GiB. It was 1.5 GiB on every card, which
+  held back nearly half of a 4 GB card's free VRAM for transient allocations
+  that take tens of MiB.
+  - **Qwen2.5-1.5B bf16, streamed:** 14 to 27 of 28 layers resident, and decode
+    from 7.5 to 27 tok/s together with the pinned cache.
+  - **Gemma 3 4B int4:** now runs resident at a 2k context without
+    `--safety-margin-gb`, at 13.2 tok/s.
+  - **Unchanged:** cards of 16 GB and up keep 1.5 GiB, and `--safety-margin-gb`
+    still overrides it.
+
+- **GPU decode and prefill are 1.3-1.9x faster.** All on a GTX 1650, prompt
+  512, 64 generated, from four kernel changes:
+
+  | Model | Decode tok/s | Prefill tok/s |
+  |---|---|---|
+  | Qwen2.5-0.5B (bf16) | 38.8 -> 49.3 | 77.7 -> 104.4 |
+  | Qwen2.5-0.5B int4 | 35.6 -> 79.2 | 70.1 -> 130.7 |
+  | Qwen2.5-1.5B int4 | 14.4 -> 33.5 | 22.4 -> 42.9 |
+  | Gemma 3 4B int4 | 6.8 -> 14.8 | 10.2 -> 19.1 |
+
+  At a 2k-token context, Qwen2.5-0.5B int4 decode went from 36.0 to 56.4 tok/s.
+  - **GEMV reduction:** 64 threads per block instead of 256. Every doubling
+    adds a barrier to each row's reduction, and 64 won on every model and width
+    measured.
+  - **Quantized GEMV:** scales and zeros are found once per row instead of once
+    per weight, which removes three integer divisions per weight element.
+    Results are bit-identical.
+  - **Attention softmax:** runs across each head's row instead of walking it
+    serially. At 2k context that took one token's softmax from 10.8 ms to
+    0.7 ms.
+  - **Device lookup:** each kernel call asks for the current device once,
+    instead of about 30 times per layer.
+- **CPU matmuls reuse a persistent thread pool.** Large GEMVs (MLP projections,
+  the LM head) used to start a fresh OS thread per chunk on every call. On
+  Qwen2.5-0.5B on CPU, measured against the previous binary back to back,
+  decode went from 7.38 to 8.28 tok/s and prefill from 9.1 to 10.8 tok/s.
+- **Sampling no longer sorts the whole vocabulary.**
+  - **`top_k`:** only the best k tokens are put in order.
+  - **Default `top_k = 0` with `top_p < 1`:** the nucleus is selected before it
+    is sorted.
+  - **Speed:** one sampled token from Qwen's 152k vocabulary took about 7 ms and
+    now takes 1.7 ms on peaked logits (0.7 ms with top-k 40).
+  - **Same output:** the distribution is identical to a full sort, and a test
+    pins it. Tied logits now order by token id, so a seed draws the same token
+    every run.
+- **Streamed layers are uploaded into the evicted layer's VRAM buffers.** The
+  eviction happens before the upload, not after, and a steady-state miss
+  allocates and frees nothing.
+  - **Allocations:** over a streamed Qwen2.5-1.5B run, `cudaMalloc` calls
+    dropped from 2,296 to 181 and time spent in `cudaMalloc` from 419 to 53 ms.
+  - **Peak VRAM:** the window no longer holds an extra layer while one loads.
+- **GPU paths no longer mirror the KV cache on the host.** Each layer and token
+  appended a zero-filled host row that nothing read. Now only a count is kept.
+  At the contexts measured this was tens of MiB, so peak RSS did not move.
+  Peak RSS on GPU runs comes from loading, not decode.
+- **`--stream` caches layers in host RAM by default, quantized or not**, when the
+  whole layer set (plus 25%) fits under a quarter of physical RAM. It was on
+  only with `--quant`; unquantized streaming re-read every layer from the mmap on
+  every window miss, which took streamed Gemma 3 1B from 46 s to 268 s on a
+  1,500-token prompt. When the set does not fit, the cache is now off rather
+  than partial (a smaller LRU never hits on a cyclic scan), and serve says so.
+  `--ram-cache-gb` still overrides either way.
+
+### Fixed
+
+- **A streamed `/v1/messages` request past `--queue-timeout` got a 200.** The
+  Anthropic stream queued its request only after the response had started, so
+  one the queue turned away came back as an empty stream ending in
+  `stop_reason: max_tokens`. It now waits for admission first, like the OpenAI
+  endpoints, and gets `503` with `Retry-After`. `--api-key`'s help and startup
+  banner also said it guarded `/v1/*` only; it guards every route but `/`,
+  `/health` and `/healthz`, and they say so.
+
+- **Qwen3's replies decoded to nothing.** A `tokenizer.json`'s added tokens
+  were registered only when marked `special`, and Qwen3 marks `<think>` and
+  `</think>` not special. Every Qwen3 chat reply opens with `<think>`, so its
+  ids could not be decoded and the server returned an empty message. All
+  added tokens are registered now, as transformers does: each is one token
+  when encoding and its text when decoding.
+
+- **API compatibility: four things that turned working clients away.**
+  - **Every model was called `dlm`.** The id in each response and in
+    `/v1/models` is now the checkpoint's own name (`qwen2.5-0.5b`, or a GGUF
+    file's). A client picking from the model list, routing between instances, or
+    checking a reply against what it asked for had nothing to go on.
+  - **`content` as an array of parts is accepted**, not only as a string. The
+    OpenAI SDKs and anything that can attach an image send the array form, and
+    dlm answered 400. Parts it cannot serve (an image) are dropped rather than
+    refused, and `content: null` reads as empty.
+  - **A request without `max_tokens` now runs to EOS**, instead of stopping at
+    128 tokens with `finish_reason: length`. It is still clamped to what is left
+    of the context window, which is the cap that matters.
+  - **`--cors-origin`** answers browser preflights and tags replies, so a browser
+    UI can reach the API. Without it the request succeeds and the browser
+    discards the answer, with nothing in the log. Off by default: a server on a
+    shared network should not hand its answers to any page that asks.
+- **A K-quant sub-block with a zero scale decoded to zero on the CPU.** ggml
+  decodes it as `-dmin * m`, and so do the GPU kernels; the CPU reference and
+  the expanded (int4/int8) layout dropped the minimum. Both now keep it.
+- **The end-to-end server test drove an engine nothing served.**
+  `tests/server.rs` exercised a second, older OpenAI router that only the test
+  referenced, so its checks said nothing about the server `dlm serve` runs. It
+  now drives `EngineService`, and the dead router is gone.
+
+- **Byte-level tokenizers split text differently from the models' own
+  tokenizers.**
+  - **Cause:** dlm's pre-tokenizer only split before spaces. GPT-2, Llama 3 and
+    Qwen split with a regex: whitespace runs become their own token, line breaks
+    end a piece, contractions and digits split off.
+  - **Effect:** prompts with code indentation, repeated spaces, newlines or
+    digits reached the model as token sequences it was never trained on. On 411
+    mixed strings, dlm matched Hugging Face `tokenizers` for only 58% (Qwen2.5),
+    54% (Llama 3) and 71% (GPT-2) of them.
+  - **Fix:** the pre-tokenizer implements each family's regex exactly (Qwen2 and
+    Qwen3, Llama 3, GPT-2), chosen from `tokenizer.json`. `\p{L}` and `\p{N}`
+    use generated Unicode 16 category tables, not `is_alphabetic`, which counts
+    Indic combining marks as letters.
+  - **Result:** all 411 strings now match for Qwen2.5, Qwen3, Llama 3 and GPT-2.
+  - **Not covered yet:** Falcon and DeepSeek chain splits of their own and get
+    the GPT-2 rule, which is much closer than splitting at spaces but not exact.
+    Unicode NFC normalization (Qwen's normalizer) is not applied.
+
+- **Config keys that change the model's behavior were read past in silence.**
+  Each one now takes effect, or is refused by name when dlm does not implement
+  it — a refusal is the only safe answer, since routing or positioning a model
+  wrongly reads as fluent, wrong output rather than an error.
+  - `use_sliding_window: false` (every Qwen2/2.5 config, next to a 32k
+    `sliding_window`) now means full attention. dlm had been windowing
+    attention the model expects whole, visible only past 32k tokens.
+  - `tie_word_embeddings: true` now reads the LM head from the embedding matrix
+    even when the checkpoint also ships an `lm_head.weight`, as transformers
+    does. Only a *missing* `lm_head.weight` used to tie them.
+  - Refused: `partial_rotary_factor` below 1.0 (Phi, GPT-NeoX, GLM rotate part
+    of each head; dlm rotates all of it), `max_window_layers` when it windows
+    only part of the model, and DeepSeek-V3's router (`scoring_func: sigmoid`,
+    `topk_method: noaux_tc`, `n_group`/`topk_group`, `routed_scaling_factor`).
+    DeepSeek-V2, whose routing dlm does implement, still loads.
+- **`dlm pull` downloaded Mistral weights twice.** Those repos ship the same
+  tensors as sharded files with an index and again as
+  `consolidated.safetensors`. dlm loads the sharded copy, so the second one is
+  now skipped — for multi-gigabyte repos it had doubled the download, the disk
+  use, and the address space mapped at load.
+- **Streamed GPU decode could read weights while they were being overwritten.**
+  A layer evicted from the VRAM window could get the next layer uploaded into
+  its buffers while kernels launched on the evicted layer were still queued.
+  Output was then wrong, and different from run to run. Uploads now wait for
+  the default stream first.
+- **`GpuKernel::run_block_batched` corrupted all but the last sequence** when it
+  fell back to one sequence at a time (more than 16 slots, or MLA).
+  `generate_batch` reached that path.
+- **One failed scheduler tick left the server spinning.** The engine closed every
+  client's stream but kept their requests in the scheduler, which failed again
+  on every tick after. It now aborts them as well.
+- **The VRAM planner sized the KV cache at half its real size.**
+  - **Cause:** it assumed 2 bytes per element, as for an fp16 cache, but the
+    device KV cache is f32. `--kv-quant` changes only the host-side stores.
+  - **Effect:** a plan that claimed to fit could run out of VRAM once the cache
+    filled. The fit checks for `serve` and `bench` now reserve the real amount.
+  - **Unchanged:** the paged pool's token capacity. Its budget comes from the
+    same plan, so the pool gets the same number of tokens.
+- **Multi-GPU stages shared one device's scratch memory.** The CUDA kernels'
+  scratch buffers were kept per thread, on the assumption that a multi-GPU
+  pipeline runs one thread per device. It does not: every stage runs on the
+  inference thread, switching devices per layer, so later stages were handed
+  buffers allocated on the first stage's GPU. Scratch is now kept per thread and
+  per device. Untested across two real GPUs.
+- **Host `--stream` ignored per-layer attention windows.** The streamed CPU
+  kernel handed every layer the model-wide config, so Gemma 2's global layers
+  were windowed too — invisible until a context passed 4,096 tokens.
+
+- **A panicking request handler leaked a connection slot permanently.** The live
+  connection counter was decremented on the last line of the connection thread,
+  which a panic unwinds past. After 256 cumulative panics the server shed every
+  connection forever, with no log line and a process that still looked healthy.
+- **`/healthz` was exempt from authentication but routed nowhere**, so a
+  Kubernetes liveness probe pointed at it got a 404 and restarted a healthy
+  process. Fixed on both the batched and distributed routers.
+- **Query strings broke routing and the auth exemption.** `/health?probe=1` was
+  not recognised as the health route and returned `401` under `--api-key`;
+  `/v1/models?limit=1` returned `404`.
+- **The Hugging Face token was passed to `curl` in `argv`**, where
+  `/proc/<pid>/cmdline` exposed it to any local user for the duration of a pull.
+  It now goes through a curl config file on stdin.
+- **`dlm pull` did not validate the repo id**, only counted its segments, so
+  `a/..` resolved the download directory to the *parent* of the intended one.
+- Connections past the concurrency cap are now refused with `503` and a
+  `Retry-After` instead of being dropped silently, which was indistinguishable
+  from a crashed server.
 
 ## [0.3.0]
 
