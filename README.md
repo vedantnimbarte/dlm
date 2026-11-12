@@ -123,6 +123,20 @@ On **Windows** (removes the binary and its user-PATH entry):
 irm https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.ps1 | iex
 ```
 
+**With Docker** (Linux, or Windows with Docker Desktop; the NVIDIA Container
+Toolkit for the GPU). The image has the CUDA kernels for Turing to Blackwell
+(sm_75 to sm_120) with the CUDA runtime linked in, so it needs only the
+driver, and is 165 MB:
+
+```sh
+docker build -t dlm .
+docker run --gpus all -p 8000:8000 -v /path/to/models:/models dlm     serve --model-path /models/Qwen2.5-0.5B-Instruct --host 0.0.0.0
+```
+
+`--host 0.0.0.0` makes the port reachable from outside the container; add
+`--api-key` before exposing it further. Without `--gpus all` it runs on the
+CPU.
+
 ---
 
 ## Table of contents

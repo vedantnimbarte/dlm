@@ -510,6 +510,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A Dockerfile.** `docker build -t dlm .` builds dlm with the CUDA kernels
+  for sm_75 to sm_120 in NVIDIA's CUDA 12.8 image, statically linked to the
+  CUDA runtime, and ships it in plain Ubuntu: a 165 MB image that needs only
+  the driver (`--gpus all`). Built and run on a GTX 1650 through Docker
+  Desktop: it served Qwen2.5-0.5B from a mounted directory on the GPU.
+
 - **Load gauges on `/metrics`, and a load and soak test.** `/metrics` had
   only counters; it now also has `dlm_requests_running`,
   `dlm_requests_waiting` and, where the GPU pages KV, `dlm_kv_free_tokens`,
