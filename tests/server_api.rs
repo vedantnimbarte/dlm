@@ -528,13 +528,20 @@ fn a_request_that_waits_too_long_is_turned_away() {
         )
     });
     std::thread::sleep(Duration::from_millis(50)); // the long one has the slot
-    for body in [
-        r#"{"prompt":"b","max_tokens":2}"#,
-        r#"{"prompt":"b","max_tokens":2,"stream":true}"#,
+    for (path, body) in [
+        ("/v1/completions", r#"{"prompt":"b","max_tokens":2}"#),
+        (
+            "/v1/completions",
+            r#"{"prompt":"b","max_tokens":2,"stream":true}"#,
+        ),
+        (
+            "/v1/messages",
+            r#"{"messages":[{"role":"user","content":"b"}],"max_tokens":2,"stream":true}"#,
+        ),
     ] {
         let mut stream = TcpStream::connect(addr).unwrap();
         let raw = format!(
-            "POST /v1/completions HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(raw.as_bytes()).unwrap();
