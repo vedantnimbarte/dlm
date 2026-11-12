@@ -92,8 +92,11 @@ jobs:
           # No Intel-Mac build: GitHub retired the macos-13 (Intel) image in Dec
           # 2025, Intel Macs can't use the CUDA path anyway, and Apple Silicon is
           # covered below. Intel-Mac users build from source (see install.sh).
+          # macos-latest, not a pinned image: macos-14's retirement cancelled
+          # v0.4.0's build before it started. Rust's deployment target (11.0),
+          # not the runner's macOS, decides which Macs the binary runs on.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
           # Windows is a first-class target: `dlm` is pure std + a CPU kernel, so
           # it builds natively here. Ships as a .zip (see `zip:` below) and is
           # installed by install.ps1.
@@ -135,8 +138,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned: NVIDIA's Ubuntu 26.04 repo (ubuntu-latest since Oct 2026) has
+          # no cuda-13-2, which failed v0.4.0's GPU build. Move on when it does.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}

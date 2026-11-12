@@ -12,6 +12,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-12
+
+The same code as 0.4.0, which shipped without two of its builds. Use this
+release, not 0.4.0.
+
+### Fixed
+
+- **0.4.0 published no Apple Silicon or Linux GPU build.** Two release runners
+  changed underneath the workflow: `macos-14` was retired, so the macOS build
+  never started, and `ubuntu-latest` became Ubuntu 26.04, whose NVIDIA repo has
+  no CUDA 13.2. `install.sh` then failed outright on Apple Silicon, and on Linux
+  with an NVIDIA GPU fell back to the CPU build. The macOS build now runs on
+  `macos-latest` and the Linux CUDA build is pinned to `ubuntu-24.04`, where
+  0.3.0's was built.
+
 ## [0.4.0] - 2026-11-12
 
 ### Verified
@@ -1306,6 +1321,7 @@ Carried forward and tracked in `RELEASING.md`:
 - DeepSeek-V2/V3 (MLA + MoE) had run only on the CPU path.
 - Llama 2 was expected to work but had not been demonstrated.
 
-[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/vedantnimbarte/dlm/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vedantnimbarte/dlm/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vedantnimbarte/dlm/releases/tag/v0.3.0
