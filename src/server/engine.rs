@@ -28,6 +28,9 @@ pub enum TokenEvent {
     /// A token, with its log-probabilities when the request asked for them.
     Next(u32, Option<TokenLogprobs>),
     Done(Option<AcceptanceStats>),
+    /// Turned away before it started: it waited in the queue past
+    /// `--queue-timeout`.
+    Rejected(String),
 }
 
 /// What the engine thread is asked to do: generate, or embed a text (run
@@ -42,6 +45,8 @@ enum Work {
 
 struct Job {
     id: u64,
+    /// Lower is admitted first.
+    priority: i32,
     prompt: Vec<u32>,
     max_new: usize,
     eos: Vec<u32>,
@@ -72,6 +77,12 @@ struct StreamMetrics {
     expert_hits: AtomicU64,
     expert_misses: AtomicU64,
     expert_evictions: AtomicU64,
+    /// The scheduler after its latest step, whatever the kernel: requests
+    /// decoding, requests queued, and (where the kernel pages KV) free KV
+    /// tokens, `u64::MAX` when there is no pool to count.
+    running: AtomicU64,
+    waiting: AtomicU64,
+    kv_free: AtomicU64,
 }
 
 impl StreamMetrics {
@@ -110,6 +121,9 @@ pub struct EngineService {
     stream: Arc<StreamMetrics>,
     /// Each token id's bytes, built on first use (see [`token_bytes`](Self::token_bytes)).
     token_bytes: OnceLock<TokenBytes>,
+    /// How long a request may wait to be admitted, in milliseconds; 0 for no
+    /// limit. Shared with the engine loop, which enforces it.
+    queue_timeout: Arc<AtomicU64>,
 }
 
 impl EngineService {
@@ -216,6 +230,8 @@ impl EngineService {
         let (job_tx, job_rx) = channel::<Work>();
         let stream = Arc::new(StreamMetrics::default());
         let stream_loop = Arc::clone(&stream);
+        let queue_timeout = Arc::new(AtomicU64::new(0));
+        let timeout_loop = Arc::clone(&queue_timeout);
         std::thread::spawn(move || {
             engine_loop(
                 generator,
@@ -225,6 +241,7 @@ impl EngineService {
                 max_batch,
                 prefix_cache_size,
                 stream_loop,
+                timeout_loop,
             )
         });
         Arc::new(Self {
@@ -241,6 +258,7 @@ impl EngineService {
             metrics: Metrics::default(),
             stream,
             token_bytes: OnceLock::new(),
+            queue_timeout,
         })
     }
 
@@ -278,6 +296,17 @@ impl EngineService {
     /// Set the EOS token id(s): generation stops (and the token is dropped from
     /// the output) when the model produces any of them. Defaults to empty (run
     /// to length).
+    /// Turn away a request that has waited longer than `limit` to be admitted,
+    /// with `503` and `Retry-After`, rather than let a backlog grow without
+    /// bound. `Duration::ZERO` waits forever, the default.
+    pub fn with_queue_timeout(self: Arc<Self>, limit: std::time::Duration) -> Arc<Self> {
+        self.queue_timeout.store(
+            limit.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        self
+    }
+
     pub fn with_eos_tokens(mut self: Arc<Self>, eos_tokens: Vec<u32>) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
             inner.eos_tokens = eos_tokens;
@@ -303,6 +332,18 @@ impl EngineService {
         eos: Vec<u32>,
         decoding: Decoding,
     ) -> Receiver<TokenEvent> {
+        self.submit_at(prompt, max_new, eos, decoding, 0)
+    }
+
+    /// [`submit`](Self::submit) at `priority` (lower is admitted first).
+    fn submit_at(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+        priority: i32,
+    ) -> Receiver<TokenEvent> {
         let (sink, out) = channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let _ = self
@@ -311,6 +352,7 @@ impl EngineService {
             .unwrap_or_else(|e| e.into_inner())
             .send(Work::Generate(Box::new(Job {
                 id,
+                priority,
                 prompt,
                 max_new,
                 eos,
@@ -360,6 +402,7 @@ fn engine_loop<K: ComputeKernel>(
     max_batch: usize,
     prefix_cache_size: usize,
     stream: Arc<StreamMetrics>,
+    queue_timeout: Arc<AtomicU64>,
 ) {
     let mut sched = match &draft {
         // Draft-model sessions can't resume, so they get no prefix cache.
@@ -369,6 +412,9 @@ fn engine_loop<K: ComputeKernel>(
         None => BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size),
     };
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
+    // The gauges hold from the start, not only after the first request.
+    let free = generator.kv_free_tokens().map_or(u64::MAX, |t| t as u64);
+    stream.kv_free.store(free, Ordering::Relaxed);
 
     loop {
         let mut take = |work: Work, sched: &mut BatchScheduler<'_, K>| match work {
@@ -385,6 +431,17 @@ fn engine_loop<K: ComputeKernel>(
         }
         while let Ok(work) = job_rx.try_recv() {
             take(work, &mut sched);
+        }
+        let limit = queue_timeout.load(Ordering::Relaxed);
+        if limit > 0 {
+            for id in sched.expire_pending(std::time::Duration::from_millis(limit)) {
+                if let Some(s) = sinks.remove(&id) {
+                    let _ = s.send(TokenEvent::Rejected(format!(
+                        "the server is busy: the request waited over {:.1} s in the queue",
+                        limit as f64 / 1000.0
+                    )));
+                }
+            }
         }
         if !sched.has_work() {
             continue;
@@ -434,6 +491,14 @@ fn engine_loop<K: ComputeKernel>(
         if let Some(s) = generator.stream_stats() {
             stream.publish(s);
         }
+        stream
+            .running
+            .store(sched.active_len() as u64, Ordering::Relaxed);
+        stream
+            .waiting
+            .store(sched.pending_len() as u64, Ordering::Relaxed);
+        let free = generator.kv_free_tokens().map_or(u64::MAX, |t| t as u64);
+        stream.kv_free.store(free, Ordering::Relaxed);
     }
 }
 
@@ -442,12 +507,21 @@ fn enqueue<K: ComputeKernel>(
     sinks: &mut HashMap<u64, Sender<TokenEvent>>,
     job: Job,
 ) {
-    match sched.submit_decoding(job.id, job.prompt, job.max_new, job.eos, job.decoding) {
+    let Job {
+        id,
+        priority,
+        prompt,
+        max_new,
+        eos,
+        decoding,
+        sink,
+    } = job;
+    match sched.submit_prioritized(id, prompt, max_new, eos, decoding, priority) {
         Ok(()) => {
-            sinks.insert(job.id, job.sink);
+            sinks.insert(id, sink);
         }
         Err(_) => {
-            let _ = job.sink.send(TokenEvent::Done(None));
+            let _ = sink.send(TokenEvent::Done(None));
         }
     }
 }
@@ -698,6 +772,9 @@ struct ChatRequest {
     /// How many completions to generate for the prompt (1-16).
     #[serde(default)]
     n: Option<usize>,
+    /// Queue priority: lower is admitted first (vLLM's field). 0 by default.
+    #[serde(default)]
+    priority: i32,
     /// Functions the model may call (`{"type": "function", "function": ...}`).
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
@@ -1524,6 +1601,26 @@ fn metrics_text(engine: &EngineService) -> String {
         m.prompt_tokens.load(Ordering::Relaxed),
         m.completion_tokens.load(Ordering::Relaxed),
     );
+    // Load, as of the scheduler's latest step: what to alert or scale on.
+    let s = &engine.stream;
+    out.push_str(&format!(
+        "# HELP dlm_requests_running Requests decoding now.\n\
+         # TYPE dlm_requests_running gauge\n\
+         dlm_requests_running {}\n\
+         # HELP dlm_requests_waiting Requests queued for a batch slot.\n\
+         # TYPE dlm_requests_waiting gauge\n\
+         dlm_requests_waiting {}\n",
+        s.running.load(Ordering::Relaxed),
+        s.waiting.load(Ordering::Relaxed),
+    ));
+    let kv_free = s.kv_free.load(Ordering::Relaxed);
+    if kv_free != u64::MAX {
+        out.push_str(&format!(
+            "# HELP dlm_kv_free_tokens KV cache tokens free in the pool.\n\
+             # TYPE dlm_kv_free_tokens gauge\n\
+             dlm_kv_free_tokens {kv_free}\n"
+        ));
+    }
     // Layer-streaming cache stats — present only when streaming weights, so a
     // scraper can see the hit rate / prefetch effectiveness and tune the window
     // and --prefetch-depth.
@@ -1680,8 +1777,48 @@ fn collect_completion(
     max_tokens: usize,
     decoding: Decoding,
     stops: &[String],
-) -> Generated {
-    collect_completions(engine, ids, max_tokens, vec![decoding], stops).remove(0)
+) -> Result<Generated, String> {
+    collect_completions(engine, ids, max_tokens, vec![decoding], stops, 0).map(|mut g| g.remove(0))
+}
+
+/// Each of a request's choices with its first event, once every one has
+/// one. They are queued together, then waited on: a request the queue turns
+/// away (`--queue-timeout`) is answered `503` before any response starts,
+/// even when it asked to stream. `Err` is why it was turned away.
+type Started = Vec<(TokenEvent, Receiver<TokenEvent>)>;
+
+fn start_choices(
+    engine: &EngineService,
+    ids: &[u32],
+    max_tokens: usize,
+    decodings: Vec<Decoding>,
+    priority: i32,
+) -> Result<Started, String> {
+    let rxs: Vec<_> = decodings
+        .into_iter()
+        .map(|d| {
+            engine.submit_at(
+                ids.to_vec(),
+                max_tokens,
+                engine.eos_tokens.clone(),
+                d,
+                priority,
+            )
+        })
+        .collect();
+    let mut started = Vec::with_capacity(rxs.len());
+    for rx in rxs {
+        match rx.recv().unwrap_or(TokenEvent::Done(None)) {
+            TokenEvent::Rejected(why) => return Err(why),
+            first => started.push((first, rx)),
+        }
+    }
+    Ok(started)
+}
+
+/// `503` for a request the queue turned away, with `Retry-After`.
+fn busy(body: Vec<u8>) -> Response {
+    Response::json(503, body).with_header("Retry-After", "1")
 }
 
 /// [`collect_completion`] for several choices of one prompt: all are queued
@@ -1693,23 +1830,22 @@ fn collect_completions(
     max_tokens: usize,
     decodings: Vec<Decoding>,
     stops: &[String],
-) -> Vec<Generated> {
+    priority: i32,
+) -> Result<Vec<Generated>, String> {
     let prompt_tokens = ids.len();
-    let rxs: Vec<_> = decodings
+    let started = start_choices(engine, &ids, max_tokens, decodings, priority)?;
+    let out: Vec<Generated> = started
         .into_iter()
-        .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
-        .collect();
-    let out: Vec<Generated> = rxs
-        .into_iter()
-        .map(|rx| collect_from(engine, rx, prompt_tokens, stops))
+        .map(|(first, rx)| collect_from(engine, first, rx, prompt_tokens, stops))
         .collect();
     engine.record(prompt_tokens, out.iter().map(|g| g.completion_tokens).sum());
-    out
+    Ok(out)
 }
 
 /// Read one choice's tokens to its end (see [`collect_completion`]).
 fn collect_from(
     engine: &Arc<EngineService>,
+    first: TokenEvent,
     rx: Receiver<TokenEvent>,
     prompt_tokens: usize,
     stops: &[String],
@@ -1718,7 +1854,7 @@ fn collect_from(
     let mut lps = Vec::new();
     let mut spec = None;
     let mut hit_eos = false;
-    for ev in rx {
+    for ev in std::iter::once(first).chain(rx) {
         match ev {
             TokenEvent::Next(t, lp) => {
                 // The scheduler emits EOS inclusively as the final token; drop it
@@ -1740,6 +1876,8 @@ fn collect_from(
                 spec = stats;
                 break;
             }
+            // Only a queued request is turned away, never one that has started.
+            TokenEvent::Rejected(_) => break,
         }
     }
     let completion_tokens = tokens.len();
@@ -1864,6 +2002,10 @@ impl Streamed {
                 self.rx = None;
                 None
             }
+            TokenEvent::Rejected(_) => {
+                self.rx = None;
+                None
+            }
         }
     }
 }
@@ -1873,19 +2015,23 @@ impl Streamed {
 /// receiver; several take turns.
 fn stream_choices(
     engine: &EngineService,
-    rxs: Vec<Receiver<TokenEvent>>,
+    started: Started,
     stops: &[String],
     hold_tools: bool,
     mut send: impl FnMut(usize, &mut Streamed, String) -> std::io::Result<()>,
 ) -> std::io::Result<Vec<Streamed>> {
     use std::sync::mpsc::RecvTimeoutError;
-    let mut choices: Vec<Streamed> = rxs
-        .into_iter()
-        .map(|rx| Streamed {
+    let mut choices = Vec::with_capacity(started.len());
+    for (i, (first, rx)) in started.into_iter().enumerate() {
+        let mut c = Streamed {
             hold_tools,
             ..Streamed::new(rx)
-        })
-        .collect();
+        };
+        if let Some(text) = c.take(engine, stops, first) {
+            send(i, &mut c, text)?;
+        }
+        choices.push(c);
+    }
     let wait = if choices.len() == 1 {
         std::time::Duration::from_secs(3600)
     } else {
@@ -1960,19 +2106,34 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
 
     if parsed.stream {
         let tools = !tools.is_empty();
+        let started = match start_choices(engine, &ids, max_tokens, decodings, parsed.priority) {
+            Ok(s) => s,
+            Err(why) => return busy(error_json(&why)),
+        };
+        let lp = logprobs.is_some();
         stream_chat(
             Arc::clone(engine),
-            ids,
-            max_tokens,
+            ids.len(),
+            started,
+            lp,
             model,
-            decodings,
             stops,
             tools,
         )
     } else {
         let request = engine.next_id.load(Ordering::Relaxed);
         let prompt_tokens = ids.len();
-        let gs = collect_completions(engine, ids, max_tokens, decodings, &stops);
+        let gs = match collect_completions(
+            engine,
+            ids,
+            max_tokens,
+            decodings,
+            &stops,
+            parsed.priority,
+        ) {
+            Ok(g) => g,
+            Err(why) => return busy(error_json(&why)),
+        };
         let completion_tokens = gs.iter().map(|g| g.completion_tokens).sum();
         let spec = if gs.len() == 1 { gs[0].spec } else { None };
         let body = ChatResponse {
@@ -2221,6 +2382,9 @@ struct CompletionRequest {
     /// How many completions to generate for the prompt (1-16).
     #[serde(default)]
     n: Option<usize>,
+    /// Queue priority: lower is admitted first (vLLM's field). 0 by default.
+    #[serde(default)]
+    priority: i32,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -2303,10 +2467,25 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_completion(Arc::clone(engine), ids, max_tokens, model, decodings, stops)
+        let started = match start_choices(engine, &ids, max_tokens, decodings, parsed.priority) {
+            Ok(s) => s,
+            Err(why) => return busy(error_json(&why)),
+        };
+        let lp = logprobs.is_some();
+        stream_completion(Arc::clone(engine), ids.len(), started, lp, model, stops)
     } else {
         let prompt_tokens = ids.len();
-        let gs = collect_completions(engine, ids, max_tokens, decodings, &stops);
+        let gs = match collect_completions(
+            engine,
+            ids,
+            max_tokens,
+            decodings,
+            &stops,
+            parsed.priority,
+        ) {
+            Ok(g) => g,
+            Err(why) => return busy(error_json(&why)),
+        };
         let completion_tokens = gs.iter().map(|g| g.completion_tokens).sum();
         let spec = if gs.len() == 1 { gs[0].spec } else { None };
         let body = CompletionResponse {
@@ -2349,10 +2528,10 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
 /// `text` and has no role chunk.
 fn stream_completion(
     engine: Arc<EngineService>,
-    ids: Vec<u32>,
-    max_tokens: usize,
+    prompt_tokens: usize,
+    started: Started,
+    logprobs: bool,
     model: String,
-    decodings: Vec<Decoding>,
     stops: Vec<String>,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
@@ -2382,13 +2561,7 @@ fn stream_completion(
             w.flush()
         };
 
-        let prompt_tokens = ids.len();
-        let logprobs = decodings[0].logprobs.is_some();
-        let rxs = decodings
-            .into_iter()
-            .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
-            .collect();
-        let choices = stream_choices(&engine, rxs, &stops, false, |i, c, text| {
+        let choices = stream_choices(&engine, started, &stops, false, |i, c, text| {
             let lps = logprobs.then(|| {
                 let mut out = CompletionLogprobs::default();
                 for (t, lp, offset) in std::mem::take(&mut c.pending) {
@@ -2638,7 +2811,10 @@ fn handle_messages(engine: &Arc<EngineService>, req: &Request) -> Response {
         );
     }
 
-    let g = collect_completion(engine, ids, max_tokens, sampler.into(), &stops);
+    let g = match collect_completion(engine, ids, max_tokens, sampler.into(), &stops) {
+        Ok(g) => g,
+        Err(why) => return busy(anthropic_error_json(&why)),
+    };
     let body = MessagesResponse {
         id: format!("msg-{id}"),
         kind: "message",
@@ -2762,7 +2938,7 @@ fn stream_messages(
                         break;
                     }
                 }
-                TokenEvent::Done(_) => break,
+                TokenEvent::Done(_) | TokenEvent::Rejected(_) => break,
             }
         }
         engine.record(prompt_tokens, completion_tokens);
@@ -2796,13 +2972,12 @@ fn stream_messages(
 /// under its `index`: a role chunk, the text as it completes (with the
 /// log-probabilities of the tokens behind it when asked for), and a final
 /// chunk with the finish reason.
-#[allow(clippy::too_many_arguments)]
 fn stream_chat(
     engine: Arc<EngineService>,
-    ids: Vec<u32>,
-    max_tokens: usize,
+    prompt_tokens: usize,
+    started: Started,
+    logprobs: bool,
     model: String,
-    decodings: Vec<Decoding>,
     stops: Vec<String>,
     tools: bool,
 ) -> Response {
@@ -2834,7 +3009,7 @@ fn stream_chat(
         };
 
         // First, each choice announces the assistant role.
-        for i in 0..decodings.len() {
+        for i in 0..started.len() {
             let role = Delta {
                 role: Some("assistant"),
                 content: None,
@@ -2843,14 +3018,8 @@ fn stream_chat(
             send_chunk(w, i, role, None, None)?;
         }
 
-        let prompt_tokens = ids.len();
-        let logprobs = decodings[0].logprobs.is_some();
-        let rxs = decodings
-            .into_iter()
-            .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
-            .collect();
         let request = engine.next_id.load(Ordering::Relaxed);
-        let mut choices = stream_choices(&engine, rxs, &stops, tools, |i, c, text| {
+        let mut choices = stream_choices(&engine, started, &stops, tools, |i, c, text| {
             let lps = logprobs.then(|| ChatLogprobs {
                 content: std::mem::take(&mut c.pending)
                     .iter()

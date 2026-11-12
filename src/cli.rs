@@ -476,6 +476,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub prefix_cache_size: Option<usize>,
 
+    /// Turn away a request that has waited this many seconds to be admitted,
+    /// with `503` and `Retry-After`, instead of letting a backlog grow without
+    /// bound. Only queued requests: one already decoding runs to its end. Off
+    /// (wait forever) unless set.
+    #[arg(long, value_name = "SECS")]
+    pub queue_timeout: Option<f64>,
+
     /// Expose `GET /v1/telemetry`, a Server-Sent Events stream of per-layer flow
     /// events: what each layer cost at each stage of
     /// `mmap → RAM cache → pinned staging → VRAM → compute`, with measured bytes

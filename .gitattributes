@@ -4,3 +4,7 @@
 
 # Test fixtures are binary GGUF files; never touch their bytes.
 *.gguf binary
+
+# Docker reads these on Linux: a CRLF line continuation breaks a RUN.
+Dockerfile text eol=lf
+.dockerignore text eol=lf

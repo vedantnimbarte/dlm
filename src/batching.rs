@@ -128,6 +128,10 @@ struct Pending {
     eos: Vec<u32>,
     /// How tokens are chosen, on the plain and the speculative path alike.
     decoding: Decoding,
+    /// Lower goes first (see [`submit_prioritized`](BatchScheduler::submit_prioritized)).
+    priority: i32,
+    /// When it was queued, for [`expire_pending`](BatchScheduler::expire_pending).
+    queued: std::time::Instant,
 }
 
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
@@ -341,19 +345,59 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         eos: Vec<u32>,
         decoding: Decoding,
     ) -> Result<()> {
+        self.submit_prioritized(id, prompt, max_new_tokens, eos, decoding, 0)
+    }
+
+    /// [`submit_decoding`](Self::submit_decoding) at `priority`: the queue is
+    /// admitted lowest priority first, and in arrival order within one (vLLM's
+    /// convention). A request already decoding is never preempted.
+    pub fn submit_prioritized(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        max_new_tokens: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+        priority: i32,
+    ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::DlmError::InvalidConfig(
                 "prompt is empty".into(),
             ));
         }
-        self.pending.push_back(Pending {
-            id,
-            prompt,
-            max_new_tokens,
-            eos,
-            decoding,
-        });
+        let at = self
+            .pending
+            .iter()
+            .position(|p| p.priority > priority)
+            .unwrap_or(self.pending.len());
+        self.pending.insert(
+            at,
+            Pending {
+                id,
+                prompt,
+                max_new_tokens,
+                eos,
+                decoding,
+                priority,
+                queued: std::time::Instant::now(),
+            },
+        );
         Ok(())
+    }
+
+    /// Drop every request that has waited in the queue longer than `limit`
+    /// without being admitted, and return their ids. A request already
+    /// decoding is not touched.
+    pub fn expire_pending(&mut self, limit: std::time::Duration) -> Vec<u64> {
+        let mut expired = Vec::new();
+        self.pending.retain(|p| {
+            let keep = p.queued.elapsed() <= limit;
+            if !keep {
+                expired.push(p.id);
+            }
+            keep
+        });
+        expired
     }
 
     /// Abandon a request (e.g. the client disconnected): drop it from the
@@ -369,6 +413,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// Whether any request is pending or in flight.
     pub fn has_work(&self) -> bool {
         !self.pending.is_empty() || !self.active.is_empty()
+    }
+
+    /// Requests queued for a slot.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     /// In-flight request count.

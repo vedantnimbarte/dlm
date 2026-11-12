@@ -1894,7 +1894,10 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     }
     .with_chat_template(template)
     .with_eos_tokens(eos_tokens.clone())
-    .with_context_window(args.context_length as usize);
+    .with_context_window(args.context_length as usize)
+    .with_queue_timeout(std::time::Duration::from_secs_f64(
+        args.queue_timeout.unwrap_or(0.0).max(0.0),
+    ));
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
@@ -1927,6 +1930,10 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     // int8/int4 but no fp16.
     let kv_note = match kv_quant {
         dlm::forward::KvQuant::None => "f32 (exact)",
+        dlm::forward::KvQuant::Int8 | dlm::forward::KvQuant::Int4 if on_gpu => {
+            "int8 on the GPU (56% of fp16's memory; fp16 where heads are not a multiple of \
+             32 wide; --kv-quant f16 for fp16)"
+        }
         _ if on_gpu => "fp16 on the GPU (half the memory of f32; --kv-quant f32 for exact)",
         dlm::forward::KvQuant::Int8 => "int8 (≈half memory, approximate)",
         dlm::forward::KvQuant::Int4 => "int4 (≈quarter memory, approximate)",

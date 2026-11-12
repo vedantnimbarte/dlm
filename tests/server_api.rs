@@ -462,3 +462,91 @@ fn bad_embedding_requests_are_refused() {
         assert!(status.contains("400"), "{body}: {status} {resp}");
     }
 }
+
+/// A server with one batch slot, a model slow enough (4 layers of 256) that
+/// a long request holds the slot for a good while, and a `queue_timeout`.
+fn start_busy_server(queue_timeout: std::time::Duration) -> SocketAddr {
+    let (vocab, hidden) = (256usize, 256usize);
+    let cfg = BlockConfig {
+        hidden_size: hidden,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 64,
+        intermediate_size: 1024,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        ..Default::default()
+    };
+    let layers = (0..4).map(|_| LayerTensors::zeros(&cfg)).collect();
+    let kernel = CpuKernel::new(cfg, layers).unwrap();
+    let fill = |n: usize| -> Vec<f32> { (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect() };
+    let generator = Generator::new(
+        kernel,
+        fill(vocab * hidden),
+        vec![1.0; hidden],
+        fill(vocab * hidden),
+        vocab,
+        1e-5,
+        KvCacheConfig {
+            num_layers: 4,
+            num_kv_heads: 2,
+            head_dim: 64,
+            block_size: 16,
+        },
+        64,
+    )
+    .unwrap();
+    let engine = EngineService::start(
+        generator,
+        BpeTokenizer::bytes_only(),
+        vocab,
+        "dlm",
+        8,
+        0,
+        1,
+        0,
+    )
+    .with_queue_timeout(queue_timeout);
+    let server = HttpServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || server.serve(router(engine)).unwrap());
+    addr
+}
+
+/// A request that waits past `--queue-timeout` for its slot is answered 503
+/// with `Retry-After`, streamed or not; one already decoding runs to its end,
+/// and the server takes requests again once the slot is free.
+#[test]
+fn a_request_that_waits_too_long_is_turned_away() {
+    use std::time::Duration;
+    let addr = start_busy_server(Duration::from_millis(30));
+    let long = std::thread::spawn(move || {
+        post(
+            addr,
+            "/v1/completions",
+            r#"{"prompt":"a","max_tokens":600}"#,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(50)); // the long one has the slot
+    for body in [
+        r#"{"prompt":"b","max_tokens":2}"#,
+        r#"{"prompt":"b","max_tokens":2,"stream":true}"#,
+    ] {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let raw = format!(
+            "POST /v1/completions HTTP/1.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 503"), "{body}: {resp}");
+        assert!(resp.contains("Retry-After:"), "{resp}");
+        assert!(resp.contains("busy"), "{resp}");
+    }
+    let (status, body) = long.join().unwrap();
+    assert!(status.contains("200"), "{status} {body}");
+    assert_eq!(json(&body)["usage"]["completion_tokens"], 600);
+    let (status, _) = post(addr, "/v1/completions", r#"{"prompt":"c","max_tokens":2}"#);
+    assert!(status.contains("200"), "{status}");
+}

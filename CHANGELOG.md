@@ -510,6 +510,36 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A Dockerfile.** `docker build -t dlm .` builds dlm with the CUDA kernels
+  for sm_75 to sm_120 in NVIDIA's CUDA 12.8 image, statically linked to the
+  CUDA runtime, and ships it in plain Ubuntu: a 165 MB image that needs only
+  the driver (`--gpus all`). Built and run on a GTX 1650 through Docker
+  Desktop: it served Qwen2.5-0.5B from a mounted directory on the GPU.
+
+- **Load gauges on `/metrics`, and a load and soak test.** `/metrics` had
+  only counters; it now also has `dlm_requests_running`,
+  `dlm_requests_waiting` and, where the GPU pages KV, `dlm_kv_free_tokens`,
+  as of the scheduler's latest step: what to alert or scale on.
+  `tests/server_soak.rs` sends 192 requests from 16 clients at four batch
+  slots, of every kind (greedy and streamed chat, `n` with `logprobs`,
+  embeddings, stop sequences, and clients that hang up mid-stream), and checks
+  every greedy answer matches the one given alone (no cross-talk between
+  batched requests' KV), then that the server drains to idle, the GPU's KV pool
+  is as full as it started, and it still answers. `DLM_SOAK_ROUNDS` repeats
+  the load: 57,600 requests over two minutes on a GTX 1650 came back clean.
+  With blocks no longer returned on drop, the GPU run fails.
+
+- **`--queue-timeout` and request `priority`: a bounded, ordered queue.** A
+  request waited for a batch slot as long as it took, and in arrival order.
+  `--queue-timeout SECS` now turns away one that has waited that long with
+  `503` and `Retry-After`; the handler waits for each choice's first event
+  before answering, so even a streamed request gets a real HTTP error rather
+  than a stream that breaks. A request already decoding runs to its end. And a
+  request's `priority` (vLLM's field, default 0; lower first, arrival order
+  within one) orders who is admitted next. `tests/server_api.rs` holds the one
+  slot with a 600-token request and checks a second is turned away streamed
+  and not, while the first finishes.
+
 - **`--lora`: serve a model with a PEFT LoRA adapter merged in.** `serve`,
   `bench` and `score` take an adapter directory and merge `(alpha / r) * B @ A`
   (`alpha / sqrt(r)` with rsLoRA) into each weight as the loader reads it,

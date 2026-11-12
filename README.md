@@ -123,6 +123,20 @@ On **Windows** (removes the binary and its user-PATH entry):
 irm https://raw.githubusercontent.com/vedantnimbarte/dlm/main/uninstall.ps1 | iex
 ```
 
+**With Docker** (Linux, or Windows with Docker Desktop; the NVIDIA Container
+Toolkit for the GPU). The image has the CUDA kernels for Turing to Blackwell
+(sm_75 to sm_120) with the CUDA runtime linked in, so it needs only the
+driver, and is 165 MB:
+
+```sh
+docker build -t dlm .
+docker run --gpus all -p 8000:8000 -v /path/to/models:/models dlm     serve --model-path /models/Qwen2.5-0.5B-Instruct --host 0.0.0.0
+```
+
+`--host 0.0.0.0` makes the port reachable from outside the container; add
+`--api-key` before exposing it further. Without `--gpus all` it runs on the
+CPU.
+
 ---
 
 ## Table of contents
@@ -900,8 +914,9 @@ inference engine):
   token counts. Send it as either `Authorization: Bearer <key>` (OpenAI) or
   `x-api-key: <key>` (Anthropic), so either SDK authenticates unchanged. The
   request body is size-capped.
-  `GET /metrics` exposes Prometheus counters
-  (requests, prompt/completion tokens, and — when streaming — layer cache
+  `GET /metrics` exposes Prometheus counters and gauges
+  (requests, prompt/completion tokens, requests running and waiting, free KV
+  tokens where the GPU pages KV, and — when streaming — layer cache
   hits/misses/evictions/prefetches and live prefetch depth). The engine picks its
   compute kernel from flags:
   - `--stream [--resident-layers N]` — **layer streaming**
@@ -1013,6 +1028,14 @@ inference engine):
   - **Admission control:** a request starts only once the pool can hold its
     prompt plus `max_tokens` alongside the running requests. Otherwise it waits
     in the queue instead of failing mid-decode.
+  - **Queue limits:** `--queue-timeout SECS` turns away a request that has
+    waited that long to be admitted, with `503` and `Retry-After` (an HTTP
+    error even for `stream: true`, since a response starts only once the
+    request has), rather than letting a backlog grow without bound. A request
+    already decoding is never cut off. Off unless set.
+  - **Priorities:** a request's `priority` (OpenAI endpoints; vLLM's field,
+    default 0) orders the queue, lowest first and in arrival order within one.
+    It decides who is admitted next; it does not preempt a running request.
   `BatchScheduler::with_speculative` swaps each slot for a `SpeculativeSession`,
   so **the server engine decodes speculatively** when `dlm serve` is given
   `--draft-model-path` (or `--speculative ngram`, or `auto` on a streamed model,

@@ -225,3 +225,34 @@ fn prompt_fed_in_pieces_decodes_like_one_prefill() {
     let got: Vec<u32> = (0..6).map(|_| session.step().unwrap()).collect();
     assert_eq!(got, want);
 }
+
+/// The queue admits the lowest priority value first, and in arrival order
+/// within one priority.
+#[test]
+fn priority_orders_the_queue() {
+    let generator = build_generator();
+    let mut sched = BatchScheduler::new(&generator, 1);
+    for (id, priority) in [(1, 5), (2, 0), (3, 5), (4, -1)] {
+        let decoding = dlm::generate::Decoding::default();
+        sched
+            .submit_prioritized(id, vec![1, 2], 3, vec![], decoding, priority)
+            .unwrap();
+    }
+    let order: Vec<u64> = sched.run().unwrap().iter().map(|f| f.id).collect();
+    assert_eq!(order, vec![4, 2, 1, 3]);
+}
+
+/// Only a request still waiting expires; one already decoding runs on.
+#[test]
+fn only_queued_requests_expire() {
+    use std::time::Duration;
+    let generator = build_generator();
+    let mut sched = BatchScheduler::new(&generator, 1);
+    sched.submit(1, vec![1, 2], 20, vec![]).unwrap();
+    sched.submit(2, vec![3], 20, vec![]).unwrap();
+    sched.step().unwrap(); // 1 is admitted; 2 waits for its slot
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(sched.expire_pending(Duration::from_millis(10)), vec![2]);
+    let done: Vec<u64> = sched.run().unwrap().iter().map(|f| f.id).collect();
+    assert_eq!(done, vec![1]);
+}
