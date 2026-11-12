@@ -1013,6 +1013,14 @@ inference engine):
   - **Admission control:** a request starts only once the pool can hold its
     prompt plus `max_tokens` alongside the running requests. Otherwise it waits
     in the queue instead of failing mid-decode.
+  - **Queue limits:** `--queue-timeout SECS` turns away a request that has
+    waited that long to be admitted, with `503` and `Retry-After` (an HTTP
+    error even for `stream: true`, since a response starts only once the
+    request has), rather than letting a backlog grow without bound. A request
+    already decoding is never cut off. Off unless set.
+  - **Priorities:** a request's `priority` (OpenAI endpoints; vLLM's field,
+    default 0) orders the queue, lowest first and in arrival order within one.
+    It decides who is admitted next; it does not preempt a running request.
   `BatchScheduler::with_speculative` swaps each slot for a `SpeculativeSession`,
   so **the server engine decodes speculatively** when `dlm serve` is given
   `--draft-model-path` (or `--speculative ngram`, or `auto` on a streamed model,

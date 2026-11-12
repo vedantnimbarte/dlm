@@ -510,6 +510,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--queue-timeout` and request `priority`: a bounded, ordered queue.** A
+  request waited for a batch slot as long as it took, and in arrival order.
+  `--queue-timeout SECS` now turns away one that has waited that long with
+  `503` and `Retry-After`; the handler waits for each choice's first event
+  before answering, so even a streamed request gets a real HTTP error rather
+  than a stream that breaks. A request already decoding runs to its end. And a
+  request's `priority` (vLLM's field, default 0; lower first, arrival order
+  within one) orders who is admitted next. `tests/server_api.rs` holds the one
+  slot with a 600-token request and checks a second is turned away streamed
+  and not, while the first finishes.
+
 - **`--lora`: serve a model with a PEFT LoRA adapter merged in.** `serve`,
   `bench` and `score` take an adapter directory and merge `(alpha / r) * B @ A`
   (`alpha / sqrt(r)` with rsLoRA) into each weight as the loader reads it,

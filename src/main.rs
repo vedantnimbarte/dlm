@@ -1894,7 +1894,10 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     }
     .with_chat_template(template)
     .with_eos_tokens(eos_tokens.clone())
-    .with_context_window(args.context_length as usize);
+    .with_context_window(args.context_length as usize)
+    .with_queue_timeout(std::time::Duration::from_secs_f64(
+        args.queue_timeout.unwrap_or(0.0).max(0.0),
+    ));
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
