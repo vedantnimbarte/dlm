@@ -24,7 +24,8 @@ commit only if the binary was built with `DLM_GIT_COMMIT` set, e.g.
 Clocks drift between runs, so measure both sides back to back, and rerun before
 believing a failure near the tolerance.
 
-**These tables are the 0.4.0 baseline and have not been re-measured since.**
+**These tables are the July 31 development build's baseline (before 0.4.0 was
+tagged) and have not been re-measured since.**
 Several changes have moved them a long way (the GPU kernel work, paged KV,
 batched serving, the batched GEMV rework), each carrying its own before/after in
 `CHANGELOG.md`. Treat the rows below as the starting point they were, not as
@@ -105,7 +106,7 @@ trusting it.
 
 ## What the numbers say
 
-What the 0.4.0 tables showed, each pointing at a roadmap item. All of them
+What the July tables showed, each pointing at a roadmap item. All of them
 have since been worked on; `CHANGELOG.md` has the before and after, and
 "Against vLLM" below the current comparison.
 
