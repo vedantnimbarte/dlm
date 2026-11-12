@@ -5,10 +5,10 @@
 # dlm
 
 <p align="center">
-  <strong><a href="https://vedantnimbarte.github.io/dlm-frontend/">Docs</a></strong> ·
-  <a href="https://vedantnimbarte.github.io/dlm-frontend/get-started/">Get started</a> ·
-  <a href="https://vedantnimbarte.github.io/dlm-frontend/calculator/">Can I run it?</a> ·
-  <a href="https://vedantnimbarte.github.io/dlm-frontend/docs/quantization/">Quantization</a>
+  <strong><a href="https://dlm-frontend.vercel.app/">Docs</a></strong> ·
+  <a href="https://dlm-frontend.vercel.app/get-started">Get started</a> ·
+  <a href="https://dlm-frontend.vercel.app/calculator">Can I run it?</a> ·
+  <a href="https://dlm-frontend.vercel.app/docs/quantization">Quantization</a>
 </p>
 
 **dlm (Dynamic LLM)** — a dynamic layer-streaming inference engine. **Run models
