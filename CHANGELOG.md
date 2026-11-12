@@ -14,6 +14,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Qwen3's replies decoded to nothing.** A `tokenizer.json`'s added tokens
+  were registered only when marked `special`, and Qwen3 marks `<think>` and
+  `</think>` not special. Every Qwen3 chat reply opens with `<think>`, so its
+  ids could not be decoded and the server returned an empty message. All
+  added tokens are registered now, as transformers does: each is one token
+  when encoding and its text when decoding.
+
 - **API compatibility: four things that turned working clients away.**
   - **Every model was called `dlm`.** The id in each response and in
     `/v1/models` is now the checkpoint's own name (`qwen2.5-0.5b`, or a GGUF
