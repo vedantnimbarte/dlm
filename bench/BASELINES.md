@@ -149,6 +149,54 @@ so vLLM's prefill includes its per-call Python overhead. Both precisions ran
 with `max_num_seqs=16, max_num_batched_tokens=4096, gpu_memory_utilization=0.78`
 (fp32 needs them to fit beside the desktop).
 
+### 2026-11-12: cost per token, dlm `a94f12e`
+
+The same workload with the GPU's board power sampled every 100 ms by
+`bench/power.py`, which times each batch's work from marker lines in the
+benchmark's output so model loading and teardown stay out:
+
+```sh
+python bench/power.py "  b" -- dlm bench ... --batch 1,4,8,16 --runs 4   # runs 2-4 of each batch
+python bench/power.py BEGIN -- python vllm_bench.py float32 1,4,8,16    # in WSL, beside vLLM
+```
+
+Alternating rounds: dlm, vLLM fp32, vLLM fp16 (batch 1), dlm with f16 KV then
+int8, vLLM again, dlm. dlm runs its default int8 KV cache. The card's clocks drifted up
+through the session, so the same engine decoded up to 40% faster in a later
+round; ranges are the spread over rounds, and the two engines' runs next to
+each other kept the same order. Energy per token is the mean power while a
+batch runs divided by its decode tok/s, the same for both engines.
+
+| Batch | dlm tok/s | dlm W | **dlm tok/J** | vLLM fp32 tok/s | vLLM fp32 W | **vLLM fp32 tok/J** |
+|---|---|---|---|---|---|---|
+| 1 | 91–129 | 68–83 | 1.33–1.56 | 68–78 | 73–78 | 0.94–1.00 |
+| 4 | 267–366 | 71–85 | **3.75–4.31** | 218–256 | 88–89 | 2.48–2.86 |
+| 8 | 350–452 | 72–84 | **4.83–5.37** | 297–323 | 89 | 3.34–3.63 |
+| 16 | 437–529 | 78–86 | **5.57–6.19** | 322–326 | 89 | 3.64–3.67 |
+
+vLLM fp16 at batch 1: 119–130 tok/s at 70 W, **1.70–1.87 tok/J**.
+
+What a million generated tokens costs at these rates, electricity at an assumed
+$0.15/kWh, GPU time to multiply by whatever the card rents for:
+
+| Batch | dlm $/1M | vLLM $/1M | dlm GPU-h/1M | vLLM GPU-h/1M |
+|---|---|---|---|---|
+| 1 | $0.027–0.031 | $0.022–0.025 (fp16) | 2.15–3.07 | 2.13–2.34 (fp16) |
+| 16 | **$0.0067–0.0075** | $0.0113–0.0114 (fp32) | **0.52–0.64** | 0.85–0.86 (fp32) |
+
+- **Batched, dlm costs 25–40% less per token**: at batch 16, 1.5–1.7x the
+  tokens per joule and 1.3–1.6x the throughput of vLLM fp32, the best vLLM
+  precision for batches on this card. vLLM fp32 runs the
+  card at its 90 W limit; dlm sits at 78–86 W.
+- **At batch 1, vLLM fp16 is cheaper on energy**: the same speed as dlm's
+  later rounds at 13 W less. dlm's single-stream decode draws batch-sized
+  power; that is the next thing to look at for low-traffic serving.
+- **Electricity is the small part.** At full load the card burns about
+  $0.013 of power an hour at $0.15/kWh, so any rental price above that makes
+  GPU-hours, that is throughput, the cost that matters.
+- dlm's f16 KV cache (`--kv-quant f16`, one round) landed inside the int8
+  ranges: 5.85 tok/J at batch 16. The int8 default costs no energy here.
+
 ### 2026-11-11: dlm `68bced0` (after the batched-decode, phase 1 and phase 2 work)
 
 Run back to back: vLLM fp16 and fp32, then dlm, then vLLM again (its batch 1
