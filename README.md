@@ -731,6 +731,23 @@ resident (the other way round when streaming: 19 against 16).
 **Not yet:** MoE `.gguf` files, whose experts are stacked into one tensor per
 layer.
 
+## LoRA adapters (`--lora`)
+
+`dlm serve --model-path <base> --lora <adapter-dir>` (and `bench`, `score`)
+merges a PEFT adapter (`adapter_config.json` + `adapter_model.safetensors`)
+into the weights as they load: `W + (alpha / r) * B @ A` (`alpha / sqrt(r)`
+with rsLoRA), before `--quant` or the round back to the checkpoint's dtype, so
+the adapted model runs at the base model's speed and size on every path. One
+adapter per process; it cannot be swapped per request.
+
+Plain LoRA on a decoder layer's seven projections (`q/k/v/o_proj`,
+`gate/up/down_proj`) of a safetensors checkpoint. Everything else is refused
+when the adapter is attached, not skipped: DoRA, adapter biases,
+`modules_to_save`, fused projections, GPTQ and GGUF weights. Checked against an
+independent merge: a rank-16 Python adapter on Qwen2.5-0.5B-Instruct, merged
+by torch and saved, scores within 2e-5 per token of `--lora` on the GPU and
+CPU, and lowers mean NLL on Python code from 0.3745 to 0.3669.
+
 ## Weight precision (`--quant`)
 
 **Omit it and dlm computes in the checkpoint's own precision** — it reads the

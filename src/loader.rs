@@ -155,7 +155,7 @@ fn bytes_to_u16(bytes: &[u8], name: &str) -> Result<Vec<u16>> {
 /// so materializing an upsized f32 copy here would be lossless (f32 exactly
 /// represents every f16/bf16 value) yet cost 2x host RAM, 2x PCIe per streamed
 /// layer, and 2x the bandwidth of the memory-bound GEMV. See [`Weights`].
-fn load_native(
+pub(crate) fn load_native(
     store: &MmapStore,
     name: &str,
     expected_len: usize,
@@ -192,6 +192,40 @@ fn load_native(
             kind,
             num_elements: expected_len,
         });
+    }
+    // A LoRA adapter's update goes in now, before `--quant` or the round back
+    // to the checkpoint's dtype (see `crate::lora`).
+    if let Some(delta) = store.lora().map(|l| l.delta(name)).transpose()?.flatten() {
+        let mut floats = bytes_to_f32(bytes, info.dtype)?;
+        if floats.len() != expected_len || delta.len() != expected_len {
+            return Err(DlmError::InvalidConfig(format!(
+                "tensor {name:?}: expected {expected_len} elements for the LoRA merge, got {} \
+                 and an update of {}",
+                floats.len(),
+                delta.len()
+            )));
+        }
+        for (w, d) in floats.iter_mut().zip(&delta) {
+            *w += d;
+        }
+        let group = crate::forward::QUANT_GROUP_SIZE;
+        return match (quant, info.dtype) {
+            (QuantScheme::Int4, _) => Weights::quantize_int4(&floats, group),
+            (QuantScheme::Int8, _) => Weights::quantize_int8(&floats, group),
+            (_, Dtype::BF16) => Ok(Weights::Bf16(
+                floats
+                    .iter()
+                    .map(|&v| crate::lora::f32_to_bf16(v))
+                    .collect(),
+            )),
+            (_, Dtype::F16) => Ok(Weights::F16(
+                floats
+                    .iter()
+                    .map(|&v| crate::storage::safetensors::f32_to_f16(v))
+                    .collect(),
+            )),
+            _ => Ok(Weights::F32(floats)),
+        };
     }
     // `--quant int4`/`int8`: quantize down from the checkpoint's floats at load.
     // Costs one f32 materialization here (transient, per tensor) and buys 4x/2x

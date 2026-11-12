@@ -510,6 +510,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--lora`: serve a model with a PEFT LoRA adapter merged in.** `serve`,
+  `bench` and `score` take an adapter directory and merge `(alpha / r) * B @ A`
+  (`alpha / sqrt(r)` with rsLoRA) into each weight as the loader reads it,
+  before `--quant` or the round back to the checkpoint's dtype, so resident,
+  streamed and split models all run it at the base model's speed and size.
+  Plain LoRA on a decoder layer's seven projections of a safetensors model;
+  DoRA, adapter biases, `modules_to_save`, fused projections, GPTQ and GGUF are
+  refused when it is attached, not skipped. A rank-16 Python adapter on
+  Qwen2.5-0.5B-Instruct: within 2e-5 per token of the same adapter merged by
+  torch, GPU and CPU; mean NLL on Python code 0.3745 -> 0.3669.
+
 - **Tool calling on chat, for ChatML models (Qwen2.5, Qwen3).** `tools` were
   ignored. They now go into the system turn exactly as Qwen's Jinja template
   writes them (checked against `transformers`' rendering of Qwen3-0.6B's,

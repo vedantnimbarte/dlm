@@ -450,6 +450,7 @@ fn run_score(args: ScoreArgs) -> Result<()> {
 
     let quant = resolve_quant(args.quant, &MmapStore::open_path(&args.model_path)?)?;
     let (config, store) = dlm::loader::open_model(&args.model_path, quant)?;
+    let store = attach_lora(store, args.lora.as_deref())?;
     let parts = dlm::loader::load_model_parts(&store, &config, tokens.len() as u32)?;
     let weight_bytes: usize = parts
         .layers
@@ -926,6 +927,7 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
     println!();
 
     let (config, store) = dlm::loader::open_model(&args.model_path, quant)?;
+    let store = attach_lora(store, args.lora.as_deref())?;
     println!(
         "model source : {}",
         if store.gguf_metadata().is_some() {
@@ -1422,6 +1424,22 @@ fn ensure_batch_kv_fits(
         )));
     }
     Ok(())
+}
+
+/// Attach `--lora`'s adapter to `store`, if one was given, after checking it
+/// against the model (see `dlm::lora`).
+fn attach_lora(store: MmapStore, dir: Option<&std::path::Path>) -> Result<MmapStore> {
+    let Some(dir) = dir else {
+        return Ok(store);
+    };
+    let lora = dlm::lora::Lora::open(dir, &store)?;
+    println!(
+        "lora         : {} projections from {}, scale {}",
+        lora.len(),
+        dir.display(),
+        lora.scale()
+    );
+    Ok(store.with_lora(lora))
 }
 
 /// VRAM the resident GPU kernel's weights take with `on_gpu` of the layers.

@@ -333,6 +333,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     pub draft_model_path: Option<PathBuf>,
 
+    /// A LoRA adapter (PEFT's `adapter_config.json` + `adapter_model.safetensors`)
+    /// to merge into the model's weights as they load. Plain LoRA on a decoder
+    /// layer's projections of a safetensors checkpoint; anything else is refused.
+    #[arg(long, value_name = "DIR")]
+    pub lora: Option<PathBuf>,
+
     /// Tokens proposed per speculative round, by the draft model or n-gram
     /// lookup.
     #[arg(long, default_value_t = 4)]
@@ -682,6 +688,10 @@ pub struct ScoreArgs {
     /// Model directory (`config.json` + safetensors).
     #[arg(long, value_name = "DIR")]
     pub model_path: std::path::PathBuf,
+
+    /// A LoRA adapter to merge, as for `serve`.
+    #[arg(long, value_name = "DIR")]
+    pub lora: Option<std::path::PathBuf>,
 
     /// Text to score, tokenized with the model's tokenizer.
     #[arg(long)]

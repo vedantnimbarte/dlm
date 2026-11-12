@@ -93,6 +93,12 @@ release is a claim, and these bound it.
   one model, Qwen2.5-1.5B `Q8_0` at a 4k-token history, on the resident GPU
   kernel only. Its speed falls with the history it reads over PCIe each step;
   nothing past 4k has been measured.
+- **The newer API features are checked on few models.** Tool calling has a
+  prompt format only for ChatML and was run on Qwen2.5-1.5B and Qwen3-0.6B
+  (Qwen2.5-0.5B answers instead of calling). `--lora` was checked with one
+  adapter, rank 16 on Qwen2.5-0.5B-Instruct, against a torch merge.
+  `/v1/embeddings` pools the last token, which suits embedding models; on a
+  chat model it is only a usable summary.
 - **Llama 2 is untested.** It shares Mistral's SentencePiece tokenizer shape,
   which is verified, so it is expected to work — expected, not demonstrated.
 

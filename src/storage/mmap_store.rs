@@ -202,12 +202,25 @@ pub(crate) fn is_consolidated(file_name: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct MmapStore {
     shards: Vec<MmapShard>,
+    /// A LoRA adapter the loader merges into the weights it reads.
+    lora: Option<std::sync::Arc<crate::lora::Lora>>,
 }
 
 impl MmapStore {
     /// Create an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Merge `lora` into every weight it updates as the loader reads them.
+    pub fn with_lora(mut self, lora: crate::lora::Lora) -> Self {
+        self.lora = Some(std::sync::Arc::new(lora));
+        self
+    }
+
+    /// The attached adapter, if any.
+    pub fn lora(&self) -> Option<&crate::lora::Lora> {
+        self.lora.as_deref()
     }
 
     /// Open a model: a directory of safetensors shards, or a single `.gguf` file.

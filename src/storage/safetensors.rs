@@ -169,7 +169,6 @@ struct RawTensor {
 /// Encode an `f32` as IEEE half precision, rounding to nearest (ties to even),
 /// overflowing to infinity and underflowing through subnormals to zero. The
 /// inverse of [`f16_to_f32`] for every value half precision can hold.
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
