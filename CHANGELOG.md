@@ -510,6 +510,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Tool calling on chat, for ChatML models (Qwen2.5, Qwen3).** `tools` were
+  ignored. They now go into the system turn exactly as Qwen's Jinja template
+  writes them (checked against `transformers`' rendering of Qwen3-0.6B's,
+  byte for byte), and the reply's `<tool_call>` blocks come back as OpenAI
+  `tool_calls` (`arguments` a JSON string, `content` null when there is no
+  text) with `finish_reason: "tool_calls"`. Streamed, text goes out until a
+  call starts and the calls follow whole in one delta. An assistant message's
+  `tool_calls` and the `tool` results render back in for the next turn.
+  `tool_choice` takes `auto` or `none`; forcing a call would need constrained
+  output and is refused. Other templates refuse `tools`. On the GPU,
+  Qwen2.5-1.5B calls `get_weather` for "What's the weather in Paris?" and
+  answers from the result; so does Qwen3-0.6B, its reasoning left in
+  `content`. Qwen2.5-0.5B answers without calling.
+
 - **`/v1/embeddings`.** Each input's embedding is the final-normed hidden
   state of its last token, at unit length: the pooling decoder embedding
   models (Qwen3-Embedding, gte-Qwen2) are trained for. `input` takes a string,

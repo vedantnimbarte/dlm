@@ -860,7 +860,15 @@ inference engine):
   embedding models (Qwen3-Embedding, gte-Qwen2) are trained for; `input` as
   text or token ids, one or several, `encoding_format` `float` or `base64`,
   and `dimensions` to keep the leading ones. A chat model's embeddings work
-  but are not tuned for retrieval. `stop` (OpenAI) / `stop_sequences`
+  but are not tuned for retrieval. **Tool calling** (chat, ChatML models such
+  as Qwen2.5 and Qwen3): `tools` go into the prompt exactly as Qwen's own
+  template writes them, and the reply's `<tool_call>` blocks come back as
+  `tool_calls` with `finish_reason: "tool_calls"`, streamed as one delta at the
+  end; an assistant message's `tool_calls` and `tool` results render back in
+  for the next turn. `tool_choice` takes `auto` or `none`. Other templates
+  refuse `tools`, as dlm has no prompt format for them. Whether a model calls
+  well is the model's: Qwen2.5-1.5B and Qwen3-0.6B do, Qwen2.5-0.5B tends to
+  answer instead. `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,

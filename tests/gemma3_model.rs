@@ -77,6 +77,7 @@ fn gemma3_answers_a_factual_question() {
     let prompt = template.apply(&[ChatMessage {
         role: "user".into(),
         content: "What is the capital of France? Answer in one word.".into(),
+        ..Default::default()
     }]);
     let ids = tokenizer.encode(&prompt).unwrap();
     let store = MmapStore::open_dir(&dir).unwrap();

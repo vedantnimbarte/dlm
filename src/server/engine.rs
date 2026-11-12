@@ -455,12 +455,159 @@ fn enqueue<K: ComputeKernel>(
 // ── OpenAI request/response shapes ──────────────────────────────────────────
 
 /// A chat message (`role` + `content`), shared by the local and distributed
-/// serving paths.
-#[derive(Deserialize)]
+/// serving paths. An assistant message may carry the tool calls it made, and a
+/// `tool` message is a call's result.
+#[derive(Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(deserialize_with = "content_text")]
     pub content: String,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCallIn>>,
+}
+
+/// JSON as Hugging Face chat templates' `tojson` writes it: `", "` and `": "`
+/// between items, non-ASCII as is.
+fn tojson(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Array(a) => format!("[{}]", a.iter().map(tojson).collect::<Vec<_>>().join(", ")),
+        Value::Object(m) => format!(
+            "{{{}}}",
+            m.iter()
+                .map(|(k, v)| format!("{}: {}", Value::String(k.clone()), tojson(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// ChatML, with Qwen's tool calling (its Jinja template, followed to the
+/// character): the tools in the system turn, an assistant's calls as
+/// `<tool_call>` blocks, and consecutive `tool` results in one user turn as
+/// `<tool_response>` blocks. Without tools or tool turns it is plain ChatML.
+fn chatml(messages: &[ChatMessage], tools: &[serde_json::Value]) -> String {
+    let mut p = String::new();
+    let mut rest = messages;
+    if !tools.is_empty() {
+        p.push_str("<|im_start|>system\n");
+        if let Some(system) = messages.first().filter(|m| m.role == "system") {
+            p.push_str(&system.content);
+            p.push_str("\n\n");
+            rest = &messages[1..];
+        }
+        p.push_str(
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+             You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+        );
+        for tool in tools {
+            p.push('\n');
+            p.push_str(&tojson(tool));
+        }
+        p.push_str(
+            "\n</tools>\n\nFor each function call, return a json object with function name and \
+             arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\
+             {\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
+        );
+    }
+    for (i, m) in rest.iter().enumerate() {
+        let calls = m.tool_calls.as_deref().unwrap_or_default();
+        match m.role.as_str() {
+            "assistant" if !calls.is_empty() => {
+                p.push_str("<|im_start|>assistant");
+                if !m.content.is_empty() {
+                    p.push('\n');
+                    p.push_str(&m.content);
+                }
+                for c in calls {
+                    // Arguments arrive as a JSON string; the model saw an object.
+                    let args = match &c.function.arguments {
+                        serde_json::Value::String(s) => serde_json::from_str(s)
+                            .map(|v| tojson(&v))
+                            .unwrap_or_else(|_| s.clone()),
+                        v => tojson(v),
+                    };
+                    p.push_str(&format!(
+                        "\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {args}}}\n</tool_call>",
+                        c.function.name
+                    ));
+                }
+                p.push_str("<|im_end|>\n");
+            }
+            "tool" => {
+                if i == 0 || rest[i - 1].role != "tool" {
+                    p.push_str("<|im_start|>user");
+                }
+                p.push_str("\n<tool_response>\n");
+                p.push_str(&m.content);
+                p.push_str("\n</tool_response>");
+                if rest.get(i + 1).is_none_or(|n| n.role != "tool") {
+                    p.push_str("<|im_end|>\n");
+                }
+            }
+            role => p.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", m.content)),
+        }
+    }
+    p.push_str("<|im_start|>assistant\n");
+    p
+}
+
+/// Where a tool call starts in a ChatML reply.
+const TOOL_OPEN: &str = "<tool_call>";
+
+/// A reply's text before its first `<tool_call>`, and each call's name and
+/// arguments (a JSON string). A reply whose blocks do not hold a call's JSON
+/// is left as text, with no calls.
+fn split_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
+    const CLOSE: &str = "</tool_call>";
+    let Some(start) = text.find(TOOL_OPEN) else {
+        return (text.to_string(), Vec::new());
+    };
+    let mut calls = Vec::new();
+    let mut rest = &text[start..];
+    while let Some(open) = rest.find(TOOL_OPEN) {
+        let body = &rest[open + TOOL_OPEN.len()..];
+        let end = body.find(CLOSE);
+        let call: Option<serde_json::Value> =
+            serde_json::from_str(body[..end.unwrap_or(body.len())].trim()).ok();
+        let Some(name) = call.as_ref().and_then(|c| c["name"].as_str()) else {
+            return (text.to_string(), Vec::new());
+        };
+        let arguments = match call.as_ref().and_then(|c| c.get("arguments")) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(v) => v.to_string(),
+            None => "{}".to_string(),
+        };
+        calls.push((name.to_string(), arguments));
+        rest = end.map_or("", |e| &body[e + CLOSE.len()..]);
+    }
+    (text[..start].trim_end().to_string(), calls)
+}
+
+/// How many of `text`'s last bytes could begin `marker`, which then cannot be
+/// shown yet.
+fn partial_marker(text: &str, marker: &str) -> usize {
+    (1..marker.len())
+        .rev()
+        .find(|&k| text.ends_with(&marker[..k]))
+        .unwrap_or(0)
+}
+
+/// A tool call in an assistant message, as OpenAI sends it back.
+#[derive(Deserialize, Default)]
+pub struct ToolCallIn {
+    #[serde(default)]
+    pub function: FunctionCallIn,
+}
+
+#[derive(Deserialize, Default)]
+pub struct FunctionCallIn {
+    #[serde(default)]
+    pub name: String,
+    /// A JSON string, as OpenAI sends it, or the object itself.
+    #[serde(default)]
+    pub arguments: serde_json::Value,
 }
 
 /// OpenAI's `content`: a string, or a list of typed parts.
@@ -551,6 +698,12 @@ struct ChatRequest {
     /// How many completions to generate for the prompt (1-16).
     #[serde(default)]
     n: Option<usize>,
+    /// Functions the model may call (`{"type": "function", "function": ...}`).
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    /// `auto` (the default with tools) or `none`.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
     #[serde(flatten)]
     extra: ExtraSampling,
 }
@@ -793,7 +946,43 @@ fn sampler_from_request(req: &ChatRequest, id: u64) -> Sampler {
 #[derive(Serialize)]
 struct RespMessage {
     role: &'static str,
-    content: String,
+    /// `null` when the reply is only tool calls.
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ToolCallOut>,
+}
+
+/// A tool call the model made, in OpenAI's shape: `arguments` is a JSON
+/// string. In a streamed delta it also carries its `index`.
+#[derive(Serialize)]
+struct ToolCallOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: FunctionCallOut,
+}
+
+#[derive(Serialize)]
+struct FunctionCallOut {
+    name: String,
+    arguments: String,
+}
+
+/// `calls` in OpenAI's shape, numbered for request `request`. `index` marks
+/// each with its position, for a streamed delta.
+fn tool_calls_out(calls: Vec<(String, String)>, request: u64, index: bool) -> Vec<ToolCallOut> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, arguments))| ToolCallOut {
+            index: index.then_some(i),
+            id: format!("call_{request}_{i}"),
+            kind: "function",
+            function: FunctionCallOut { name, arguments },
+        })
+        .collect()
 }
 #[derive(Serialize)]
 struct Choice {
@@ -917,6 +1106,8 @@ struct Delta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallOut>>,
 }
 #[derive(Serialize)]
 struct ChunkChoice {
@@ -1078,6 +1269,24 @@ impl ChatTemplate {
     /// Render `messages` into the prompt string for this template. BOS is left
     /// to the tokenizer (`add_bos_token`), which skips it when the text already
     /// starts with it.
+    /// [`apply`](Self::apply), with `tools` the model may call. Only ChatML has a
+    /// tool format dlm writes (Qwen's: the tools in the system turn, calls in
+    /// `<tool_call>` tags); any other template refuses them.
+    pub fn apply_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> Result<String, String> {
+        match self {
+            _ if tools.is_empty() => Ok(self.apply(messages)),
+            ChatTemplate::ChatMl => Ok(chatml(messages, tools)),
+            other => Err(format!(
+                "tools need the chatml chat template (Qwen); this model's is {}",
+                other.name()
+            )),
+        }
+    }
+
     pub fn apply(&self, messages: &[ChatMessage]) -> String {
         let mut p = String::new();
         match self {
@@ -1090,15 +1299,7 @@ impl ChatTemplate {
                 }
                 p.push_str("assistant:");
             }
-            ChatTemplate::ChatMl => {
-                for m in messages {
-                    p.push_str(&format!(
-                        "<|im_start|>{}\n{}<|im_end|>\n",
-                        m.role, m.content
-                    ));
-                }
-                p.push_str("<|im_start|>assistant\n");
-            }
+            ChatTemplate::ChatMl => p = chatml(messages, &[]),
             ChatTemplate::Llama3 => {
                 p.push_str("<|begin_of_text|>");
                 for m in messages {
@@ -1597,6 +1798,9 @@ struct Streamed {
     /// Tokens with log-probabilities whose text has not gone out, with their
     /// character offsets.
     pending: Vec<(u32, TokenLogprobs, usize)>,
+    /// Hold back text from the first `<tool_call>` on: the request has tools,
+    /// and calls go out whole at the end.
+    hold_tools: bool,
 }
 
 impl Streamed {
@@ -1609,6 +1813,7 @@ impl Streamed {
             finish: "length",
             spec: None,
             pending: Vec::new(),
+            hold_tools: false,
         }
     }
 
@@ -1634,7 +1839,14 @@ impl Streamed {
                 let full = engine.tokenizer.decode(&self.ids).unwrap_or_default();
                 self.chars = full.chars().count();
                 let cut = earliest_stop(&full, stops);
-                let visible = &full[..cut.unwrap_or(full.len())];
+                let mut end = cut.unwrap_or(full.len());
+                if self.hold_tools {
+                    end = match full[..end].find(TOOL_OPEN) {
+                        Some(at) => at,
+                        None => end - partial_marker(&full[..end], TOOL_OPEN),
+                    };
+                }
+                let visible = &full[..end];
                 let shown = visible.chars().count();
                 let delta = (shown > self.sent).then(|| {
                     let d: String = visible.chars().skip(self.sent).collect();
@@ -1663,10 +1875,17 @@ fn stream_choices(
     engine: &EngineService,
     rxs: Vec<Receiver<TokenEvent>>,
     stops: &[String],
+    hold_tools: bool,
     mut send: impl FnMut(usize, &mut Streamed, String) -> std::io::Result<()>,
 ) -> std::io::Result<Vec<Streamed>> {
     use std::sync::mpsc::RecvTimeoutError;
-    let mut choices: Vec<Streamed> = rxs.into_iter().map(Streamed::new).collect();
+    let mut choices: Vec<Streamed> = rxs
+        .into_iter()
+        .map(|rx| Streamed {
+            hold_tools,
+            ..Streamed::new(rx)
+        })
+        .collect();
     let wait = if choices.len() == 1 {
         std::time::Duration::from_secs(3600)
     } else {
@@ -1690,14 +1909,32 @@ fn stream_choices(
 }
 
 fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
-    let parsed: ChatRequest = match serde_json::from_slice(&req.body) {
+    let mut parsed: ChatRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
         Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
     };
     if parsed.messages.is_empty() {
         return Response::json(400, error_json("messages must not be empty"));
     }
-    let prompt = engine.chat_template.apply(&parsed.messages);
+    // `tool_choice: none` keeps the tools out of the prompt; a forced call
+    // would need the output constrained, which is not done.
+    let tools = match parsed.tool_choice.as_ref().map(|c| c.as_str()) {
+        None | Some(Some("auto")) => parsed.tools.take().unwrap_or_default(),
+        Some(Some("none")) => Vec::new(),
+        _ => {
+            return Response::json(
+                400,
+                error_json("tool_choice must be auto or none; dlm does not force a tool call"),
+            )
+        }
+    };
+    let prompt = match engine
+        .chat_template
+        .apply_with_tools(&parsed.messages, &tools)
+    {
+        Ok(p) => p,
+        Err(e) => return Response::json(400, error_json(&e)),
+    };
     let ids = match engine.encode_prompt(&prompt) {
         Ok(ids) => ids,
         Err(e) => return Response::json(400, error_json(&e)),
@@ -1722,8 +1959,18 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let model = parsed.model.unwrap_or_else(|| engine.model_id.clone());
 
     if parsed.stream {
-        stream_chat(Arc::clone(engine), ids, max_tokens, model, decodings, stops)
+        let tools = !tools.is_empty();
+        stream_chat(
+            Arc::clone(engine),
+            ids,
+            max_tokens,
+            model,
+            decodings,
+            stops,
+            tools,
+        )
     } else {
+        let request = engine.next_id.load(Ordering::Relaxed);
         let prompt_tokens = ids.len();
         let gs = collect_completions(engine, ids, max_tokens, decodings, &stops);
         let completion_tokens = gs.iter().map(|g| g.completion_tokens).sum();
@@ -1736,23 +1983,32 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             choices: gs
                 .into_iter()
                 .enumerate()
-                .map(|(index, g)| Choice {
-                    index,
-                    finish_reason: match g.finish {
-                        Finish::Length => "length",
-                        _ => "stop",
-                    },
-                    logprobs: logprobs.map(|_| ChatLogprobs {
-                        content: g
-                            .logprobs
-                            .iter()
-                            .map(|(t, lp, _)| chat_logprob(engine, *t, lp))
-                            .collect(),
-                    }),
-                    message: RespMessage {
-                        role: "assistant",
-                        content: g.text,
-                    },
+                .map(|(index, g)| {
+                    let (content, calls) = if tools.is_empty() {
+                        (g.text, Vec::new())
+                    } else {
+                        split_tool_calls(&g.text)
+                    };
+                    Choice {
+                        index,
+                        finish_reason: match g.finish {
+                            _ if !calls.is_empty() => "tool_calls",
+                            Finish::Length => "length",
+                            _ => "stop",
+                        },
+                        logprobs: logprobs.map(|_| ChatLogprobs {
+                            content: g
+                                .logprobs
+                                .iter()
+                                .map(|(t, lp, _)| chat_logprob(engine, *t, lp))
+                                .collect(),
+                        }),
+                        message: RespMessage {
+                            role: "assistant",
+                            content: (!content.is_empty() || calls.is_empty()).then_some(content),
+                            tool_calls: tool_calls_out(calls, request, false),
+                        },
+                    }
                 })
                 .collect(),
             usage: Usage {
@@ -2132,7 +2388,7 @@ fn stream_completion(
             .into_iter()
             .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
             .collect();
-        let choices = stream_choices(&engine, rxs, &stops, |i, c, text| {
+        let choices = stream_choices(&engine, rxs, &stops, false, |i, c, text| {
             let lps = logprobs.then(|| {
                 let mut out = CompletionLogprobs::default();
                 for (t, lp, offset) in std::mem::take(&mut c.pending) {
@@ -2286,6 +2542,7 @@ fn anthropic_prompt(
             messages.push(ChatMessage {
                 role: "system".into(),
                 content: text,
+                ..Default::default()
             });
         }
     }
@@ -2293,6 +2550,7 @@ fn anthropic_prompt(
         messages.push(ChatMessage {
             role: m.role.clone(),
             content: m.content.to_text(),
+            ..Default::default()
         });
     }
     engine.chat_template.apply(&messages)
@@ -2538,6 +2796,7 @@ fn stream_messages(
 /// under its `index`: a role chunk, the text as it completes (with the
 /// log-probabilities of the tokens behind it when asked for), and a final
 /// chunk with the finish reason.
+#[allow(clippy::too_many_arguments)]
 fn stream_chat(
     engine: Arc<EngineService>,
     ids: Vec<u32>,
@@ -2545,6 +2804,7 @@ fn stream_chat(
     model: String,
     decodings: Vec<Decoding>,
     stops: Vec<String>,
+    tools: bool,
 ) -> Response {
     Response::stream(200, "text/event-stream", move |w| {
         let id = format!("chatcmpl-{}", engine.next_id.load(Ordering::Relaxed));
@@ -2578,6 +2838,7 @@ fn stream_chat(
             let role = Delta {
                 role: Some("assistant"),
                 content: None,
+                tool_calls: None,
             };
             send_chunk(w, i, role, None, None)?;
         }
@@ -2588,7 +2849,8 @@ fn stream_chat(
             .into_iter()
             .map(|d| engine.submit(ids.clone(), max_tokens, engine.eos_tokens.clone(), d))
             .collect();
-        let choices = stream_choices(&engine, rxs, &stops, |i, c, text| {
+        let request = engine.next_id.load(Ordering::Relaxed);
+        let mut choices = stream_choices(&engine, rxs, &stops, tools, |i, c, text| {
             let lps = logprobs.then(|| ChatLogprobs {
                 content: std::mem::take(&mut c.pending)
                     .iter()
@@ -2598,15 +2860,45 @@ fn stream_chat(
             let delta = Delta {
                 role: None,
                 content: Some(text),
+                tool_calls: None,
             };
             send_chunk(w, i, delta, None, lps)
         })?;
         let completion_tokens = choices.iter().map(|c| c.ids.len()).sum();
         engine.record(prompt_tokens, completion_tokens);
+        // What was held back: the calls, whole, or (when the blocks held no
+        // call) the rest of the text after all.
+        if tools {
+            for (i, c) in choices.iter_mut().enumerate() {
+                let full = engine.tokenizer.decode(&c.ids).unwrap_or_default();
+                let full = &full[..earliest_stop(&full, &stops).unwrap_or(full.len())];
+                let (_, calls) = split_tool_calls(full);
+                let delta = if calls.is_empty() {
+                    let rest: String = full.chars().skip(c.sent).collect();
+                    if rest.is_empty() {
+                        continue;
+                    }
+                    Delta {
+                        role: None,
+                        content: Some(rest),
+                        tool_calls: None,
+                    }
+                } else {
+                    c.finish = "tool_calls";
+                    Delta {
+                        role: None,
+                        content: None,
+                        tool_calls: Some(tool_calls_out(calls, request, true)),
+                    }
+                };
+                send_chunk(w, i, delta, None, None)?;
+            }
+        }
         for (i, c) in choices.iter().enumerate() {
             let end = Delta {
                 role: None,
                 content: None,
+                tool_calls: None,
             };
             send_chunk(w, i, end, Some(c.finish), None)?;
         }
@@ -2643,6 +2935,91 @@ fn stream_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tools render exactly as Qwen3's own Jinja template renders them
+    /// (`transformers`' `apply_chat_template` on Qwen3-0.6B gave the string
+    /// below), from the request as an OpenAI client sends it: arguments as a
+    /// JSON string, consecutive tool results.
+    #[test]
+    fn tools_render_as_qwens_template_does() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Weather in Paris and Rome?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}},
+                    {"id": "b", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Rome\"}"}}]},
+                {"role": "tool", "tool_call_id": "a", "content": "18C"},
+                {"role": "tool", "tool_call_id": "b", "content": "24C"}],
+              "tools": [{"type": "function", "function": {"name": "get_weather",
+                "description": "Weather for a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                               "required": ["city"]}}}]}"#,
+        )
+        .unwrap();
+        let tools = req.tools.unwrap();
+        let want: String = serde_json::from_str(r#""<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Weather for a city\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n24C\n</tool_response><|im_end|>\n<|im_start|>assistant\n""#).unwrap();
+        assert_eq!(
+            ChatTemplate::ChatMl
+                .apply_with_tools(&req.messages, &tools)
+                .unwrap(),
+            want
+        );
+        assert!(ChatTemplate::Llama3
+            .apply_with_tools(&req.messages, &tools)
+            .is_err());
+        // Without tools, ChatML is as it was.
+        assert_eq!(
+            ChatTemplate::ChatMl
+                .apply_with_tools(&req.messages[..2], &[])
+                .unwrap(),
+            "<|im_start|>system
+You are terse.<|im_end|>
+<|im_start|>user
+Weather in Paris and Rome?<|im_end|>
+<|im_start|>assistant
+"
+        );
+    }
+
+    #[test]
+    fn tool_calls_are_read_out_of_the_reply() {
+        let reply = "Checking.
+<tool_call>
+{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}
+</tool_call>
+<tool_call>
+{\"name\": \"now\"}
+</tool_call>";
+        let (text, calls) = split_tool_calls(reply);
+        assert_eq!(text, "Checking.");
+        assert_eq!(
+            calls,
+            vec![
+                ("get_weather".to_string(), r#"{"city":"Paris"}"#.to_string()),
+                ("now".to_string(), "{}".to_string())
+            ]
+        );
+        // No call, or a block that holds none: all text.
+        assert_eq!(split_tool_calls("plain"), ("plain".to_string(), vec![]));
+        let broken = "x <tool_call>not json</tool_call>";
+        assert_eq!(split_tool_calls(broken), (broken.to_string(), vec![]));
+        // A call cut off at the length limit is not a call.
+        assert!(split_tool_calls(
+            "<tool_call>
+{\"name\": \"f\", \"argu"
+        )
+        .1
+        .is_empty());
+    }
+
+    #[test]
+    fn a_stream_holds_back_what_may_start_a_tool_call() {
+        assert_eq!(partial_marker("Sure <tool", TOOL_OPEN), 5);
+        assert_eq!(partial_marker("Sure <", TOOL_OPEN), 1);
+        assert_eq!(partial_marker("Sure", TOOL_OPEN), 0);
+        assert_eq!(partial_marker("a <b", TOOL_OPEN), 0);
+    }
 
     /// RFC 4648's own examples, every padding case.
     #[test]
@@ -2705,6 +3082,7 @@ mod tests {
         let msgs = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            ..Default::default()
         }];
 
         let cm = ChatTemplate::ChatMl.apply(&msgs);
@@ -2733,6 +3111,7 @@ mod tests {
         let msg = |role: &str, content: &str| ChatMessage {
             role: role.into(),
             content: content.into(),
+            ..Default::default()
         };
         let convo = vec![
             msg("system", "Be brief."),
@@ -2832,12 +3211,14 @@ mod tests {
             messages.push(ChatMessage {
                 role: "system".into(),
                 content: sys.to_text(),
+                ..Default::default()
             });
         }
         for m in &req.messages {
             messages.push(ChatMessage {
                 role: m.role.clone(),
                 content: m.content.to_text(),
+                ..Default::default()
             });
         }
         let prompt = ChatTemplate::Plain.apply(&messages);
