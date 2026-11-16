@@ -404,9 +404,9 @@ pub fn decode_block(kind: GgmlKind, bytes: &[u8]) -> BlockAffine {
             } else {
                 &bytes[32..96]
             };
-            for i in 0..256 {
+            for (i, code) in a.codes.iter_mut().enumerate().take(256) {
                 let (n, j, l) = (i / 128, (i / 32) % 4, i % 32);
-                a.codes[i] = (qs[n * 32 + l] >> (2 * j)) & 3;
+                *code = (qs[n * 32 + l] >> (2 * j)) & 3;
             }
             if kind == GgmlKind::Q2K {
                 // 4-bit scale low, 4-bit minimum high, then `d` and `dmin`.
@@ -607,16 +607,12 @@ pub fn expand(kind: GgmlKind, blob: &[u8], elements: usize) -> crate::forward::W
                 (a.scales[g], a.zeros[g]) = (-a.offsets[g], 0.0);
             }
         }
-        for i in 0..n {
+        for (i, &code) in a.codes.iter().enumerate().take(n) {
             let at = b * elems + i;
             if four_bit {
-                out[at / 2] |= if at % 2 == 0 {
-                    a.codes[i] & 0x0F
-                } else {
-                    a.codes[i] << 4
-                };
+                out[at / 2] |= if at % 2 == 0 { code & 0x0F } else { code << 4 };
             } else {
-                out[at] = a.codes[i];
+                out[at] = code;
             }
         }
         for g in 0..n.div_ceil(group) {

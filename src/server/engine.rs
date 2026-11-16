@@ -41,6 +41,8 @@ enum Work {
         tokens: Vec<u32>,
         reply: Sender<Result<Vec<f32>, String>>,
     },
+    /// Keep the prefix cache in this directory from now on.
+    PersistPrefixCache(std::path::PathBuf),
 }
 
 struct Job {
@@ -307,6 +309,17 @@ impl EngineService {
         self
     }
 
+    /// Keep the prefix cache in `dir` too, loading what an earlier run left
+    /// there. `dir` must be specific to the model and its settings.
+    pub fn with_prefix_cache_dir(self: Arc<Self>, dir: std::path::PathBuf) -> Arc<Self> {
+        let _ = self
+            .job_tx
+            .lock()
+            .unwrap()
+            .send(Work::PersistPrefixCache(dir));
+        self
+    }
+
     pub fn with_eos_tokens(mut self: Arc<Self>, eos_tokens: Vec<u32>) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
             inner.eos_tokens = eos_tokens;
@@ -412,6 +425,10 @@ fn engine_loop<K: ComputeKernel>(
             Work::Embed { tokens, reply } => {
                 let _ = reply.send(generator.embedding(&tokens).map_err(|e| e.to_string()));
             }
+            Work::PersistPrefixCache(dir) => match sched.persist_prefix_cache(dir.clone()) {
+                Ok(n) => println!("prefix cache : {n} prefixes loaded from {}", dir.display()),
+                Err(e) => eprintln!("prefix cache : cannot use {}: {e}", dir.display()),
+            },
         };
         if !sched.has_work() {
             match job_rx.recv() {

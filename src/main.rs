@@ -632,6 +632,51 @@ fn run_generation<K: ComputeKernel>(
 /// client picking a model from that list, or routing between several dlm
 /// instances, has nothing to go on — and the tools that check the reply's
 /// `model` against what they asked for see a mismatch.
+/// A name for the prefix-cache directory of this model and these settings: a
+/// KV snapshot is only valid for the weights, precision, KV format and device
+/// that produced it. FNV-1a over the model files' names, sizes and modified
+/// times, the settings, and the dlm version, so it is stable across runs.
+fn prefix_cache_fingerprint(args: &ServeArgs) -> Result<String> {
+    let mut key = format!(
+        "{:?}|{:?}|{:?}|{:?}|{}",
+        args.quant,
+        args.kv_quant,
+        args.device,
+        args.lora,
+        env!("CARGO_PKG_VERSION")
+    );
+    let path = &args.model_path;
+    let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|source| DlmError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect()
+    } else {
+        vec![path.clone()]
+    };
+    files.sort();
+    for f in files {
+        let m = std::fs::metadata(&f).map_err(|source| DlmError::Io {
+            path: f.clone(),
+            source,
+        })?;
+        let mtime = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        key.push_str(&format!("|{}|{}|{mtime}", f.display(), m.len()));
+    }
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    });
+    Ok(format!("{hash:016x}"))
+}
+
 fn model_id_from_path(path: &Path) -> String {
     let name = if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
         path.file_stem()
@@ -1898,6 +1943,12 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     .with_queue_timeout(std::time::Duration::from_secs_f64(
         args.queue_timeout.unwrap_or(0.0).max(0.0),
     ));
+    let engine = match &args.prefix_cache_dir {
+        Some(dir) if prefix_cache > 0 => {
+            engine.with_prefix_cache_dir(dir.join(prefix_cache_fingerprint(args)?))
+        }
+        _ => engine,
+    };
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");

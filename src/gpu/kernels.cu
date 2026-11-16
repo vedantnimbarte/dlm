@@ -4487,6 +4487,28 @@ extern "C" int dlm_moe_take_row(int hidden_size, int b)
     return (int)cudaGetLastError();
 }
 
+// Copy the current FFN input (`normed2`) out to `dst`, or `src` back into it, so
+// a pass can run attention for many tokens first and then each routed expert once
+// over every token that chose it (grouped MoE prefill and batched decode).
+extern "C" int dlm_moe_save_normed(int hidden_size, float* dst)
+{
+    DLM_ENTER
+    cudaError_t e = scratch_ensure(MOE_NORMED2, hidden_size);
+    if (e != cudaSuccess) return (int)e;
+    copy_kernel<<<grid_for(hidden_size, 256), 256>>>(g_scratch[MOE_NORMED2], dst, hidden_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dlm_moe_load_normed(int hidden_size, const float* src)
+{
+    DLM_ENTER
+    cudaError_t e = scratch_ensure(MOE_NORMED2, hidden_size);
+    if (e != cudaSuccess) return (int)e;
+    copy_kernel<<<grid_for(hidden_size, 256), 256>>>(src, g_scratch[MOE_NORMED2], hidden_size);
+    g_q8_ready = 0;  // any int8 codes held for the old contents are stale now
+    return (int)cudaGetLastError();
+}
+
 // Post-attention norm for a MoE layer whose attention ran in a *separate* call —
 // the MLA path, where `dlm_mla_attn` folds the attention residual into `x` but
 // (unlike `dlm_moe_attn`) leaves no FFN input behind. This produces exactly the

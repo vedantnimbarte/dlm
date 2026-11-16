@@ -39,6 +39,11 @@ impl KvSnapshot {
         self.position
     }
 
+    /// Layers it holds history for.
+    pub fn layers(&self) -> usize {
+        self.kv_layers.len()
+    }
+
     /// The first `rows` positions of this snapshot (at most all of them). Paged
     /// device KV is shared, so `rows` must be a whole number of KV blocks for a
     /// snapshot of device history; host history is copied at any length.
@@ -48,6 +53,55 @@ impl KvSnapshot {
             kv_layers: self.kv_layers.iter().map(|kv| kv.prefix_of(rows)).collect(),
             position: rows,
         }
+    }
+
+    /// Write the snapshot, first pulling any device-resident rows to the host
+    /// (on a copy: `self` keeps sharing its device blocks).
+    pub(crate) fn write_to(&self, w: &mut impl std::io::Write) -> Result<()> {
+        let io = |e: std::io::Error| DlmError::InvalidConfig(format!("writing a KV snapshot: {e}"));
+        w.write_all(&(self.position as u64).to_le_bytes())
+            .map_err(io)?;
+        w.write_all(&(self.kv_layers.len() as u64).to_le_bytes())
+            .map_err(io)?;
+        for kv in &self.kv_layers {
+            let kv = kv.clone();
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            let kv = {
+                let mut kv = kv;
+                kv.sync_from_device()?;
+                kv
+            };
+            kv.write_host(w).map_err(io)?;
+        }
+        Ok(())
+    }
+
+    /// A snapshot written by [`write_to`](Self::write_to), its rows on the host.
+    pub(crate) fn read_from(r: &mut impl std::io::Read) -> std::io::Result<KvSnapshot> {
+        let mut b = [0u8; 8];
+        r.read_exact(&mut b)?;
+        let position = u64::from_le_bytes(b) as usize;
+        r.read_exact(&mut b)?;
+        let layers = u64::from_le_bytes(b);
+        if layers > 4096 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "layer count out of range",
+            ));
+        }
+        let kv_layers = (0..layers)
+            .map(|_| KvLayerCache::read_host(r))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if kv_layers.iter().any(|kv| kv.len() != position) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "layer length differs from the snapshot position",
+            ));
+        }
+        Ok(KvSnapshot {
+            kv_layers,
+            position,
+        })
     }
 }
 

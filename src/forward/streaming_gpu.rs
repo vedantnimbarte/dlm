@@ -30,13 +30,13 @@
 //! on a real card before tagging a release.
 
 use crate::error::{DlmError, Result};
-use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors};
+use crate::forward::cpu::{BlockConfig, KvLayerCache, LayerTensors, Weights};
 use crate::forward::kernel::ComputeKernel;
-use crate::forward::streaming::{LayerSource, StreamStats};
+use crate::forward::streaming::{evict_index, ewma, LayerSource, StreamStats};
 use crate::gpu::device::{synchronize_default, CopyTimer, DeviceBuffer, Stream};
 use crate::memory::PinnedBuffer;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -46,8 +46,9 @@ use std::thread::JoinHandle;
 // kernel signature changed — a silent mismatch the compiler only warns about.
 use crate::forward::gpu::{
     bias_ptr, dlm_decode_block, dlm_decode_block_batched, dlm_dense_ffn, dlm_mla_attn,
-    dlm_moe_attn, dlm_moe_norm, upload_bias, upload_weight, DlmBlockExt, GpuBlockBiases, GpuExpert,
-    GpuMla, GpuMoeCore, SlotKv, DLM_MAX_BATCH,
+    dlm_moe_attn, dlm_moe_load_normed, dlm_moe_norm, dlm_moe_save_normed, upload_bias,
+    upload_weight, DlmBlockExt, GpuBlockBiases, GpuExpert, GpuMla, GpuMoeCore, SlotKv,
+    DLM_MAX_BATCH,
 };
 
 /// A layer's feed-forward weights in VRAM: a single dense MLP, or the MoE core
@@ -495,67 +496,75 @@ enum HostLayer {
     Host(Arc<LayerTensors>),
 }
 
-/// Index in `order` (least-recent first) of the entry to evict when inserting
-/// `inserting`: the most recently used one, skipping `inserting` itself in case a
-/// concurrent load already placed it there. `None` when there is nothing safe to
-/// evict.
+/// Passes through a layer over which an expert's routing count halves. inferssd
+/// runs DeepSeek decode with a half-life of 2 tokens (`count_decay2`).
+const EXPERT_HALF_LIFE: f64 = 2.0;
+
+/// Count-decay routing scores per `(layer, expert)`: each selection adds 1 and
+/// the total halves every [`EXPERT_HALF_LIFE`] passes through the layer, so a
+/// score tracks what the layer routes to *now*. It drives eviction (lowest score
+/// leaves the VRAM cache) and prefetch (highest scores are warmed). LRU would
+/// evict an expert picked every other token for one picked once just now.
 ///
-/// Split out from [`WeightLru::insert`] so the policy — the subtle part — is
-/// testable without a GPU.
-fn evict_index(order: &VecDeque<u32>, inserting: u32) -> Option<usize> {
-    match order.back().copied() {
-        Some(l) if l == inserting => order.len().checked_sub(2),
-        Some(_) => order.len().checked_sub(1),
-        None => None,
-    }
-}
-
-/// Router-selection history: how often each `(layer, expert)` has been picked so
-/// far this session. A token's exact experts aren't known until its router runs,
-/// but MoE routing is heavily skewed — a handful of experts per layer dominate —
-/// so the historically-hot set is a good prediction of the next token's needs.
-/// The prefetch worker uses [`hot`](ExpertHistory::hot) to warm those experts for
-/// the *next* layer while the current one computes, moving their load off the
-/// critical path (see [`GpuExpertCache`]).
+/// `hints` holds each layer's experts as its own router predicts them from the
+/// layer before (see `StreamingGpuKernel::hint_next`): exact where `hot` guesses.
 #[derive(Default)]
-struct ExpertHistory {
-    counts: HashMap<(u32, u32), u32>,
+struct ExpertScores {
+    /// Passes through each layer so far: the clock its scores decay on.
+    clock: HashMap<u32, u64>,
+    /// `(score, clock when it was set)`.
+    scores: HashMap<(u32, u32), (f64, u64)>,
+    hints: HashMap<u32, Vec<u32>>,
 }
 
-impl ExpertHistory {
+impl ExpertScores {
+    /// One pass through `layer` (a decode token, or a whole prefill).
+    fn tick(&mut self, layer: u32) {
+        *self.clock.entry(layer).or_insert(0) += 1;
+    }
+
     /// Record that `expert` was routed to in `layer` for one token.
     fn record(&mut self, layer: u32, expert: u32) {
-        *self.counts.entry((layer, expert)).or_insert(0) += 1;
+        let now = self.clock.get(&layer).copied().unwrap_or(0);
+        let s = self.score((layer, expert));
+        self.scores.insert((layer, expert), (s + 1.0, now));
     }
 
-    /// The `n` most-selected experts in `layer`, most-frequent first. Ties break
-    /// on expert id for determinism (testability). Empty until the layer has run.
+    /// The decayed score of `(layer, expert)`; 0 if never routed to.
+    fn score(&self, key: (u32, u32)) -> f64 {
+        let now = self.clock.get(&key.0).copied().unwrap_or(0);
+        self.scores.get(&key).map_or(0.0, |&(s, at)| {
+            s * (-((now - at) as f64) / EXPERT_HALF_LIFE).exp2()
+        })
+    }
+
+    /// The experts to warm for `layer`: its router's prediction when there is
+    /// one, else the `n` highest-scoring (ties on expert id, for determinism).
     fn hot(&self, layer: u32, n: usize) -> Vec<u32> {
-        let mut v: Vec<(u32, u32)> = self
-            .counts
-            .iter()
-            .filter(|((l, _), _)| *l == layer)
-            .map(|((_, e), c)| (*e, *c))
+        if let Some(h) = self.hints.get(&layer) {
+            return h.clone();
+        }
+        let mut v: Vec<(u32, f64)> = self
+            .scores
+            .keys()
+            .filter(|(l, _)| *l == layer)
+            .map(|&(l, e)| (e, self.score((l, e))))
             .collect();
-        // Descending by count, then ascending by expert id.
-        v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         v.into_iter().take(n).map(|(e, _)| e).collect()
     }
 }
 
 /// A bounded VRAM cache of routed MoE experts, keyed `(layer, expert)`.
 ///
-/// Unlike the layer window this is a **true LRU**: expert selection is
-/// data-dependent, not a cyclic scan, and consecutive decode tokens reuse the
-/// same experts heavily — so evicting the least-recently-used expert keeps the
-/// hot set resident. A miss streams the expert from the checkpoint on demand. The
-/// prefetch worker additionally warms each layer's historically-hot experts ahead
-/// of compute (see [`ExpertHistory`]); a token's *exact* experts still aren't
-/// known until its router runs, so on-critical-path misses can still occur.
+/// Evicts the lowest [`ExpertScores`] score, preferring another layer's expert
+/// to one of the layer being filled, so warming a layer's predicted experts
+/// never evicts the others just warmed for it. A miss streams the expert from
+/// the checkpoint; the prefetch worker warms each layer's predicted experts
+/// ahead of compute.
 struct GpuExpertCache {
     capacity: usize,
     map: HashMap<(u32, u32), Arc<GpuExpert>>,
-    order: VecDeque<(u32, u32)>,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -566,41 +575,32 @@ impl GpuExpertCache {
         Self {
             capacity: capacity.max(1),
             map: HashMap::new(),
-            order: VecDeque::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
         }
     }
 
-    fn touch(&mut self, key: (u32, u32)) {
-        if let Some(pos) = self.order.iter().position(|&k| k == key) {
-            self.order.remove(pos);
-        }
-        self.order.push_back(key);
-    }
-
-    fn insert(&mut self, key: (u32, u32), expert: Arc<GpuExpert>) {
-        while self.map.len() >= self.capacity {
-            // True LRU: evict the front (least-recently-used).
-            let Some(evict) = self.order.pop_front() else {
+    fn insert(&mut self, key: (u32, u32), expert: Arc<GpuExpert>, scores: &ExpertScores) {
+        while self.map.len() >= self.capacity && !self.map.contains_key(&key) {
+            // ponytail: O(capacity) scan per eviction; a heap if caches reach
+            // the tens of thousands.
+            let Some(&victim) = self.map.keys().filter(|k| **k != key).min_by(|a, b| {
+                (a.0 == key.0)
+                    .cmp(&(b.0 == key.0))
+                    .then(scores.score(**a).total_cmp(&scores.score(**b)))
+            }) else {
                 break;
             };
-            if evict == key {
-                // Don't evict the entry we're about to insert; try the next.
-                self.order.push_back(evict);
-                if self.order.len() <= 1 {
-                    break;
-                }
-                continue;
-            }
-            self.map.remove(&evict);
+            self.map.remove(&victim);
             self.evictions += 1;
         }
         self.map.insert(key, expert);
-        self.order.push_back(key);
     }
 }
+
+/// A MoE layer's router weights and post-attention norm, on the host.
+type HostRouter = (Weights, Vec<f32>);
 
 /// State shared between the compute thread and the prefetch worker.
 struct GpuShared<S: LayerSource> {
@@ -617,8 +617,17 @@ struct GpuShared<S: LayerSource> {
     pinned: Mutex<PinnedLru>,
     /// VRAM cache of routed MoE experts (empty/unused for dense models).
     experts: Mutex<GpuExpertCache>,
-    /// Router-selection history driving expert prefetch (unused for dense models).
-    history: Mutex<ExpertHistory>,
+    /// Count-decay routing scores and router predictions, driving expert
+    /// eviction and prefetch (unused for dense models).
+    scores: Mutex<ExpertScores>,
+    /// Each MoE layer's router and post-attention norm on the host, kept as its
+    /// core streams in, so the layer before can predict its experts.
+    routers: Mutex<HashMap<u32, Arc<HostRouter>>>,
+    /// EWMA ns to serve a decode expert miss by uploading it (GPU) or by
+    /// computing it on the CPU; the cheaper one serves the next miss.
+    miss_gpu_ns: AtomicU64,
+    miss_cpu_ns: AtomicU64,
+    misses_seen: AtomicU64,
 }
 
 impl<S: LayerSource> GpuShared<S> {
@@ -673,9 +682,10 @@ impl<S: LayerSource> GpuShared<S> {
             // layers take the sync path either way — their projection set doesn't
             // fit the staged dense layout.
             let uploaded = if self.cfg.moe.is_some() {
-                self.source
-                    .load_layer_core(layer)
-                    .and_then(|t| GpuWeights::upload_sync(&t).map(Arc::new))
+                self.source.load_layer_core(layer).and_then(|t| {
+                    self.keep_router(layer, &t);
+                    GpuWeights::upload_sync(&t).map(Arc::new)
+                })
             } else if self.cfg.mla.is_some() {
                 self.source
                     .load_layer(layer)
@@ -762,8 +772,10 @@ impl<S: LayerSource> GpuShared<S> {
             if bytes > lru.budget {
                 return Ok(HostLayer::Host(t));
             }
+            // Most recently used first: the pinned tier is read in the same
+            // cycle as the window, where LRU never hits (see `evict_index`).
             while lru.bytes + bytes > lru.budget {
-                let Some(old) = lru.order.pop_front() else {
+                let Some(old) = lru.order.pop_back() else {
                     break;
                 };
                 if let Some(p) = lru.map.remove(&old) {
@@ -840,36 +852,73 @@ impl<S: LayerSource> GpuShared<S> {
         }
     }
 
-    /// Ensure routed expert `(layer, expert)` is VRAM-resident, streaming it from
-    /// the checkpoint on a miss. Records hit/miss on the expert cache.
-    fn ensure_expert(&self, layer: u32, expert: u32) -> Result<Arc<GpuExpert>> {
-        {
-            let mut cache = self.experts.lock().unwrap();
-            if let Some(e) = cache.map.get(&(layer, expert)) {
-                let e = Arc::clone(e);
-                cache.hits += 1;
-                cache.touch((layer, expert));
-                return Ok(e);
-            }
+    /// Routed expert `(layer, expert)` if VRAM-resident. Records hit/miss.
+    fn cached_expert(&self, layer: u32, expert: u32) -> Option<Arc<GpuExpert>> {
+        let mut cache = self.experts.lock().unwrap();
+        let e = cache.map.get(&(layer, expert)).cloned();
+        if e.is_some() {
+            cache.hits += 1;
+        } else {
             cache.misses += 1;
         }
-        // Load + upload without the cache lock. A rare concurrent double-load just
-        // uploads twice; both return a valid expert and the cache keeps the last.
+        e
+    }
+
+    /// Stream `(layer, expert)` from the checkpoint into the VRAM cache. Runs
+    /// without the cache lock; a rare concurrent double-load just uploads twice.
+    fn upload_expert(&self, layer: u32, expert: u32) -> Result<Arc<GpuExpert>> {
         let host = self.source.load_expert(layer, expert)?;
         let gpu = Arc::new(GpuExpert::upload(&host)?);
-        let mut cache = self.experts.lock().unwrap();
-        cache.insert((layer, expert), Arc::clone(&gpu));
+        let scores = self.scores.lock().unwrap();
+        self.experts
+            .lock()
+            .unwrap()
+            .insert((layer, expert), Arc::clone(&gpu), &scores);
         Ok(gpu)
     }
 
-    /// Warm `layer`'s historically-hot experts into the VRAM cache, off the
-    /// compute critical path. Best-effort (errors ignored) and a no-op until the
-    /// layer has routing history. Warms up to `experts_per_tok` experts — the
-    /// count a token actually consumes — so prefetch doesn't churn the LRU.
+    /// Ensure routed expert `(layer, expert)` is VRAM-resident.
+    fn ensure_expert(&self, layer: u32, expert: u32) -> Result<Arc<GpuExpert>> {
+        match self.cached_expert(layer, expert) {
+            Some(e) => Ok(e),
+            None => self.upload_expert(layer, expert),
+        }
+    }
+
+    /// Whether the next decode expert miss should run on the CPU: whichever of
+    /// CPU and upload has measured cheaper, each tried once first, and the
+    /// dearer one retried every 32nd miss so a cold first sample can't stick.
+    fn miss_on_cpu(&self) -> bool {
+        let (cpu, gpu) = (
+            self.miss_cpu_ns.load(Ordering::Relaxed),
+            self.miss_gpu_ns.load(Ordering::Relaxed),
+        );
+        let explore = self.misses_seen.fetch_add(1, Ordering::Relaxed) % 32 == 31;
+        if cpu == 0 || gpu == 0 {
+            return cpu == 0;
+        }
+        (cpu <= gpu) != explore
+    }
+
+    /// Keep `layer`'s router and post-attention norm on the host (MoE only).
+    fn keep_router(&self, layer: u32, t: &LayerTensors) {
+        if let Ok((router, ..)) = t.moe() {
+            self.routers
+                .lock()
+                .unwrap()
+                .entry(layer)
+                .or_insert_with(|| Arc::new((router.clone(), t.post_attention_layernorm.clone())));
+        }
+    }
+
+    /// Warm `layer`'s predicted experts into the VRAM cache, off the compute
+    /// critical path: its router's prediction when the layer before made one,
+    /// else its `experts_per_tok` highest-scoring. Best-effort (errors ignored)
+    /// and a no-op for dense models and unseen layers.
     fn prefetch_experts(&self, layer: u32) {
         let Some(m) = self.cfg.moe else { return };
         let hot = self
-            .history
+            .scores
             .lock()
             .unwrap()
             .hot(layer, m.experts_per_tok as usize);
@@ -905,6 +954,8 @@ pub struct StreamingGpuKernel<S: LayerSource + 'static> {
     /// `[DLM_MAX_BATCH, hidden]` block `decode_batch` keeps a batch in across
     /// the layer stack.
     d_batch: DeviceBuffer,
+    /// One token's MoE FFN input, brought to the host for CPU experts.
+    d_normed: DeviceBuffer,
     prefetch_tx: Option<Sender<u32>>,
     worker: Option<JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
@@ -1056,7 +1107,11 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             staging: Mutex::new(PinnedBuffer::with_len(staging_bytes)?),
             pinned: Mutex::new(PinnedLru::default()),
             experts: Mutex::new(GpuExpertCache::new(expert_capacity)),
-            history: Mutex::new(ExpertHistory::default()),
+            scores: Mutex::new(ExpertScores::default()),
+            routers: Mutex::new(HashMap::new()),
+            miss_gpu_ns: AtomicU64::new(0),
+            miss_cpu_ns: AtomicU64::new(0),
+            misses_seen: AtomicU64::new(0),
         });
         let (tx, rx) = channel::<u32>();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -1109,6 +1164,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         };
         let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
         let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
+        let d_normed = DeviceBuffer::new(cfg.hidden_size)?;
         Ok(Self {
             // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
             kv_pools: crate::forward::kv_pool::KvPools::new(
@@ -1125,6 +1181,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             mla_inv_freq,
             d_hidden,
             d_batch,
+            d_normed,
             prefetch_tx: Some(tx),
             worker: Some(worker),
             stopped,
@@ -1153,7 +1210,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         layer: u32,
         w: &GpuWeights,
         dkv: &crate::forward::cpu::DeviceKv,
-        d_hidden: &DeviceBuffer,
+        d_hidden: *mut f32,
+        defer: Option<*mut f32>,
         num_positions: usize,
         position: usize,
     ) -> Result<()> {
@@ -1184,7 +1242,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 bias_ptr(&w.q_norm),
                 bias_ptr(&w.k_norm),
                 self.inv_freq_for(layer),
-                d_hidden.as_mut_ptr(),
+                d_hidden,
                 dkv.keys,
                 dkv.values,
                 num_positions as i32,
@@ -1207,7 +1265,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 code,
             });
         }
-        self.run_moe_ffn(layer, w, d_hidden)
+        self.run_moe_ffn(layer, w, d_hidden, defer)
     }
 
     /// The routed-expert FFN half of a MoE layer: router → top-k → per-expert
@@ -1225,7 +1283,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         w: &GpuWeights,
         kv: &mut KvLayerCache,
         position: usize,
-        d_hidden: &DeviceBuffer,
+        d_hidden: *mut f32,
+        defer: Option<*mut f32>,
     ) -> Result<()> {
         let kv_dim = self.shared.cfg.kv_dim();
         let cfg = &self.shared.cfg;
@@ -1278,7 +1337,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                         .expect("mla_inv_freq present whenever cfg.mla is")
                         .as_ptr(),
                     crate::forward::cpu::rope_mscale(cfg.rope_scaling),
-                    d_hidden.as_mut_ptr(),
+                    d_hidden,
                     kv_keys,
                     num_positions as i32,
                     position as i32,
@@ -1304,7 +1363,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             f.down.as_ptr() as *const std::ffi::c_void,
                             w.post_attention_layernorm.as_ptr(),
                             cfg.activation.code(),
-                            d_hidden.as_mut_ptr(),
+                            d_hidden,
                         )
                     };
                     if code != 0 {
@@ -1322,7 +1381,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             cfg.hidden_size as i32,
                             cfg.rms_eps,
                             w.post_attention_layernorm.as_ptr(),
-                            d_hidden.as_mut_ptr(),
+                            d_hidden,
                         )
                     };
                     if code != 0 {
@@ -1331,7 +1390,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             code,
                         });
                     }
-                    self.run_moe_ffn(layer, w, d_hidden)?;
+                    self.run_moe_ffn(layer, w, d_hidden, defer)?;
                 }
             }
         } else {
@@ -1366,7 +1425,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                             bias_ptr(&w.q_norm),
                             bias_ptr(&w.k_norm),
                             self.inv_freq_for(layer),
-                            d_hidden.as_mut_ptr(),
+                            d_hidden,
                             kv_keys,
                             kv_values,
                             num_positions as i32,
@@ -1391,26 +1450,251 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                     }
                 }
                 GpuFfn::Moe { .. } => {
-                    self.run_moe_block(layer, w, &dkv, d_hidden, num_positions, position)?;
+                    self.run_moe_block(layer, w, &dkv, d_hidden, defer, num_positions, position)?;
                 }
             }
         }
         Ok(())
     }
 
-    /// The expert half of a MoE layer, with each selected expert pulled through
-    /// the per-`(layer, expert)` VRAM cache. The routing itself lives in
-    /// [`GpuMoeCore::run`], shared with the resident kernel; only where the
-    /// experts come from differs.
-    fn run_moe_ffn(&self, layer: u32, w: &GpuWeights, d_hidden: &DeviceBuffer) -> Result<()> {
+    /// The expert half of a MoE layer for one token. Each selected expert runs
+    /// on the GPU when VRAM-resident; a miss runs on the CPU or is uploaded,
+    /// whichever has measured cheaper. One token per expert is a memory-bound
+    /// read, and system RAM can outrun the PCIe link of a small card, which is
+    /// why inferssd keeps decode experts on the CPU. With `defer` it only saves
+    /// the FFN input there, for [`moe_ffn_grouped`](Self::moe_ffn_grouped).
+    fn run_moe_ffn(
+        &self,
+        layer: u32,
+        w: &GpuWeights,
+        d_hidden: *mut f32,
+        defer: Option<*mut f32>,
+    ) -> Result<()> {
+        let cfg = &self.shared.cfg;
+        let h = cfg.hidden_size;
+        if let Some(dst) = defer {
+            // SAFETY: `dst` is a live device row of `h` floats.
+            return gpu_ok("dlm_moe_save_normed", unsafe {
+                dlm_moe_save_normed(h as i32, dst)
+            });
+        }
         let GpuFfn::Moe(core) = &w.ffn else {
             unreachable!("run_moe_ffn on a dense layer");
         };
-        core.run(&self.shared.cfg, d_hidden.as_mut_ptr(), |e| {
-            // Feed the prefetch heuristic: next token's hot set predicts this one's.
-            self.shared.history.lock().unwrap().record(layer, e as u32);
-            self.shared.ensure_expert(layer, e as u32)
-        })
+        let m = cfg.moe.expect("MoE layer has a MoE config");
+        // The router's logits come back to the host, so the device is idle here.
+        let selected = core.route(cfg)?;
+        {
+            let mut sc = self.shared.scores.lock().unwrap();
+            sc.tick(layer);
+            for &(e, _) in &selected {
+                sc.record(layer, e as u32);
+            }
+        }
+        let (mut on_gpu, mut on_cpu) = (Vec::new(), Vec::new());
+        for (e, weight) in selected {
+            let e = e as u32;
+            if let Some(x) = self.shared.cached_expert(layer, e) {
+                on_gpu.push((x, weight));
+            } else if self.shared.miss_on_cpu() {
+                on_cpu.push((e, weight));
+            } else {
+                let t = std::time::Instant::now();
+                on_gpu.push((self.shared.upload_expert(layer, e)?, weight));
+                ewma(&self.shared.miss_gpu_ns, t.elapsed().as_nanos() as u64);
+            }
+        }
+        // Single-token decode always chains through `self.d_hidden`.
+        debug_assert_eq!(d_hidden, self.d_hidden.as_mut_ptr());
+        let mut ffn_inp = vec![0f32; h];
+        self.d_hidden.download(&mut ffn_inp)?;
+        let mut normed = vec![0f32; h];
+        if !on_cpu.is_empty() {
+            // SAFETY: `d_normed` holds `h` floats.
+            gpu_ok("dlm_moe_save_normed", unsafe {
+                dlm_moe_save_normed(h as i32, self.d_normed.as_mut_ptr())
+            })?;
+            self.d_normed.download(&mut normed)?;
+        }
+        core.apply_routed(cfg, &on_gpu, d_hidden)?;
+        core.apply_shared(cfg, d_hidden)?;
+        // Host work from here overlaps the experts running on the device.
+        self.hint_next(layer, &ffn_inp);
+        if on_cpu.is_empty() {
+            return Ok(());
+        }
+        let inter = m.moe_intermediate_size as usize;
+        let mut add = vec![0f32; h];
+        for (e, weight) in on_cpu {
+            let t = std::time::Instant::now();
+            let expert = self.shared.source.load_expert(layer, e)?;
+            let y = crate::forward::cpu::swiglu_ffn(&expert, &normed, h, inter, cfg.activation);
+            for (a, v) in add.iter_mut().zip(&y) {
+                *a += weight * v;
+            }
+            ewma(&self.shared.miss_cpu_ns, t.elapsed().as_nanos() as u64);
+        }
+        synchronize_default()?;
+        let mut x = vec![0f32; h];
+        self.d_hidden.download(&mut x)?;
+        for (x, a) in x.iter_mut().zip(&add) {
+            *x += a;
+        }
+        self.d_hidden.upload(&x)
+    }
+
+    /// `decode_batch` for a MoE model: layer by layer for the whole batch, each
+    /// sequence's attention in turn, then the experts grouped over the batch
+    /// ([`moe_ffn_grouped`](Self::moe_ffn_grouped)). Each layer core streams in
+    /// once per step and each expert once per layer, not once per sequence.
+    fn decode_batch_moe(
+        &self,
+        hiddens: &mut [&mut [f32]],
+        kv_layers: &mut [&mut [KvLayerCache]],
+        positions: &[usize],
+    ) -> Result<()> {
+        let h = self.shared.cfg.hidden_size;
+        let b = hiddens.len();
+        let mut flat: Vec<f32> = hiddens.iter().flat_map(|x| x.iter().copied()).collect();
+        let d_x = DeviceBuffer::from_slice(&flat)?;
+        let d_norm = DeviceBuffer::new(b * h)?;
+        // SAFETY (every `row`): both buffers hold `b` rows of `h` floats.
+        let row = |d: &DeviceBuffer, i: usize| unsafe { d.as_mut_ptr().add(i * h) };
+        for layer in 0..self.num_layers {
+            let w = self.shared.fetch(layer)?;
+            if let Some(tx) = &self.prefetch_tx {
+                let _ = tx.send((layer + 1) % self.num_layers);
+            }
+            let moe = matches!(w.ffn, GpuFfn::Moe(_));
+            for (i, kvs) in kv_layers.iter_mut().enumerate() {
+                let kv = &mut kvs[layer as usize];
+                if kv.len() >= self.kv_capacity_tokens {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "GPU KV capacity {} exceeded at position {}",
+                        self.kv_capacity_tokens, positions[i]
+                    )));
+                }
+                let defer = moe.then(|| row(&d_norm, i));
+                self.run_layer(layer, &w, kv, positions[i], row(&d_x, i), defer)?;
+                kv.advance(1);
+            }
+            if moe {
+                self.moe_ffn_grouped(layer, &w, d_x.as_mut_ptr(), d_norm.as_mut_ptr(), b)?;
+            }
+        }
+        synchronize_default()?;
+        d_x.download(&mut flat)?;
+        for (i, hidden) in hiddens.iter_mut().enumerate() {
+            hidden.copy_from_slice(&flat[i * h..(i + 1) * h]);
+        }
+        Ok(())
+    }
+
+    /// Predict layer `layer + 1`'s experts by running its own router on this
+    /// layer's FFN input, and send the worker to warm them while this layer's
+    /// experts and the next attention run (inferssd's prefetch hint). Exact
+    /// more often than the next layer's score history, which only knows what it
+    /// routed to before. No-op until the next layer's core has streamed in once.
+    fn hint_next(&self, layer: u32, ffn_inp: &[f32]) {
+        let next = layer + 1;
+        let cfg = &self.shared.cfg;
+        let Some(m) = cfg.moe else { return };
+        if next >= self.num_layers {
+            return;
+        }
+        let Some(r) = self.shared.routers.lock().unwrap().get(&next).cloned() else {
+            return;
+        };
+        let (router, norm) = &*r;
+        let x = crate::forward::cpu::rmsnorm(ffn_inp, norm, cfg.rms_eps);
+        let logits =
+            crate::forward::cpu::matvec_native(router, &x, m.num_experts as usize, cfg.hidden_size);
+        let experts =
+            crate::forward::cpu::route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob)
+                .into_iter()
+                .map(|(e, _)| e as u32)
+                .collect();
+        self.shared
+            .scores
+            .lock()
+            .unwrap()
+            .hints
+            .insert(next, experts);
+        if let Some(tx) = &self.prefetch_tx {
+            let _ = tx.send(next);
+        }
+    }
+
+    /// The expert half of a MoE layer for `n` tokens at once, expert-major:
+    /// row `t` of `norm` holds token `t`'s FFN input (saved by a deferred
+    /// [`run_layer`](Self::run_layer)) and row `t` of `x` its hidden, both on
+    /// the device. Each selected expert is fetched once and applied to every
+    /// token that chose it; token by token, a cache smaller than the experts a
+    /// prompt touches re-uploaded the same expert over and over (inferssd's
+    /// grouped prefill). The pass counts as one tick of the layer's scores, so
+    /// a prompt's most-routed experts start decode warm.
+    ///
+    /// ponytail: one GEMV per (expert, token); a batched expert GEMM over each
+    /// expert's rows if a profile shows the expert compute, not its upload.
+    fn moe_ffn_grouped(
+        &self,
+        layer: u32,
+        w: &GpuWeights,
+        x: *mut f32,
+        norm: *mut f32,
+        n: usize,
+    ) -> Result<()> {
+        let GpuFfn::Moe(core) = &w.ffn else {
+            unreachable!("moe_ffn_grouped on a dense layer");
+        };
+        let cfg = &self.shared.cfg;
+        let h = cfg.hidden_size;
+        let inter = cfg.moe.expect("MoE layer").moe_intermediate_size as i32;
+        // SAFETY (every `row`): `x` and `norm` hold `n` rows of `h` floats.
+        let row = |p: *mut f32, t: usize| unsafe { p.add(t * h) };
+        let load = |t: usize| {
+            gpu_ok("dlm_moe_load_normed", unsafe {
+                dlm_moe_load_normed(h as i32, row(norm, t))
+            })
+        };
+        let mut by_expert: std::collections::BTreeMap<u32, Vec<(usize, f32)>> =
+            std::collections::BTreeMap::new();
+        for t in 0..n {
+            load(t)?;
+            for (e, weight) in core.route(cfg)? {
+                by_expert.entry(e as u32).or_default().push((t, weight));
+            }
+        }
+        {
+            let mut sc = self.shared.scores.lock().unwrap();
+            sc.tick(layer);
+            for (&e, rows) in &by_expert {
+                for _ in rows {
+                    sc.record(layer, e);
+                }
+            }
+        }
+        for (e, rows) in by_expert {
+            let expert = self.shared.ensure_expert(layer, e)?;
+            for (t, weight) in rows {
+                load(t)?;
+                core.apply_one(cfg, &expert, inter, weight, row(x, t))?;
+            }
+        }
+        for t in 0..n {
+            load(t)?;
+            core.apply_shared(cfg, row(x, t))?;
+        }
+        Ok(())
+    }
+}
+
+/// A device call's status as a `Result`.
+fn gpu_ok(api: &'static str, code: i32) -> Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(DlmError::Gpu { api, code })
     }
 }
 
@@ -1466,9 +1750,11 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
     ///
     /// Dense standard-attention layers run up to [`DLM_MAX_BATCH`] tokens per
     /// device call, every slot aliasing the one layer KV (see `GpuKernel::prefill`
-    /// for why that is exact causal attention). MLA and MoE layers have no batched
-    /// block, so their tokens go one at a time through the same per-token body
-    /// `run_block` uses — still one stream-in per layer.
+    /// for why that is exact causal attention). MoE layers run attention token
+    /// by token, then each routed expert once for the whole prompt
+    /// ([`moe_ffn_grouped`](Self::moe_ffn_grouped)). MLA layers with a dense FFN
+    /// go one token at a time through the body `run_block` uses — still one
+    /// stream-in per layer.
     ///
     /// ponytail: the hidden states live on the host between layers and cross the
     /// bus per chunk (dense) or per token (MLA/MoE). Small next to a streamed
@@ -1479,7 +1765,8 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
     /// which streamed every non-resident layer once per sequence, so at batch 4 a
     /// streamed model decoded slower in total than at batch 1.
     ///
-    /// MoE and MLA models have no batched block and keep the default.
+    /// MoE models take [`decode_batch_moe`](Self::decode_batch_moe); MLA
+    /// models have no batched block and keep the default.
     fn decode_batch(
         &self,
         hiddens: &mut [&mut [f32]],
@@ -1487,7 +1774,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         positions: &[usize],
     ) -> Result<()> {
         let cfg = &self.shared.cfg;
-        if hiddens.len() <= 1 || cfg.mla.is_some() || cfg.moe.is_some() {
+        if hiddens.len() > 1 && cfg.moe.is_some() {
+            return self.decode_batch_moe(hiddens, kv_layers, positions);
+        }
+        if hiddens.len() <= 1 || cfg.mla.is_some() {
             for ((hidden, kvs), &position) in
                 hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
             {
@@ -1565,17 +1855,53 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                 start + n - 1
             )));
         }
+        // MoE layers keep the prompt on the device as `[n, hidden]` rows plus
+        // each token's FFN input, for `moe_ffn_grouped`.
+        let moe_rows = match cfg.moe {
+            Some(_) => Some((
+                DeviceBuffer::new(n * hidden_size)?,
+                DeviceBuffer::new(n * hidden_size)?,
+            )),
+            None => None,
+        };
         for layer in 0..self.num_layers {
             let w = self.shared.fetch(layer)?;
             if let Some(tx) = &self.prefetch_tx {
                 let _ = tx.send((layer + 1) % self.num_layers);
             }
             let kv = &mut kv_layers[layer as usize];
+            if let (GpuFfn::Moe(_), Some((d_x, d_norm))) = (&w.ffn, &moe_rows) {
+                // Attention token by token, then each expert once for the prompt.
+                // Reserve the KV up front so no token grows it under queued work.
+                kv.device_kv(
+                    &self.kv_pools,
+                    layer as usize,
+                    kv.len() + n,
+                    self.kv_capacity_tokens,
+                    cfg.mla.is_none(),
+                )?;
+                d_x.upload(hiddens)?;
+                for i in 0..n {
+                    // SAFETY: row `i` of two `[n, hidden]` device buffers.
+                    let (x, norm) = unsafe {
+                        (
+                            d_x.as_mut_ptr().add(i * hidden_size),
+                            d_norm.as_mut_ptr().add(i * hidden_size),
+                        )
+                    };
+                    self.run_layer(layer, &w, kv, start + i, x, Some(norm))?;
+                    kv.advance(1);
+                }
+                self.moe_ffn_grouped(layer, &w, d_x.as_mut_ptr(), d_norm.as_mut_ptr(), n)?;
+                synchronize_default()?;
+                d_x.download(hiddens)?;
+                continue;
+            }
             let batched = cfg.mla.is_none() && matches!(w.ffn, GpuFfn::Dense(_));
             if !batched {
                 for (i, hidden) in hiddens.chunks_mut(hidden_size).enumerate() {
                     self.d_hidden.upload(hidden)?;
-                    self.run_layer(layer, &w, kv, start + i, &self.d_hidden)?;
+                    self.run_layer(layer, &w, kv, start + i, self.d_hidden.as_mut_ptr(), None)?;
                     synchronize_default()?;
                     self.d_hidden.download(hidden)?;
                     kv.advance(1);
@@ -1636,7 +1962,7 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         if is_first {
             d_hidden.upload(hidden)?;
         }
-        self.run_layer(layer, &w, kv, position, d_hidden)?;
+        self.run_layer(layer, &w, kv, position, d_hidden.as_mut_ptr(), None)?;
 
         // Bring the result back only after the last layer. `download` is a blocking
         // D2H that drains the default stream, so an in-flight weight upload on the
@@ -1740,40 +2066,37 @@ mod tests {
         assert_eq!(evict_index(&single, 7), None); // nothing else to evict
     }
 
-    /// The prefetch heuristic ranks a layer's experts by how often they've been
-    /// routed to, most-frequent first, and keeps layers independent.
+    /// Scores rank a layer's experts by decayed routing count, keep layers
+    /// independent, and let a recent expert overtake one that has gone quiet.
     #[test]
-    fn expert_history_ranks_hot_experts_per_layer() {
-        let mut h = super::ExpertHistory::default();
-        // Layer 0: expert 5 picked 3×, expert 2 twice, expert 9 once.
+    fn expert_scores_rank_and_decay() {
+        let mut h = super::ExpertScores::default();
+        h.tick(0);
         for _ in 0..3 {
             h.record(0, 5);
         }
-        for _ in 0..2 {
-            h.record(0, 2);
-        }
-        h.record(0, 9);
-        // Layer 1: different hot set — must not bleed into layer 0.
+        h.record(0, 2);
         h.record(1, 7);
-        h.record(1, 7);
-        h.record(1, 1);
-
-        assert_eq!(h.hot(0, 2), vec![5, 2], "top-2 by frequency, desc");
-        assert_eq!(
-            h.hot(0, 10),
-            vec![5, 2, 9],
-            "n larger than the set returns all, ranked"
-        );
-        assert_eq!(h.hot(1, 2), vec![7, 1], "layer 1 is independent");
+        assert_eq!(h.hot(0, 2), vec![5, 2]);
+        assert_eq!(h.hot(1, 2), vec![7], "layer 1 is independent");
         assert!(h.hot(3, 4).is_empty(), "an unseen layer has no hot experts");
+        // Six passes later 5's three picks are worth 3/8; 2 picked twice now wins.
+        for _ in 0..6 {
+            h.tick(0);
+        }
+        h.record(0, 2);
+        assert_eq!(h.hot(0, 2), vec![2, 5]);
+        // A router prediction overrides the scores.
+        h.hints.insert(0, vec![9]);
+        assert_eq!(h.hot(0, 2), vec![9]);
     }
 
-    /// Ties break on expert id so prefetch order is deterministic (testable).
+    /// Ties break on expert id so prefetch order is deterministic.
     #[test]
-    fn expert_history_breaks_ties_by_id() {
-        let mut h = super::ExpertHistory::default();
+    fn expert_scores_break_ties_by_id() {
+        let mut h = super::ExpertScores::default();
         h.record(0, 8);
         h.record(0, 3);
-        assert_eq!(h.hot(0, 2), vec![3, 8], "equal counts → ascending id");
+        assert_eq!(h.hot(0, 2), vec![3, 8], "equal scores → ascending id");
     }
 }

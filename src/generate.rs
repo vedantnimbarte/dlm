@@ -889,6 +889,11 @@ impl<K: ComputeKernel> Generator<K> {
             .kv_free_tokens(crate::forward::cpu::KvElem::for_quant(self.kv_quant))
     }
 
+    /// Transformer layers in the model.
+    pub(crate) fn num_layers(&self) -> usize {
+        self.kernel.num_layers() as usize
+    }
+
     /// A fresh single-sequence orchestrator over this generator's kernel and KV
     /// budget.
     pub(crate) fn orchestrator(&self) -> ForwardOrchestrator<&K> {

@@ -12,6 +12,49 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Ideas taken from [InferSSD](https://wici.ai/inferssd), a llama.cpp
+fork that runs large MoE models from SSD.
+
+### Changed
+
+- **Every layer cache on the streaming path now evicts the most recently used
+  layer.** The VRAM window already did, since layers are read in a cycle and
+  LRU evicts the layer needed next. The host-RAM tier (`--ram-cache-gb`), the
+  pinned staging cache and the CPU kernel's host window still used LRU, so
+  once the model outgrew one of them it stopped hitting at all. The CPU
+  window's prefetch also no longer marks a layer it loaded ahead as the next
+  victim. GTX 1650, Qwen2.5-0.5B bf16, `--stream --resident-layers 4
+  --ram-cache-gb 0.3` (a third of the model pinned), decode 2.52–2.74 →
+  3.65–3.96 tok/s, two back-to-back pairs of 3-run medians.
+- **Streamed MoE: routed experts are grouped across tokens.** Prefill used to
+  run a MoE layer one token at a time, uploading any expert missing from the
+  VRAM cache for each token that chose it. A prompt touching more experts than
+  the cache holds re-uploaded the same expert over and over. Now attention runs
+  for every token first, then each selected expert is fetched once and applied
+  to every token that chose it. Batched decode of a streamed MoE model works the
+  same way, layer by layer for the whole batch, where it used to run each
+  sequence through the whole stack in turn.
+- **Streamed MoE: decode expert misses can run on the CPU.** A missed expert is
+  computed on the CPU from host RAM or uploaded to the GPU, whichever has
+  measured cheaper so far. One token per expert is a memory-bound read, and
+  system RAM can be faster than a small card's PCIe link.
+- **Streamed MoE: the VRAM expert cache evicts by decayed routing count.**
+  Each selection adds 1 to an expert's score and the score halves every two
+  passes through its layer. The lowest score is evicted, preferring another
+  layer's expert, instead of the least recently used.
+- **Streamed MoE: experts are prefetched from the next layer's own router.**
+  While a layer computes, the next layer's router runs on the host over this
+  layer's FFN input, and the worker warms the experts it predicts. Before, it
+  warmed whichever experts the next layer had picked most often so far.
+
+### Added
+
+- **`serve --prefix-cache-dir DIR`** keeps cached prompt prefixes on disk, so
+  a long system prompt is prefilled once rather than once per server start.
+  Entries go in a subdirectory per model and setting (weights, `--quant`,
+  `--kv-quant`, device, LoRA, dlm version). At start-up the newest are loaded,
+  up to `--prefix-cache-size` entries and 1 GiB.
+
 ## [0.4.1] - 2026-11-12
 
 The same code as 0.4.0, which shipped without two of its builds. Use this
