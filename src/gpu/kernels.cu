@@ -1912,10 +1912,12 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
 // Slots 24-25 are the int8 activation codes and their block scales (dp4a).
 // Slot 28 holds the LM head's sampling candidates (`dlm_lm_head_top`).
-enum { SCRATCH_N = 29 };
+enum { SCRATCH_N = 35 };
 enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26, LM_TOP = 28 };   // 26: fp16 tensor-core row scales
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12, MOE_NORMED2B = 27 };   // 27: a batch's FFN inputs
+// 29-34: `dlm_apply_expert_rows`' gathered inputs, gate, up, output, row indices, weights.
+enum { EXP_X = 29, EXP_G = 30, EXP_U = 31, EXP_OUT = 32, EXP_IDX = 33, EXP_W = 34 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
 enum { DLM_MAX_DEVICES = 16 };
 static thread_local float* g_scratch_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}};
@@ -4991,6 +4993,82 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
         swiglu_kernel<<<grid_for(inter, B), B>>>(g, u, inter_buf, inter, activation);
         launch_matvec(w_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, w_group_size);
         scaled_add_kernel<<<grid_for(hidden_size, B), B>>>(x, down_out, weight, hidden_size);
+        e = cudaGetLastError();
+    }
+    return (int)e;
+}
+
+// `dst[t] = src[idx[t]]` for `T` rows of `h` floats.
+__global__ void gather_rows_kernel(const float* src, const int* idx, float* dst, int T, int h) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)T * h) return;
+    int t = (int)(i / h), c = (int)(i % h);
+    dst[i] = src[(long)idx[t] * h + c];
+}
+
+// `x[idx[t]] += w[t] * src[t]` for `T` rows of `h` floats. Rows of one call are
+// distinct (a token picks an expert once), so no two threads add to one value.
+__global__ void scatter_add_rows_kernel(float* x, const float* src, const int* idx,
+                                        const float* w, int T, int h) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)T * h) return;
+    int t = (int)(i / h), c = (int)(i % h);
+    x[(long)idx[t] * h + c] += w[t] * src[i];
+}
+
+// `out[T, M] = W · X[T, K]`: the tiled GEMM for many rows, else the batched
+// GEMV (weights read once per DLM_MAX_BATCH rows) for few, or for a shape the
+// GEMM cannot take.
+static void expert_matmul(int dt, const void* W, const float* X, float* out, int M, int K, int T,
+                          int group_size) {
+    if (T > DLM_MAX_BATCH && launch_gemm(dt, W, X, (const float*)0, out, M, K, T, group_size, false))
+        return;
+    for (int t = 0; t < T; t += DLM_MAX_BATCH) {
+        int n = T - t < DLM_MAX_BATCH ? T - t : DLM_MAX_BATCH;
+        launch_matvec_batched(dt, W, X + (long)t * K, (const float*)0, out + (long)t * M, M, K,
+                              group_size, n);
+    }
+}
+
+// One routed expert over every token that chose it: row `rows_host[t]` of
+// `norm` (each token's FFN input) gathered, gate/up/down run once over all the
+// rows, and `x[rows_host[t]] += weights_host[t] * expert(...)`. Per token, the
+// grouped prefill read the expert's weights once per row. In pieces of 256 rows
+// to bound the scratch.
+extern "C" int dlm_apply_expert_rows(int hidden_size, int inter, int w_dtype, int w_group_size,
+                                     const void* gate, const void* up, const void* down,
+                                     const float* norm, const int* rows_host,
+                                     const float* weights_host, int T, float* x, int activation)
+{
+    DLM_ENTER
+    const int B = 256, PIECE = 256;
+    cudaError_t e = cudaSuccess;
+    for (int t0 = 0; t0 < T && e == cudaSuccess; t0 += PIECE) {
+        int n = T - t0 < PIECE ? T - t0 : PIECE;
+        #define DLM_ALLOC(idx, cnt) if (e == cudaSuccess) { e = scratch_ensure((idx), (cnt)); }
+        DLM_ALLOC(EXP_X, PIECE * hidden_size)
+        DLM_ALLOC(EXP_G, PIECE * inter)
+        DLM_ALLOC(EXP_U, PIECE * inter)
+        DLM_ALLOC(EXP_OUT, PIECE * hidden_size)
+        DLM_ALLOC(EXP_IDX, PIECE)
+        DLM_ALLOC(EXP_W, PIECE)
+        #undef DLM_ALLOC
+        if (e != cudaSuccess) break;
+        float *X = g_scratch[EXP_X], *G = g_scratch[EXP_G], *U = g_scratch[EXP_U];
+        float *O = g_scratch[EXP_OUT], *W = g_scratch[EXP_W];
+        int* idx = (int*)g_scratch[EXP_IDX];
+        // Pageable copies on the default stream wait for the work before them,
+        // so the last piece's kernels are done with these slots.
+        e = cudaMemcpy(idx, rows_host + t0, n * sizeof(int), cudaMemcpyHostToDevice);
+        if (e == cudaSuccess) e = cudaMemcpy(W, weights_host + t0, n * sizeof(float), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) break;
+        long nh = (long)n * hidden_size, ni = (long)n * inter;
+        gather_rows_kernel<<<grid_for((int)nh, B), B>>>(norm, idx, X, n, hidden_size);
+        expert_matmul(w_dtype, gate, X, G, inter, hidden_size, n, w_group_size);
+        expert_matmul(w_dtype, up, X, U, inter, hidden_size, n, w_group_size);
+        swiglu_batched_kernel<<<grid_for((int)ni, B), B>>>(G, U, G, ni, activation);
+        expert_matmul(w_dtype, down, G, O, hidden_size, inter, n, w_group_size);
+        scatter_add_rows_kernel<<<grid_for((int)nh, B), B>>>(x, O, idx, W, n, hidden_size);
         e = cudaGetLastError();
     }
     return (int)e;

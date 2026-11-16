@@ -45,10 +45,10 @@ use std::thread::JoinHandle;
 // Restating the `extern` block let this path keep calling the old ABI after the
 // kernel signature changed — a silent mismatch the compiler only warns about.
 use crate::forward::gpu::{
-    bias_ptr, dlm_decode_block, dlm_decode_block_batched, dlm_dense_ffn, dlm_mla_attn,
-    dlm_moe_attn, dlm_moe_load_normed, dlm_moe_norm, dlm_moe_save_normed, upload_bias,
-    upload_weight, DlmBlockExt, GpuBlockBiases, GpuExpert, GpuMla, GpuMoeCore, SlotKv,
-    DLM_MAX_BATCH,
+    bias_ptr, dlm_apply_expert_rows, dlm_decode_block, dlm_decode_block_batched, dlm_dense_ffn,
+    dlm_mla_attn, dlm_moe_attn, dlm_moe_attn_batched, dlm_moe_load_normed, dlm_moe_norm,
+    dlm_moe_save_normed, dlm_moe_take_row, upload_bias, upload_weight, DlmBlockExt, GpuBlockBiases,
+    GpuExpert, GpuMla, GpuMoeCore, SlotKv, DLM_MAX_BATCH,
 };
 
 /// A layer's feed-forward weights in VRAM: a single dense MLP, or the MoE core
@@ -1040,6 +1040,76 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         Ok(())
     }
 
+    /// Attention for a MoE layer (standard attention) over `slots.len()` rows
+    /// at `x`, each projection read once for all of them, then each row's FFN
+    /// input saved to the same row of `norm` for
+    /// [`moe_ffn_grouped`](Self::moe_ffn_grouped). Token by token, every row
+    /// read every attention matrix again.
+    fn moe_attn_batched(
+        &self,
+        layer: u32,
+        w: &GpuWeights,
+        x: *mut f32,
+        slots: &SlotKv,
+        norm: *mut f32,
+    ) -> Result<()> {
+        let cfg = self.shared.cfg.for_layer(layer);
+        let h = cfg.hidden_size;
+        // SAFETY: live device buffers of the sizes the kernel expects; `x`
+        // holds `slots.len()` rows and every slot's KV has a block for the row
+        // it writes (`device_kv` ensured it).
+        let code = unsafe {
+            dlm_moe_attn_batched(
+                h as i32,
+                cfg.q_dim() as i32,
+                cfg.kv_dim() as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const std::ffi::c_void,
+                w.k_proj.as_ptr() as *const std::ffi::c_void,
+                w.v_proj.as_ptr() as *const std::ffi::c_void,
+                w.o_proj.as_ptr() as *const std::ffi::c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.q_bias),
+                bias_ptr(&w.k_bias),
+                bias_ptr(&w.v_bias),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq_for(layer),
+                x,
+                &slots.keys,
+                &slots.values,
+                &slots.tables,
+                &slots.num_positions,
+                &slots.positions,
+                slots.len() as i32,
+                cfg.sliding_window.unwrap_or(0) as i32,
+                crate::forward::cpu::rope_mscale(cfg.rope_scaling),
+                cfg.attn_scale(),
+                cfg.attn_logit_softcap.unwrap_or(0.0),
+                &DlmBlockExt::new(&cfg, &w.biases, slots.elem, std::ptr::null())
+                    .with_weight_dtypes(&w.dtypes),
+            )
+        };
+        gpu_ok("dlm_moe_attn_batched", code)?;
+        for b in 0..slots.len() {
+            // SAFETY: row `b` of the scratch the batched call filled, and of
+            // `norm`'s rows.
+            gpu_ok("dlm_moe_take_row", unsafe {
+                dlm_moe_take_row(h as i32, b as i32)
+            })?;
+            gpu_ok("dlm_moe_save_normed", unsafe {
+                dlm_moe_save_normed(h as i32, norm.add(b * h))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Keep up to `bytes` of dense layers staged in pinned host memory, so
     /// uploading one copies straight to the device instead of first copying its
     /// weights into the staging buffer. Meant to take the place of a host RAM
@@ -1543,8 +1613,9 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         self.d_hidden.upload(&x)
     }
 
-    /// `decode_batch` for a MoE model: layer by layer for the whole batch, each
-    /// sequence's attention in turn, then the experts grouped over the batch
+    /// `decode_batch` for a MoE model: layer by layer for the whole batch,
+    /// attention batched over up to DLM_MAX_BATCH sequences (one at a time for
+    /// MLA), then the experts grouped over the batch
     /// ([`moe_ffn_grouped`](Self::moe_ffn_grouped)). Each layer core streams in
     /// once per step and each expert once per layer, not once per sequence.
     fn decode_batch_moe(
@@ -1566,17 +1637,43 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 let _ = tx.send((layer + 1) % self.num_layers);
             }
             let moe = matches!(w.ffn, GpuFfn::Moe(_));
-            for (i, kvs) in kv_layers.iter_mut().enumerate() {
-                let kv = &mut kvs[layer as usize];
-                if kv.len() >= self.kv_capacity_tokens {
+            for (i, kvs) in kv_layers.iter().enumerate() {
+                if kvs[layer as usize].len() >= self.kv_capacity_tokens {
                     return Err(DlmError::InvalidConfig(format!(
                         "GPU KV capacity {} exceeded at position {}",
                         self.kv_capacity_tokens, positions[i]
                     )));
                 }
-                let defer = moe.then(|| row(&d_norm, i));
-                self.run_layer(layer, &w, kv, positions[i], row(&d_x, i), defer)?;
-                kv.advance(1);
+            }
+            if moe && self.shared.cfg.mla.is_none() {
+                // Up to DLM_MAX_BATCH sequences per call, each with its own KV.
+                for c in (0..b).step_by(DLM_MAX_BATCH) {
+                    let end = (c + DLM_MAX_BATCH).min(b);
+                    let mut slots = SlotKv::new();
+                    for (i, kvs) in kv_layers[c..end].iter_mut().enumerate() {
+                        let kv = &mut kvs[layer as usize];
+                        let n = kv.len();
+                        let dkv = kv.device_kv(
+                            &self.kv_pools,
+                            layer as usize,
+                            n + 1,
+                            self.kv_capacity_tokens,
+                            true,
+                        )?;
+                        slots.push(&dkv, n, positions[c + i]);
+                    }
+                    self.moe_attn_batched(layer, &w, row(&d_x, c), &slots, row(&d_norm, c))?;
+                }
+                for kvs in kv_layers.iter_mut() {
+                    kvs[layer as usize].advance(1);
+                }
+            } else {
+                for (i, kvs) in kv_layers.iter_mut().enumerate() {
+                    let kv = &mut kvs[layer as usize];
+                    let defer = moe.then(|| row(&d_norm, i));
+                    self.run_layer(layer, &w, kv, positions[i], row(&d_x, i), defer)?;
+                    kv.advance(1);
+                }
             }
             if moe {
                 self.moe_ffn_grouped(layer, &w, d_x.as_mut_ptr(), d_norm.as_mut_ptr(), b)?;
@@ -1626,16 +1723,15 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     }
 
     /// The expert half of a MoE layer for `n` tokens at once, expert-major:
-    /// row `t` of `norm` holds token `t`'s FFN input (saved by a deferred
-    /// [`run_layer`](Self::run_layer)) and row `t` of `x` its hidden, both on
-    /// the device. Each selected expert is fetched once and applied to every
-    /// token that chose it; token by token, a cache smaller than the experts a
-    /// prompt touches re-uploaded the same expert over and over (inferssd's
-    /// grouped prefill). The pass counts as one tick of the layer's scores, so
-    /// a prompt's most-routed experts start decode warm.
-    ///
-    /// ponytail: one GEMV per (expert, token); a batched expert GEMM over each
-    /// expert's rows if a profile shows the expert compute, not its upload.
+    /// row `t` of `norm` holds token `t`'s FFN input and row `t` of `x` its
+    /// hidden, both on the device. Each selected expert is fetched once and run
+    /// once over every token that chose it (`dlm_apply_expert_rows`: a GEMM
+    /// for many rows, the batched GEMV for few), and the shared expert once over
+    /// all of them. Token by token, a cache smaller than the experts a prompt
+    /// touches re-uploaded the same expert over and over, and every token read
+    /// each expert's weights again (inferssd's grouped prefill). The pass counts
+    /// as one tick of the layer's scores, so a prompt's most-routed experts
+    /// start decode warm.
     fn moe_ffn_grouped(
         &self,
         layer: u32,
@@ -1650,40 +1746,61 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         let cfg = &self.shared.cfg;
         let h = cfg.hidden_size;
         let inter = cfg.moe.expect("MoE layer").moe_intermediate_size as i32;
-        // SAFETY (every `row`): `x` and `norm` hold `n` rows of `h` floats.
-        let row = |p: *mut f32, t: usize| unsafe { p.add(t * h) };
-        let load = |t: usize| {
-            gpu_ok("dlm_moe_load_normed", unsafe {
-                dlm_moe_load_normed(h as i32, row(norm, t))
-            })
-        };
-        let mut by_expert: std::collections::BTreeMap<u32, Vec<(usize, f32)>> =
+        let shared = core.shared(cfg);
+        let mut by_expert: std::collections::BTreeMap<u32, (Vec<i32>, Vec<f32>)> =
             std::collections::BTreeMap::new();
+        let mut shared_weights = Vec::with_capacity(if shared.is_some() { n } else { 0 });
         for t in 0..n {
-            load(t)?;
+            // SAFETY: row `t` of `norm`'s `n` rows of `h` floats.
+            gpu_ok("dlm_moe_load_normed", unsafe {
+                dlm_moe_load_normed(h as i32, norm.add(t * h))
+            })?;
             for (e, weight) in core.route(cfg)? {
-                by_expert.entry(e as u32).or_default().push((t, weight));
+                let (rows, ws) = by_expert.entry(e as u32).or_default();
+                rows.push(t as i32);
+                ws.push(weight);
+            }
+            if shared.is_some() {
+                shared_weights.push(core.shared_weight(cfg)?);
             }
         }
         {
             let mut sc = self.shared.scores.lock().unwrap();
             sc.tick(layer);
-            for (&e, rows) in &by_expert {
+            for (&e, (rows, _)) in &by_expert {
                 for _ in rows {
                     sc.record(layer, e);
                 }
             }
         }
-        for (e, rows) in by_expert {
+        let apply = |e: &GpuExpert, inter: i32, rows: &[i32], ws: &[f32]| {
+            // SAFETY: live device weights; `norm` and `x` hold `n` rows and every
+            // index in `rows` is a distinct row below `n`.
+            gpu_ok("dlm_apply_expert_rows", unsafe {
+                dlm_apply_expert_rows(
+                    h as i32,
+                    inter,
+                    e.w_dtype,
+                    e.w_group_size,
+                    e.gate.as_ptr() as *const std::ffi::c_void,
+                    e.up.as_ptr() as *const std::ffi::c_void,
+                    e.down.as_ptr() as *const std::ffi::c_void,
+                    norm,
+                    rows.as_ptr(),
+                    ws.as_ptr(),
+                    rows.len() as i32,
+                    x,
+                    cfg.activation.code(),
+                )
+            })
+        };
+        for (e, (rows, ws)) in by_expert {
             let expert = self.shared.ensure_expert(layer, e)?;
-            for (t, weight) in rows {
-                load(t)?;
-                core.apply_one(cfg, &expert, inter, weight, row(x, t))?;
-            }
+            apply(&expert, inter, &rows, &ws)?;
         }
-        for t in 0..n {
-            load(t)?;
-            core.apply_shared(cfg, row(x, t))?;
+        if let Some((sh, sinter)) = shared {
+            let all: Vec<i32> = (0..n as i32).collect();
+            apply(sh, sinter, &all, &shared_weights)?;
         }
         Ok(())
     }
@@ -1750,8 +1867,9 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
     ///
     /// Dense standard-attention layers run up to [`DLM_MAX_BATCH`] tokens per
     /// device call, every slot aliasing the one layer KV (see `GpuKernel::prefill`
-    /// for why that is exact causal attention). MoE layers run attention token
-    /// by token, then each routed expert once for the whole prompt
+    /// for why that is exact causal attention). MoE layers run attention the
+    /// same way (token by token for MLA), then each routed expert once for the
+    /// whole prompt
     /// ([`moe_ffn_grouped`](Self::moe_ffn_grouped)). MLA layers with a dense FFN
     /// go one token at a time through the body `run_block` uses — still one
     /// stream-in per layer.
@@ -1881,16 +1999,40 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
                     cfg.mla.is_none(),
                 )?;
                 d_x.upload(hiddens)?;
-                for i in 0..n {
-                    // SAFETY: row `i` of two `[n, hidden]` device buffers.
-                    let (x, norm) = unsafe {
-                        (
-                            d_x.as_mut_ptr().add(i * hidden_size),
-                            d_norm.as_mut_ptr().add(i * hidden_size),
-                        )
-                    };
-                    self.run_layer(layer, &w, kv, start + i, x, Some(norm))?;
-                    kv.advance(1);
+                // SAFETY (every `row`): both buffers hold `n` rows of `hidden_size`.
+                let row =
+                    |d: &DeviceBuffer, i: usize| unsafe { d.as_mut_ptr().add(i * hidden_size) };
+                if cfg.mla.is_none() {
+                    // Every slot aliases the one layer KV, as the dense chunks do.
+                    for c in (0..n).step_by(DLM_MAX_BATCH) {
+                        let batch = (n - c).min(DLM_MAX_BATCH);
+                        let history = kv.len();
+                        let dkv = kv.device_kv(
+                            &self.kv_pools,
+                            layer as usize,
+                            history + batch,
+                            self.kv_capacity_tokens,
+                            true,
+                        )?;
+                        let mut slots = SlotKv::new();
+                        for b in 0..batch {
+                            slots.push(&dkv, history + b, start + c + b);
+                        }
+                        self.moe_attn_batched(layer, &w, row(d_x, c), &slots, row(d_norm, c))?;
+                        kv.advance(batch);
+                    }
+                } else {
+                    for i in 0..n {
+                        self.run_layer(
+                            layer,
+                            &w,
+                            kv,
+                            start + i,
+                            row(d_x, i),
+                            Some(row(d_norm, i)),
+                        )?;
+                        kv.advance(1);
+                    }
                 }
                 self.moe_ffn_grouped(layer, &w, d_x.as_mut_ptr(), d_norm.as_mut_ptr(), n)?;
                 synchronize_default()?;
