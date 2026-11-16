@@ -38,6 +38,11 @@ fork that runs large MoE models from SSD.
   computed on the CPU from host RAM or uploaded to the GPU, whichever has
   measured cheaper so far. One token per expert is a memory-bound read, and
   system RAM can be faster than a small card's PCIe link.
+- **Streamed MoE: expert uploads are staged through pinned memory and reuse
+  an evicted expert's VRAM.** An expert was uploaded with three pageable
+  copies, which block and serialize with the kernels on the default stream,
+  so an expert the worker prefetched could not load under compute; and the
+  evicted expert's buffers were freed, which waits for the whole device.
 - **Streamed MoE: the VRAM expert cache evicts by decayed routing count.**
   Each selection adds 1 to an expert's score and the score halves every two
   passes through its layer. The lowest score is evicted, preferring another
