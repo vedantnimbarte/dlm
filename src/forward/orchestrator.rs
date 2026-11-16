@@ -64,9 +64,13 @@ impl KvSnapshot {
         w.write_all(&(self.kv_layers.len() as u64).to_le_bytes())
             .map_err(io)?;
         for kv in &self.kv_layers {
-            let mut kv = kv.clone();
+            let kv = kv.clone();
             #[cfg(any(feature = "cuda", feature = "rocm"))]
-            kv.sync_from_device()?;
+            let kv = {
+                let mut kv = kv;
+                kv.sync_from_device()?;
+                kv
+            };
             kv.write_host(w).map_err(io)?;
         }
         Ok(())

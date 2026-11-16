@@ -980,6 +980,11 @@ inference engine):
       are dropped, oldest first, when a new request needs their blocks.
     - **On the CPU** each entry is a host copy of the prefix's KV, so it is off
       unless set.
+  - `--prefix-cache-dir DIR` also writes cached prefixes to `DIR`, so they
+    survive a restart. Each model and setting (weights, `--quant`,
+    `--kv-quant`, device, LoRA, dlm version) gets its own subdirectory. At
+    start-up the newest entries are loaded, up to `--prefix-cache-size` and
+    1 GiB; a restored entry is a host copy of its KV until a request uses it.
 
   **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a
