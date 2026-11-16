@@ -665,6 +665,37 @@ impl Default for GenerationConfig {
     }
 }
 
+/// How [`Generator::embedding`] pools the tokens' hidden states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pooling {
+    /// The last token's: what a causal model's last position has read all of.
+    #[default]
+    Last,
+    /// The mean over every token.
+    Mean,
+}
+
+impl Pooling {
+    /// What a sentence-transformers export of the model asks for in
+    /// `1_Pooling/config.json`: mean or last token. Last without that file, or
+    /// for a mode dlm does not implement (CLS and max make little sense for a
+    /// causal model).
+    pub fn for_model(model_path: &std::path::Path) -> Self {
+        let dir = if model_path.is_dir() {
+            model_path
+        } else {
+            model_path.parent().unwrap_or(model_path)
+        };
+        let cfg: Option<serde_json::Value> = std::fs::read(dir.join("1_Pooling/config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        match cfg {
+            Some(c) if c["pooling_mode_mean_tokens"] == true => Pooling::Mean,
+            _ => Pooling::Last,
+        }
+    }
+}
+
 /// A CPU text generator: a transformer kernel plus the embedding, final norm,
 /// and LM head that turn token ids into logits and back.
 pub struct Generator<K: ComputeKernel> {
@@ -993,6 +1024,17 @@ impl<K: ComputeKernel> Generator<K> {
         orch: &mut ForwardOrchestrator<&K>,
         tokens: &[u32],
     ) -> Result<Vec<f32>> {
+        self.prefill_with(orch, tokens, |_| {})
+    }
+
+    /// [`prefill`](Self::prefill), handing each chunk's hidden states (every
+    /// token's, `[chunk, hidden]`, before the final norm) to `each`.
+    fn prefill_with(
+        &self,
+        orch: &mut ForwardOrchestrator<&K>,
+        tokens: &[u32],
+        mut each: impl FnMut(&[f32]),
+    ) -> Result<Vec<f32>> {
         let mut hiddens = Vec::new();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             hiddens.clear();
@@ -1000,6 +1042,7 @@ impl<K: ComputeKernel> Generator<K> {
                 hiddens.extend(self.embed(token, orch.position() + i)?);
             }
             orch.prefill(&mut hiddens)?;
+            each(&hiddens);
         }
         Ok(hiddens.split_off(hiddens.len() - self.hidden_size))
     }
@@ -1123,17 +1166,35 @@ impl<K: ComputeKernel> Generator<K> {
         false
     }
 
-    /// `tokens`' embedding: the final-normed hidden state of the last token,
-    /// scaled to unit length. Last-token pooling is what decoder embedding
-    /// models (Qwen3-Embedding, gte-Qwen2) are trained for; on a chat model it
-    /// is still a usable summary of the text, not a tuned one.
-    pub fn embedding(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+    /// `tokens`' embedding: the final-normed hidden states pooled as `pooling`
+    /// says, scaled to unit length. Last-token pooling is what most decoder
+    /// embedding models (Qwen3-Embedding, gte-Qwen2) are trained for; others
+    /// say mean in their sentence-transformers config (see
+    /// [`Pooling::for_model`]). On a chat model either is a usable summary of
+    /// the text, not a tuned one.
+    pub fn embedding(&self, tokens: &[u32], pooling: Pooling) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(DlmError::InvalidConfig("nothing to embed".into()));
         }
         let mut orch = self.orchestrator();
-        let last = self.prefill(&mut orch, tokens)?;
-        let mut v = self.final_norm(&last);
+        let h = self.hidden_size;
+        let mut sum = vec![0f64; h];
+        let last = self.prefill_with(&mut orch, tokens, |hiddens| {
+            if pooling == Pooling::Mean {
+                for row in hiddens.chunks(h) {
+                    for (s, x) in sum.iter_mut().zip(self.final_norm(row)) {
+                        *s += x as f64;
+                    }
+                }
+            }
+        })?;
+        let mut v = match pooling {
+            Pooling::Last => self.final_norm(&last),
+            Pooling::Mean => sum
+                .iter()
+                .map(|s| (s / tokens.len() as f64) as f32)
+                .collect(),
+        };
         let norm = v
             .iter()
             .map(|&x| (x as f64) * (x as f64))
@@ -1785,6 +1846,32 @@ mod tests {
             kernel, embedding, final_norm, lm_head, vocab, 1e-5, kv_config, 8,
         )
         .unwrap()
+    }
+
+    /// Last-token pooling is the last token's normed state; mean pooling
+    /// averages every token's. Through an identity block, token t's state is
+    /// one-hot at t, so the two come out apart. `for_model` follows a
+    /// sentence-transformers pooling config.
+    #[test]
+    fn embedding_pools_last_or_mean() {
+        let g = counting_generator();
+        let last = g.embedding(&[0, 1], Pooling::Last).unwrap();
+        let mean = g.embedding(&[0, 1], Pooling::Mean).unwrap();
+        let close = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(close(&last, &[0.0, 1.0, 0.0, 0.0]), "{last:?}");
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(close(&mean, &[h, h, 0.0, 0.0]), "{mean:?}");
+
+        let dir = std::env::temp_dir().join(format!("dlm-pooling-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("1_Pooling")).unwrap();
+        assert_eq!(Pooling::for_model(&dir), Pooling::Last);
+        std::fs::write(
+            dir.join("1_Pooling/config.json"),
+            r#"{"pooling_mode_mean_tokens": true, "pooling_mode_lasttoken": false}"#,
+        )
+        .unwrap();
+        assert_eq!(Pooling::for_model(&dir), Pooling::Mean);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The distribution `score_and_next` returns is the one the next token would

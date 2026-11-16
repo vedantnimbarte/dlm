@@ -39,6 +39,7 @@ enum Work {
     Generate(Box<Job>),
     Embed {
         tokens: Vec<u32>,
+        pooling: crate::generate::Pooling,
         reply: Sender<Result<Vec<f32>, String>>,
     },
     /// Keep the prefix cache in this directory from now on.
@@ -112,6 +113,7 @@ pub struct EngineService {
     created: u64,
     default_max_tokens: usize,
     chat_template: ChatTemplate,
+    embedding_pooling: crate::generate::Pooling,
     /// Stop generation when any of these token ids is produced (the model's
     /// EOS set). Empty means run to `max_tokens`.
     eos_tokens: Vec<u32>,
@@ -255,6 +257,7 @@ impl EngineService {
             created,
             default_max_tokens,
             chat_template: ChatTemplate::default(),
+            embedding_pooling: crate::generate::Pooling::default(),
             eos_tokens: Vec::new(),
             max_context: usize::MAX,
             metrics: Metrics::default(),
@@ -320,6 +323,17 @@ impl EngineService {
         self
     }
 
+    /// How `/v1/embeddings` pools the tokens' hidden states.
+    pub fn with_embedding_pooling(
+        mut self: Arc<Self>,
+        pooling: crate::generate::Pooling,
+    ) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.embedding_pooling = pooling;
+        }
+        self
+    }
+
     pub fn with_eos_tokens(mut self: Arc<Self>, eos_tokens: Vec<u32>) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
             inner.eos_tokens = eos_tokens;
@@ -372,7 +386,11 @@ impl EngineService {
         self.job_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send(Work::Embed { tokens, reply })
+            .send(Work::Embed {
+                tokens,
+                pooling: self.embedding_pooling,
+                reply,
+            })
             .map_err(|_| "the engine has stopped".to_string())?;
         out.recv()
             .map_err(|_| "the engine has stopped".to_string())?
@@ -422,8 +440,16 @@ fn engine_loop<K: ComputeKernel>(
     loop {
         let mut take = |work: Work, sched: &mut BatchScheduler<'_, K>| match work {
             Work::Generate(job) => enqueue(sched, &mut sinks, *job),
-            Work::Embed { tokens, reply } => {
-                let _ = reply.send(generator.embedding(&tokens).map_err(|e| e.to_string()));
+            Work::Embed {
+                tokens,
+                pooling,
+                reply,
+            } => {
+                let _ = reply.send(
+                    generator
+                        .embedding(&tokens, pooling)
+                        .map_err(|e| e.to_string()),
+                );
             }
             Work::PersistPrefixCache(dir) => match sched.persist_prefix_cache(dir.clone()) {
                 Ok(n) => println!("prefix cache : {n} prefixes loaded from {}", dir.display()),
@@ -545,6 +571,9 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallIn>>,
+    /// On a `tool` message, the call it answers (Mistral's format names it).
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 /// JSON as Hugging Face chat templates' `tojson` writes it: `", "` and `": "`
@@ -634,12 +663,280 @@ fn chatml(messages: &[ChatMessage], tools: &[serde_json::Value]) -> String {
     p
 }
 
+/// A call's arguments as the model saw them: an object, where OpenAI sends a
+/// JSON string.
+fn call_arguments(c: &ToolCallIn) -> serde_json::Value {
+    match &c.function.arguments {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        }
+        v => v.clone(),
+    }
+}
+
+/// Today as Llama 3's template writes it (`strftime("%d %b %Y")`, UTC).
+fn today_dmy() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400) as i64;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!("{day:02} {} {year}", MONTHS[month as usize - 1])
+}
+
+/// JSON as Python's `json.dumps(v, indent=4)` writes it, which Llama 3's
+/// template uses for each tool.
+fn tojson_indent4(v: &serde_json::Value) -> String {
+    use serde::Serialize;
+    let mut out = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
+    v.serialize(&mut ser).expect("a JSON value serializes");
+    String::from_utf8(out).expect("serde_json writes UTF-8")
+}
+
+/// Llama 3.1/3.2 with tools, following its Jinja template to the character with
+/// its defaults (`tools_in_user_message`): an `ipython` system header, the tools
+/// and their instructions in the first user turn, a call as a bare
+/// `{"name": …, "parameters": …}` reply, and a result as an `ipython` turn.
+fn llama3_tools(
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    date: &str,
+) -> Result<String, String> {
+    let (system, mut rest) = match messages.first() {
+        Some(m) if m.role == "system" => (m.content.trim(), &messages[1..]),
+        _ => ("", messages),
+    };
+    let mut p = String::from("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n");
+    p.push_str("Environment: ipython\nCutting Knowledge Date: December 2023\n");
+    p.push_str(&format!("Today Date: {date}\n\n{system}<|eot_id|>"));
+    let Some(first) = rest.first() else {
+        return Err(
+            "Cannot put tools in the first user message when there's no first user message!".into(),
+        );
+    };
+    rest = &rest[1..];
+    p.push_str(
+        "<|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please \
+         respond with a JSON for a function call with its proper arguments that best answers \
+         the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": \
+         dictionary of argument name and its value}.Do not use variables.\n\n",
+    );
+    for t in tools {
+        p.push_str(&tojson_indent4(t));
+        p.push_str("\n\n");
+    }
+    p.push_str(first.content.trim());
+    p.push_str("<|eot_id|>");
+    for m in rest {
+        let calls = m.tool_calls.as_deref().unwrap_or_default();
+        if !calls.is_empty() {
+            let [c] = calls else {
+                return Err("This model only supports single tool-calls at once!".into());
+            };
+            p.push_str(&format!(
+                "<|start_header_id|>assistant<|end_header_id|>\n\n{{\"name\": \"{}\", \
+                 \"parameters\": {}}}<|eot_id|>",
+                c.function.name,
+                tojson(&call_arguments(c))
+            ));
+        } else if m.role == "tool" || m.role == "ipython" {
+            // The template JSON-encodes the result: to Jinja a string is iterable.
+            p.push_str("<|start_header_id|>ipython<|end_header_id|>\n\n");
+            p.push_str(&tojson(&serde_json::Value::String(m.content.clone())));
+            p.push_str("<|eot_id|>");
+        } else {
+            p.push_str(&format!(
+                "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+                m.role,
+                m.content.trim()
+            ));
+        }
+    }
+    p.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    Ok(p)
+}
+
+/// A tool-call id as Mistral's template requires it: 9 alphanumerics. An id
+/// of that shape passes through; any other (OpenAI's `call_…`, or none) maps
+/// to one derived from it, the same for the call and the result naming it.
+fn mistral_call_id(id: Option<&str>, fallback: usize) -> String {
+    match id {
+        Some(id) if id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric()) => id.into(),
+        _ => {
+            let key = id.map_or_else(|| fallback.to_string(), str::to_string);
+            let mut h = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+            });
+            const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            (0..9)
+                .map(|_| {
+                    let c = ALNUM[(h % ALNUM.len() as u64) as usize] as char;
+                    h /= ALNUM.len() as u64;
+                    c
+                })
+                .collect()
+        }
+    }
+}
+
+/// Mistral v0.3 with tools, following its Jinja template to the character:
+/// `[AVAILABLE_TOOLS]` before the last user turn, the system message folded
+/// into the last user turn, calls as `[TOOL_CALLS] [...]` and results as
+/// `[TOOL_RESULTS]`. BOS is left to the tokenizer, as for plain Mistral.
+fn mistral_tools(messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<String, String> {
+    let (system, rest) = match messages.first() {
+        Some(m) if m.role == "system" => (Some(m.content.as_str()), &messages[1..]),
+        _ => (None, messages),
+    };
+    let is_call = |m: &ChatMessage| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    let turns = rest.iter().filter(|m| !(m.role == "tool" || is_call(m)));
+    for (turn, m) in turns.enumerate() {
+        if (m.role == "user") != (turn % 2 == 0) {
+            return Err(
+                "After the optional system message, conversation roles must alternate \
+                        user/assistant/user/assistant/..."
+                    .into(),
+            );
+        }
+    }
+    let last_user = rest.iter().rposition(|m| m.role == "user");
+    let mut p = String::new();
+    let mut call_index = 0;
+    for (i, m) in rest.iter().enumerate() {
+        if m.role == "user" {
+            if Some(i) == last_user {
+                let listed: Vec<String> = tools
+                    .iter()
+                    .map(|t| {
+                        let fields: Vec<String> = t["function"]
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .filter(|(k, _)| k.as_str() != "return")
+                            .map(|(k, v)| match v {
+                                serde_json::Value::String(s) => format!("\"{k}\": \"{s}\""),
+                                v => format!("\"{k}\": {}", tojson(v)),
+                            })
+                            .collect();
+                        format!(
+                            "{{\"type\": \"function\", \"function\": {{{}}}}}",
+                            fields.join(", ")
+                        )
+                    })
+                    .collect();
+                p.push_str(&format!(
+                    "[AVAILABLE_TOOLS] [{}][/AVAILABLE_TOOLS]",
+                    listed.join(", ")
+                ));
+            }
+            match system {
+                Some(sys) if i + 1 == rest.len() => {
+                    p.push_str(&format!("[INST] {sys}\n\n{}[/INST]", m.content))
+                }
+                _ => p.push_str(&format!("[INST] {}[/INST]", m.content)),
+            }
+        } else if is_call(m) {
+            let calls: Vec<String> = m
+                .tool_calls
+                .iter()
+                .flatten()
+                .map(|c| {
+                    call_index += 1;
+                    format!(
+                        "{{\"name\": {}, \"arguments\": {}, \"id\": \"{}\"}}",
+                        tojson(&serde_json::Value::String(c.function.name.clone())),
+                        tojson(&call_arguments(c)),
+                        mistral_call_id(c.id.as_deref(), call_index)
+                    )
+                })
+                .collect();
+            p.push_str(&format!("[TOOL_CALLS] [{}]</s>", calls.join(", ")));
+        } else if m.role == "assistant" {
+            p.push_str(&format!(" {}</s>", m.content.trim()));
+        } else if m.role == "tool" {
+            p.push_str(&format!(
+                "[TOOL_RESULTS] {{\"content\": {}, \"call_id\": \"{}\"}}[/TOOL_RESULTS]",
+                m.content,
+                mistral_call_id(m.tool_call_id.as_deref(), call_index)
+            ));
+        } else {
+            return Err(
+                "Only user and assistant roles are supported, with the exception of an \
+                        initial optional system message!"
+                    .into(),
+            );
+        }
+    }
+    Ok(p)
+}
+
 /// Where a tool call starts in a ChatML reply.
 const TOOL_OPEN: &str = "<tool_call>";
 
-/// A reply's text before its first `<tool_call>`, and each call's name and
-/// arguments (a JSON string). A reply whose blocks do not hold a call's JSON
-/// is left as text, with no calls.
+/// The calls in a reply, as `(name, arguments JSON)`: every JSON object (or
+/// each object of a JSON array) from `start` on, taking its arguments from
+/// `arguments` or Llama's `parameters`. `None` unless all of it parses.
+fn json_calls(after: &str) -> Option<Vec<(String, String)>> {
+    let mut calls = Vec::new();
+    for v in serde_json::Deserializer::from_str(after).into_iter::<serde_json::Value>() {
+        let v = v.ok()?;
+        let items = match v {
+            serde_json::Value::Array(a) => a,
+            one => vec![one],
+        };
+        for c in items {
+            let name = c["name"].as_str()?.to_string();
+            let args = match c.get("arguments").or_else(|| c.get("parameters")) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => "{}".to_string(),
+            };
+            calls.push((name, args));
+        }
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// A reply's text before its first tool call, and each call's name and
+/// arguments, in `template`'s format: ChatML's `<tool_call>` blocks, Mistral's
+/// `[TOOL_CALLS] [...]`, or Llama 3's bare JSON object. A reply whose call does
+/// not parse is left as text, with no calls.
+fn split_tool_calls_for(template: ChatTemplate, text: &str) -> (String, Vec<(String, String)>) {
+    let open = template.tool_open();
+    if open == TOOL_OPEN {
+        return split_tool_calls(text);
+    }
+    let Some(start) = text.find(open) else {
+        return (text.to_string(), Vec::new());
+    };
+    // Mistral's marker is a token of its own; Llama's is the call's first bytes.
+    let body = if template == ChatTemplate::Mistral {
+        &text[start + open.len()..]
+    } else {
+        &text[start..]
+    };
+    match json_calls(body) {
+        Some(calls) => (text[..start].trim_end().to_string(), calls),
+        None => (text.to_string(), Vec::new()),
+    }
+}
+
+/// ChatML's [`split_tool_calls_for`]: a reply's text before its first
+/// `<tool_call>`, and each call's name and arguments (a JSON string). A reply
+/// whose blocks do not hold a call's JSON is left as text, with no calls.
 fn split_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
     const CLOSE: &str = "</tool_call>";
     let Some(start) = text.find(TOOL_OPEN) else {
@@ -678,6 +975,8 @@ fn partial_marker(text: &str, marker: &str) -> usize {
 /// A tool call in an assistant message, as OpenAI sends it back.
 #[derive(Deserialize, Default)]
 pub struct ToolCallIn {
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub function: FunctionCallIn,
 }
@@ -1337,6 +1636,15 @@ impl ChatTemplate {
         }
     }
 
+    /// Where a tool call starts in this format's replies.
+    fn tool_open(&self) -> &'static str {
+        match self {
+            ChatTemplate::Llama3 => "{\"name\"",
+            ChatTemplate::Mistral => "[TOOL_CALLS]",
+            _ => TOOL_OPEN,
+        }
+    }
+
     /// The control token that closes a turn, when the format has one distinct
     /// from EOS. Generation must stop on it even when `config.json` lists only
     /// `<eos>` (gemma-1.1 does), or the model runs on into a fabricated next turn.
@@ -1353,9 +1661,9 @@ impl ChatTemplate {
     /// Render `messages` into the prompt string for this template. BOS is left
     /// to the tokenizer (`add_bos_token`), which skips it when the text already
     /// starts with it.
-    /// [`apply`](Self::apply), with `tools` the model may call. Only ChatML has a
-    /// tool format dlm writes (Qwen's: the tools in the system turn, calls in
-    /// `<tool_call>` tags); any other template refuses them.
+    /// [`apply`](Self::apply), with `tools` the model may call, in the format
+    /// the model was trained on: ChatML (Qwen's), Llama 3.1+ and Mistral v0.3.
+    /// Gemma's template has no tool format, and other templates refuse tools.
     pub fn apply_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -1364,8 +1672,10 @@ impl ChatTemplate {
         match self {
             _ if tools.is_empty() => Ok(self.apply(messages)),
             ChatTemplate::ChatMl => Ok(chatml(messages, tools)),
+            ChatTemplate::Llama3 => llama3_tools(messages, tools, &today_dmy()),
+            ChatTemplate::Mistral => mistral_tools(messages, tools),
             other => Err(format!(
-                "tools need the chatml chat template (Qwen); this model's is {}",
+                "tools need the chatml (Qwen), llama3 or mistral chat template; this model's is {}",
                 other.name()
             )),
         }
@@ -1943,9 +2253,9 @@ struct Streamed {
     /// Tokens with log-probabilities whose text has not gone out, with their
     /// character offsets.
     pending: Vec<(u32, TokenLogprobs, usize)>,
-    /// Hold back text from the first `<tool_call>` on: the request has tools,
-    /// and calls go out whole at the end.
-    hold_tools: bool,
+    /// Hold back text from the first tool-call marker on: the request has
+    /// tools, and calls go out whole at the end.
+    hold_tools: Option<&'static str>,
 }
 
 impl Streamed {
@@ -1958,7 +2268,7 @@ impl Streamed {
             finish: "length",
             spec: None,
             pending: Vec::new(),
-            hold_tools: false,
+            hold_tools: None,
         }
     }
 
@@ -1985,10 +2295,10 @@ impl Streamed {
                 self.chars = full.chars().count();
                 let cut = earliest_stop(&full, stops);
                 let mut end = cut.unwrap_or(full.len());
-                if self.hold_tools {
-                    end = match full[..end].find(TOOL_OPEN) {
+                if let Some(open) = self.hold_tools {
+                    end = match full[..end].find(open) {
                         Some(at) => at,
-                        None => end - partial_marker(&full[..end], TOOL_OPEN),
+                        None => end - partial_marker(&full[..end], open),
                     };
                 }
                 let visible = &full[..end];
@@ -2024,7 +2334,7 @@ fn stream_choices(
     engine: &EngineService,
     started: Started,
     stops: &[String],
-    hold_tools: bool,
+    hold_tools: Option<&'static str>,
     mut send: impl FnMut(usize, &mut Streamed, String) -> std::io::Result<()>,
 ) -> std::io::Result<Vec<Streamed>> {
     use std::sync::mpsc::RecvTimeoutError;
@@ -2155,7 +2465,7 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
                     let (content, calls) = if tools.is_empty() {
                         (g.text, Vec::new())
                     } else {
-                        split_tool_calls(&g.text)
+                        split_tool_calls_for(engine.chat_template, &g.text)
                     };
                     Choice {
                         index,
@@ -2568,7 +2878,7 @@ fn stream_completion(
             w.flush()
         };
 
-        let choices = stream_choices(&engine, started, &stops, false, |i, c, text| {
+        let choices = stream_choices(&engine, started, &stops, None, |i, c, text| {
             let lps = logprobs.then(|| {
                 let mut out = CompletionLogprobs::default();
                 for (t, lp, offset) in std::mem::take(&mut c.pending) {
@@ -3024,7 +3334,8 @@ fn stream_chat(
         }
 
         let request = engine.next_id.load(Ordering::Relaxed);
-        let mut choices = stream_choices(&engine, started, &stops, tools, |i, c, text| {
+        let hold = tools.then(|| engine.chat_template.tool_open());
+        let mut choices = stream_choices(&engine, started, &stops, hold, |i, c, text| {
             let lps = logprobs.then(|| ChatLogprobs {
                 content: std::mem::take(&mut c.pending)
                     .iter()
@@ -3046,7 +3357,7 @@ fn stream_chat(
             for (i, c) in choices.iter_mut().enumerate() {
                 let full = engine.tokenizer.decode(&c.ids).unwrap_or_default();
                 let full = &full[..earliest_stop(&full, &stops).unwrap_or(full.len())];
-                let (_, calls) = split_tool_calls(full);
+                let (_, calls) = split_tool_calls_for(engine.chat_template, full);
                 let delta = if calls.is_empty() {
                     let rest: String = full.chars().skip(c.sent).collect();
                     if rest.is_empty() {
@@ -3110,6 +3421,86 @@ fn stream_chat(
 mod tests {
     use super::*;
 
+    const WEATHER_TOOL: &str = r#"{"type": "function", "function": {
+        "description": "Get the weather in a city", "name": "get_weather",
+        "parameters": {"properties": {"city": {"description": "City name", "type": "string"}},
+                       "required": ["city"], "type": "object"}}}"#;
+
+    /// Llama 3.2's own Jinja template (rendered by `transformers` with
+    /// `date_string="17 Nov 2026"`) gave the expected string, from the request
+    /// as an OpenAI client sends it.
+    #[test]
+    fn tools_render_as_llama3s_template_does() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "18C and sunny"}]}"#,
+        )
+        .unwrap();
+        let tools = [serde_json::from_str(WEATHER_TOOL).unwrap()];
+        let got = llama3_tools(&req.messages, &tools, "17 Nov 2026").unwrap();
+        let want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\nToday Date: 17 Nov 2026\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"description\": \"Get the weather in a city\",\n        \"name\": \"get_weather\",\n        \"parameters\": {\n            \"properties\": {\n                \"city\": {\n                    \"description\": \"City name\",\n                    \"type\": \"string\"\n                }\n            },\n            \"required\": [\n                \"city\"\n            ],\n            \"type\": \"object\"\n        }\n    }\n}\n\nWeather in Paris?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}<|eot_id|><|start_header_id|>ipython<|end_header_id|>\n\n\"18C and sunny\"<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+        assert_eq!(got, want);
+    }
+
+    /// Mistral v0.3's own Jinja template (rendered by `transformers`) gave the
+    /// expected string. Its 9-character call id passes through unchanged.
+    #[test]
+    fn tools_render_as_mistrals_template_does() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "abc123XYZ", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "abc123XYZ", "content": "18C and sunny"},
+                {"role": "assistant", "content": "It is 18C and sunny."},
+                {"role": "user", "content": "And Rome?"}]}"#,
+        )
+        .unwrap();
+        let tools = [serde_json::from_str(WEATHER_TOOL).unwrap()];
+        let got = mistral_tools(&req.messages, &tools).unwrap();
+        let want = "[INST] Weather in Paris?[/INST][TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"abc123XYZ\"}]</s>[TOOL_RESULTS] {\"content\": 18C and sunny, \"call_id\": \"abc123XYZ\"}[/TOOL_RESULTS] It is 18C and sunny.</s>[AVAILABLE_TOOLS] [{\"type\": \"function\", \"function\": {\"description\": \"Get the weather in a city\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST] Be brief.\n\nAnd Rome?[/INST]";
+        assert_eq!(got, want);
+        // An OpenAI-style id maps to 9 alphanumerics, the same for the call and
+        // the result that names it.
+        let id = mistral_call_id(Some("call_17_0"), 1);
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(id, mistral_call_id(Some("call_17_0"), 5));
+    }
+
+    /// Each format's calls come back out of a reply; text before the call is
+    /// kept, and a call that does not parse leaves the reply as text.
+    #[test]
+    fn tool_calls_parse_per_template() {
+        let llama = "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}";
+        assert_eq!(
+            split_tool_calls_for(ChatTemplate::Llama3, llama),
+            (
+                String::new(),
+                vec![("get_weather".into(), "{\"city\":\"Paris\"}".into())]
+            )
+        );
+        let mistral = "Sure.[TOOL_CALLS] [{\"name\": \"a\", \"arguments\": {\"x\": 1}}, {\"name\": \"b\", \"arguments\": {}}]";
+        let (text, calls) = split_tool_calls_for(ChatTemplate::Mistral, mistral);
+        assert_eq!(text, "Sure.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "b");
+        let broken = "[TOOL_CALLS] [{\"name\": ";
+        assert_eq!(
+            split_tool_calls_for(ChatTemplate::Mistral, broken),
+            (broken.to_string(), vec![])
+        );
+        assert_eq!(
+            split_tool_calls_for(ChatTemplate::Llama3, "Paris is sunny."),
+            ("Paris is sunny.".to_string(), vec![])
+        );
+    }
+
     /// Tools render exactly as Qwen3's own Jinja template renders them
     /// (`transformers`' `apply_chat_template` on Qwen3-0.6B gave the string
     /// below), from the request as an OpenAI client sends it: arguments as a
@@ -3132,7 +3523,7 @@ mod tests {
         )
         .unwrap();
         let tools = req.tools.unwrap();
-        let want: String = serde_json::from_str(r#""<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Weather for a city\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n24C\n</tool_response><|im_end|>\n<|im_start|>assistant\n""#).unwrap();
+        let want: String = serde_json::from_str(r#""<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n24C\n</tool_response><|im_end|>\n<|im_start|>assistant\n""#).unwrap();
         assert_eq!(
             ChatTemplate::ChatMl
                 .apply_with_tools(&req.messages, &tools)

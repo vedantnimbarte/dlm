@@ -126,6 +126,18 @@ pub enum DistributedMode {
     Worker,
 }
 
+/// How `/v1/embeddings` pools hidden states (`--embedding-pooling`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PoolingArg {
+    /// What a sentence-transformers export says in `1_Pooling/config.json`
+    /// (mean or last token); the last token without one.
+    Auto,
+    /// The last token's hidden state.
+    Last,
+    /// The mean over every token.
+    Mean,
+}
+
 /// Compute device for generation (`--device`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Device {
@@ -460,6 +472,13 @@ pub struct ServeArgs {
     /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `phi3`, `deepseek`.
     #[arg(long, value_name = "NAME", default_value = "auto")]
     pub chat_template: String,
+
+    /// How `/v1/embeddings` pools the tokens' hidden states. `auto` follows a
+    /// sentence-transformers export's `1_Pooling/config.json` (mean or last
+    /// token) and otherwise takes the last token, which most decoder embedding
+    /// models are trained for.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub embedding_pooling: PoolingArg,
 
     /// Stop generation when the model produces this token id (the model's EOS).
     /// Overrides the `eos_token_id` auto-detected from `config.json`; omit to use
