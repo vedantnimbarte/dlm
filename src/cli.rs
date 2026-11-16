@@ -477,6 +477,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub prefix_cache_size: Option<usize>,
 
+    /// Also keep cached prompt prefixes in this directory, so they survive a
+    /// restart: a long system prompt is prefilled once, not once per start.
+    /// Each model and setting (weights, `--quant`, `--kv-quant`, device, dlm
+    /// version) gets a subdirectory of its own. Needs the prefix cache on.
+    #[arg(long, value_name = "DIR")]
+    pub prefix_cache_dir: Option<PathBuf>,
+
     /// Turn away a request that has waited this many seconds to be admitted,
     /// with `503` and `Retry-After`, instead of letting a backlog grow without
     /// bound. Only queued requests: one already decoding runs to its end. Off

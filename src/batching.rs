@@ -57,6 +57,69 @@ struct PrefixCache {
     max_entries: usize,
     /// `(prompt tokens, snapshot after prefilling them)`, oldest first.
     entries: Vec<(Vec<u32>, KvSnapshot)>,
+    /// Where each entry is also written, so it outlives the process
+    /// (`--prefix-cache-dir`); `None` keeps the cache in memory only.
+    dir: Option<std::path::PathBuf>,
+}
+
+/// Cached prefixes read back at start-up stop at this many bytes of files.
+/// On a GPU a restored entry is a host copy of its KV until a request resumes
+/// from it, so the bound is host RAM.
+///
+/// ponytail: a fixed 1 GiB; size it from free RAM if that ever matters.
+const DISK_LOAD_BYTES: u64 = 1 << 30;
+
+/// The file a cached `prompt` is kept in under `dir`. The name only has to be
+/// unique per prompt: the tokens themselves are stored inside.
+fn prefix_file(dir: &std::path::Path, prompt: &[u32]) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut h);
+    dir.join(format!("{:016x}.kv", h.finish()))
+}
+
+/// Write `prompt` and its snapshot to `path`, via a temporary file so a crash
+/// mid-write never leaves a torn entry for the next start to read.
+fn write_prefix(path: &std::path::Path, prompt: &[u32], snapshot: &KvSnapshot) -> Result<()> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(prompt.len() as u64).to_le_bytes());
+    for t in prompt {
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
+    // Pulls device rows to the host: done here, on the scheduler thread that
+    // owns the GPU; only the file write is left to another thread.
+    snapshot.write_to(&mut buf)?;
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let tmp = path.with_extension("tmp");
+        let done = std::fs::write(&tmp, &buf).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = done {
+            eprintln!("prefix cache: could not write {}: {e}", path.display());
+        }
+    });
+    Ok(())
+}
+
+/// A prompt and snapshot written by [`write_prefix`].
+fn read_prefix(path: &std::path::Path) -> std::io::Result<(Vec<u32>, KvSnapshot)> {
+    use std::io::Read;
+    let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    let n = u64::from_le_bytes(b);
+    if n > 1 << 24 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "prompt length out of range",
+        ));
+    }
+    let mut toks = vec![0u8; n as usize * 4];
+    r.read_exact(&mut toks)?;
+    let prompt = toks
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok((prompt, KvSnapshot::read_from(&mut r)?))
 }
 
 impl PrefixCache {
@@ -64,7 +127,52 @@ impl PrefixCache {
         Self {
             max_entries,
             entries: Vec::new(),
+            dir: None,
         }
+    }
+
+    /// Keep entries in `dir` from now on, first loading what an earlier run
+    /// left there: the newest entries, up to the cache's bound and
+    /// [`DISK_LOAD_BYTES`]. Older files are deleted, and so are unreadable ones.
+    /// `dir` must be specific to the model and its settings (the caller's
+    /// fingerprint): a snapshot is only valid for the weights that made it.
+    /// Returns how many entries were loaded.
+    fn persist_in(&mut self, dir: std::path::PathBuf, layers: usize) -> std::io::Result<usize> {
+        std::fs::create_dir_all(&dir)?;
+        let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> =
+            std::fs::read_dir(&dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "kv"))
+                .filter_map(|e| {
+                    let m = e.metadata().ok()?;
+                    Some((m.modified().ok()?, m.len(), e.path()))
+                })
+                .collect();
+        files.sort_by_key(|f| std::cmp::Reverse(f.0)); // newest first
+        let (mut bytes, mut loaded) = (0u64, Vec::new());
+        for (_, len, path) in files {
+            if loaded.len() >= self.max_entries || bytes + len > DISK_LOAD_BYTES {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            match read_prefix(&path) {
+                Ok(entry) if entry.1.layers() == layers => {
+                    bytes += len;
+                    loaded.push(entry);
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        let n = loaded.len();
+        loaded.reverse(); // oldest first, like `entries`
+        self.entries.extend(loaded);
+        while self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
+        self.dir = Some(dir);
+        Ok(n)
     }
 
     /// A snapshot of the longest run of leading tokens `prompt` shares with a
@@ -111,10 +219,22 @@ impl PrefixCache {
         if self.max_entries == 0 {
             return;
         }
+        if let Some(dir) = &self.dir {
+            // Same prompt, same model: a file already there holds the same KV.
+            let path = prefix_file(dir, &prompt);
+            if !path.exists() {
+                if let Err(e) = write_prefix(&path, &prompt, &snapshot) {
+                    eprintln!("prefix cache: could not save a prefix: {e}");
+                }
+            }
+        }
         self.entries.retain(|(toks, _)| toks != &prompt);
         self.entries.push((prompt, snapshot));
         if self.entries.len() > self.max_entries {
-            self.entries.remove(0);
+            let (old, _) = self.entries.remove(0);
+            if let Some(dir) = &self.dir {
+                let _ = std::fs::remove_file(prefix_file(dir, &old));
+            }
         }
     }
 }
@@ -301,6 +421,17 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// speculative slots. Zero unless the scheduler speculates.
     pub fn speculative_stats(&self) -> (usize, usize) {
         (self.proposed, self.accepted)
+    }
+
+    /// Also keep the prefix cache in `dir`, loading what an earlier run left
+    /// there (see `PrefixCache::persist_in`). `dir` must be specific to the
+    /// model and its settings. Returns the entries loaded; 0 with the cache off.
+    pub fn persist_prefix_cache(&mut self, dir: std::path::PathBuf) -> std::io::Result<usize> {
+        let layers = self.generator.num_layers();
+        match self.prefix_cache.as_mut() {
+            Some(c) => c.persist_in(dir, layers),
+            None => Ok(0),
+        }
     }
 
     /// How many admitted requests resumed from a cached prefix (prefix-cache
@@ -809,6 +940,31 @@ mod prefix_cache_tests {
         let mut off = PrefixCache::new(0);
         off.insert(vec![1, 2], snap());
         assert!(off.entries.is_empty());
+    }
+
+    /// Entries written to a directory come back in a new cache, newest first
+    /// within the bound, and the oldest file goes once the bound evicts it.
+    #[test]
+    fn prefix_cache_persists_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("dlm-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = PrefixCache::new(2);
+        a.persist_in(dir.clone(), 1).unwrap();
+        for i in 0..3u32 {
+            a.insert(vec![i, i + 1, i + 2], snap_of(3));
+            std::thread::sleep(std::time::Duration::from_millis(50)); // writes land, mtimes differ
+        }
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(files, 2, "the evicted entry's file is gone");
+
+        let mut b = PrefixCache::new(2);
+        assert_eq!(b.persist_in(dir.clone(), 1).unwrap(), 2);
+        let prompts: Vec<_> = b.entries.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(prompts, vec![vec![1, 2, 3], vec![2, 3, 4]]);
+        assert_eq!(b.entries[1].1.position(), 3);
+        // A model with another layer count reads none of them.
+        assert_eq!(PrefixCache::new(2).persist_in(dir.clone(), 7).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Re-inserting a prompt replaces its entry instead of duplicating it —

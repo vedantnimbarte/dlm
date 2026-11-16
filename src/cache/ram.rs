@@ -13,7 +13,8 @@
 //! Autoregressive generation streams every layer once per token, so without a
 //! cache each token re-faults the whole model off disk. With it, as many hot
 //! layers as fit in the RAM budget stay resident across token steps and skip the
-//! disk read entirely. Eviction is strict LRU by byte budget; a single entry
+//! disk read entirely. Eviction is most-recently-used first by byte budget
+//! (layers are read in a cycle, where LRU never hits); a single entry
 //! larger than the whole budget is kept rather than thrashed (it has nowhere
 //! smaller to go).
 
@@ -72,7 +73,7 @@ impl LayerRamCache {
 
     /// Fetch layer `layer`, loading it via `load` on a miss and caching the
     /// result. On a hit the layer is marked most-recently-used; on a miss the
-    /// loaded bytes are inserted and LRU entries are evicted to fit the budget.
+    /// loaded bytes are inserted and entries are evicted to fit the budget.
     pub fn get_or_load<F>(&mut self, layer: u32, load: F) -> Result<&[u8]>
     where
         F: FnOnce() -> Result<Vec<u8>>,
@@ -164,7 +165,7 @@ impl LayerRamCache {
         self.order.push_back(layer);
     }
 
-    /// Insert a freshly loaded layer and evict LRU entries to fit the budget.
+    /// Insert a freshly loaded layer and evict entries to fit the budget.
     fn insert_new(&mut self, layer: u32, bytes: Vec<u8>) {
         self.resident_bytes += bytes.len() as u64;
         self.entries.insert(layer, bytes);
@@ -172,18 +173,16 @@ impl LayerRamCache {
         self.evict_to_fit(layer);
     }
 
-    /// Evict least-recently-used entries until within budget, never evicting the
-    /// just-inserted `protected` layer (it sits at the back, so it is only ever
-    /// the victim when it is the sole entry — which the length guard prevents).
+    /// Evict most-recently-used entries until within budget, never the
+    /// just-inserted `protected` layer. Layers are read in a cycle, so the most
+    /// recent one is needed last; LRU would evict the next layer due and never
+    /// hit once the model outgrows the budget.
     fn evict_to_fit(&mut self, protected: u32) {
-        while self.resident_bytes > self.capacity_bytes && self.order.len() > 1 {
-            let victim = *self.order.front().expect("non-empty");
-            if victim == protected {
-                // Defensive: rotate it to the back and retry.
-                self.order.rotate_left(1);
-                continue;
-            }
-            self.order.pop_front();
+        while self.resident_bytes > self.capacity_bytes {
+            let Some(i) = self.order.iter().rposition(|&l| l != protected) else {
+                break;
+            };
+            let victim = self.order.remove(i).expect("index in range");
             if let Some(bytes) = self.entries.remove(&victim) {
                 self.resident_bytes -= bytes.len() as u64;
                 self.evictions += 1;
@@ -231,23 +230,34 @@ mod tests {
     }
 
     #[test]
-    fn evicts_lru_when_over_budget() {
+    fn evicts_most_recent_when_over_budget() {
         // Budget for exactly two 100-byte layers.
         let mut cache = LayerRamCache::new(200);
         cache.get_or_load(0, || Ok(bytes_of(0, 100))).unwrap();
         cache.get_or_load(1, || Ok(bytes_of(1, 100))).unwrap();
-        assert_eq!(cache.len(), 2);
-
-        // Touch layer 0 so layer 1 becomes LRU.
+        // Touch layer 0 so it is the most recent.
         cache.get_or_load(0, || Ok(bytes_of(0, 100))).unwrap();
-        // Insert layer 2 → must evict layer 1 (the LRU), keep 0 and 2.
+        // Insert layer 2 → evicts layer 0 (most recent), keeps 1 and 2.
         cache.get_or_load(2, || Ok(bytes_of(2, 100))).unwrap();
 
-        assert!(cache.contains(0));
-        assert!(!cache.contains(1));
+        assert!(!cache.contains(0));
+        assert!(cache.contains(1));
         assert!(cache.contains(2));
         assert_eq!(cache.resident_bytes(), 200);
         assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
+    fn cyclic_scan_keeps_hitting_when_model_outgrows_budget() {
+        // 3 of 5 layers fit. LRU would miss all 5 every pass after the first.
+        let mut cache = LayerRamCache::new(300);
+        for _ in 0..4 {
+            for l in 0..5 {
+                cache.get_or_load(l, || Ok(bytes_of(l, 100))).unwrap();
+            }
+        }
+        // Passes 2-4 hit at least 2 of 5 layers each.
+        assert!(cache.stats().hits >= 6, "{:?}", cache.stats());
     }
 
     #[test]

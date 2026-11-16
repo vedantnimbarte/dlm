@@ -3052,6 +3052,41 @@ fn gpu_decode_batch_matches_solo() {
             }
         }
     }
+    // A streamed MoE model decodes a batch layer by layer with its experts
+    // grouped over the batch; alone, a token's expert misses may run on the CPU.
+    // An expert cache of 1 makes the grouped pass evict between experts.
+    let moe_cfg = BlockConfig {
+        moe: Some(MoeConfig {
+            num_experts: 4,
+            experts_per_tok: 2,
+            moe_intermediate_size: 64,
+            shared_intermediate_size: Some(64),
+            norm_topk_prob: true,
+            naming: MoeNaming::Qwen,
+            first_k_dense: 0,
+        }),
+        ..cfg
+    };
+    for cache in [1, 64] {
+        let streaming = StreamingGpuKernel::new(
+            moe_cfg,
+            MoeVecSource(random_moe_layers(&moe_cfg, 3, 0xDECD)),
+            64,
+            2,
+            Some(cache),
+        )
+        .unwrap()
+        .with_kv_pool_tokens(5 * 64);
+        for n in [2, 5] {
+            assert_decode_batch_matches_solo(
+                &streaming,
+                moe_cfg,
+                n,
+                dlm::forward::KvQuant::None,
+                &format!("streaming moe, expert cache {cache}"),
+            );
+        }
+    }
     let (mla_cfg, shape) = mla_test_config(None);
     let mla = GpuKernel::new(
         mla_cfg,

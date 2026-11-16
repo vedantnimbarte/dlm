@@ -225,6 +225,13 @@ extern "C" {
     /// router and expert calls read.
     pub(crate) fn dlm_moe_take_row(hidden_size: i32, b: i32) -> i32;
 
+    /// Copy the current FFN input out to `dst` (`hidden_size` device floats).
+    pub(crate) fn dlm_moe_save_normed(hidden_size: i32, dst: *mut f32) -> i32;
+
+    /// Make `src` (`hidden_size` device floats) the FFN input the router and
+    /// expert calls read.
+    pub(crate) fn dlm_moe_load_normed(hidden_size: i32, src: *const f32) -> i32;
+
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
     /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
     pub(crate) fn dlm_moe_matvec(
@@ -975,9 +982,19 @@ impl GpuMoeCore {
         hidden: *mut f32,
         mut expert: impl FnMut(usize) -> Result<E>,
     ) -> Result<()> {
-        let m = cfg.moe.expect("GpuMoeCore::run on a dense model");
+        let selected = self.route(cfg)?;
+        let mut experts = Vec::with_capacity(selected.len());
+        for (e, weight) in selected {
+            experts.push((expert(e)?, weight));
+        }
+        self.apply_routed(cfg, &experts, hidden)?;
+        self.apply_shared(cfg, hidden)
+    }
 
-        // 1. Router logits → host, then top-k + softmax there.
+    /// Router logits for the current FFN input → host, then top-k + softmax
+    /// there: `(expert, gate weight)` pairs.
+    pub(crate) fn route(&self, cfg: &BlockConfig) -> Result<Vec<(usize, f32)>> {
+        let m = cfg.moe.expect("GpuMoeCore::route on a dense model");
         let n_exp = m.num_experts as usize;
         let mut logits = vec![0f32; n_exp];
         let code = unsafe {
@@ -996,18 +1013,26 @@ impl GpuMoeCore {
                 code,
             });
         }
+        Ok(crate::forward::cpu::route_topk(
+            &logits,
+            m.experts_per_tok as usize,
+            m.norm_topk_prob,
+        ))
+    }
 
-        // 2. Apply the selected experts in one grouped launch (`dlm_apply_experts`:
+    /// `hidden += Σ weight · expert(normed2)` over the already-selected experts.
+    pub(crate) fn apply_routed<E: std::ops::Deref<Target = GpuExpert>>(
+        &self,
+        cfg: &BlockConfig,
+        experts: &[(E, f32)],
+        hidden: *mut f32,
+    ) -> Result<()> {
+        let m = cfg.moe.expect("GpuMoeCore::apply_routed on a dense model");
+        // Apply the selected experts in one grouped launch (`dlm_apply_experts`:
         // 3 kernels total rather than 3 per expert, each with a k-times-larger
         // grid). Same arithmetic as applying them one at a time — only the
         // summation order over experts differs.
         let inter = m.moe_intermediate_size as i32;
-        let selected =
-            crate::forward::cpu::route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob);
-        let mut experts = Vec::with_capacity(selected.len());
-        for (e, weight) in selected {
-            experts.push((expert(e)?, weight));
-        }
         // The grouped kernel takes one dtype for the whole group and a bounded
         // expert count; both hold for every real checkpoint (one export, top-k
         // <= 8). Anything else falls back to the per-expert path rather than
@@ -1051,12 +1076,17 @@ impl GpuMoeCore {
                 });
             }
         } else {
-            for (expert, weight) in &experts {
+            for (expert, weight) in experts {
                 self.apply_one(cfg, expert, inter, *weight, hidden)?;
             }
         }
+        Ok(())
+    }
 
-        // 3. Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
+    /// The shared expert (Qwen2-MoE / DeepSeek), if any, on the current FFN input.
+    pub(crate) fn apply_shared(&self, cfg: &BlockConfig, hidden: *mut f32) -> Result<()> {
+        let m = cfg.moe.expect("GpuMoeCore::apply_shared on a dense model");
+        // Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
         if let Some(sh) = &self.shared {
             let weight = match &self.shared_gate {
                 Some(g) => {
@@ -1091,7 +1121,7 @@ impl GpuMoeCore {
     }
 
     /// `x += weight * expert(normed2)`, one expert at a time.
-    fn apply_one(
+    pub(crate) fn apply_one(
         &self,
         cfg: &BlockConfig,
         expert: &GpuExpert,

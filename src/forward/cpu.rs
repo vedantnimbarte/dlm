@@ -1267,6 +1267,116 @@ pub enum KvQuant {
     Int4,
 }
 
+impl KvLayerCache {
+    /// Write this layer's history: width, device element and the host store's
+    /// arrays as they are. Every row must be on the host (a GPU kernel's cache
+    /// goes through `sync_from_device` first). Read back by [`read_host`](Self::read_host).
+    pub(crate) fn write_host(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        if self.device_tokens != 0 {
+            return Err(std::io::Error::other("KV rows still on the device"));
+        }
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let i8s = |v: &[i8]| v.iter().map(|&x| x as u8).collect::<Vec<u8>>();
+        let (tag, arrays): (u8, [Vec<u8>; 4]) = match &self.store {
+            KvStore::Full { keys, values } => (0, [f32s(keys), f32s(values), vec![], vec![]]),
+            KvStore::Int8 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => (
+                1,
+                [i8s(keys), f32s(key_scales), i8s(values), f32s(value_scales)],
+            ),
+            KvStore::Int4 {
+                keys,
+                key_scales,
+                values,
+                value_scales,
+            } => (
+                2,
+                [
+                    keys.clone(),
+                    f32s(key_scales),
+                    values.clone(),
+                    f32s(value_scales),
+                ],
+            ),
+        };
+        w.write_all(&(self.kv_dim as u64).to_le_bytes())?;
+        w.write_all(&[tag, self.device_elem as u8])?;
+        for a in arrays {
+            w.write_all(&(a.len() as u64).to_le_bytes())?;
+            w.write_all(&a)?;
+        }
+        Ok(())
+    }
+
+    /// A layer written by [`write_host`](Self::write_host), its rows on the host.
+    pub(crate) fn read_host(r: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let bad =
+            |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_string());
+        let mut u64b = [0u8; 8];
+        r.read_exact(&mut u64b)?;
+        let kv_dim = u64::from_le_bytes(u64b) as usize;
+        let mut tag = [0u8; 2];
+        r.read_exact(&mut tag)?;
+        let mut arrays: [Vec<u8>; 4] = Default::default();
+        for a in &mut arrays {
+            r.read_exact(&mut u64b)?;
+            let n = u64::from_le_bytes(u64b);
+            // A corrupt length must not become a giant allocation.
+            if n > 1 << 36 {
+                return Err(bad("KV array length out of range"));
+            }
+            *a = vec![0u8; n as usize];
+            r.read_exact(a)?;
+        }
+        let f32s = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let i8s = |b: &[u8]| b.iter().map(|&x| x as i8).collect::<Vec<i8>>();
+        let [a, b, c, d] = arrays;
+        let store = match tag[0] {
+            0 => KvStore::Full {
+                keys: f32s(&a),
+                values: f32s(&b),
+            },
+            1 => KvStore::Int8 {
+                keys: i8s(&a),
+                key_scales: f32s(&b),
+                values: i8s(&c),
+                value_scales: f32s(&d),
+            },
+            2 => KvStore::Int4 {
+                keys: a,
+                key_scales: f32s(&b),
+                values: c,
+                value_scales: f32s(&d),
+            },
+            _ => return Err(bad("unknown KV store")),
+        };
+        let device_elem = match tag[1] {
+            0 => KvElem::F32,
+            1 => KvElem::F16,
+            2 => KvElem::I8,
+            _ => return Err(bad("unknown KV element")),
+        };
+        Ok(Self {
+            kv_dim,
+            store,
+            device_tokens: 0,
+            device_elem,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            gpu: None,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            paged: None,
+        })
+    }
+}
+
 /// How a layer's K/V history is stored: exact `f32`, or int8/int4-quantized with
 /// a scale per [`KV_QGROUP`] values of each token. See [`KvQuant`].
 #[derive(Debug, Clone)]
@@ -2186,7 +2296,13 @@ fn activate(act: Activation, x: f32) -> f32 {
 /// One gated-MLP expert applied to `x`: `down · (act(gate·x) ⊙ up·x)`, returning
 /// the `hidden`-wide contribution to the residual (the caller scales and adds it).
 /// `act` selects SwiGLU (SiLU) or Gemma's GeGLU (GELU).
-fn swiglu_ffn(f: &ExpertFfn, x: &[f32], hidden: usize, inter: usize, act: Activation) -> Vec<f32> {
+pub(crate) fn swiglu_ffn(
+    f: &ExpertFfn,
+    x: &[f32],
+    hidden: usize,
+    inter: usize,
+    act: Activation,
+) -> Vec<f32> {
     ffn_eval(f, x, hidden, inter, act, FfnKind::Gated)
 }
 
