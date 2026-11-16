@@ -17,6 +17,12 @@ fork that runs large MoE models from SSD.
 
 ### Changed
 
+- **JSON keeps the client's key order.** `serde_json` sorted object keys, so
+  tool definitions reached the prompt in a different order from the one
+  `transformers` writes (the existing Qwen test expected the sorted order;
+  rendering Qwen3's template shows otherwise), and a JSON schema's properties
+  were generated alphabetically rather than in the schema's order.
+
 - **Every layer cache on the streaming path now evicts the most recently used
   layer.** The VRAM window already did, since layers are read in a cycle and
   LRU evicts the layer needed next. The host-RAM tier (`--ram-cache-gb`), the
@@ -49,6 +55,14 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **Tool calling for Llama 3.1/3.2 and Mistral v0.3.** `tools` used to need
+  the ChatML template (Qwen). The `llama3` and `mistral` templates now write
+  tools, calls and results as each model's own Jinja template does (checked
+  string for string against `transformers`' rendering), and read the model's
+  calls back out of its reply. Gemma's template has no tool format.
+- **`serve --embedding-pooling auto|last|mean`.** `/v1/embeddings` took only
+  the last token; `auto` follows a sentence-transformers export's
+  `1_Pooling/config.json`.
 - **`serve --prefix-cache-dir DIR`** keeps cached prompt prefixes on disk, so
   a long system prompt is prefilled once rather than once per server start.
   Entries go in a subdirectory per model and setting (weights, `--quant`,
