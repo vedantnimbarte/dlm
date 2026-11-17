@@ -637,6 +637,9 @@ pub enum Ffn {
         experts: Vec<ExpertFfn>,      // routed experts (may be empty when streamed)
         shared: Option<ExpertFfn>,    // Qwen2-MoE shared expert; None otherwise
         shared_gate: Option<Weights>, // [1, hidden] sigmoid gate for the shared expert
+        /// DeepSeek-V3's `e_score_correction_bias` (`[num_experts]`), added to
+        /// the scores to choose experts (see [`route`]); `None` elsewhere.
+        router_bias: Option<Vec<f32>>,
     },
 }
 
@@ -650,6 +653,7 @@ impl Ffn {
                 experts,
                 shared,
                 shared_gate,
+                ..
             } => Box::new(
                 std::iter::once(router).chain(shared_gate.iter()).chain(
                     shared
@@ -670,6 +674,7 @@ impl Ffn {
                 experts,
                 shared,
                 shared_gate,
+                ..
             } => Box::new(
                 std::iter::once(router).chain(shared_gate.iter_mut()).chain(
                     shared
@@ -816,8 +821,10 @@ impl LayerTensors {
                 experts,
                 shared,
                 shared_gate,
+                router_bias,
             } => {
                 router.as_bytes().len()
+                    + bias(router_bias)
                     + experts.iter().map(ExpertFfn::byte_size).sum::<usize>()
                     + shared.as_ref().map_or(0, ExpertFfn::byte_size)
                     + shared_gate.as_ref().map_or(0, |g| g.as_bytes().len())
@@ -888,6 +895,14 @@ impl LayerTensors {
         }
     }
 
+    /// The router's score-correction bias (DeepSeek-V3), if the layer has one.
+    pub fn router_bias(&self) -> Option<&[f32]> {
+        match &self.ffn {
+            Ffn::Moe { router_bias, .. } => router_bias.as_deref(),
+            Ffn::Dense(_) => None,
+        }
+    }
+
     /// The MoE block (router + routed experts + optional shared expert), or an
     /// error if this layer is dense.
     #[allow(clippy::type_complexity)] // a borrow-tuple of the four MoE parts; a struct would only add indirection
@@ -898,6 +913,7 @@ impl LayerTensors {
                 experts,
                 shared,
                 shared_gate,
+                ..
             } => Ok((router, experts, shared.as_ref(), shared_gate.as_ref())),
             Ffn::Dense(_) => Err(DlmError::InvalidConfig(
                 "expected a Mixture-of-Experts layer but found a dense FFN".into(),
@@ -1063,6 +1079,7 @@ impl LayerTensors {
                     experts,
                     shared,
                     shared_gate,
+                    router_bias,
                 },
                 Some(m),
             ) => {
@@ -1073,6 +1090,12 @@ impl LayerTensors {
                         "router: expected {} elements, got {}",
                         n * h,
                         router.len()
+                    )));
+                }
+                if let Some(b) = router_bias.as_ref().filter(|b| b.len() != n) {
+                    return Err(DlmError::QuantLayout(format!(
+                        "e_score_correction_bias: expected {n} elements, got {}",
+                        b.len()
                     )));
                 }
                 for (e, ffn) in experts.iter().enumerate() {
@@ -1132,6 +1155,10 @@ impl LayerTensors {
                         shared_gate: m
                             .shared_intermediate_size
                             .map(|_| Weights::zeros(cfg.hidden_size)),
+                        router_bias: m
+                            .routing
+                            .score_bias
+                            .then(|| vec![0.0; m.num_experts as usize]),
                     }
                 }
             },
@@ -1165,16 +1192,20 @@ pub enum KvElem {
     /// codes (36 bytes): 1.125 bytes a value. Needs every 32-value group inside
     /// one head (`head_dim % 32 == 0`); a pool falls back to fp16 otherwise.
     I8 = 2,
+    /// int4 in the same groups of 32: a float scale then 16 bytes of 4-bit
+    /// codes (20 bytes), 0.625 bytes a value, the CPU's int4 store. Same
+    /// one-head rule as int8.
+    I4 = 3,
 }
 
 impl KvElem {
-    /// The device element type `quant` asks for. Both quantized modes take
-    /// int8 on the GPU: the CPU's int4 store has no device counterpart.
+    /// The device element type `quant` asks for.
     pub fn for_quant(quant: KvQuant) -> Self {
         match quant {
             KvQuant::None => KvElem::F32,
             KvQuant::F16 => KvElem::F16,
-            KvQuant::Int8 | KvQuant::Int4 => KvElem::I8,
+            KvQuant::Int8 => KvElem::I8,
+            KvQuant::Int4 => KvElem::I4,
         }
     }
 
@@ -1362,6 +1393,7 @@ impl KvLayerCache {
             0 => KvElem::F32,
             1 => KvElem::F16,
             2 => KvElem::I8,
+            3 => KvElem::I4,
             _ => return Err(bad("unknown KV element")),
         };
         Ok(Self {
@@ -2366,6 +2398,75 @@ pub(crate) fn route_topk(logits: &[f32], k: usize, norm: bool) -> Vec<(usize, f3
     chosen
 }
 
+/// Pick one token's experts from its router `logits` as `m.routing` says, as
+/// `(expert, weight)` pairs. The plain softmax top-k is [`route_topk`]. Otherwise,
+/// following `transformers`' DeepSeek-V2/V3 routers: scores by softmax or
+/// sigmoid; for the choice only, `bias` added (V3); with groups, only the
+/// `topk_group` best groups eligible, a group scoring its best score (V2) or its
+/// two best summed (V3); the top-k of what is eligible, weighted by their
+/// unbiased scores, renormalized if `norm_topk_prob`, then times the routed
+/// scaling factor.
+pub(crate) fn route(logits: &[f32], m: &MoeConfig, bias: Option<&[f32]>) -> Vec<(usize, f32)> {
+    let r = m.routing;
+    let k = (m.experts_per_tok as usize).min(logits.len());
+    if r.is_plain() {
+        return route_topk(logits, k, m.norm_topk_prob);
+    }
+    let mut scores = logits.to_vec();
+    if r.sigmoid {
+        for s in &mut scores {
+            *s = 1.0 / (1.0 + (-*s).exp());
+        }
+    } else {
+        softmax_inplace(&mut scores);
+    }
+    let mut choice: Vec<f32> = match bias.filter(|_| r.score_bias) {
+        Some(b) => scores.iter().zip(b).map(|(s, b)| s + b).collect(),
+        None => scores.clone(),
+    };
+    let desc = |v: &[f32], a: usize, b: usize| {
+        v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal)
+    };
+    if r.n_group > 1 {
+        let per = choice.len() / r.n_group as usize;
+        let group_score = |g: &[f32]| {
+            let mut best = [f32::NEG_INFINITY; 2];
+            for &v in g {
+                if v > best[0] {
+                    best = [v, best[0]];
+                } else if v > best[1] {
+                    best[1] = v;
+                }
+            }
+            if r.group_by_top2 {
+                best[0] + best[1]
+            } else {
+                best[0]
+            }
+        };
+        let gs: Vec<f32> = choice.chunks(per).map(group_score).collect();
+        let mut order: Vec<usize> = (0..gs.len()).collect();
+        order.sort_by(|&a, &b| desc(&gs, a, b));
+        for &g in &order[r.topk_group as usize..] {
+            choice[g * per..(g + 1) * per].fill(f32::NEG_INFINITY);
+        }
+    }
+    let mut idx: Vec<usize> = (0..choice.len()).collect();
+    idx.sort_by(|&a, &b| desc(&choice, a, b));
+    idx.truncate(k);
+    let mut chosen: Vec<(usize, f32)> = idx.into_iter().map(|e| (e, scores[e])).collect();
+    if m.norm_topk_prob {
+        let sum: f32 = chosen.iter().map(|&(_, w)| w).sum::<f32>() + 1e-20;
+        for (_, w) in &mut chosen {
+            *w /= sum;
+        }
+    }
+    for (_, w) in &mut chosen {
+        *w *= r.scale;
+    }
+    chosen
+}
+
 /// Add the Qwen2-MoE shared expert's contribution into `out`, gated by its
 /// sigmoid (`sigmoid(shared_gate · x)`; ungated → weight 1). No-op when the
 /// model has no shared expert. Shared by the resident and streamed MoE paths.
@@ -2401,8 +2502,10 @@ fn add_shared_expert(
 /// shared expert (Qwen2-MoE) gated by its sigmoid. Returns the `hidden`-wide
 /// contribution to the residual. Experts are borrowed **resident** here (no
 /// per-token clone); the streamed host path uses [`moe_ffn_streaming`] instead.
+#[allow(clippy::too_many_arguments)]
 fn moe_ffn(
     router: &Weights,
+    bias: Option<&[f32]>,
     experts: &[ExpertFfn],
     shared: Option<&ExpertFfn>,
     shared_gate: Option<&Weights>,
@@ -2416,7 +2519,7 @@ fn moe_ffn(
     let inter = m.moe_intermediate_size as usize;
     let logits = matvec_native(router, x, m.num_experts as usize, hidden);
     let mut out = vec![0.0f32; hidden];
-    for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+    for (e, weight) in route(&logits, &m, bias) {
         let expert = experts.get(e).ok_or_else(|| {
             DlmError::QuantLayout(format!(
                 "router selected expert {e} but only {} are resident",
@@ -2441,8 +2544,10 @@ fn moe_ffn(
 ///
 /// Returns any expert `fetch_expert` fails on so the caller (host or GPU cache
 /// miss) can report the exact expert that couldn't be loaded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn moe_ffn_streaming<F, E>(
     router: &Weights,
+    bias: Option<&[f32]>,
     shared: Option<&ExpertFfn>,
     shared_gate: Option<&Weights>,
     x: &[f32],
@@ -2460,7 +2565,7 @@ where
     let inter = m.moe_intermediate_size as usize;
     let logits = matvec_native(router, x, m.num_experts as usize, hidden);
     let mut out = vec![0.0f32; hidden];
-    for (e, weight) in route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob) {
+    for (e, weight) in route(&logits, &m, bias) {
         // `expert` may be an `Arc<ExpertFfn>` from a host cache — deref, don't clone.
         let expert = fetch_expert(e)?;
         let down = swiglu_ffn(&expert, x, hidden, inter, cfg.activation);
@@ -2585,6 +2690,20 @@ fn rope_inplace(
     }
 }
 
+/// RoPE for MLA's rope dims: DeepSeek rotates adjacent pairs `(2i, 2i+1)`
+/// (its reference code views them as `(d/2, 2)`), not the halves
+/// `(i, i + d/2)` [`rope_inplace`] pairs for Llama-style checkpoints. Pairing
+/// the halves leaves q.k wrong. `mla_rope_kernel` in `src/gpu/kernels.cu`
+/// mirrors this.
+fn mla_rope_inplace(v: &mut [f32], position: usize, inv_freq: &[f32]) {
+    for (i, pair) in v.chunks_exact_mut(2).enumerate() {
+        let (sin, cos) = (position as f32 * inv_freq[i]).sin_cos();
+        let (a, b) = (pair[0], pair[1]);
+        pair[0] = a * cos - b * sin;
+        pair[1] = a * sin + b * cos;
+    }
+}
+
 /// Add a projection bias in place, when the checkpoint declares one.
 fn add_bias(v: &mut [f32], bias: Option<&Vec<f32>>) {
     if let Some(b) = bias {
@@ -2691,9 +2810,9 @@ fn mla_attention_sublayer(
     // itself is unscaled (mscale = 1.0) — only the rope sub-dims rotate.
     for hh in 0..nh {
         let base = hh * qk + nope;
-        rope_inplace(&mut q[base..base + rope], 1, rope, position, &inv_freq, 1.0);
+        mla_rope_inplace(&mut q[base..base + rope], position, &inv_freq);
     }
-    rope_inplace(&mut k_pe, 1, rope, position, &inv_freq, 1.0);
+    mla_rope_inplace(&mut k_pe, position, &inv_freq);
 
     // Cache [c_kv ; k_pe] as this token's key (values unused on the MLA path).
     let mut key = c_kv;
@@ -2810,8 +2929,10 @@ pub fn decode_block(
             experts,
             shared,
             shared_gate,
+            router_bias,
         } => moe_ffn(
             router,
+            router_bias.as_deref(),
             experts,
             shared.as_ref(),
             shared_gate.as_ref(),
@@ -2938,7 +3059,15 @@ where
         None => attention_sublayer(cfg, w, hidden, kv, position)?,
     };
     let normed2 = rmsnorm(&h1, w.ffn_input_norm(), cfg.rms_eps);
-    let mut ffn_out = moe_ffn_streaming(router, shared, shared_gate, &normed2, cfg, fetch_expert)?;
+    let mut ffn_out = moe_ffn_streaming(
+        router,
+        w.router_bias(),
+        shared,
+        shared_gate,
+        &normed2,
+        cfg,
+        fetch_expert,
+    )?;
     if let Some(post_ffn) = &w.post_feedforward_layernorm {
         ffn_out = rmsnorm(&ffn_out, post_ffn, cfg.rms_eps);
     }
@@ -4025,6 +4154,62 @@ mod tests {
         }
     }
 
+    /// DeepSeek-V3's and V2's grouped routers, against `transformers`'
+    /// `DeepseekV3TopkRouter` / `DeepseekV2TopkRouter` with an identity weight
+    /// (so their logits are these), which chose these experts and weights.
+    #[test]
+    fn deepseek_routers_match_transformers() {
+        let logits = [
+            0.3f32, -1.2, 2.0, 0.1, 0.9, 0.8, -0.5, 0.0, 1.5, -2.0, 0.4, 0.6, -0.3, 1.1, 0.2, -0.9,
+        ];
+        let bias = [
+            0.05f32, 0.0, -0.1, 0.2, 0.0, 0.1, 0.0, 0.3, -0.2, 0.0, 0.0, 0.0, 0.1, -0.05, 0.0, 0.0,
+        ];
+        let moe = |routing, norm| MoeConfig {
+            num_experts: 16,
+            experts_per_tok: 4,
+            moe_intermediate_size: 8,
+            shared_intermediate_size: None,
+            norm_topk_prob: norm,
+            naming: crate::model::MoeNaming::DeepSeek,
+            first_k_dense: 0,
+            routing,
+        };
+        let sorted = |mut v: Vec<(usize, f32)>| {
+            v.sort_by_key(|&(e, _)| e);
+            v
+        };
+        let check = |got: Vec<(usize, f32)>, want: &[(usize, f32)]| {
+            assert_eq!(got.len(), want.len(), "{got:?}");
+            for ((ge, gw), (we, ww)) in got.iter().zip(want) {
+                assert_eq!(ge, we, "{got:?}");
+                assert!((gw - ww).abs() < 1e-5, "{got:?} vs {want:?}");
+            }
+        };
+        let v3 = crate::model::Routing {
+            sigmoid: true,
+            n_group: 4,
+            topk_group: 2,
+            group_by_top2: true,
+            score_bias: true,
+            scale: 2.5,
+        };
+        check(
+            sorted(route(&logits, &moe(v3, true), Some(&bias))),
+            &[(2, 0.8483067), (3, 0.505614), (5, 0.664523), (7, 0.4815562)],
+        );
+        let v2 = crate::model::Routing {
+            n_group: 4,
+            topk_group: 2,
+            scale: 16.0,
+            ..Default::default()
+        };
+        check(
+            sorted(route(&logits, &moe(v2, false), None)),
+            &[(2, 3.975165), (8, 2.411059), (10, 0.802572), (11, 0.980264)],
+        );
+    }
+
     #[test]
     fn route_topk_selects_highest_and_renormalizes() {
         // Softmax over all, then top-2. idx1 is largest, idx0 next, idx2 dropped.
@@ -4065,6 +4250,7 @@ mod tests {
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
             first_k_dense: 0,
+            routing: Default::default(),
         });
         let hidden = vec![1.0f32, 1.0];
 
@@ -4126,6 +4312,7 @@ mod tests {
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
             first_k_dense: 0,
+            routing: Default::default(),
         });
         let hidden = vec![0.7f32, -1.3];
         let mut w = LayerTensors::zeros(&cfg);
@@ -4177,6 +4364,7 @@ mod tests {
             norm_topk_prob: true,
             naming: MoeNaming::Qwen,
             first_k_dense: 0,
+            routing: Default::default(),
         });
         let hidden = vec![1.0f32, 0.4];
         let mut w = LayerTensors::zeros(&cfg);

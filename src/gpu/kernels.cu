@@ -1687,11 +1687,20 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
 // heads that are not a multiple of 32.
 #define DLM_KV_I8 2
 #define KV_I8_GROUP_BYTES 36
+// int4 (`--kv-quant int4`): the same 32-value groups as int8, a float scale
+// (largest magnitude over 7) then 16 bytes of 4-bit codes in -7..7, two per
+// byte, value `2j` in the low nibble of byte `j` -- the CPU's int4 store. 0.625
+// bytes a value. Same one-head rule as int8.
+#define DLM_KV_I4 3
+#define KV_I4_GROUP_BYTES 20
+// int8 and int4 KV are written a 32-value group at a time, by one warp.
+#define KV_GROUPED(KT) ((KT) == DLM_KV_I8 || (KT) == DLM_KV_I4)
 
 // Launch `...` (which names the element type `KT_`) for KV held as `kind`.
 #define DLM_KV_SWITCH(kind, ...)                                        \
     switch (kind) {                                                     \
         case DLM_KV_I8: { constexpr int KT_ = DLM_KV_I8; __VA_ARGS__; } break;   \
+        case DLM_KV_I4: { constexpr int KT_ = DLM_KV_I4; __VA_ARGS__; } break;   \
         case DLM_KV_F16: { constexpr int KT_ = DLM_KV_F16; __VA_ARGS__; } break; \
         default: { constexpr int KT_ = DLM_KV_F32; __VA_ARGS__; } break;         \
     }
@@ -1710,6 +1719,16 @@ __device__ __forceinline__ float load_kv<DLM_KV_I8>(const void* kv, long i) {
     const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
     return *(const float*)g * (float)(signed char)g[4 + (i & 31)];
 }
+// A 4-bit two's-complement code as a float.
+__device__ __forceinline__ float i4_code(unsigned int nib) {
+    return (float)((int)(nib & 15u) - (int)((nib & 8u) << 1));
+}
+template <>
+__device__ __forceinline__ float load_kv<DLM_KV_I4>(const void* kv, long i) {
+    const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I4_GROUP_BYTES;
+    const unsigned int byte = g[4 + ((i & 31) >> 1)];
+    return *(const float*)g * i4_code(byte >> (4 * (i & 1)));
+}
 
 // Write 32 values, one per lane of a full warp, as the int8 group starting at
 // element `at` (a multiple of 32): the group's largest magnitude over 127 is
@@ -1723,6 +1742,30 @@ __device__ __forceinline__ void kv_store_i8(float x, void* kv, long at) {
     unsigned char* g = (unsigned char*)kv + (at >> 5) * KV_I8_GROUP_BYTES;
     g[4 + lane] = (unsigned char)(signed char)(scale > 0.0f ? __float2int_rn(x / scale) : 0);
     if (lane == 0) *(float*)g = scale;
+}
+
+// `kv_store_i8` for int4: the group's largest magnitude over 7 is its scale,
+// codes rounded half away from zero as the CPU store rounds, and each even
+// lane writes its byte with the next lane's code in the high nibble.
+__device__ __forceinline__ void kv_store_i4(float x, void* kv, long at) {
+    const int lane = threadIdx.x & 31;
+    float amax = fabsf(x);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float scale = amax / 7.0f;
+    const int q = scale > 0.0f ? max(-7, min(7, (int)roundf(x / scale))) : 0;
+    const unsigned int nib = (unsigned int)q & 15u;
+    const unsigned int hi = __shfl_down_sync(0xffffffffu, nib, 1);
+    unsigned char* g = (unsigned char*)kv + (at >> 5) * KV_I4_GROUP_BYTES;
+    if ((lane & 1) == 0) g[4 + (lane >> 1)] = (unsigned char)(nib | (hi << 4));
+    if (lane == 0) *(float*)g = scale;
+}
+
+// A grouped KV store, one warp per 32-value group: int8 or int4.
+template <int KT>
+__device__ __forceinline__ void kv_store_group(float x, void* kv, long at) {
+    if (KT == DLM_KV_I4) kv_store_i4(x, kv, at);
+    else kv_store_i8(x, kv, at);
 }
 
 // The KV cache is paged. A layer's keys (and values) live in one pool of
@@ -1746,12 +1789,13 @@ __global__ void kv_append_kernel(const float* src, void* kv, const int* table, i
     else ((float*)kv)[at] = src[i];
 }
 
-// `kv_append_kernel` for int8: one warp per 32-value group. `n % 32 == 0`.
-// <<<n / 32, 32>>>.
-__global__ void kv_append_i8_kernel(const float* src, void* kv, const int* table, int shift,
-                                    long row, int n) {
+// `kv_append_kernel` for int8 and int4: one warp per 32-value group.
+// `n % 32 == 0`. <<<n / 32, 32>>>.
+template <int KT>
+__global__ void kv_append_group_kernel(const float* src, void* kv, const int* table, int shift,
+                                       long row, int n) {
     const int i = blockIdx.x * 32 + threadIdx.x;
-    kv_store_i8(src[i], kv, kv_row(table, shift, row) * n + blockIdx.x * 32);
+    kv_store_group<KT>(src[i], kv, kv_row(table, shift, row) * n + blockIdx.x * 32);
 }
 
 template <int KT>
@@ -1912,10 +1956,12 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
 // Slots 24-25 are the int8 activation codes and their block scales (dp4a).
 // Slot 28 holds the LM head's sampling candidates (`dlm_lm_head_top`).
-enum { SCRATCH_N = 29 };
+enum { SCRATCH_N = 35 };
 enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26, LM_TOP = 28 };   // 26: fp16 tensor-core row scales
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12, MOE_NORMED2B = 27 };   // 27: a batch's FFN inputs
+// 29-34: `dlm_apply_expert_rows`' gathered inputs, gate, up, output, row indices, weights.
+enum { EXP_X = 29, EXP_G = 30, EXP_U = 31, EXP_OUT = 32, EXP_IDX = 33, EXP_W = 34 };
 enum { MLA_NORMED = 13, MLA_Q = 14, MLA_CQ = 15, MLA_KVA = 16, MLA_CKV = 17, MLA_CTX = 18 };
 enum { DLM_MAX_DEVICES = 16 };
 static thread_local float* g_scratch_by_device[DLM_MAX_DEVICES][SCRATCH_N] = {{0}};
@@ -2066,7 +2112,13 @@ typedef struct { int v[DLM_MAX_BATCH]; } DlmInts;
 // Eight values from element `i`, a multiple of 8.
 template <int KT>
 __device__ __forceinline__ void load_kv8(const void* kv, long i, float* out) {
-    if (KT == DLM_KV_I8) {
+    if (KT == DLM_KV_I4) {
+        const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I4_GROUP_BYTES;
+        const float s = *(const float*)g;
+        const unsigned int u = *(const unsigned int*)(g + 4 + ((i & 31) >> 1));   // 4-byte aligned
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = s * i4_code(u >> (4 * j));
+    } else if (KT == DLM_KV_I8) {
         const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
         const float s = *(const float*)g;
         const unsigned int* c = (const unsigned int*)(g + 4 + (i & 31));   // 4-byte aligned
@@ -2182,11 +2234,11 @@ attn_split_body(const float* __restrict__ q, const void* keys, const void* value
             const long kvd = (long)num_kv_heads * head_dim;
             const long dst = kv_row(table, shift, post->row) * kvd + (long)kvh * head_dim;
             const float* vh = post->v + (long)kvh * head_dim;
-            if (KT == DLM_KV_I8) {
+            if (KV_GROUPED(KT)) {
                 if (t < 32)
                     for (int g = 0; g < head_dim; g += 32) {
-                        kv_store_i8(kbuf[g + t], (void*)keys, dst + g);
-                        kv_store_i8(vh[g + t], (void*)values, dst + g);
+                        kv_store_group<KT>(kbuf[g + t], (void*)keys, dst + g);
+                        kv_store_group<KT>(vh[g + t], (void*)values, dst + g);
                     }
             } else {
                 for (int i = t; i < head_dim; i += C) {
@@ -2439,7 +2491,7 @@ static cudaError_t launch_attention_post(float* q, float* k, const float* v, flo
     const int G = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
     const bool split_ok = G >= 1 && G <= FA_MAX_G && G * num_kv_heads == num_heads &&
                           head_dim % 8 == 0 && head_dim <= 256 &&
-                          (kv_half != DLM_KV_I8 || head_dim % 32 == 0);
+                          (!KV_GROUPED(kv_half) || head_dim % 32 == 0);
     if (!split_ok) {
         launch_qk_post(q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position,
                        inv_freq, mscale, rope, eps, keys, values, table, shift, num_positions,
@@ -2476,8 +2528,11 @@ static void launch_kv_append(const float* k, const float* v, void* keys, void* v
                              const int* table, int shift, long row, int kv_dim, int kv_half) {
     const int B = 256;
     if (kv_half == DLM_KV_I8) {
-        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
-        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
+        kv_append_group_kernel<DLM_KV_I8><<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
+        kv_append_group_kernel<DLM_KV_I8><<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
+    } else if (kv_half == DLM_KV_I4) {
+        kv_append_group_kernel<DLM_KV_I4><<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
+        kv_append_group_kernel<DLM_KV_I4><<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
     } else if (kv_half) {
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(k, keys, table, shift, row, kv_dim);
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(v, values, table, shift, row, kv_dim);
@@ -2697,7 +2752,7 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
         }
         vec[i] = a;
         vec[i + half] = b;
-        if (is_k && KT != DLM_KV_I8) {
+        if (is_k && !KV_GROUPED(KT)) {
             if (KT == DLM_KV_F16) {
                 ((__half*)kv_keys)[dst + i] = __float2half(a);
                 ((__half*)kv_keys)[dst + i + half] = __float2half(b);
@@ -2709,13 +2764,13 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
     }
     if (is_k) {
         const float* vh = v + (long)head * head_dim;
-        if (KT == DLM_KV_I8) {
+        if (KV_GROUPED(KT)) {
             // Whole groups (head_dim % 32 == 0), each lane's value written by
             // another lane above: wait for the warp's writes to `vec`.
             __syncwarp();
             for (int g = 0; g < head_dim; g += 32) {
-                kv_store_i8(vec[g + lane], kv_keys, dst + g);
-                kv_store_i8(vh[g + lane], kv_values, dst + g);
+                kv_store_group<KT>(vec[g + lane], kv_keys, dst + g);
+                kv_store_group<KT>(vh[g + lane], kv_values, dst + g);
             }
             return;
         }
@@ -4996,6 +5051,82 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
     return (int)e;
 }
 
+// `dst[t] = src[idx[t]]` for `T` rows of `h` floats.
+__global__ void gather_rows_kernel(const float* src, const int* idx, float* dst, int T, int h) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)T * h) return;
+    int t = (int)(i / h), c = (int)(i % h);
+    dst[i] = src[(long)idx[t] * h + c];
+}
+
+// `x[idx[t]] += w[t] * src[t]` for `T` rows of `h` floats. Rows of one call are
+// distinct (a token picks an expert once), so no two threads add to one value.
+__global__ void scatter_add_rows_kernel(float* x, const float* src, const int* idx,
+                                        const float* w, int T, int h) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)T * h) return;
+    int t = (int)(i / h), c = (int)(i % h);
+    x[(long)idx[t] * h + c] += w[t] * src[i];
+}
+
+// `out[T, M] = W · X[T, K]`: the tiled GEMM for many rows, else the batched
+// GEMV (weights read once per DLM_MAX_BATCH rows) for few, or for a shape the
+// GEMM cannot take.
+static void expert_matmul(int dt, const void* W, const float* X, float* out, int M, int K, int T,
+                          int group_size) {
+    if (T > DLM_MAX_BATCH && launch_gemm(dt, W, X, (const float*)0, out, M, K, T, group_size, false))
+        return;
+    for (int t = 0; t < T; t += DLM_MAX_BATCH) {
+        int n = T - t < DLM_MAX_BATCH ? T - t : DLM_MAX_BATCH;
+        launch_matvec_batched(dt, W, X + (long)t * K, (const float*)0, out + (long)t * M, M, K,
+                              group_size, n);
+    }
+}
+
+// One routed expert over every token that chose it: row `rows_host[t]` of
+// `norm` (each token's FFN input) gathered, gate/up/down run once over all the
+// rows, and `x[rows_host[t]] += weights_host[t] * expert(...)`. Per token, the
+// grouped prefill read the expert's weights once per row. In pieces of 256 rows
+// to bound the scratch.
+extern "C" int dlm_apply_expert_rows(int hidden_size, int inter, int w_dtype, int w_group_size,
+                                     const void* gate, const void* up, const void* down,
+                                     const float* norm, const int* rows_host,
+                                     const float* weights_host, int T, float* x, int activation)
+{
+    DLM_ENTER
+    const int B = 256, PIECE = 256;
+    cudaError_t e = cudaSuccess;
+    for (int t0 = 0; t0 < T && e == cudaSuccess; t0 += PIECE) {
+        int n = T - t0 < PIECE ? T - t0 : PIECE;
+        #define DLM_ALLOC(idx, cnt) if (e == cudaSuccess) { e = scratch_ensure((idx), (cnt)); }
+        DLM_ALLOC(EXP_X, PIECE * hidden_size)
+        DLM_ALLOC(EXP_G, PIECE * inter)
+        DLM_ALLOC(EXP_U, PIECE * inter)
+        DLM_ALLOC(EXP_OUT, PIECE * hidden_size)
+        DLM_ALLOC(EXP_IDX, PIECE)
+        DLM_ALLOC(EXP_W, PIECE)
+        #undef DLM_ALLOC
+        if (e != cudaSuccess) break;
+        float *X = g_scratch[EXP_X], *G = g_scratch[EXP_G], *U = g_scratch[EXP_U];
+        float *O = g_scratch[EXP_OUT], *W = g_scratch[EXP_W];
+        int* idx = (int*)g_scratch[EXP_IDX];
+        // Pageable copies on the default stream wait for the work before them,
+        // so the last piece's kernels are done with these slots.
+        e = cudaMemcpy(idx, rows_host + t0, n * sizeof(int), cudaMemcpyHostToDevice);
+        if (e == cudaSuccess) e = cudaMemcpy(W, weights_host + t0, n * sizeof(float), cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) break;
+        long nh = (long)n * hidden_size, ni = (long)n * inter;
+        gather_rows_kernel<<<grid_for((int)nh, B), B>>>(norm, idx, X, n, hidden_size);
+        expert_matmul(w_dtype, gate, X, G, inter, hidden_size, n, w_group_size);
+        expert_matmul(w_dtype, up, X, U, inter, hidden_size, n, w_group_size);
+        swiglu_batched_kernel<<<grid_for((int)ni, B), B>>>(G, U, G, ni, activation);
+        expert_matmul(w_dtype, down, G, O, hidden_size, inter, n, w_group_size);
+        scatter_add_rows_kernel<<<grid_for((int)nh, B), B>>>(x, O, idx, W, n, hidden_size);
+        e = cudaGetLastError();
+    }
+    return (int)e;
+}
+
 // Dense SwiGLU/GeGLU FFN sublayer on its own: `x += down·(act(gate·norm(x)) ⊙
 // up·norm(x))`. Used by the MLA path, whose attention is a separate call (the
 // dense block folds attention + FFN into one `dlm_decode_block`).
@@ -5032,19 +5163,23 @@ extern "C" int dlm_dense_ffn(int hidden_size, int inter, float rms_eps, int w_dt
 // reconstructed on the fly from the cached latent inside the attention kernel
 // (materializing all of them would need gigabytes of scratch).
 
-// RoPE the rope-part of each query head: q[h*qk + nope .. + qk_rope].
-__global__ void mla_rope_q_kernel(float* q, int num_heads, int qk, int nope, int rope,
-                                  int position, const float* inv_freq) {
+// RoPE the `rope` values at `v[h*stride + offset ..]` for each of `heads`: the
+// query heads' rope parts (stride qk, offset nope) or the shared k_pe (one head).
+// DeepSeek pairs adjacent values (2i, 2i+1) -- its reference code views the
+// rope dims as (d/2, 2) before rotating -- not the halves (i, i + d/2) Llama's
+// RoPE pairs; with the halves, q.k comes out wrong.
+__global__ void mla_rope_kernel(float* v, int heads, int stride, int offset, int rope,
+                                int position, const float* inv_freq) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = rope / 2;
-    if (idx >= num_heads * half) return;
+    if (idx >= heads * half) return;
     int h = idx / half, i = idx % half;
-    int base = h * qk + nope;
+    float* p = v + (long)h * stride + offset + 2 * i;
     float ang = (float)position * inv_freq[i];
     float s = sinf(ang), c = cosf(ang);
-    float a = q[base + i], b = q[base + i + half];
-    q[base + i] = a * c - b * s;
-    q[base + i + half] = a * s + b * c;
+    float a = p[0], b = p[1];
+    p[0] = a * c - b * s;
+    p[1] = a * s + b * c;
 }
 
 // MLA attention over `positions` cached latents, without reconstructing K or V.
@@ -5217,8 +5352,8 @@ extern "C" int dlm_mla_attn(
     // KV down → [latent | k_pe]; norm the latent, RoPE the shared k_pe + q rope-parts.
     launch_matvec(w_dtype, kv_a_proj, normed, (const float*)0, kva, latent + qk_rope, hidden_size, w_group_size);
     rmsnorm_kernel<<<1, RMS_THREADS>>>(kva, kv_a_layernorm, c_kv, latent, rms_eps);
-    mla_rope_q_kernel<<<grid_for(num_heads * (qk_rope / 2), B), B>>>(q, num_heads, qk, qk_nope, qk_rope, position, inv_freq);
-    rope_kernel<<<grid_for(qk_rope / 2, B), B>>>(kva + latent, 1, qk_rope, position, inv_freq, 1.0f);
+    mla_rope_kernel<<<grid_for(num_heads * (qk_rope / 2), B), B>>>(q, num_heads, qk, qk_nope, qk_rope, position, inv_freq);
+    mla_rope_kernel<<<grid_for(qk_rope / 2, B), B>>>(kva + latent, 1, qk_rope, 0, qk_rope, position, inv_freq);
     // Append [c_kv ; k_pe] to the cache at slot num_positions.
     copy_kernel<<<grid_for(latent, B), B>>>(c_kv, kv_keys + (long)num_positions * kv_dim, latent);
     copy_kernel<<<grid_for(qk_rope, B), B>>>(kva + latent, kv_keys + (long)num_positions * kv_dim + latent, qk_rope);

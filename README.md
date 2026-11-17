@@ -479,7 +479,7 @@ names. That covers:
 | Phi-3 / Phi-3.5 | supported — fused `qkv_proj` and `gate_up_proj` are split at load; the block is otherwise Llama-shaped. The 128k `longrope` variant is **refused** (dlm does not implement that scaling, and running without it yields fluent nonsense) |
 | GPT-2 | supported — LayerNorm (not RMSNorm), learned position embeddings instead of RoPE, an ungated MLP, biases on every projection, and `Conv1D` weights transposed at load. CPU and GPU, resident and streamed — each checked against the real `openai-community/gpt2` |
 | Falcon | supported — parallel attention/FFN, multi-query (`multi_query` is a flag, not a count), LayerNorm, ungated MLP, fused `query_key_value`. **Config-verified, not run**: the smallest RoPE Falcon is 14 GB. `alibi: true` (falcon-rw-*) and `new_decoder_architecture` (Falcon-40B) are **refused** rather than mis-decoded. CPU and GPU; the GPU block is checked against the CPU oracle on synthetic Falcon-shaped weights |
-| DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU, resident or streamed. V3/R1's own router (sigmoid scoring, group-limited top-k) is **refused**: dlm routes with V2's softmax top-k, and routing a token through the wrong experts reads as fluent, wrong output |
+| DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU, resident or streamed. Routing as V2 (softmax top-k, or `group_limited_greedy`) and as V3/R1 (sigmoid scores, the `e_score_correction_bias`, top-2-sum group-limited top-k, `routed_scaling_factor`), each checked against `transformers` on a tiny random checkpoint; an unknown `scoring_func` or `topk_method` is **refused**, since routing a token through the wrong experts reads as fluent, wrong output. V3's multi-token-prediction layer is not used |
 | Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
 | Gemma 3 (270M, 1B; and the text model of 4B/12B/27B) | supported — Gemma 2's norm layout without softcapping, per-head (1+w) Q/K norms, five sliding-window layers to each global one (from `sliding_window_pattern` or `layer_types`), and a separate RoPE base for the windowed layers. CPU and GPU, resident and streamed; checked on the real `gemma-3-1b-it` by its answers and by the cross-entropy of a passage twice the window. The 4B+ checkpoints are multimodal (`Gemma3ForConditionalGeneration`): dlm reads the language model out of `text_config` and `language_model.*` and ignores the vision tower, so they serve **text only** — checked on the real `gemma-3-4b-it`, whose 8 GB of weights stream through a 4 GB card |
 | anything else | **not supported** — errors on unknown tensor names |
@@ -959,9 +959,12 @@ inference engine):
     independent of `--quant`: one sizes the weights, the other the KV history.
     - `auto` is the default: `int8` on the GPU, `f16` elsewhere. `f32` is exact
       (`none` is accepted as an alias).
-    - **On the GPU**, `int8` (and `int4`) keep a scale per 32 values and 32 int8
-      codes, 56% of fp16's memory, at fp16's speed; heads not a multiple of 32
-      wide keep fp16. The loader shrinks the few key channels that would set
+    - **On the GPU**, `int8` keeps a scale per 32 values and 32 int8 codes, 56%
+      of fp16's memory, at fp16's speed; `int4` keeps the scale and 16 bytes of
+      4-bit codes, 31% of fp16's memory. Heads not a multiple of 32 wide keep
+      fp16 either way. `int4` costs real accuracy: on Qwen2.5-0.5B it scored
+      4.59 nats per token where fp16 and int8 scored 3.95, so reach for it only
+      when the extra context matters more than the output. The loader shrinks the few key channels that would set
       those scales alone (Qwen's are a hundred times the rest) and grows the
       matching query channels by the same power of two, which leaves `q . k`
       unchanged to the bit; with it, int8 scored within 0.005 nats per token of

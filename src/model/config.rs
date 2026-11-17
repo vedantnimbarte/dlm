@@ -478,46 +478,58 @@ fn build_mla_config(raw: &RawConfig) -> Result<Option<MlaConfig>> {
 /// the tensor naming family. A model that declares experts but omits the top-k
 /// count is refused rather than guessed at — routing every token through the
 /// wrong number of experts is silent garbage, the worst failure mode.
-/// Refuse the DeepSeek-V3 router, whose four keys dlm's softmax top-k does not
-/// implement. Every one of them changes which experts a token is routed to, and
-/// routing to the wrong experts produces fluent nonsense rather than an error —
-/// so each is refused by name instead of ignored.
-///
-/// DeepSeek-V2 leaves all four at the values dlm implements, so it still loads.
-fn check_routing_supported(raw: &RawConfig) -> Result<()> {
-    let refuse = |what: String| -> Result<()> {
+/// The router's rule from DeepSeek's four routing keys: `scoring_func`
+/// (softmax or V3's sigmoid), `topk_method` (`greedy`, V2's
+/// `group_limited_greedy`, V3's `noaux_tc`, which also reads a per-expert
+/// `e_score_correction_bias`), the `n_group`/`topk_group` split, and
+/// `routed_scaling_factor`. Mixtral and Qwen set none and get plain softmax
+/// top-k. A value dlm does not implement is refused by name: routing to the
+/// wrong experts reads as fluent, wrong output rather than failing.
+fn routing_from(raw: &RawConfig, num_experts: u32) -> Result<Routing> {
+    let refuse = |what: String| -> Result<Routing> {
         Err(DlmError::InvalidConfig(format!(
-            "{what} dlm's MoE router scores gate logits with softmax and takes a plain \
-             top-k (DeepSeek-V2's routing). Running this checkpoint under that rule would \
-             route tokens through the wrong experts, which reads as fluent, wrong output \
-             rather than failing."
+            "{what} dlm routes with softmax or sigmoid scores and the greedy, \
+             group_limited_greedy or noaux_tc top-k (DeepSeek-V2/V3); running this \
+             checkpoint under another rule would route tokens through the wrong experts."
         )))
     };
-    match raw.scoring_func.as_deref().map(str::to_ascii_lowercase) {
-        None => {}
-        Some(ref f) if f == "softmax" => {}
+    let sigmoid = match raw.scoring_func.as_deref().map(str::to_ascii_lowercase) {
+        None => false,
+        Some(ref f) if f == "softmax" => false,
+        Some(ref f) if f == "sigmoid" => true,
         Some(other) => return refuse(format!("config declares scoring_func {other:?};")),
-    }
-    match raw.topk_method.as_deref().map(str::to_ascii_lowercase) {
-        None => {}
-        Some(ref m) if m == "greedy" => {}
-        // `noaux_tc` also adds a per-expert `e_score_correction_bias` tensor to
-        // the scores before the top-k, which dlm does not read.
+    };
+    let method = raw.topk_method.as_deref().map(str::to_ascii_lowercase);
+    let (grouped, by_top2, score_bias) = match method.as_deref() {
+        None | Some("greedy") => (false, false, false),
+        Some("group_limited_greedy") => (true, false, false),
+        Some("noaux_tc") => (true, true, true),
         Some(other) => return refuse(format!("config declares topk_method {other:?};")),
+    };
+    let n_group = raw.n_group.unwrap_or(1).max(1);
+    let topk_group = raw.topk_group.unwrap_or(n_group);
+    if grouped && n_group > 1 {
+        let per = num_experts / n_group;
+        if num_experts % n_group != 0 || topk_group == 0 || topk_group > n_group {
+            return refuse(format!(
+                "config groups {num_experts} experts into {n_group} (n_group), keeping \
+                 {topk_group} (topk_group), which does not divide them;"
+            ));
+        }
+        if by_top2 && per < 2 {
+            return refuse(format!(
+                "config's groups hold {per} expert, too few to score by their top two;"
+            ));
+        }
     }
-    if let Some(groups) = raw.n_group.filter(|&g| g > 1) {
-        return refuse(format!(
-            "config splits the experts into {groups} groups (n_group) and routes within \
-             {} of them (topk_group);",
-            raw.topk_group.unwrap_or(1)
-        ));
-    }
-    if let Some(scale) = raw.routed_scaling_factor.filter(|s| *s != 1.0) {
-        return refuse(format!(
-            "config scales the routed experts' output by {scale} (routed_scaling_factor);"
-        ));
-    }
-    Ok(())
+    Ok(Routing {
+        sigmoid,
+        n_group: if grouped { n_group } else { 1 },
+        topk_group: if grouped { topk_group } else { 1 },
+        group_by_top2: by_top2,
+        score_bias,
+        scale: raw.routed_scaling_factor.unwrap_or(1.0),
+    })
 }
 
 fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
@@ -531,7 +543,7 @@ fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
     if num_experts == 0 {
         return Ok(None); // an expert count of 0 is just a dense model
     }
-    check_routing_supported(raw)?;
+    let routing = routing_from(raw, num_experts)?;
     let experts_per_tok = raw.num_experts_per_tok.ok_or_else(|| {
         DlmError::InvalidConfig(
             "config declares experts but no num_experts_per_tok; dlm will not guess the \
@@ -584,6 +596,7 @@ fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
         norm_topk_prob: raw.norm_topk_prob.unwrap_or(true),
         naming,
         first_k_dense: raw.first_k_dense_replace.unwrap_or(0),
+        routing,
     }))
 }
 
@@ -631,6 +644,50 @@ pub struct MoeConfig {
     /// `first_k_dense_replace`). `0` — every other MoE family — means every layer
     /// is routed. Resolved per layer by [`BlockConfig::for_layer`].
     pub first_k_dense: u32,
+    /// How the router picks experts and weighs them.
+    pub routing: Routing,
+}
+
+/// How a MoE router turns a token's gate logits into experts and weights. The
+/// default is the softmax top-k Mixtral, Qwen and DeepSeek-V2 use; DeepSeek-V2's
+/// full model limits the choice to the best groups of experts, and V3 scores
+/// with a sigmoid, adds a learned bias for the choice only, and scales.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Routing {
+    /// Sigmoid scores (V3) rather than softmax.
+    pub sigmoid: bool,
+    /// Experts split into this many equal groups (1: no grouping), of which the
+    /// `topk_group` best are eligible.
+    pub n_group: u32,
+    pub topk_group: u32,
+    /// A group scores the sum of its two best (V3's `noaux_tc`); else its best
+    /// (V2's `group_limited_greedy`).
+    pub group_by_top2: bool,
+    /// The layer's `e_score_correction_bias` is added to the scores for the
+    /// choice, not for the weights (V3's `noaux_tc`).
+    pub score_bias: bool,
+    /// Multiplies the routed experts' weights (`routed_scaling_factor`).
+    pub scale: f32,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Routing {
+            sigmoid: false,
+            n_group: 1,
+            topk_group: 1,
+            group_by_top2: false,
+            score_bias: false,
+            scale: 1.0,
+        }
+    }
+}
+
+impl Routing {
+    /// The plain softmax top-k: no sigmoid, groups, bias or scale.
+    pub fn is_plain(&self) -> bool {
+        *self == Routing::default()
+    }
 }
 
 /// Validated Multi-head Latent Attention geometry (DeepSeek-V2/V3). Present only
@@ -1499,8 +1556,8 @@ mod tests {
         );
     }
 
-    /// DeepSeek-V2's routing is the one dlm implements, so it must keep loading
-    /// while V3's is refused (next test).
+    /// DeepSeek-V2's plain softmax top-k keeps loading as the default routing
+    /// (V3's is the next test).
     #[test]
     fn deepseek_v2_routing_is_accepted() {
         let json = br#"{"model_type":"deepseek_v2","hidden_size":16,
@@ -1513,25 +1570,45 @@ mod tests {
             .is_moe());
     }
 
-    /// DeepSeek-V3/R1 scores with sigmoid, adds a per-expert bias, and limits the
-    /// top-k to a few expert groups. dlm's router does none of that, and routing
-    /// a token through the wrong experts reads as fluent, wrong output — so each
-    /// key is refused by name rather than ignored.
+    /// DeepSeek-V3's routing keys become its router; a value dlm does not
+    /// implement is still refused by name, since routing a token through the
+    /// wrong experts reads as fluent, wrong output.
     #[test]
-    fn deepseek_v3_routing_is_refused() {
+    fn deepseek_v3_routing_parses_and_unknown_routing_is_refused() {
         let base = r#""model_type":"deepseek_v3","hidden_size":16,
             "num_attention_heads":4,"num_hidden_layers":4,"vocab_size":32,
             "intermediate_size":8,"moe_intermediate_size":4,"n_routed_experts":64,
             "num_experts_per_tok":6"#;
+        let v3 = format!(
+            r#"{{{base},"scoring_func":"sigmoid","topk_method":"noaux_tc","n_group":8,
+                "topk_group":4,"routed_scaling_factor":2.5}}"#
+        );
+        let cfg = ModelConfig::from_json_bytes(v3.as_bytes(), QuantScheme::Fp16).unwrap();
+        let r = cfg.moe.unwrap().routing;
+        assert_eq!(
+            r,
+            Routing {
+                sigmoid: true,
+                n_group: 8,
+                topk_group: 4,
+                group_by_top2: true,
+                score_bias: true,
+                scale: 2.5,
+            }
+        );
         for (key, value) in [
-            ("scoring_func", r#""sigmoid""#),
-            ("topk_method", r#""noaux_tc""#),
-            ("n_group", "8"),
-            ("routed_scaling_factor", "2.5"),
+            ("scoring_func", r#""tanh""#),
+            ("topk_method", r#""random""#),
+            ("n_group", "7"), // 64 experts do not split into 7 groups
         ] {
-            let json = format!(r#"{{{base},"{key}":{value}}}"#);
+            let extra = if key == "n_group" {
+                r#","topk_method":"noaux_tc""#
+            } else {
+                ""
+            };
+            let json = format!(r#"{{{base},"{key}":{value}{extra}}}"#);
             let err = ModelConfig::from_json_bytes(json.as_bytes(), QuantScheme::Fp16)
-                .expect_err("V3 routing must be refused");
+                .expect_err("unknown routing must be refused");
             assert!(
                 format!("{err}").contains(key),
                 "expected the refusal to name {key}, got: {err}"
