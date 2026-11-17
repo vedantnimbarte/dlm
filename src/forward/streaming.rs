@@ -86,6 +86,9 @@ pub struct CachedLayerSource<S: LayerSource> {
     experts: Mutex<ExpertRamCache>,
 }
 
+/// Marks a RAM-tier key as a MoE layer core rather than a whole layer.
+const CORE_KEY: u32 = 1 << 31;
+
 /// LRU state for [`CachedLayerSource`].
 struct RamCache {
     map: HashMap<u32, Arc<LayerTensors>>,
@@ -144,25 +147,20 @@ impl<S: LayerSource> CachedLayerSource<S> {
         (s.hits, s.misses)
     }
 
-    #[cfg(test)]
-    fn inner_for_test(&self) -> &S {
-        &self.inner
-    }
-}
-
-impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
-    fn num_layers(&self) -> u32 {
-        self.inner.num_layers()
-    }
-
-    fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+    /// `layer` from the RAM tier under `key`, loading it with `load` on a miss.
+    fn cached(
+        &self,
+        layer: u32,
+        key: u32,
+        load: impl FnOnce() -> Result<Arc<LayerTensors>>,
+    ) -> Result<Arc<LayerTensors>> {
         {
             let mut s = self.state.lock().unwrap();
-            if let Some(t) = s.map.get(&layer) {
+            if let Some(t) = s.map.get(&key) {
                 let t = Arc::clone(t);
                 s.hits += 1;
-                s.order.retain(|&l| l != layer);
-                s.order.push_back(layer);
+                s.order.retain(|&l| l != key);
+                s.order.push_back(key);
                 // A hit here means the layer never touched the disk on this
                 // pass. Hit-versus-miss at this seam is the difference between
                 // a storage-bound run and a cached one — the aggregate counters
@@ -181,7 +179,7 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
         // Load with the lock released so concurrent loads (and the prefetch
         // worker) overlap. A duplicate concurrent load of the same layer just
         // wastes one read; the second insert replaces an identical value.
-        let t = self.inner.load_layer(layer)?;
+        let t = load()?;
         crate::telemetry::emit(crate::telemetry::FlowEvent::new(
             layer,
             crate::telemetry::Stage::RamMiss,
@@ -196,7 +194,7 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
         let size = t.byte_size();
         // A layer bigger than the whole budget is never cached (caching it would
         // evict everything and still not fit).
-        if size <= s.budget && !s.map.contains_key(&layer) {
+        if size <= s.budget && !s.map.contains_key(&key) {
             // Most recently used goes first: layers come round in a cycle, so
             // LRU would evict the next layer needed and never hit once the
             // model outgrows the budget (see `evict_index`).
@@ -210,16 +208,37 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
                     None => break,
                 }
             }
-            s.map.insert(layer, Arc::clone(&t));
-            s.order.push_back(layer);
+            s.map.insert(key, Arc::clone(&t));
+            s.order.push_back(key);
             s.bytes += size;
         }
         Ok(t)
     }
 
-    // MoE per-expert streaming forwards straight to the inner source. The GPU
+    #[cfg(test)]
+    fn inner_for_test(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
+    fn num_layers(&self) -> u32 {
+        self.inner.num_layers()
+    }
+
+    fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+        self.cached(layer, layer, || self.inner.load_layer(layer))
+    }
+
+    /// A MoE layer's core (attention, router, shared expert), from the same
+    /// RAM tier as whole layers. Forwarding it to the checkpoint re-read and
+    /// re-quantized every streamed core on every token: TinyMixtral 4x248M at
+    /// `--quant int4` with 4 of 12 layers resident decoded 1.8 tok/s against
+    /// 33 with all 12. Keyed apart from whole layers.
     fn load_layer_core(&self, layer: u32) -> Result<Arc<LayerTensors>> {
-        self.inner.load_layer_core(layer)
+        self.cached(layer, layer | CORE_KEY, || {
+            self.inner.load_layer_core(layer)
+        })
     }
 
     /// Serve a materialized expert from the host-RAM tier when cached, so a VRAM
@@ -932,6 +951,24 @@ mod tests {
         }
         let (hits, _) = src.stats();
         assert!(hits >= 4, "{hits} hits over 4 warm passes");
+    }
+
+    /// A MoE layer core comes from the RAM tier like a whole layer: streaming
+    /// one re-read and re-quantized it from the checkpoint every token.
+    #[test]
+    fn ram_cache_holds_moe_layer_cores() {
+        let c = cfg();
+        let ls = layers(&c, 2);
+        let one = ls[0].byte_size();
+        let src = CachedLayerSource::new(CountingSource(ls, AtomicU64::new(0)), one * 4);
+        for _ in 0..3 {
+            src.load_layer_core(0).unwrap();
+            src.load_layer_core(1).unwrap();
+        }
+        assert_eq!(src_loads(&src), 2, "each core read once");
+        // A whole layer is keyed apart from its core.
+        src.load_layer(0).unwrap();
+        assert_eq!(src_loads(&src), 3);
     }
 
     #[test]

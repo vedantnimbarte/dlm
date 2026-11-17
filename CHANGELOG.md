@@ -25,6 +25,17 @@ fork that runs large MoE models from SSD.
   0.39 nats; now by 1e-6, pinned by `tests/deepseek_parity.rs` against a
   committed fixture. dlm's own CPU/GPU parity tests compared it with itself
   and could not see it.
+- **Streamed MoE re-read and re-quantized from the checkpoint every token.**
+  The host-RAM tier served whole layers but passed a MoE layer's core
+  (attention, router, shared expert) straight through to the checkpoint, so
+  every streamed core was read and quantized again on every token. And its
+  default size counted the cores alone, leaving the routed experts a fraction
+  of the room they need, so expert misses did the same. The tier now caches
+  cores, and a streamed MoE model's default covers the experts too, up to a
+  quarter of RAM; unlike cyclic layers, a partial expert cache still hits.
+  GTX 1650, TinyMixtral 4x248M at `--quant int4`, 4 of 12 layers resident,
+  defaults otherwise: decode 0.28 -> 12.8 tok/s at batch 1 and 1.0 -> 40.3 at
+  batch 4, batch-4 prefill 7.6 -> 135 tok/s.
 
 ### Changed
 

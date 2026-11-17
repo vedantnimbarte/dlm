@@ -1096,7 +1096,7 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                 }
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
-                let ram_cache = resolve_ram_cache_bytes(&args, &plan);
+                let ram_cache = resolve_ram_cache_bytes(&args, &plan, &config);
                 // Lookup speculation pays on the GPU, and on the CPU where a pass
                 // moves layers from the checkpoint because the RAM cache cannot
                 // hold every one. A CPU pass over cached layers is compute, where
@@ -1139,6 +1139,8 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                         ram_cache as f64 / (1024.0 * 1024.0),
                         if args.ram_cache_gb.is_some() {
                             ""
+                        } else if config.is_moe() {
+                            " (default: the layers and their experts, up to a quarter of RAM)"
                         } else {
                             " (default: every layer fits)"
                         },
@@ -2483,15 +2485,20 @@ fn ram_cache_cap() -> u64 {
 /// prompt took 268 s without the cache and 46 s with it. The cache does
 /// duplicate weights on top of the OS page cache, which is why it is bounded.
 ///
-/// All or nothing, because a partial cache buys nothing: layers stream in a
-/// fixed cycle, so an LRU smaller than the layer set evicts each layer before it
-/// comes round again and never records a hit -- it only costs RAM.
-fn resolve_ram_cache_bytes(args: &ServeArgs, plan: &VramPlan) -> usize {
+/// All or nothing, because a partial cache buys little: layers stream in a
+/// fixed cycle, so a cache smaller than the layer set holds only part of each
+/// pass. A MoE model is the exception ([`moe_ram_cache_bytes`]): most of its
+/// cache is experts, which the router reuses.
+fn resolve_ram_cache_bytes(args: &ServeArgs, plan: &VramPlan, config: &ModelConfig) -> usize {
     if let Some(gb) = args.ram_cache_gb {
         return (gb.max(0.0) * GIB as f64) as usize;
     }
     if !args.stream {
         return 0;
+    }
+    if config.is_moe() {
+        let all = config.estimated_total_params() as f64 * config.quant.bytes_per_param();
+        return moe_ram_cache_bytes(all as u64, ram_cache_cap()) as usize;
     }
     default_ram_cache_bytes(
         plan.per_layer_weight_bytes,
@@ -2510,6 +2517,21 @@ fn resolve_ram_cache_bytes(args: &ServeArgs, plan: &VramPlan) -> usize {
 /// int4 at group 128), plus the f32 norms and biases. A budget a few percent
 /// short is not a slightly worse cache but no cache at all, for the reason
 /// above; overshooting only reserves RAM the cache never fills.
+/// The default cache for a streamed MoE model: the whole model, routed experts
+/// included, plus headroom, or as much of it as `cap` allows.
+///
+/// The cache holds the layer cores and, separately, the routed experts. The
+/// layer estimate counts the core alone, so sizing from it left the experts a
+/// fraction of the room they need, and each expert miss read the expert from
+/// the checkpoint and quantized it again: 4.4 s a token streaming TinyMixtral
+/// 4x248M at `--quant int4` with an 8-expert VRAM cache. Unlike layers, which
+/// come round in a cycle, experts are reused by the router, so a cache short of
+/// all of them still keeps the hot ones: it takes what the cap allows, not
+/// nothing.
+fn moe_ram_cache_bytes(model_bytes: u64, cap: u64) -> u64 {
+    (model_bytes + model_bytes / 4).min(cap)
+}
+
 fn default_ram_cache_bytes(layer_bytes: u64, num_layers: u32, cap: u64) -> Option<u64> {
     let whole_model = layer_bytes * num_layers as u64;
     let with_headroom = whole_model + whole_model / 4; // +25%
@@ -2632,6 +2654,15 @@ mod tests {
             Some(1000 * mib)
         );
         assert_eq!(default_ram_cache_bytes(801 * mib, 1, 1000 * mib), None);
+    }
+
+    /// A MoE model's cache covers its experts too, and a partial one is kept:
+    /// the router reuses hot experts, so it hits without holding them all.
+    #[test]
+    fn moe_ram_cache_takes_what_the_cap_allows() {
+        let mib = 1024 * 1024;
+        assert_eq!(moe_ram_cache_bytes(400 * mib, 4 * GIB), 500 * mib);
+        assert_eq!(moe_ram_cache_bytes(20 * GIB, 4 * GIB), 4 * GIB);
     }
 
     #[test]
