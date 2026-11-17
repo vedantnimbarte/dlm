@@ -25,8 +25,9 @@ fork that runs large MoE models from SSD.
   of the room they need, so expert misses did the same. The tier now caches
   cores, and a streamed MoE model's default covers the experts too, up to a
   quarter of RAM; unlike cyclic layers, a partial expert cache still hits.
-  GTX 1650, TinyMixtral 4x248M at `--quant int4`, batch-1 decode with 4 of 12
-  layers resident: see the PR for before and after.
+  GTX 1650, TinyMixtral 4x248M at `--quant int4`, 4 of 12 layers resident,
+  defaults otherwise: decode 0.28 -> 12.8 tok/s at batch 1 and 1.0 -> 40.3 at
+  batch 4, batch-4 prefill 7.6 -> 135 tok/s.
 
 ### Changed
 
