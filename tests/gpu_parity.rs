@@ -1023,7 +1023,11 @@ fn gpu_kv_in_host_ram_matches_vram() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::Int8] {
+    for quant in [
+        dlm::forward::KvQuant::None,
+        dlm::forward::KvQuant::Int8,
+        dlm::forward::KvQuant::Int4,
+    ] {
         let orch = |host_from: usize| {
             let mut k = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
             k.set_kv_host_layers(host_from);
@@ -1628,7 +1632,7 @@ fn gpu_resumed_prefix_matches_full_prefill() {
     // int8 KV needs heads a multiple of 32 wide (`int8_kv_cfg`).
     let cases = [
         (small_cfg(), &[KvQuant::None, KvQuant::F16][..]),
-        (int8_kv_cfg(), &[KvQuant::Int8][..]),
+        (int8_kv_cfg(), &[KvQuant::Int8, KvQuant::Int4][..]),
     ];
     for (cfg, quants) in cases {
         let num_layers = 3u32;
@@ -1836,8 +1840,13 @@ fn assert_prefill_matches_cpu_kv<K: ComputeKernel>(
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         // int8 KV rounds each value to 1/254 of its group's largest magnitude.
+        // int4 rounds to 1/14 of it, so a value the two sides compute a hair
+        // apart can land a whole step apart. Both quantize the same way: scored
+        // on Qwen2.5-0.5B, int4 KV on the GPU and on the CPU came within 0.011
+        // nats per token of each other.
         let tol = match gpu_kv {
-            dlm::forward::KvQuant::Int8 | dlm::forward::KvQuant::Int4 => 1e-2,
+            dlm::forward::KvQuant::Int8 => 1e-2,
+            dlm::forward::KvQuant::Int4 => 0.15,
             _ => prefill_tol(),
         };
         assert!(
@@ -1922,6 +1931,7 @@ fn gpu_tiled_prefill_matches_cpu() {
             (None, dlm::forward::KvQuant::None),
             (Some(11), dlm::forward::KvQuant::None),
             (None, dlm::forward::KvQuant::Int8),
+            (None, dlm::forward::KvQuant::Int4),
         ] {
             let cfg = BlockConfig {
                 hidden_size: 128,
@@ -1951,22 +1961,25 @@ fn gpu_tiled_prefill_matches_cpu() {
 fn gpu_prefill_matches_cpu_decode_with_int8_kv() {
     let cfg = int8_kv_cfg();
     let layers = random_layers(&cfg, 3, 0x1E8);
-    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
-    assert_prefill_matches_cpu_kv(
-        cfg,
-        layers.clone(),
-        gpu,
-        "dense int8 kv",
-        dlm::forward::KvQuant::Int8,
-    );
-    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
-    assert_prefill_matches_cpu_kv(
-        cfg,
-        layers,
-        streaming,
-        "streaming int8 kv",
-        dlm::forward::KvQuant::Int8,
-    );
+    for quant in [dlm::forward::KvQuant::Int8, dlm::forward::KvQuant::Int4] {
+        let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+        assert_prefill_matches_cpu_kv(
+            cfg,
+            layers.clone(),
+            gpu,
+            &format!("dense {quant:?} kv"),
+            quant,
+        );
+        let streaming =
+            StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+        assert_prefill_matches_cpu_kv(
+            cfg,
+            layers.clone(),
+            streaming,
+            &format!("streaming {quant:?} kv"),
+            quant,
+        );
+    }
 }
 
 /// Gemma2's windowed layers must clip inside a prefill chunk too: the window (2)
@@ -2992,19 +3005,21 @@ fn gpu_decode_batch_matches_solo_over_long_histories() {
             &|b| lens[b],
         );
     }
-    // int8 KV: both paths quantize each group the same way.
+    // int8 and int4 KV: both paths quantize each group the same way.
     let cfg = int8_kv_cfg();
     let gpu = GpuKernel::new(cfg, random_layers(&cfg, 2, 0x10F7), 320)
         .unwrap()
         .with_kv_pool_tokens(lens.len() * 320);
-    assert_decode_batch_matches_solo_after(
-        &gpu,
-        cfg,
-        lens.len(),
-        dlm::forward::KvQuant::Int8,
-        "long Int8",
-        &|b| lens[b],
-    );
+    for quant in [dlm::forward::KvQuant::Int8, dlm::forward::KvQuant::Int4] {
+        assert_decode_batch_matches_solo_after(
+            &gpu,
+            cfg,
+            lens.len(),
+            quant,
+            &format!("long {quant:?}"),
+            &|b| lens[b],
+        );
+    }
 }
 
 #[test]

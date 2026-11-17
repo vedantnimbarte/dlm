@@ -1687,11 +1687,20 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
 // heads that are not a multiple of 32.
 #define DLM_KV_I8 2
 #define KV_I8_GROUP_BYTES 36
+// int4 (`--kv-quant int4`): the same 32-value groups as int8, a float scale
+// (largest magnitude over 7) then 16 bytes of 4-bit codes in -7..7, two per
+// byte, value `2j` in the low nibble of byte `j` -- the CPU's int4 store. 0.625
+// bytes a value. Same one-head rule as int8.
+#define DLM_KV_I4 3
+#define KV_I4_GROUP_BYTES 20
+// int8 and int4 KV are written a 32-value group at a time, by one warp.
+#define KV_GROUPED(KT) ((KT) == DLM_KV_I8 || (KT) == DLM_KV_I4)
 
 // Launch `...` (which names the element type `KT_`) for KV held as `kind`.
 #define DLM_KV_SWITCH(kind, ...)                                        \
     switch (kind) {                                                     \
         case DLM_KV_I8: { constexpr int KT_ = DLM_KV_I8; __VA_ARGS__; } break;   \
+        case DLM_KV_I4: { constexpr int KT_ = DLM_KV_I4; __VA_ARGS__; } break;   \
         case DLM_KV_F16: { constexpr int KT_ = DLM_KV_F16; __VA_ARGS__; } break; \
         default: { constexpr int KT_ = DLM_KV_F32; __VA_ARGS__; } break;         \
     }
@@ -1710,6 +1719,16 @@ __device__ __forceinline__ float load_kv<DLM_KV_I8>(const void* kv, long i) {
     const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
     return *(const float*)g * (float)(signed char)g[4 + (i & 31)];
 }
+// A 4-bit two's-complement code as a float.
+__device__ __forceinline__ float i4_code(unsigned int nib) {
+    return (float)((int)(nib & 15u) - (int)((nib & 8u) << 1));
+}
+template <>
+__device__ __forceinline__ float load_kv<DLM_KV_I4>(const void* kv, long i) {
+    const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I4_GROUP_BYTES;
+    const unsigned int byte = g[4 + ((i & 31) >> 1)];
+    return *(const float*)g * i4_code(byte >> (4 * (i & 1)));
+}
 
 // Write 32 values, one per lane of a full warp, as the int8 group starting at
 // element `at` (a multiple of 32): the group's largest magnitude over 127 is
@@ -1723,6 +1742,30 @@ __device__ __forceinline__ void kv_store_i8(float x, void* kv, long at) {
     unsigned char* g = (unsigned char*)kv + (at >> 5) * KV_I8_GROUP_BYTES;
     g[4 + lane] = (unsigned char)(signed char)(scale > 0.0f ? __float2int_rn(x / scale) : 0);
     if (lane == 0) *(float*)g = scale;
+}
+
+// `kv_store_i8` for int4: the group's largest magnitude over 7 is its scale,
+// codes rounded half away from zero as the CPU store rounds, and each even
+// lane writes its byte with the next lane's code in the high nibble.
+__device__ __forceinline__ void kv_store_i4(float x, void* kv, long at) {
+    const int lane = threadIdx.x & 31;
+    float amax = fabsf(x);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float scale = amax / 7.0f;
+    const int q = scale > 0.0f ? max(-7, min(7, (int)roundf(x / scale))) : 0;
+    const unsigned int nib = (unsigned int)q & 15u;
+    const unsigned int hi = __shfl_down_sync(0xffffffffu, nib, 1);
+    unsigned char* g = (unsigned char*)kv + (at >> 5) * KV_I4_GROUP_BYTES;
+    if ((lane & 1) == 0) g[4 + (lane >> 1)] = (unsigned char)(nib | (hi << 4));
+    if (lane == 0) *(float*)g = scale;
+}
+
+// A grouped KV store, one warp per 32-value group: int8 or int4.
+template <int KT>
+__device__ __forceinline__ void kv_store_group(float x, void* kv, long at) {
+    if (KT == DLM_KV_I4) kv_store_i4(x, kv, at);
+    else kv_store_i8(x, kv, at);
 }
 
 // The KV cache is paged. A layer's keys (and values) live in one pool of
@@ -1746,12 +1789,13 @@ __global__ void kv_append_kernel(const float* src, void* kv, const int* table, i
     else ((float*)kv)[at] = src[i];
 }
 
-// `kv_append_kernel` for int8: one warp per 32-value group. `n % 32 == 0`.
-// <<<n / 32, 32>>>.
-__global__ void kv_append_i8_kernel(const float* src, void* kv, const int* table, int shift,
-                                    long row, int n) {
+// `kv_append_kernel` for int8 and int4: one warp per 32-value group.
+// `n % 32 == 0`. <<<n / 32, 32>>>.
+template <int KT>
+__global__ void kv_append_group_kernel(const float* src, void* kv, const int* table, int shift,
+                                       long row, int n) {
     const int i = blockIdx.x * 32 + threadIdx.x;
-    kv_store_i8(src[i], kv, kv_row(table, shift, row) * n + blockIdx.x * 32);
+    kv_store_group<KT>(src[i], kv, kv_row(table, shift, row) * n + blockIdx.x * 32);
 }
 
 template <int KT>
@@ -2066,7 +2110,13 @@ typedef struct { int v[DLM_MAX_BATCH]; } DlmInts;
 // Eight values from element `i`, a multiple of 8.
 template <int KT>
 __device__ __forceinline__ void load_kv8(const void* kv, long i, float* out) {
-    if (KT == DLM_KV_I8) {
+    if (KT == DLM_KV_I4) {
+        const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I4_GROUP_BYTES;
+        const float s = *(const float*)g;
+        const unsigned int u = *(const unsigned int*)(g + 4 + ((i & 31) >> 1));   // 4-byte aligned
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = s * i4_code(u >> (4 * j));
+    } else if (KT == DLM_KV_I8) {
         const unsigned char* g = (const unsigned char*)kv + (i >> 5) * KV_I8_GROUP_BYTES;
         const float s = *(const float*)g;
         const unsigned int* c = (const unsigned int*)(g + 4 + (i & 31));   // 4-byte aligned
@@ -2182,11 +2232,11 @@ attn_split_body(const float* __restrict__ q, const void* keys, const void* value
             const long kvd = (long)num_kv_heads * head_dim;
             const long dst = kv_row(table, shift, post->row) * kvd + (long)kvh * head_dim;
             const float* vh = post->v + (long)kvh * head_dim;
-            if (KT == DLM_KV_I8) {
+            if (KV_GROUPED(KT)) {
                 if (t < 32)
                     for (int g = 0; g < head_dim; g += 32) {
-                        kv_store_i8(kbuf[g + t], (void*)keys, dst + g);
-                        kv_store_i8(vh[g + t], (void*)values, dst + g);
+                        kv_store_group<KT>(kbuf[g + t], (void*)keys, dst + g);
+                        kv_store_group<KT>(vh[g + t], (void*)values, dst + g);
                     }
             } else {
                 for (int i = t; i < head_dim; i += C) {
@@ -2439,7 +2489,7 @@ static cudaError_t launch_attention_post(float* q, float* k, const float* v, flo
     const int G = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
     const bool split_ok = G >= 1 && G <= FA_MAX_G && G * num_kv_heads == num_heads &&
                           head_dim % 8 == 0 && head_dim <= 256 &&
-                          (kv_half != DLM_KV_I8 || head_dim % 32 == 0);
+                          (!KV_GROUPED(kv_half) || head_dim % 32 == 0);
     if (!split_ok) {
         launch_qk_post(q, k, v, q_norm, k_norm, num_heads, num_kv_heads, head_dim, position,
                        inv_freq, mscale, rope, eps, keys, values, table, shift, num_positions,
@@ -2476,8 +2526,11 @@ static void launch_kv_append(const float* k, const float* v, void* keys, void* v
                              const int* table, int shift, long row, int kv_dim, int kv_half) {
     const int B = 256;
     if (kv_half == DLM_KV_I8) {
-        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
-        kv_append_i8_kernel<<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
+        kv_append_group_kernel<DLM_KV_I8><<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
+        kv_append_group_kernel<DLM_KV_I8><<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
+    } else if (kv_half == DLM_KV_I4) {
+        kv_append_group_kernel<DLM_KV_I4><<<kv_dim / 32, 32>>>(k, keys, table, shift, row, kv_dim);
+        kv_append_group_kernel<DLM_KV_I4><<<kv_dim / 32, 32>>>(v, values, table, shift, row, kv_dim);
     } else if (kv_half) {
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(k, keys, table, shift, row, kv_dim);
         kv_append_kernel<DLM_KV_F16><<<grid_for(kv_dim, B), B>>>(v, values, table, shift, row, kv_dim);
@@ -2697,7 +2750,7 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
         }
         vec[i] = a;
         vec[i + half] = b;
-        if (is_k && KT != DLM_KV_I8) {
+        if (is_k && !KV_GROUPED(KT)) {
             if (KT == DLM_KV_F16) {
                 ((__half*)kv_keys)[dst + i] = __float2half(a);
                 ((__half*)kv_keys)[dst + i + half] = __float2half(b);
@@ -2709,13 +2762,13 @@ qk_post_body(float* q, float* k, const float* v, const float* q_norm, const floa
     }
     if (is_k) {
         const float* vh = v + (long)head * head_dim;
-        if (KT == DLM_KV_I8) {
+        if (KV_GROUPED(KT)) {
             // Whole groups (head_dim % 32 == 0), each lane's value written by
             // another lane above: wait for the warp's writes to `vec`.
             __syncwarp();
             for (int g = 0; g < head_dim; g += 32) {
-                kv_store_i8(vec[g + lane], kv_keys, dst + g);
-                kv_store_i8(vh[g + lane], kv_values, dst + g);
+                kv_store_group<KT>(vec[g + lane], kv_keys, dst + g);
+                kv_store_group<KT>(vh[g + lane], kv_values, dst + g);
             }
             return;
         }

@@ -17,6 +17,13 @@ fork that runs large MoE models from SSD.
 
 ### Changed
 
+- **`--kv-quant int4` keeps int4 KV on the GPU.** It used to fall back to
+  int8 there; the GPU now has the CPU's int4 store (a scale per 32 values and
+  16 bytes of 4-bit codes, 0.625 bytes a value against int8's 1.125), so the
+  same VRAM holds 1.8x the context. It costs accuracy: Qwen2.5-0.5B scored
+  4.59 nats per token over 490 tokens with int4 KV (4.60 on the CPU, which
+  quantizes the same way), against 3.95 with fp16 or int8. The default stays
+  int8, and anyone passing `int4` on the GPU now gets int4.
 - **Every layer cache on the streaming path now evicts the most recently used
   layer.** The VRAM window already did, since layers are read in a cycle and
   LRU evicts the layer needed next. The host-RAM tier (`--ram-cache-gb`), the
