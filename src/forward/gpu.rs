@@ -228,6 +228,27 @@ extern "C" {
     /// Copy the current FFN input out to `dst` (`hidden_size` device floats).
     pub(crate) fn dlm_moe_save_normed(hidden_size: i32, dst: *mut f32) -> i32;
 
+    /// One routed expert over `t` tokens: row `rows[i]` of `norm` (`[*, hidden]`
+    /// device FFN inputs) gathered, the expert run once over all of them, and
+    /// `x[rows[i]] += weights[i] * expert(norm[rows[i]])`. `rows` and `weights`
+    /// are host arrays of `t`; the rows must be distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_apply_expert_rows(
+        hidden_size: i32,
+        inter: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        gate: *const c_void,
+        up: *const c_void,
+        down: *const c_void,
+        norm: *const f32,
+        rows: *const i32,
+        weights: *const f32,
+        t: i32,
+        x: *mut f32,
+        activation: i32,
+    ) -> i32;
+
     /// Make `src` (`hidden_size` device floats) the FFN input the router and
     /// expert calls read.
     pub(crate) fn dlm_moe_load_normed(hidden_size: i32, src: *const f32) -> i32;
@@ -922,6 +943,54 @@ impl GpuExpert {
             w_group_size: e.up.group_size() as i32,
         })
     }
+
+    /// [`upload`](Self::upload) through page-locked `staging` on `stream`,
+    /// into `reuse`'s buffers when their sizes match. A plain pageable copy
+    /// blocks the host and serializes with the kernels on the default stream,
+    /// so an expert prefetched by the worker could not load under compute; and
+    /// freeing an evicted expert's buffers waits for the whole device. The
+    /// caller makes sure nothing still queued reads `reuse`.
+    pub(crate) fn upload_staged(
+        e: &crate::forward::cpu::ExpertFfn,
+        staging: &mut crate::memory::PinnedBuffer,
+        stream: &crate::gpu::device::Stream,
+        reuse: Option<GpuExpert>,
+    ) -> Result<Self> {
+        let parts = [&e.gate, &e.up, &e.down];
+        let total: usize = parts.iter().map(|w| w.as_bytes().len()).sum();
+        if staging.len() < total {
+            *staging = crate::memory::PinnedBuffer::with_len(total)?;
+        }
+        let mut old = reuse.map(|g| [g.gate, g.up, g.down].into_iter());
+        let mut bufs = Vec::with_capacity(3);
+        let mut off = 0;
+        for w in parts {
+            let bytes = w.as_bytes();
+            staging.as_mut_slice()[off..off + bytes.len()].copy_from_slice(bytes);
+            let buf = match old.as_mut().and_then(|o| o.next()) {
+                Some(b) if b.bytes() == bytes.len().max(1) && b.len() == w.len() => b,
+                _ => DeviceBuffer::new_bytes(bytes.len(), w.len())?,
+            };
+            // SAFETY: `staging` is page-locked and holds these bytes at `off`
+            // until `stream` is synchronized below.
+            buf.upload_async_bytes(
+                unsafe { staging.as_ptr().add(off) } as *const c_void,
+                bytes.len(),
+                stream,
+            )?;
+            bufs.push(buf);
+            off += bytes.len();
+        }
+        stream.synchronize()?;
+        let [gate, up, down]: [DeviceBuffer; 3] = bufs.try_into().ok().expect("three parts");
+        Ok(Self {
+            gate,
+            up,
+            down,
+            w_dtype: e.up.dtype_code(),
+            w_group_size: e.up.group_size() as i32,
+        })
+    }
 }
 
 /// A MoE layer's **unrouted** weights in VRAM: the router, and the shared expert
@@ -937,6 +1006,8 @@ pub(crate) struct GpuMoeCore {
     shared_gate: Option<DeviceBuffer>,
     shared_gate_dtype: i32,
     shared_gate_group: i32,
+    /// DeepSeek-V3's choice-only score bias, on the host where routing runs.
+    router_bias: Option<Vec<f32>>,
 }
 
 impl GpuMoeCore {
@@ -957,6 +1028,7 @@ impl GpuMoeCore {
                 .transpose()?,
             shared_gate_dtype,
             shared_gate_group,
+            router_bias: t.router_bias().map(<[f32]>::to_vec),
         })
     }
 
@@ -1013,10 +1085,10 @@ impl GpuMoeCore {
                 code,
             });
         }
-        Ok(crate::forward::cpu::route_topk(
+        Ok(crate::forward::cpu::route(
             &logits,
-            m.experts_per_tok as usize,
-            m.norm_topk_prob,
+            &m,
+            self.router_bias.as_deref(),
         ))
     }
 
@@ -1085,39 +1157,47 @@ impl GpuMoeCore {
 
     /// The shared expert (Qwen2-MoE / DeepSeek), if any, on the current FFN input.
     pub(crate) fn apply_shared(&self, cfg: &BlockConfig, hidden: *mut f32) -> Result<()> {
-        let m = cfg.moe.expect("GpuMoeCore::apply_shared on a dense model");
-        // Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
-        if let Some(sh) = &self.shared {
-            let weight = match &self.shared_gate {
-                Some(g) => {
-                    let mut logit = [0f32; 1];
-                    let code = unsafe {
-                        dlm_moe_matvec(
-                            1,
-                            cfg.hidden_size as i32,
-                            self.shared_gate_dtype,
-                            self.shared_gate_group,
-                            g.as_ptr() as *const c_void,
-                            logit.as_mut_ptr(),
-                        )
-                    };
-                    if code != 0 {
-                        return Err(DlmError::Gpu {
-                            api: "dlm_moe_matvec",
-                            code,
-                        });
-                    }
-                    1.0 / (1.0 + (-logit[0]).exp())
-                }
-                // DeepSeek ships no gate: its shared expert is added whole.
-                None => 1.0,
-            };
-            let sinter = m
-                .shared_intermediate_size
-                .unwrap_or(m.moe_intermediate_size) as i32;
-            self.apply_one(cfg, sh, sinter, weight, hidden)?;
+        if let Some((sh, inter)) = self.shared(cfg) {
+            let weight = self.shared_weight(cfg)?;
+            self.apply_one(cfg, sh, inter, weight, hidden)?;
         }
         Ok(())
+    }
+
+    /// The shared expert and its intermediate size, if the layer has one.
+    pub(crate) fn shared(&self, cfg: &BlockConfig) -> Option<(&GpuExpert, i32)> {
+        let m = cfg.moe.expect("GpuMoeCore::shared on a dense model");
+        let inter = m
+            .shared_intermediate_size
+            .unwrap_or(m.moe_intermediate_size) as i32;
+        self.shared.as_ref().map(|sh| (sh, inter))
+    }
+
+    /// The shared expert's weight for the current FFN input: Qwen2-MoE gates it
+    /// by `sigmoid(shared_gate · normed2)`; DeepSeek ships no gate and adds it
+    /// whole.
+    pub(crate) fn shared_weight(&self, cfg: &BlockConfig) -> Result<f32> {
+        let Some(g) = &self.shared_gate else {
+            return Ok(1.0);
+        };
+        let mut logit = [0f32; 1];
+        let code = unsafe {
+            dlm_moe_matvec(
+                1,
+                cfg.hidden_size as i32,
+                self.shared_gate_dtype,
+                self.shared_gate_group,
+                g.as_ptr() as *const c_void,
+                logit.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_matvec",
+                code,
+            });
+        }
+        Ok(1.0 / (1.0 + (-logit[0]).exp()))
     }
 
     /// `x += weight * expert(normed2)`, one expert at a time.

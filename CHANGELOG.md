@@ -15,14 +15,31 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Ideas taken from [InferSSD](https://wici.ai/inferssd), a llama.cpp
 fork that runs large MoE models from SSD.
 
+### Fixed
+
+- **DeepSeek MLA rotated the wrong pairs of its RoPE dimensions.** DeepSeek's
+  reference code rotates adjacent values `(2i, 2i+1)` of `q_pe` and `k_pe`;
+  dlm rotated the halves `(i, i + d/2)`, as for Llama-style checkpoints, so
+  every DeepSeek-V2 attention score was off. On a tiny random DeepSeek-V2
+  checkpoint, dlm's log-probabilities differed from `transformers`' by up to
+  0.39 nats; now by 1e-6, pinned by `tests/deepseek_parity.rs` against a
+  committed fixture. dlm's own CPU/GPU parity tests compared it with itself
+  and could not see it.
+
 ### Changed
 
+- **`--kv-quant int4` keeps int4 KV on the GPU.** It used to fall back to
+  int8 there; the GPU now has the CPU's int4 store (a scale per 32 values and
+  16 bytes of 4-bit codes, 0.625 bytes a value against int8's 1.125), so the
+  same VRAM holds 1.8x the context. It costs accuracy: Qwen2.5-0.5B scored
+  4.59 nats per token over 490 tokens with int4 KV (4.60 on the CPU, which
+  quantizes the same way), against 3.95 with fp16 or int8. The default stays
+  int8, and anyone passing `int4` on the GPU now gets int4.
 - **JSON keeps the client's key order.** `serde_json` sorted object keys, so
   tool definitions reached the prompt in a different order from the one
   `transformers` writes (the existing Qwen test expected the sorted order;
   rendering Qwen3's template shows otherwise), and a JSON schema's properties
   were generated alphabetically rather than in the schema's order.
-
 - **Every layer cache on the streaming path now evicts the most recently used
   layer.** The VRAM window already did, since layers are read in a cycle and
   LRU evicts the layer needed next. The host-RAM tier (`--ram-cache-gb`), the
@@ -40,10 +57,22 @@ fork that runs large MoE models from SSD.
   to every token that chose it. Batched decode of a streamed MoE model works the
   same way, layer by layer for the whole batch, where it used to run each
   sequence through the whole stack in turn.
+- **Streamed MoE: grouped experts run as one batched call per expert, and
+  attention is batched too.** The grouped pass applied an expert one token at a
+  time, reading its weights once per token; each expert now runs once over all
+  its tokens (a GEMM for many rows, the batched GEMV for up to 16), and the
+  shared expert once over every token. Prefill and batched decode also run a
+  MoE layer's attention 16 rows per call, each projection read once for all of
+  them (MLA attention still goes token by token).
 - **Streamed MoE: decode expert misses can run on the CPU.** A missed expert is
   computed on the CPU from host RAM or uploaded to the GPU, whichever has
   measured cheaper so far. One token per expert is a memory-bound read, and
   system RAM can be faster than a small card's PCIe link.
+- **Streamed MoE: expert uploads are staged through pinned memory and reuse
+  an evicted expert's VRAM.** An expert was uploaded with three pageable
+  copies, which block and serialize with the kernels on the default stream,
+  so an expert the worker prefetched could not load under compute; and the
+  evicted expert's buffers were freed, which waits for the whole device.
 - **Streamed MoE: the VRAM expert cache evicts by decayed routing count.**
   Each selection adds 1 to an expert's score and the score halves every two
   passes through its layer. The lowest score is evicted, preferring another
@@ -55,6 +84,15 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **DeepSeek-V3 routing.** V3/R1 checkpoints were refused for their router.
+  dlm now routes as V3 does (sigmoid scores, the per-layer
+  `e_score_correction_bias` added for the choice only, the best `topk_group`
+  of `n_group` groups by their top two scores, renormalized weights times
+  `routed_scaling_factor`) and as DeepSeek-V2's full model does
+  (`group_limited_greedy`). Checked against `transformers` on a tiny random
+  V3 checkpoint (`tests/deepseek_parity.rs`). An unknown `scoring_func` or
+  `topk_method` is still refused. V3's multi-token-prediction layer is not
+  used.
 - **Tool calling for Llama 3.1/3.2 and Mistral v0.3.** `tools` used to need
   the ChatML template (Qwen). The `llama3` and `mistral` templates now write
   tools, calls and results as each model's own Jinja template does (checked

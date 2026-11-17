@@ -8,3 +8,6 @@
 # Docker reads these on Linux: a CRLF line continuation breaks a RUN.
 Dockerfile text eol=lf
 .dockerignore text eol=lf
+
+# Test fixture checkpoints are binary too.
+*.safetensors binary

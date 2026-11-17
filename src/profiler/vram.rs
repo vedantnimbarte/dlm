@@ -156,7 +156,8 @@ impl VramProfiler {
             KvElem::F32 => 32,
             KvElem::F16 => 16,
             KvElem::I8 if config.head_dim() % 32 == 0 => 9,
-            KvElem::I8 => 16,
+            KvElem::I4 if config.head_dim() % 32 == 0 => 5,
+            KvElem::I8 | KvElem::I4 => 16,
         };
         (values * eighths).div_ceil(8) * self.target_context as u64
     }
