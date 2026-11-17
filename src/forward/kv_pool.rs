@@ -378,7 +378,8 @@ impl Drop for PagedKv {
 pub struct KvPools {
     layers: Vec<Mutex<[Option<Arc<KvPool>>; 4]>>,
     blocks: u32,
-    kv_dim: usize,
+    /// K/V width per layer (Gemma 4's global layers are wider).
+    kv_dims: Vec<usize>,
     /// int8 groups fit inside heads (`head_dim % 32 == 0`); else int8 asks get
     /// fp16 pools.
     int8: bool,
@@ -390,13 +391,22 @@ impl KvPools {
     /// Pools for `num_layers` layers of K/V width `kv_dim` (heads of
     /// `head_dim`) holding up to `tokens` tokens each.
     pub fn new(num_layers: usize, kv_dim: usize, head_dim: usize, tokens: usize) -> Self {
+        Self::with_layer_dims(vec![kv_dim; num_layers], head_dim, tokens)
+    }
+
+    /// Pools whose layers differ in K/V width (`kv_dims[layer]`); `head_dim`
+    /// is the narrowest head, which decides whether int8 groups fit.
+    pub fn with_layer_dims(kv_dims: Vec<usize>, head_dim: usize, tokens: usize) -> Self {
+        let num_layers = kv_dims.len();
         Self {
             layers: (0..num_layers)
                 .map(|_| Mutex::new([None, None, None, None]))
                 .collect(),
             blocks: tokens.div_ceil(KV_BLOCK_ROWS).max(1).min(u32::MAX as usize) as u32,
-            kv_dim,
-            int8: head_dim > 0 && head_dim % I8_GROUP == 0 && kv_dim % I8_GROUP == 0,
+            int8: head_dim > 0
+                && head_dim % I8_GROUP == 0
+                && kv_dims.iter().all(|d| d % I8_GROUP == 0),
+            kv_dims,
             host_from: num_layers,
         }
     }
@@ -440,7 +450,7 @@ impl KvPools {
             return Ok(Arc::clone(pool));
         }
         let host = layer >= self.host_from;
-        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dim, elem, host)?);
+        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dims[layer], elem, host)?);
         *slot = Some(Arc::clone(&pool));
         Ok(pool)
     }
