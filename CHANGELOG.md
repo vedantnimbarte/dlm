@@ -45,6 +45,13 @@ fork that runs large MoE models from SSD.
   to every token that chose it. Batched decode of a streamed MoE model works the
   same way, layer by layer for the whole batch, where it used to run each
   sequence through the whole stack in turn.
+- **Streamed MoE: grouped experts run as one batched call per expert, and
+  attention is batched too.** The grouped pass applied an expert one token at a
+  time, reading its weights once per token; each expert now runs once over all
+  its tokens (a GEMM for many rows, the batched GEMV for up to 16), and the
+  shared expert once over every token. Prefill and batched decode also run a
+  MoE layer's attention 16 rows per call, each projection read once for all of
+  them (MLA attention still goes token by token).
 - **Streamed MoE: decode expert misses can run on the CPU.** A missed expert is
   computed on the CPU from host RAM or uploaded to the GPU, whichever has
   measured cheaper so far. One token per expert is a memory-bound read, and

@@ -228,6 +228,27 @@ extern "C" {
     /// Copy the current FFN input out to `dst` (`hidden_size` device floats).
     pub(crate) fn dlm_moe_save_normed(hidden_size: i32, dst: *mut f32) -> i32;
 
+    /// One routed expert over `t` tokens: row `rows[i]` of `norm` (`[*, hidden]`
+    /// device FFN inputs) gathered, the expert run once over all of them, and
+    /// `x[rows[i]] += weights[i] * expert(norm[rows[i]])`. `rows` and `weights`
+    /// are host arrays of `t`; the rows must be distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_apply_expert_rows(
+        hidden_size: i32,
+        inter: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        gate: *const c_void,
+        up: *const c_void,
+        down: *const c_void,
+        norm: *const f32,
+        rows: *const i32,
+        weights: *const f32,
+        t: i32,
+        x: *mut f32,
+        activation: i32,
+    ) -> i32;
+
     /// Make `src` (`hidden_size` device floats) the FFN input the router and
     /// expert calls read.
     pub(crate) fn dlm_moe_load_normed(hidden_size: i32, src: *const f32) -> i32;
@@ -1136,39 +1157,47 @@ impl GpuMoeCore {
 
     /// The shared expert (Qwen2-MoE / DeepSeek), if any, on the current FFN input.
     pub(crate) fn apply_shared(&self, cfg: &BlockConfig, hidden: *mut f32) -> Result<()> {
-        let m = cfg.moe.expect("GpuMoeCore::apply_shared on a dense model");
-        // Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
-        if let Some(sh) = &self.shared {
-            let weight = match &self.shared_gate {
-                Some(g) => {
-                    let mut logit = [0f32; 1];
-                    let code = unsafe {
-                        dlm_moe_matvec(
-                            1,
-                            cfg.hidden_size as i32,
-                            self.shared_gate_dtype,
-                            self.shared_gate_group,
-                            g.as_ptr() as *const c_void,
-                            logit.as_mut_ptr(),
-                        )
-                    };
-                    if code != 0 {
-                        return Err(DlmError::Gpu {
-                            api: "dlm_moe_matvec",
-                            code,
-                        });
-                    }
-                    1.0 / (1.0 + (-logit[0]).exp())
-                }
-                // DeepSeek ships no gate: its shared expert is added whole.
-                None => 1.0,
-            };
-            let sinter = m
-                .shared_intermediate_size
-                .unwrap_or(m.moe_intermediate_size) as i32;
-            self.apply_one(cfg, sh, sinter, weight, hidden)?;
+        if let Some((sh, inter)) = self.shared(cfg) {
+            let weight = self.shared_weight(cfg)?;
+            self.apply_one(cfg, sh, inter, weight, hidden)?;
         }
         Ok(())
+    }
+
+    /// The shared expert and its intermediate size, if the layer has one.
+    pub(crate) fn shared(&self, cfg: &BlockConfig) -> Option<(&GpuExpert, i32)> {
+        let m = cfg.moe.expect("GpuMoeCore::shared on a dense model");
+        let inter = m
+            .shared_intermediate_size
+            .unwrap_or(m.moe_intermediate_size) as i32;
+        self.shared.as_ref().map(|sh| (sh, inter))
+    }
+
+    /// The shared expert's weight for the current FFN input: Qwen2-MoE gates it
+    /// by `sigmoid(shared_gate · normed2)`; DeepSeek ships no gate and adds it
+    /// whole.
+    pub(crate) fn shared_weight(&self, cfg: &BlockConfig) -> Result<f32> {
+        let Some(g) = &self.shared_gate else {
+            return Ok(1.0);
+        };
+        let mut logit = [0f32; 1];
+        let code = unsafe {
+            dlm_moe_matvec(
+                1,
+                cfg.hidden_size as i32,
+                self.shared_gate_dtype,
+                self.shared_gate_group,
+                g.as_ptr() as *const c_void,
+                logit.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_matvec",
+                code,
+            });
+        }
+        Ok(1.0 / (1.0 + (-logit[0]).exp()))
     }
 
     /// `x += weight * expert(normed2)`, one expert at a time.
