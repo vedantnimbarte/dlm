@@ -982,11 +982,12 @@ impl GpuExpert {
             off += bytes.len();
         }
         stream.synchronize()?;
-        let [gate, up, down]: [DeviceBuffer; 3] = bufs.try_into().ok().expect("three parts");
+        let mut bufs = bufs.into_iter();
+        let mut next = || bufs.next().expect("one buffer per part");
         Ok(Self {
-            gate,
-            up,
-            down,
+            gate: next(),
+            up: next(),
+            down: next(),
             w_dtype: e.up.dtype_code(),
             w_group_size: e.up.group_size() as i32,
         })
