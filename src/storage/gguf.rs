@@ -250,6 +250,14 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
     }
     let data_len = file_len - data_offset;
 
+    // Gemma 2 and 3 norm the FFN input with their own norm and keep
+    // `post_attention_norm` for the attention output, so their `ffn_norm` is
+    // `pre_feedforward_layernorm`; everywhere else `ffn_norm` is the one norm
+    // between attention and FFN, `post_attention_layernorm`.
+    let sandwich = matches!(
+        metadata.get("general.architecture").and_then(Value::as_str),
+        Some("gemma2" | "gemma3")
+    );
     let mut tensors = BTreeMap::new();
     for (gguf_name, shape, kind, offset) in raw {
         let dtype = dtype_of(kind, &gguf_name)?;
@@ -270,7 +278,7 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
                 "tensor {gguf_name:?} runs past the end of the data section"
             )));
         }
-        let name = match hf_name(&gguf_name) {
+        let name = match hf_name(&gguf_name, sandwich) {
             Some(name) => name,
             // Tensors dlm has no use for (llama.cpp's rope frequency tables, for
             // instance) keep their own name rather than being dropped: the loader
@@ -392,7 +400,7 @@ fn dtype_of(kind: u32, name: &str) -> Result<Dtype> {
 /// This is the whole of GGUF's "different architecture" for a dense model: the
 /// same tensors under different names. Keeping the translation here means every
 /// family the loader already supports arrives at it unchanged.
-fn hf_name(gguf: &str) -> Option<String> {
+fn hf_name(gguf: &str, sandwich: bool) -> Option<String> {
     // Model-level tensors.
     match gguf {
         "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
@@ -416,6 +424,7 @@ fn hf_name(gguf: &str) -> Option<String> {
         "attn_output" => "self_attn.o_proj",
         "attn_q_norm" => "self_attn.q_norm",
         "attn_k_norm" => "self_attn.k_norm",
+        "ffn_norm" if sandwich => "pre_feedforward_layernorm",
         "ffn_norm" => "post_attention_layernorm",
         "ffn_gate" => "mlp.gate_proj",
         "ffn_up" => "mlp.up_proj",
@@ -427,9 +436,6 @@ fn hf_name(gguf: &str) -> Option<String> {
         "ffn_post_norm" => "post_feedforward_layernorm",
         _ => return None,
     };
-    // Gemma writes `attn_norm` for the pre-attention norm and `post_attention_norm`
-    // for the one after it; both map above, and the loader tells them apart by
-    // which names are present, exactly as it does for a safetensors Gemma.
     Some(format!("model.layers.{layer}.{hf}.{suffix}"))
 }
 
@@ -537,9 +543,36 @@ mod tests {
             ),
         ];
         for (gguf, hf) in cases {
-            assert_eq!(hf_name(gguf).as_deref(), Some(hf), "{gguf}");
+            assert_eq!(hf_name(gguf, false).as_deref(), Some(hf), "{gguf}");
         }
         // Not a tensor dlm knows: kept under its own name rather than guessed at.
-        assert_eq!(hf_name("rope_freqs.weight"), None);
+        assert_eq!(hf_name("rope_freqs.weight", false), None);
+        // Gemma 2/3 carry four norms per layer; `ffn_norm` is the pre-FFN one,
+        // and must not land on top of `post_attention_norm`.
+        let gemma = [
+            (
+                "blk.2.attn_norm.weight",
+                "model.layers.2.input_layernorm.weight",
+            ),
+            (
+                "blk.2.post_attention_norm.weight",
+                "model.layers.2.post_attention_layernorm.weight",
+            ),
+            (
+                "blk.2.ffn_norm.weight",
+                "model.layers.2.pre_feedforward_layernorm.weight",
+            ),
+            (
+                "blk.2.post_ffw_norm.weight",
+                "model.layers.2.post_feedforward_layernorm.weight",
+            ),
+        ];
+        for (gguf, hf) in gemma {
+            assert_eq!(hf_name(gguf, true).as_deref(), Some(hf), "{gguf}");
+        }
+        assert_eq!(
+            hf_name("blk.2.ffn_norm.weight", false).as_deref(),
+            Some("model.layers.2.post_attention_layernorm.weight")
+        );
     }
 }
