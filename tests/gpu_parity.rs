@@ -1130,6 +1130,7 @@ fn random_moe_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> 
                     down_bias: None,
                 }),
                 shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+                router_bias: None,
             };
             LayerTensors {
                 q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * h, s)),
@@ -1250,6 +1251,7 @@ fn gpu_moe_matches_cpu_routed_only() {
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
             first_k_dense: 0,
+            routing: Default::default(),
         },
         "routed-only",
     );
@@ -1267,6 +1269,7 @@ fn gpu_moe_matches_cpu_with_shared_expert() {
             norm_topk_prob: true,
             naming: MoeNaming::Qwen,
             first_k_dense: 0,
+            routing: Default::default(),
         },
         "shared-expert",
     );
@@ -1480,6 +1483,7 @@ fn random_mla_layers(
                             down_bias: None,
                         }),
                         shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+                        router_bias: None,
                     }
                 }
             };
@@ -1580,6 +1584,7 @@ fn gpu_mla_moe_streaming_matches_cpu() {
         norm_topk_prob: true,
         naming: MoeNaming::Mixtral,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 6, 0xD5EE, Some(m));
@@ -1598,6 +1603,7 @@ fn gpu_mla_moe_streaming_matches_cpu_with_shared_expert() {
         norm_topk_prob: true,
         naming: MoeNaming::Qwen,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 6, 0xD5EF, Some(m));
@@ -1774,6 +1780,7 @@ fn gpu_grouped_experts_match_cpu() {
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
             first_k_dense: 0,
+            routing: Default::default(),
         },
         "grouped-top4",
     );
@@ -2005,6 +2012,7 @@ fn streaming_gpu_prefill_matches_cpu_decode_moe() {
         norm_topk_prob: true,
         naming: MoeNaming::Qwen,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let cfg = BlockConfig {
         moe: Some(m),
@@ -2035,6 +2043,7 @@ fn streaming_gpu_prefill_matches_cpu_decode_mla_moe() {
         norm_topk_prob: true,
         naming: MoeNaming::Mixtral,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 4, 0xD5F1, Some(m));
@@ -3064,6 +3073,7 @@ fn gpu_decode_batch_matches_solo() {
             norm_topk_prob: true,
             naming: MoeNaming::Qwen,
             first_k_dense: 0,
+            routing: Default::default(),
         }),
         ..cfg
     };
@@ -3145,6 +3155,7 @@ fn gpu_decode_batch_matches_solo() {
         norm_topk_prob: true,
         naming: MoeNaming::Qwen,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let moe_cfg = BlockConfig {
         moe: Some(m),

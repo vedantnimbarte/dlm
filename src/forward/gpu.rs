@@ -937,6 +937,8 @@ pub(crate) struct GpuMoeCore {
     shared_gate: Option<DeviceBuffer>,
     shared_gate_dtype: i32,
     shared_gate_group: i32,
+    /// DeepSeek-V3's choice-only score bias, on the host where routing runs.
+    router_bias: Option<Vec<f32>>,
 }
 
 impl GpuMoeCore {
@@ -957,6 +959,7 @@ impl GpuMoeCore {
                 .transpose()?,
             shared_gate_dtype,
             shared_gate_group,
+            router_bias: t.router_bias().map(<[f32]>::to_vec),
         })
     }
 
@@ -1013,10 +1016,10 @@ impl GpuMoeCore {
                 code,
             });
         }
-        Ok(crate::forward::cpu::route_topk(
+        Ok(crate::forward::cpu::route(
             &logits,
-            m.experts_per_tok as usize,
-            m.norm_topk_prob,
+            &m,
+            self.router_bias.as_deref(),
         ))
     }
 

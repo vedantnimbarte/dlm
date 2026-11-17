@@ -1534,11 +1534,25 @@ pub(crate) fn load_moe_ffn(
         _ => (None, None),
     };
 
+    // DeepSeek-V3's choice-only score bias, a `[num_experts]` buffer beside the
+    // router weight.
+    let router_bias = if m.routing.score_bias {
+        Some(load_norm(
+            store,
+            &format!("{}.e_score_correction_bias", names.router),
+            m.num_experts as usize,
+            false,
+        )?)
+    } else {
+        None
+    };
+
     Ok(Ffn::Moe {
         router,
         experts,
         shared,
         shared_gate,
+        router_bias,
     })
 }
 

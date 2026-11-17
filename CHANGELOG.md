@@ -60,6 +60,15 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **DeepSeek-V3 routing.** V3/R1 checkpoints were refused for their router.
+  dlm now routes as V3 does (sigmoid scores, the per-layer
+  `e_score_correction_bias` added for the choice only, the best `topk_group`
+  of `n_group` groups by their top two scores, renormalized weights times
+  `routed_scaling_factor`) and as DeepSeek-V2's full model does
+  (`group_limited_greedy`). Checked against `transformers` on a tiny random
+  V3 checkpoint (`tests/deepseek_parity.rs`). An unknown `scoring_func` or
+  `topk_method` is still refused. V3's multi-token-prediction layer is not
+  used.
 - **`serve --prefix-cache-dir DIR`** keeps cached prompt prefixes on disk, so
   a long system prompt is prefilled once rather than once per server start.
   Entries go in a subdirectory per model and setting (weights, `--quant`,
