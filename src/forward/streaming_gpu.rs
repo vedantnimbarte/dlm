@@ -581,15 +581,40 @@ impl GpuExpertCache {
         }
     }
 
-    fn insert(&mut self, key: (u32, u32), expert: Arc<GpuExpert>, scores: &ExpertScores) {
-        while self.map.len() >= self.capacity && !self.map.contains_key(&key) {
-            // ponytail: O(capacity) scan per eviction; a heap if caches reach
-            // the tens of thousands.
-            let Some(&victim) = self.map.keys().filter(|k| **k != key).min_by(|a, b| {
+    /// The entry to evict for `key`: the lowest score, another layer's expert
+    /// before one of `key`'s own layer (so warming a layer's predicted experts
+    /// never evicts the others just warmed for it), and with `idle` only one no
+    /// compute call holds.
+    ///
+    /// ponytail: O(capacity) scan per eviction; a heap if caches reach the tens
+    /// of thousands.
+    fn victim(&self, key: (u32, u32), scores: &ExpertScores, idle: bool) -> Option<(u32, u32)> {
+        self.map
+            .iter()
+            .filter(|(k, e)| **k != key && (!idle || Arc::strong_count(e) == 1))
+            .map(|(k, _)| *k)
+            .min_by(|a, b| {
                 (a.0 == key.0)
                     .cmp(&(b.0 == key.0))
-                    .then(scores.score(**a).total_cmp(&scores.score(**b)))
-            }) else {
+                    .then(scores.score(*a).total_cmp(&scores.score(*b)))
+            })
+    }
+
+    /// When full, evict the entry `insert(key)` would and hand back its buffers
+    /// for the new expert to load into, provided nothing holds it. Evicting
+    /// before the load also keeps the cache from holding `capacity + 1`.
+    fn take_idle_victim(&mut self, key: (u32, u32), scores: &ExpertScores) -> Option<GpuExpert> {
+        if self.map.len() < self.capacity || self.map.contains_key(&key) {
+            return None;
+        }
+        let victim = self.victim(key, scores, true)?;
+        self.evictions += 1;
+        Arc::try_unwrap(self.map.remove(&victim)?).ok()
+    }
+
+    fn insert(&mut self, key: (u32, u32), expert: Arc<GpuExpert>, scores: &ExpertScores) {
+        while self.map.len() >= self.capacity && !self.map.contains_key(&key) {
+            let Some(victim) = self.victim(key, scores, false) else {
                 break;
             };
             self.map.remove(&victim);
@@ -616,6 +641,8 @@ struct GpuShared<S: LayerSource> {
     staging: Mutex<PinnedBuffer>,
     /// Dense layers kept staged in pinned memory (budget 0 disables it).
     pinned: Mutex<PinnedLru>,
+    /// Page-locked staging for routed-expert uploads, grown to the largest.
+    expert_staging: Mutex<PinnedBuffer>,
     /// VRAM cache of routed MoE experts (empty/unused for dense models).
     experts: Mutex<GpuExpertCache>,
     /// Count-decay routing scores and router predictions, driving expert
@@ -869,7 +896,27 @@ impl<S: LayerSource> GpuShared<S> {
     /// without the cache lock; a rare concurrent double-load just uploads twice.
     fn upload_expert(&self, layer: u32, expert: u32) -> Result<Arc<GpuExpert>> {
         let host = self.source.load_expert(layer, expert)?;
-        let gpu = Arc::new(GpuExpert::upload(&host)?);
+        let spare = {
+            let scores = self.scores.lock().unwrap();
+            self.experts
+                .lock()
+                .unwrap()
+                .take_idle_victim((layer, expert), &scores)
+        };
+        if spare.is_some() {
+            // No compute call holds the victim, but kernels its last one queued
+            // may still be reading it.
+            synchronize_default()?;
+        }
+        let gpu = {
+            let mut staging = self.expert_staging.lock().unwrap();
+            Arc::new(GpuExpert::upload_staged(
+                &host,
+                &mut staging,
+                &self.copy_stream,
+                spare,
+            )?)
+        };
         let scores = self.scores.lock().unwrap();
         self.experts
             .lock()
@@ -1113,6 +1160,7 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
             copy_stream: Stream::new_nonblocking()?,
             staging: Mutex::new(PinnedBuffer::with_len(staging_bytes)?),
             pinned: Mutex::new(PinnedLru::default()),
+            expert_staging: Mutex::new(PinnedBuffer::with_len(1)?),
             experts: Mutex::new(GpuExpertCache::new(expert_capacity)),
             scores: Mutex::new(ExpertScores::default()),
             routers: Mutex::new(HashMap::new()),

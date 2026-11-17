@@ -922,6 +922,54 @@ impl GpuExpert {
             w_group_size: e.up.group_size() as i32,
         })
     }
+
+    /// [`upload`](Self::upload) through page-locked `staging` on `stream`,
+    /// into `reuse`'s buffers when their sizes match. A plain pageable copy
+    /// blocks the host and serializes with the kernels on the default stream,
+    /// so an expert prefetched by the worker could not load under compute; and
+    /// freeing an evicted expert's buffers waits for the whole device. The
+    /// caller makes sure nothing still queued reads `reuse`.
+    pub(crate) fn upload_staged(
+        e: &crate::forward::cpu::ExpertFfn,
+        staging: &mut crate::memory::PinnedBuffer,
+        stream: &crate::gpu::device::Stream,
+        reuse: Option<GpuExpert>,
+    ) -> Result<Self> {
+        let parts = [&e.gate, &e.up, &e.down];
+        let total: usize = parts.iter().map(|w| w.as_bytes().len()).sum();
+        if staging.len() < total {
+            *staging = crate::memory::PinnedBuffer::with_len(total)?;
+        }
+        let mut old = reuse.map(|g| [g.gate, g.up, g.down].into_iter());
+        let mut bufs = Vec::with_capacity(3);
+        let mut off = 0;
+        for w in parts {
+            let bytes = w.as_bytes();
+            staging.as_mut_slice()[off..off + bytes.len()].copy_from_slice(bytes);
+            let buf = match old.as_mut().and_then(|o| o.next()) {
+                Some(b) if b.bytes() == bytes.len().max(1) && b.len() == w.len() => b,
+                _ => DeviceBuffer::new_bytes(bytes.len(), w.len())?,
+            };
+            // SAFETY: `staging` is page-locked and holds these bytes at `off`
+            // until `stream` is synchronized below.
+            buf.upload_async_bytes(
+                unsafe { staging.as_ptr().add(off) } as *const c_void,
+                bytes.len(),
+                stream,
+            )?;
+            bufs.push(buf);
+            off += bytes.len();
+        }
+        stream.synchronize()?;
+        let [gate, up, down]: [DeviceBuffer; 3] = bufs.try_into().ok().expect("three parts");
+        Ok(Self {
+            gate,
+            up,
+            down,
+            w_dtype: e.up.dtype_code(),
+            w_group_size: e.up.group_size() as i32,
+        })
+    }
 }
 
 /// A MoE layer's **unrouted** weights in VRAM: the router, and the shared expert
