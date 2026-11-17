@@ -887,19 +887,27 @@ inference engine):
   the prompt, decoded together in one batch; a sampled choice `i` draws with
   seed `seed + i`, so the choices differ, and streamed chunks carry each
   choice's `index`. **Embeddings** (`/v1/embeddings`): the final-normed hidden
-  state of each input's last token, at unit length, the pooling decoder
-  embedding models (Qwen3-Embedding, gte-Qwen2) are trained for; `input` as
+  states of each input, pooled and at unit length. `--embedding-pooling auto`
+  (the default) follows a sentence-transformers export's
+  `1_Pooling/config.json` (mean or last token) and otherwise takes the last
+  token, the pooling decoder embedding models (Qwen3-Embedding, gte-Qwen2) are
+  trained for; `last` or `mean` force one. `input` as
   text or token ids, one or several, `encoding_format` `float` or `base64`,
   and `dimensions` to keep the leading ones. A chat model's embeddings work
-  but are not tuned for retrieval. **Tool calling** (chat, ChatML models such
-  as Qwen2.5 and Qwen3): `tools` go into the prompt exactly as Qwen's own
-  template writes them, and the reply's `<tool_call>` blocks come back as
-  `tool_calls` with `finish_reason: "tool_calls"`, streamed as one delta at the
-  end; an assistant message's `tool_calls` and `tool` results render back in
-  for the next turn. `tool_choice` takes `auto` or `none`. Other templates
-  refuse `tools`, as dlm has no prompt format for them. Whether a model calls
-  well is the model's: Qwen2.5-1.5B and Qwen3-0.6B do, Qwen2.5-0.5B tends to
-  answer instead. `stop` (OpenAI) / `stop_sequences`
+  but are not tuned for retrieval. **Tool calling** (chat, in the `chatml`
+  (Qwen2.5, Qwen3), `llama3` (Llama 3.1/3.2) and `mistral` (Mistral v0.3)
+  templates): `tools` go into the prompt exactly as each model's own template
+  writes them, and the reply's calls (`<tool_call>` blocks, Llama's bare
+  `{"name": …, "parameters": …}` object, Mistral's `[TOOL_CALLS] [...]`) come
+  back as `tool_calls` with `finish_reason: "tool_calls"`, streamed as one
+  delta at the end; an assistant message's `tool_calls` and `tool` results
+  render back in for the next turn. Llama 3 takes one call per turn, as its
+  template does; Mistral's 9-character call ids are made from OpenAI's when
+  they differ. `tool_choice` takes `auto` or `none`. Other templates refuse
+  `tools`: Gemma's has no tool format. Whether a model calls well is the
+  model's: Qwen2.5-1.5B and Qwen3-0.6B do, Qwen2.5-0.5B tends to answer
+  instead. The Llama 3 and Mistral formats are checked against their
+  templates' output, not yet on the models themselves. `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,

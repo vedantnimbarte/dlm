@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
-    GenerateArgs, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs, Speculative,
-    TokenizeArgs,
+    GenerateArgs, PoolingArg, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs,
+    Speculative, TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -1940,6 +1940,11 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         ),
     }
     .with_chat_template(template)
+    .with_embedding_pooling(match args.embedding_pooling {
+        PoolingArg::Auto => dlm::generate::Pooling::for_model(&args.model_path),
+        PoolingArg::Last => dlm::generate::Pooling::Last,
+        PoolingArg::Mean => dlm::generate::Pooling::Mean,
+    })
     .with_eos_tokens(eos_tokens.clone())
     .with_context_window(args.context_length as usize)
     .with_queue_timeout(std::time::Duration::from_secs_f64(
