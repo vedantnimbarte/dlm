@@ -250,6 +250,17 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
     }
     let data_len = file_len - data_offset;
 
+    let arch = metadata.get("general.architecture").and_then(Value::as_str);
+    // llama.cpp numbers a model's MTP layers after its own; they are read as
+    // `mtp.layers.{i}`, as transformers names them.
+    let arch_int = |key: &str| {
+        arch.and_then(|a| metadata.get(&format!("{a}.{key}")))
+            .and_then(Value::as_u64)
+    };
+    let mtp_from = match (arch_int("block_count"), arch_int("nextn_predict_layers")) {
+        (Some(blocks), Some(mtp)) if mtp > 0 && mtp <= blocks => Some(blocks - mtp),
+        _ => None,
+    };
     let mut tensors = BTreeMap::new();
     for (gguf_name, shape, kind, offset) in raw {
         let dtype = dtype_of(kind, &gguf_name)?;
@@ -270,8 +281,11 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
                 "tensor {gguf_name:?} runs past the end of the data section"
             )));
         }
-        let name = match hf_name(&gguf_name) {
-            Some(name) => name,
+        let qwen35 = (arch == Some("qwen35moe"))
+            .then(|| qwen35_name(&gguf_name))
+            .flatten();
+        let name = match qwen35.or_else(|| hf_name(&gguf_name)) {
+            Some(name) => mtp_layer_name(name, mtp_from),
             // Tensors dlm has no use for (llama.cpp's rope frequency tables, for
             // instance) keep their own name rather than being dropped: the loader
             // looks up what it needs by name and never iterates blindly.
@@ -433,6 +447,68 @@ fn hf_name(gguf: &str) -> Option<String> {
     Some(format!("model.layers.{layer}.{hf}.{suffix}"))
 }
 
+/// `model.layers.{n}.x` as `mtp.layers.{n - first}.x` when layer `n` is one of
+/// the MTP layers llama.cpp counts after the model's (from `first` on).
+fn mtp_layer_name(name: String, first: Option<u64>) -> String {
+    let Some(first) = first else { return name };
+    let Some((idx, rest)) = name
+        .strip_prefix("model.layers.")
+        .and_then(|r| r.split_once('.'))
+    else {
+        return name;
+    };
+    match idx.parse::<u64>() {
+        Ok(i) if i >= first => format!("mtp.layers.{}.{rest}", i - first),
+        _ => name,
+    }
+}
+
+/// The names llama.cpp gives Qwen3.5/3.6's own tensors (`qwen35moe`), as the
+/// loader reads them, or `None` for the ones [`hf_name`] covers. Kept apart
+/// because some of these names mean something else in other architectures
+/// (`attn_qkv` is Phi-3's fused attention).
+///
+/// Two are stored transformed and get names of their own: `ssm_a` holds
+/// `-exp(A_log)` (read as `A_neg`), and the stacked experts are
+/// `experts.{gate,up,down}_exps`. The MTP head's `nextn.*` tensors become
+/// `mtp.*`.
+fn qwen35_name(gguf: &str) -> Option<String> {
+    let rest = gguf.strip_prefix("blk.")?;
+    let (layer, rest) = rest.split_once('.')?;
+    layer.parse::<u32>().ok()?;
+    let mtp = match rest {
+        "nextn.eh_proj.weight" => Some("fc"),
+        "nextn.enorm.weight" => Some("pre_fc_norm_embedding"),
+        "nextn.hnorm.weight" => Some("pre_fc_norm_hidden"),
+        "nextn.shared_head_norm.weight" => Some("norm"),
+        _ => None,
+    };
+    if let Some(m) = mtp {
+        return Some(format!("mtp.{m}.weight"));
+    }
+    let hf = match rest {
+        "attn_qkv.weight" => "linear_attn.in_proj_qkv.weight",
+        "attn_gate.weight" => "linear_attn.in_proj_z.weight",
+        "ssm_beta.weight" => "linear_attn.in_proj_b.weight",
+        "ssm_alpha.weight" => "linear_attn.in_proj_a.weight",
+        "ssm_out.weight" => "linear_attn.out_proj.weight",
+        "ssm_conv1d.weight" => "linear_attn.conv1d.weight",
+        "ssm_norm.weight" => "linear_attn.norm.weight",
+        "ssm_dt.bias" | "ssm_dt" => "linear_attn.dt_bias",
+        "ssm_a" | "ssm_a.weight" => "linear_attn.A_neg",
+        "ffn_gate_inp.weight" => "mlp.gate.weight",
+        "ffn_gate_inp_shexp.weight" => "mlp.shared_expert_gate.weight",
+        "ffn_gate_shexp.weight" => "mlp.shared_expert.gate_proj.weight",
+        "ffn_up_shexp.weight" => "mlp.shared_expert.up_proj.weight",
+        "ffn_down_shexp.weight" => "mlp.shared_expert.down_proj.weight",
+        "ffn_gate_exps.weight" => "mlp.experts.gate_exps",
+        "ffn_up_exps.weight" => "mlp.experts.up_exps",
+        "ffn_down_exps.weight" => "mlp.experts.down_exps",
+        _ => return None,
+    };
+    Some(format!("model.layers.{layer}.{hf}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +617,32 @@ mod tests {
         }
         // Not a tensor dlm knows: kept under its own name rather than guessed at.
         assert_eq!(hf_name("rope_freqs.weight"), None);
+    }
+
+    /// Qwen3.5/3.6's linear attention, stacked experts and MTP head arrive under
+    /// the names the hybrid loader reads; a dense name still falls through.
+    #[test]
+    fn translates_the_names_qwen35moe_uses() {
+        let cases = [
+            (
+                "blk.0.attn_qkv.weight",
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+            ),
+            ("blk.2.ssm_a", "model.layers.2.linear_attn.A_neg"),
+            ("blk.2.ssm_dt.bias", "model.layers.2.linear_attn.dt_bias"),
+            (
+                "blk.5.ffn_down_exps.weight",
+                "model.layers.5.mlp.experts.down_exps",
+            ),
+            (
+                "blk.5.ffn_gate_inp_shexp.weight",
+                "model.layers.5.mlp.shared_expert_gate.weight",
+            ),
+            ("blk.40.nextn.eh_proj.weight", "mtp.fc.weight"),
+        ];
+        for (gguf, hf) in cases {
+            assert_eq!(qwen35_name(gguf).as_deref(), Some(hf), "{gguf}");
+        }
+        assert_eq!(qwen35_name("blk.3.attn_q.weight"), None);
     }
 }

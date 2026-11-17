@@ -349,6 +349,69 @@ fn qwen3_family_fixture_has_explicit_head_dim() {
     assert_round_trip(&tok, "qwen3");
 }
 
+/// Qwen3.6-35B-A3B: the hybrid layout read out of its multimodal config (three
+/// Gated DeltaNet layers to one gated full-attention layer, partial RoPE from
+/// `rope_parameters`, the generation config's extra EOS), its tokenizer's
+/// marks-with-letters split, and its thinking chat template.
+#[test]
+fn qwen36_family_fixture() {
+    use dlm::server::engine::ChatTemplate;
+    let Some(dir) = fixture("qwen3.6") else {
+        eprintln!("skipping qwen3.6: fixture absent");
+        return;
+    };
+    let cfg = ModelConfig::from_path(&dir, QuantScheme::Fp16).expect("qwen3.6 config.json");
+    assert_eq!(
+        (cfg.hidden_size, cfg.num_layers, cfg.vocab_size),
+        (2048, 40, 248320)
+    );
+    let l = cfg.linear_attn.expect("hybrid");
+    assert_eq!(
+        (
+            l.num_k_heads,
+            l.num_v_heads,
+            l.k_head_dim,
+            l.v_head_dim,
+            l.conv_kernel
+        ),
+        (16, 32, 128, 128, 4)
+    );
+    assert_eq!(cfg.attention_layers(), 10);
+    assert_eq!((cfg.head_dim(), cfg.rotary_dim), (256, Some(64)));
+    assert_eq!(cfg.rope_theta, 1e7);
+    let m = cfg.moe.expect("MoE");
+    assert_eq!(
+        (m.num_experts, m.experts_per_tok, m.moe_intermediate_size),
+        (256, 8, 512)
+    );
+    assert_eq!(m.shared_intermediate_size, Some(512));
+    assert!(cfg.attn_output_gate && cfg.norm_add_one && !cfg.tie_word_embeddings);
+    assert_eq!(cfg.mtp_layers, 1);
+    let tok = BpeTokenizer::from_dir(&dir).expect("qwen3.6 tokenizer");
+    assert_pieces(
+        &tok,
+        &["The", "Ġcapital", "Ġof", "ĠFrance", "Ġis"],
+        "qwen3.6",
+    );
+    assert_round_trip(&tok, "qwen3.6");
+    // Ids transformers gives (Qwen3.6's tokenizer.json): a Devanagari word stays
+    // whole with its vowel signs, and digits split one by one.
+    assert_eq!(
+        tok.encode("नमस्ते दुनिया").unwrap(),
+        [58069, 84237, 150104, 153348, 184642, 235886]
+    );
+    assert_eq!(
+        tok.encode("I don't THINK it's 12345!").unwrap(),
+        [40, 1459, 914, 88943, 424, 579, 220, 16, 17, 18, 19, 20, 0]
+    );
+    for eos in ["<|im_end|>", "<|endoftext|>"] {
+        let id = tok.id_of(eos).unwrap();
+        assert!(cfg.eos_token_ids.contains(&id), "{eos} stops generation");
+    }
+    let template = ChatTemplate::read_jinja(&dir).and_then(|j| ChatTemplate::detect(&j));
+    assert_eq!(template, Some(ChatTemplate::Qwen35));
+}
+
 /// Phi-3: a real config for the fused-projection family.
 ///
 /// The weight *mapping* — splitting `qkv_proj` and `gate_up_proj` — is checked in

@@ -27,11 +27,13 @@ use std::path::{Path, PathBuf};
 fn text_model_view(
     tensors: std::collections::BTreeMap<String, TensorInfo>,
 ) -> std::collections::BTreeMap<String, TensorInfo> {
-    const VISION: [&str; 4] = [
+    // Qwen3.5/3.6 call their tower `model.visual`.
+    const VISION: [&str; 5] = [
         "vision_tower.",
         "multi_modal_projector.",
         "model.vision_tower.",
         "model.multi_modal_projector.",
+        "model.visual.",
     ];
     const TEXT: [(&str, &str); 3] = [
         ("language_model.model.", "model."),

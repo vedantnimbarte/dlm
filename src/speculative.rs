@@ -189,6 +189,20 @@ impl<D: ComputeKernel> Drafter for ModelDrafter<'_, D> {
     }
 }
 
+/// Speculation rolls rejected tokens back out of the KV history; a model with a
+/// recurrent state (Qwen3.5/3.6's linear attention) has no history to cut, so
+/// it is refused up front rather than failing mid-generation.
+fn refuse_recurrent(recurrent: bool) -> Result<()> {
+    if recurrent {
+        return Err(DlmError::InvalidConfig(
+            "speculative decoding is not supported for this model: its linear-attention \
+             layers keep a recurrent state, which cannot be rolled back past rejected tokens"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Longest context suffix n-gram lookup tries. Longer matches predict better;
 /// past a few tokens they mostly find the same place a shorter one does.
 const NGRAM_MAX: usize = 3;
@@ -270,6 +284,7 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         prompt: &[u32],
         sampler: Sampler,
     ) -> Result<Self> {
+        refuse_recurrent(target.recurrent() || draft.recurrent())?;
         let mut kv = draft.orchestrator();
         if let Some((_, head)) = prompt.split_last().filter(|(_, h)| !h.is_empty()) {
             draft.prefill(&mut kv, head)?;
@@ -300,6 +315,7 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         gamma: usize,
     ) -> Result<(Self, u32)> {
         debug_assert!(session.grammar.is_none(), "lookup cannot honor a grammar");
+        refuse_recurrent(session.generator.recurrent())?;
         let first = session.sample_next()?;
         let speculative = Self {
             target: session.generator,
@@ -327,6 +343,7 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         let Some((_, head)) = prompt.split_last() else {
             return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         };
+        refuse_recurrent(target.recurrent())?;
         let mut target_kv = target.orchestrator();
         if !head.is_empty() {
             target.prefill(&mut target_kv, head)?;

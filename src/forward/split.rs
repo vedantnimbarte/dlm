@@ -49,6 +49,10 @@ impl<F: ComputeKernel, B: ComputeKernel> ComputeKernel for SplitKernel<F, B> {
         self.front.kv_dim()
     }
 
+    fn recurrent(&self) -> bool {
+        self.front.recurrent() || self.back.recurrent()
+    }
+
     fn run_block(
         &self,
         layer: u32,

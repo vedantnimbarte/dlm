@@ -843,6 +843,12 @@ impl<K: ComputeKernel> Generator<K> {
         self.vocab_size
     }
 
+    /// Whether the model keeps recurrent state (Qwen3.5/3.6's linear attention),
+    /// which cannot be rolled back: see [`ComputeKernel::recurrent`].
+    pub fn recurrent(&self) -> bool {
+        self.kernel.recurrent()
+    }
+
     /// Embed a token id into a fresh hidden vector.
     /// Move the LM head into VRAM, so each step's vocabulary-wide GEMV runs on the
     /// device instead of the host.

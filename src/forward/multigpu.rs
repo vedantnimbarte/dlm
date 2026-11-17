@@ -78,6 +78,10 @@ impl<K: ComputeKernel> ComputeKernel for PipelineParallelKernel<K> {
         self.inner.kv_dim()
     }
 
+    fn recurrent(&self) -> bool {
+        self.inner.recurrent()
+    }
+
     fn run_block(
         &self,
         layer: u32,

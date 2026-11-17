@@ -20,12 +20,15 @@ pub enum TensorRole {
     /// Anything not recognized (rotary buffers, misc). Treated as pinned
     /// overhead so the budget never under-counts resident bytes.
     Other,
+    /// Shipped beside the model but not run: the multi-token-prediction head
+    /// (`mtp.*`). Neither streamed nor pinned.
+    Unused,
 }
 
 impl TensorRole {
     /// True if this tensor stays resident in VRAM for the whole run.
     pub fn is_pinned(self) -> bool {
-        !matches!(self, TensorRole::Layer(_))
+        !matches!(self, TensorRole::Layer(_) | TensorRole::Unused)
     }
 }
 
@@ -35,6 +38,9 @@ impl TensorRole {
 /// checkpoints: `model.layers.{i}.*`, `transformer.h.{i}.*`, `*.blocks.{i}.*`
 /// for blocks, plus `embed_tokens`/`wte`, `lm_head`, and the top-level norm.
 pub fn classify(name: &str) -> TensorRole {
+    if name.starts_with("mtp.") {
+        return TensorRole::Unused;
+    }
     if let Some(index) = layer_index(name) {
         return TensorRole::Layer(index);
     }

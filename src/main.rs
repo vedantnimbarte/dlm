@@ -155,6 +155,9 @@ fn tiny_cfg() -> BlockConfig {
         norm_kind: Default::default(),
         parallel_residual: false,
         learned_positions: false,
+        linear: None,
+        attn_output_gate: false,
+        rotary_dim: None,
     }
 }
 
@@ -1106,7 +1109,9 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                         .is_some_and(|all| ram_cache as u64 >= all);
                 let cheap_verify =
                     device == Device::Gpu || (window < config.num_layers as usize && !cached);
-                args.speculative = args.speculative.resolve(false, cheap_verify)?;
+                args.speculative = args
+                    .speculative
+                    .resolve(false, cheap_verify && !config.is_hybrid())?;
                 publish_telemetry_snapshot(&config, &store, window as u32, true, device);
                 println!();
                 let dest = if device == Device::Gpu {
@@ -1202,9 +1207,10 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                 return start_batched_server(generator, None, &args, &config, &listen, None);
             }
 
-            args.speculative = args
-                .speculative
-                .resolve(args.draft_model_path.is_some(), device == Device::Gpu)?;
+            args.speculative = args.speculative.resolve(
+                args.draft_model_path.is_some(),
+                device == Device::Gpu && !config.is_hybrid(),
+            )?;
             // Non-streaming paths materialize all layers resident.
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
 
@@ -1883,9 +1889,22 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     // Cached prefixes share paged device KV and give it back under pressure, so
     // they are on by default where the kernel pages KV. On the CPU each one is a
     // host copy of its KV, so only when asked for.
-    let prefix_cache = args
-        .prefix_cache_size
-        .unwrap_or(if kv_pool.is_some() { 64 } else { 0 });
+    // A recurrent (hybrid) model can neither speculate nor resume from a prefix
+    // of a cached state: refused, and the prefix cache left off.
+    let recurrent = generator.recurrent();
+    if recurrent && (draft.is_some() || args.speculative == Speculative::Ngram) {
+        return Err(DlmError::InvalidConfig(
+            "speculative decoding is not supported for this model: its linear-attention layers keep \
+             a recurrent state, which cannot be rolled back past rejected tokens"
+                .into(),
+        ));
+    }
+    let prefix_cache = if recurrent {
+        0
+    } else {
+        args.prefix_cache_size
+            .unwrap_or(if kv_pool.is_some() { 64 } else { 0 })
+    };
     if let Some(opts) = &args.bench {
         return bench_generator(&generator, &tokenizer, opts, args, config);
     }
