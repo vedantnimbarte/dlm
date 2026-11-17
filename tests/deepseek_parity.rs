@@ -41,3 +41,10 @@ fn assert_matches_transformers(fixture: &str) {
 fn deepseek_v2_matches_transformers() {
     assert_matches_transformers("deepseek_v2");
 }
+
+/// DeepSeek-V3's router: sigmoid scores, the score-correction bias, groups
+/// scored by their top two, renormalized weights times the scaling factor.
+#[test]
+fn deepseek_v3_matches_transformers() {
+    assert_matches_transformers("deepseek_v3");
+}
