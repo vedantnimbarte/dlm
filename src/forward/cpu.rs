@@ -1192,16 +1192,20 @@ pub enum KvElem {
     /// codes (36 bytes): 1.125 bytes a value. Needs every 32-value group inside
     /// one head (`head_dim % 32 == 0`); a pool falls back to fp16 otherwise.
     I8 = 2,
+    /// int4 in the same groups of 32: a float scale then 16 bytes of 4-bit
+    /// codes (20 bytes), 0.625 bytes a value, the CPU's int4 store. Same
+    /// one-head rule as int8.
+    I4 = 3,
 }
 
 impl KvElem {
-    /// The device element type `quant` asks for. Both quantized modes take
-    /// int8 on the GPU: the CPU's int4 store has no device counterpart.
+    /// The device element type `quant` asks for.
     pub fn for_quant(quant: KvQuant) -> Self {
         match quant {
             KvQuant::None => KvElem::F32,
             KvQuant::F16 => KvElem::F16,
-            KvQuant::Int8 | KvQuant::Int4 => KvElem::I8,
+            KvQuant::Int8 => KvElem::I8,
+            KvQuant::Int4 => KvElem::I4,
         }
     }
 
@@ -1389,6 +1393,7 @@ impl KvLayerCache {
             0 => KvElem::F32,
             1 => KvElem::F16,
             2 => KvElem::I8,
+            3 => KvElem::I4,
             _ => return Err(bad("unknown KV element")),
         };
         Ok(Self {

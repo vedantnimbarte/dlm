@@ -959,9 +959,12 @@ inference engine):
     independent of `--quant`: one sizes the weights, the other the KV history.
     - `auto` is the default: `int8` on the GPU, `f16` elsewhere. `f32` is exact
       (`none` is accepted as an alias).
-    - **On the GPU**, `int8` (and `int4`) keep a scale per 32 values and 32 int8
-      codes, 56% of fp16's memory, at fp16's speed; heads not a multiple of 32
-      wide keep fp16. The loader shrinks the few key channels that would set
+    - **On the GPU**, `int8` keeps a scale per 32 values and 32 int8 codes, 56%
+      of fp16's memory, at fp16's speed; `int4` keeps the scale and 16 bytes of
+      4-bit codes, 31% of fp16's memory. Heads not a multiple of 32 wide keep
+      fp16 either way. `int4` costs real accuracy: on Qwen2.5-0.5B it scored
+      4.59 nats per token where fp16 and int8 scored 3.95, so reach for it only
+      when the extra context matters more than the output. The loader shrinks the few key channels that would set
       those scales alone (Qwen's are a hundred times the rest) and grows the
       matching query channels by the same power of two, which leaves `q . k`
       unchanged to the bit; with it, int8 scored within 0.005 nats per token of
