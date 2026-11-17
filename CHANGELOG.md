@@ -15,6 +15,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Ideas taken from [InferSSD](https://wici.ai/inferssd), a llama.cpp
 fork that runs large MoE models from SSD.
 
+### Fixed
+
+- **DeepSeek MLA rotated the wrong pairs of its RoPE dimensions.** DeepSeek's
+  reference code rotates adjacent values `(2i, 2i+1)` of `q_pe` and `k_pe`;
+  dlm rotated the halves `(i, i + d/2)`, as for Llama-style checkpoints, so
+  every DeepSeek-V2 attention score was off. On a tiny random DeepSeek-V2
+  checkpoint, dlm's log-probabilities differed from `transformers`' by up to
+  0.39 nats; now by 1e-6, pinned by `tests/deepseek_parity.rs` against a
+  committed fixture. dlm's own CPU/GPU parity tests compared it with itself
+  and could not see it.
+
 ### Changed
 
 - **Every layer cache on the streaming path now evicts the most recently used

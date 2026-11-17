@@ -5032,19 +5032,23 @@ extern "C" int dlm_dense_ffn(int hidden_size, int inter, float rms_eps, int w_dt
 // reconstructed on the fly from the cached latent inside the attention kernel
 // (materializing all of them would need gigabytes of scratch).
 
-// RoPE the rope-part of each query head: q[h*qk + nope .. + qk_rope].
-__global__ void mla_rope_q_kernel(float* q, int num_heads, int qk, int nope, int rope,
-                                  int position, const float* inv_freq) {
+// RoPE the `rope` values at `v[h*stride + offset ..]` for each of `heads`: the
+// query heads' rope parts (stride qk, offset nope) or the shared k_pe (one head).
+// DeepSeek pairs adjacent values (2i, 2i+1) -- its reference code views the
+// rope dims as (d/2, 2) before rotating -- not the halves (i, i + d/2) Llama's
+// RoPE pairs; with the halves, q.k comes out wrong.
+__global__ void mla_rope_kernel(float* v, int heads, int stride, int offset, int rope,
+                                int position, const float* inv_freq) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = rope / 2;
-    if (idx >= num_heads * half) return;
+    if (idx >= heads * half) return;
     int h = idx / half, i = idx % half;
-    int base = h * qk + nope;
+    float* p = v + (long)h * stride + offset + 2 * i;
     float ang = (float)position * inv_freq[i];
     float s = sinf(ang), c = cosf(ang);
-    float a = q[base + i], b = q[base + i + half];
-    q[base + i] = a * c - b * s;
-    q[base + i + half] = a * s + b * c;
+    float a = p[0], b = p[1];
+    p[0] = a * c - b * s;
+    p[1] = a * s + b * c;
 }
 
 // MLA attention over `positions` cached latents, without reconstructing K or V.
@@ -5217,8 +5221,8 @@ extern "C" int dlm_mla_attn(
     // KV down → [latent | k_pe]; norm the latent, RoPE the shared k_pe + q rope-parts.
     launch_matvec(w_dtype, kv_a_proj, normed, (const float*)0, kva, latent + qk_rope, hidden_size, w_group_size);
     rmsnorm_kernel<<<1, RMS_THREADS>>>(kva, kv_a_layernorm, c_kv, latent, rms_eps);
-    mla_rope_q_kernel<<<grid_for(num_heads * (qk_rope / 2), B), B>>>(q, num_heads, qk, qk_nope, qk_rope, position, inv_freq);
-    rope_kernel<<<grid_for(qk_rope / 2, B), B>>>(kva + latent, 1, qk_rope, position, inv_freq, 1.0f);
+    mla_rope_kernel<<<grid_for(num_heads * (qk_rope / 2), B), B>>>(q, num_heads, qk, qk_nope, qk_rope, position, inv_freq);
+    mla_rope_kernel<<<grid_for(qk_rope / 2, B), B>>>(kva + latent, 1, qk_rope, 0, qk_rope, position, inv_freq);
     // Append [c_kv ; k_pe] to the cache at slot num_positions.
     copy_kernel<<<grid_for(latent, B), B>>>(c_kv, kv_keys + (long)num_positions * kv_dim, latent);
     copy_kernel<<<grid_for(qk_rope, B), B>>>(kva + latent, kv_keys + (long)num_positions * kv_dim + latent, qk_rope);
