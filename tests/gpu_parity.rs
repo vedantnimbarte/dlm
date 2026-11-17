@@ -1130,6 +1130,7 @@ fn random_moe_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> 
                     down_bias: None,
                 }),
                 shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+                router_bias: None,
             };
             LayerTensors {
                 q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * h, s)),
@@ -1482,6 +1483,7 @@ fn random_mla_layers(
                             down_bias: None,
                         }),
                         shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+                        router_bias: None,
                     }
                 }
             };
