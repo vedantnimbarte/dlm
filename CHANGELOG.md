@@ -15,6 +15,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Ideas taken from [InferSSD](https://wici.ai/inferssd), a llama.cpp
 fork that runs large MoE models from SSD.
 
+### Fixed
+
+- **Streamed MoE re-read and re-quantized from the checkpoint every token.**
+  The host-RAM tier served whole layers but passed a MoE layer's core
+  (attention, router, shared expert) straight through to the checkpoint, so
+  every streamed core was read and quantized again on every token. And its
+  default size counted the cores alone, leaving the routed experts a fraction
+  of the room they need, so expert misses did the same. The tier now caches
+  cores, and a streamed MoE model's default covers the experts too, up to a
+  quarter of RAM; unlike cyclic layers, a partial expert cache still hits.
+  GTX 1650, TinyMixtral 4x248M at `--quant int4`, batch-1 decode with 4 of 12
+  layers resident: see the PR for before and after.
+
 ### Changed
 
 - **Every layer cache on the streaming path now evicts the most recently used
