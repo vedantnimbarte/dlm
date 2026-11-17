@@ -20,12 +20,16 @@ pub enum TensorRole {
     /// Anything not recognized (rotary buffers, misc). Treated as pinned
     /// overhead so the budget never under-counts resident bytes.
     Other,
+    /// Read from the mapped file a row at a time and never placed in VRAM:
+    /// Gemma 4's per-layer token embeddings, a table as large as the rest of
+    /// the model.
+    HostOnly,
 }
 
 impl TensorRole {
     /// True if this tensor stays resident in VRAM for the whole run.
     pub fn is_pinned(self) -> bool {
-        !matches!(self, TensorRole::Layer(_))
+        !matches!(self, TensorRole::Layer(_) | TensorRole::HostOnly)
     }
 }
 
@@ -37,6 +41,9 @@ impl TensorRole {
 pub fn classify(name: &str) -> TensorRole {
     if let Some(index) = layer_index(name) {
         return TensorRole::Layer(index);
+    }
+    if name.contains("embed_tokens_per_layer") {
+        return TensorRole::HostOnly;
     }
     if name.contains("embed_tokens") || name.contains("wte") || name.contains("embeddings") {
         return TensorRole::Embedding;

@@ -155,6 +155,7 @@ fn tiny_cfg() -> BlockConfig {
         norm_kind: Default::default(),
         parallel_residual: false,
         learned_positions: false,
+        ..Default::default()
     }
 }
 
@@ -841,6 +842,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         embed_scale: None,
         final_logit_softcap: None,
         head_int4: false,
+        per_layer: None,
     })
 }
 

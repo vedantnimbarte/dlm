@@ -710,7 +710,13 @@ pub struct Generator<K: ComputeKernel> {
     /// is bound by those bytes.
     lm_head: Weights,
     vocab_size: usize,
+    /// The model's residual width: the embedding's and the LM head's.
     hidden_size: usize,
+    /// Values per token the kernel exchanges: `hidden_size`, then Gemma 4's
+    /// per-layer inputs ([`ComputeKernel::per_layer_input_width`]).
+    row: usize,
+    /// Gemma 4's per-layer token embeddings, read a row per token.
+    per_layer: Option<crate::loader::PerLayerEmbedding>,
     rms_eps: f32,
     kv_config: KvCacheConfig,
     kv_total_blocks: u32,
@@ -753,7 +759,8 @@ impl<K: ComputeKernel> Generator<K> {
         kv_config: KvCacheConfig,
         kv_total_blocks: u32,
     ) -> Result<Self> {
-        let hidden_size = kernel.hidden_size();
+        let row = kernel.hidden_size();
+        let hidden_size = row - kernel.per_layer_input_width();
         let checks = [
             ("embedding", embedding.len(), vocab_size * hidden_size),
             ("lm_head", lm_head.len(), vocab_size * hidden_size),
@@ -777,6 +784,8 @@ impl<K: ComputeKernel> Generator<K> {
             },
             vocab_size,
             hidden_size,
+            row,
+            per_layer: None,
             rms_eps,
             kv_config,
             kv_total_blocks,
@@ -815,6 +824,25 @@ impl<K: ComputeKernel> Generator<K> {
         self.position_embedding = position_embedding;
         self.final_norm_bias = final_norm_bias;
         self
+    }
+
+    /// Attach Gemma 4's per-layer token embeddings, whose rows [`embed`] appends
+    /// to each token's hidden state for the kernel's layers to read.
+    ///
+    /// [`embed`]: Self::embed
+    pub fn with_per_layer_embedding(
+        mut self,
+        table: crate::loader::PerLayerEmbedding,
+    ) -> Result<Self> {
+        if table.width() != self.row - self.hidden_size {
+            return Err(DlmError::InvalidConfig(format!(
+                "per-layer embedding rows are {} wide; the model's layers take {}",
+                table.width(),
+                self.row - self.hidden_size
+            )));
+        }
+        self.per_layer = Some(table);
+        Ok(self)
     }
 
     pub fn with_embed_scale(mut self, scale: Option<f32>) -> Self {
@@ -1013,6 +1041,17 @@ impl<K: ComputeKernel> Generator<K> {
                 *x += p;
             }
         }
+        // Gemma 4: the token's per-layer embedding rides after the hidden state.
+        if self.row > self.hidden_size {
+            let table = self.per_layer.as_ref().ok_or_else(|| {
+                DlmError::InvalidConfig(
+                    "the model's layers take per-layer inputs, but no per-layer embedding \
+                     table is attached"
+                        .into(),
+                )
+            })?;
+            v.extend(table.row(token)?);
+        }
         Ok(v)
     }
 
@@ -1044,7 +1083,7 @@ impl<K: ComputeKernel> Generator<K> {
             orch.prefill(&mut hiddens)?;
             each(&hiddens);
         }
-        Ok(hiddens.split_off(hiddens.len() - self.hidden_size))
+        Ok(hiddens.split_off(hiddens.len() - self.row))
     }
 
     /// The log-probability the model assigns each token given the ones before it
@@ -1071,12 +1110,12 @@ impl<K: ComputeKernel> Generator<K> {
         let mut out = Vec::with_capacity(tokens.len().saturating_sub(1));
         let mut next = Vec::new();
         for (c, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
-            let mut hiddens = Vec::with_capacity(chunk.len() * self.hidden_size);
+            let mut hiddens = Vec::with_capacity(chunk.len() * self.row);
             for (i, &token) in chunk.iter().enumerate() {
                 hiddens.extend(self.embed(token, orch.position() + i)?);
             }
             orch.prefill(&mut hiddens)?;
-            for (i, hidden) in hiddens.chunks(self.hidden_size).enumerate() {
+            for (i, hidden) in hiddens.chunks(self.row).enumerate() {
                 let mut logprobs = self.logits(hidden)?;
                 log_softmax_f64(&mut logprobs);
                 match tokens.get(c * PREFILL_CHUNK + i + 1) {
@@ -1181,7 +1220,7 @@ impl<K: ComputeKernel> Generator<K> {
         let mut sum = vec![0f64; h];
         let last = self.prefill_with(&mut orch, tokens, |hiddens| {
             if pooling == Pooling::Mean {
-                for row in hiddens.chunks(h) {
+                for row in hiddens.chunks(self.row) {
                     for (s, x) in sum.iter_mut().zip(self.final_norm(row)) {
                         *s += x as f64;
                     }
@@ -1208,9 +1247,11 @@ impl<K: ComputeKernel> Generator<K> {
         Ok(v)
     }
 
+    /// The final norm of a row's hidden state (a Gemma 4 row's per-layer inputs
+    /// after it are not part of it).
     fn final_norm(&self, hidden: &[f32]) -> Vec<f32> {
         crate::forward::cpu::norm(
-            hidden,
+            &hidden[..self.hidden_size],
             &self.final_norm,
             self.final_norm_bias.as_deref(),
             self.rms_eps,
@@ -1321,17 +1362,16 @@ impl<K: ComputeKernel> Generator<K> {
                 return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
             }
         }
-        let nl = self.kernel.num_layers() as usize;
-        let kv_dim = self.kernel.kv_dim();
+        let nl = self.kernel.num_layers();
         // Per-sequence KV (one cache per layer) + hidden + absolute position.
         let mut kvs: Vec<Vec<KvLayerCache>> = (0..b)
             .map(|_| {
                 (0..nl)
-                    .map(|_| KvLayerCache::new_quant(kv_dim, self.kv_quant))
+                    .map(|l| KvLayerCache::new_quant(self.kernel.layer_kv_dim(l), self.kv_quant))
                     .collect()
             })
             .collect();
-        let mut hidden = vec![vec![0.0f32; self.hidden_size]; b];
+        let mut hidden = vec![vec![0.0f32; self.row]; b];
         let mut position = vec![0usize; b];
 
         // Prefill each sequence (per-sequence — prompts differ in length). After
@@ -1345,8 +1385,9 @@ impl<K: ComputeKernel> Generator<K> {
                 // decode steps that show the steady-state streaming cost.
                 crate::telemetry::set_token(0);
                 let mut h = self.embed(tok, position[s])?;
-                for (l, kv) in kvs[s].iter_mut().enumerate() {
-                    self.kernel.run_block(l as u32, &mut h, kv, position[s])?;
+                for l in 0..nl {
+                    let kv = &mut kvs[s][self.kernel.kv_source(l) as usize];
+                    self.kernel.run_block(l, &mut h, kv, position[s])?;
                 }
                 hidden[s] = h;
                 position[s] += 1;

@@ -168,11 +168,13 @@ impl<'a> Reader<'a> {
         }
         let mut out = Vec::with_capacity(len.min(1 << 20));
         for _ in 0..len {
-            out.push(
-                self.value(kind)?
-                    .as_f64()
-                    .ok_or_else(|| bad("array element is neither a number nor a string"))?,
-            );
+            // Booleans count as 0/1: Gemma 4 marks its windowed layers with an
+            // array of them.
+            let v = match self.value(kind)? {
+                Value::Bool(b) => Some(b as u8 as f64),
+                other => other.as_f64(),
+            };
+            out.push(v.ok_or_else(|| bad("array element is neither a number nor a string"))?);
         }
         Ok(Value::Numbers(out))
     }
@@ -250,14 +252,13 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
     }
     let data_len = file_len - data_offset;
 
-    // Gemma 2 and 3 norm the FFN input with their own norm and keep
+    // Gemma 2, 3 and 4 norm the FFN input with their own norm and keep
     // `post_attention_norm` for the attention output, so their `ffn_norm` is
     // `pre_feedforward_layernorm`; everywhere else `ffn_norm` is the one norm
     // between attention and FFN, `post_attention_layernorm`.
-    let sandwich = matches!(
-        metadata.get("general.architecture").and_then(Value::as_str),
-        Some("gemma2" | "gemma3")
-    );
+    let arch = metadata.get("general.architecture").and_then(Value::as_str);
+    let sandwich = matches!(arch, Some("gemma2" | "gemma3" | "gemma4"));
+    let gemma4 = arch == Some("gemma4");
     let mut tensors = BTreeMap::new();
     for (gguf_name, shape, kind, offset) in raw {
         let dtype = dtype_of(kind, &gguf_name)?;
@@ -278,7 +279,7 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
                 "tensor {gguf_name:?} runs past the end of the data section"
             )));
         }
-        let name = match hf_name(&gguf_name, sandwich) {
+        let name = match gemma4_name(gemma4, &gguf_name).or_else(|| hf_name(&gguf_name, sandwich)) {
             Some(name) => name,
             // Tensors dlm has no use for (llama.cpp's rope frequency tables, for
             // instance) keep their own name rather than being dropped: the loader
@@ -392,6 +393,34 @@ fn dtype_of(kind: u32, name: &str) -> Result<Dtype> {
             )));
         }
     })
+}
+
+/// The Hugging Face name of a Gemma 4 tensor `hf_name` does not cover, when
+/// `gemma4`: its per-layer-input tensors and its per-layer output scale.
+fn gemma4_name(gemma4: bool, gguf: &str) -> Option<String> {
+    if !gemma4 {
+        return None;
+    }
+    match gguf {
+        "per_layer_token_embd.weight" => return Some("model.embed_tokens_per_layer.weight".into()),
+        "per_layer_model_proj.weight" => {
+            return Some("model.per_layer_model_projection.weight".into())
+        }
+        "per_layer_proj_norm.weight" => {
+            return Some("model.per_layer_projection_norm.weight".into())
+        }
+        _ => {}
+    }
+    let (layer, rest) = gguf.strip_prefix("blk.")?.split_once('.')?;
+    layer.parse::<u32>().ok()?;
+    let hf = match rest {
+        "inp_gate.weight" => "per_layer_input_gate.weight",
+        "proj.weight" => "per_layer_projection.weight",
+        "post_norm.weight" => "post_per_layer_input_norm.weight",
+        "layer_output_scale.weight" => "layer_scalar",
+        _ => return None,
+    };
+    Some(format!("model.layers.{layer}.{hf}"))
 }
 
 /// llama.cpp's tensor name as the Hugging Face name dlm's loader looks up, or

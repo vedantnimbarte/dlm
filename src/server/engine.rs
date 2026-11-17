@@ -1548,6 +1548,8 @@ pub enum ChatTemplate {
     /// Gemma 1/2 (`<start_of_turn>user … <end_of_turn>`); the assistant role is
     /// `model`, and a system prompt is folded into the first user turn.
     Gemma,
+    /// Gemma 4 (`<|turn>user … <turn|>`), which has a system turn of its own.
+    Gemma4,
     /// Phi-3 (`<|user|>\n … <|end|>`).
     Phi3,
     /// DeepSeek-V2 chat (`User: …\n\nAssistant:`).
@@ -1556,7 +1558,8 @@ pub enum ChatTemplate {
 
 impl ChatTemplate {
     /// Every name `--chat-template` accepts, besides `auto`.
-    pub const NAMES: &'static str = "plain, chatml, llama3, llama2, mistral, gemma, phi3, deepseek";
+    pub const NAMES: &'static str =
+        "plain, chatml, llama3, llama2, mistral, gemma, gemma4, phi3, deepseek";
 
     /// Parse a `--chat-template` value (`auto` is resolved by the caller).
     pub fn parse(s: &str) -> Option<Self> {
@@ -1567,6 +1570,7 @@ impl ChatTemplate {
             "llama2" | "llama-2" => Some(ChatTemplate::Llama2),
             "mistral" => Some(ChatTemplate::Mistral),
             "gemma" => Some(ChatTemplate::Gemma),
+            "gemma4" => Some(ChatTemplate::Gemma4),
             "phi3" | "phi-3" => Some(ChatTemplate::Phi3),
             "deepseek" => Some(ChatTemplate::DeepSeek),
             _ => None,
@@ -1582,6 +1586,7 @@ impl ChatTemplate {
             ChatTemplate::Llama2 => "llama2",
             ChatTemplate::Mistral => "mistral",
             ChatTemplate::Gemma => "gemma",
+            ChatTemplate::Gemma4 => "gemma4",
             ChatTemplate::Phi3 => "phi3",
             ChatTemplate::DeepSeek => "deepseek",
         }
@@ -1621,6 +1626,8 @@ impl ChatTemplate {
             Some(ChatTemplate::ChatMl)
         } else if has("<|start_header_id|>") {
             Some(ChatTemplate::Llama3)
+        } else if has("<|turn>") {
+            Some(ChatTemplate::Gemma4)
         } else if has("<start_of_turn>") {
             Some(ChatTemplate::Gemma)
         } else if has("<<SYS>>") {
@@ -1653,6 +1660,7 @@ impl ChatTemplate {
             ChatTemplate::ChatMl => Some("<|im_end|>"),
             ChatTemplate::Llama3 => Some("<|eot_id|>"),
             ChatTemplate::Gemma => Some("<end_of_turn>"),
+            ChatTemplate::Gemma4 => Some("<turn|>"),
             ChatTemplate::Phi3 => Some("<|end|>"),
             _ => None,
         }
@@ -1757,6 +1765,7 @@ impl ChatTemplate {
                 }
                 p.push_str("<start_of_turn>model\n");
             }
+            ChatTemplate::Gemma4 => p = gemma4(messages),
             ChatTemplate::Phi3 => {
                 for m in messages {
                     p.push_str(&format!("<|{}|>\n{}<|end|>\n", m.role, m.content));
@@ -1778,6 +1787,54 @@ impl ChatTemplate {
         }
         p
     }
+}
+
+/// Gemma 4's chat template (`chat_template.jinja`) for plain text turns, as
+/// transformers renders it with `add_generation_prompt`: `<bos>`, a system turn
+/// when the conversation opens with a system (or developer) message, then a
+/// `<|turn>role\n…<turn|>\n` per message with the assistant as `model`.
+/// Consecutive assistant messages share one turn, and an assistant's earlier
+/// thinking (`<|channel>…<channel|>`) is dropped from what it said, as the
+/// template's `strip_thinking` does. Tools and thinking mode are not rendered.
+fn gemma4(messages: &[ChatMessage]) -> String {
+    // Jinja's `trim` is Python's `strip`: whitespace both ends.
+    fn strip_thinking(text: &str) -> String {
+        let mut out = String::new();
+        for part in text.split("<channel|>") {
+            out.push_str(part.split("<|channel>").next().unwrap_or(""));
+        }
+        out.trim().to_string()
+    }
+    let mut p = String::from("<bos>");
+    let mut rest = messages;
+    if let Some(first) = messages
+        .first()
+        .filter(|m| matches!(m.role.as_str(), "system" | "developer"))
+    {
+        p.push_str("<|turn>system\n");
+        p.push_str(first.content.trim());
+        p.push_str("<turn|>\n");
+        rest = &messages[1..];
+    }
+    for (i, m) in rest.iter().enumerate() {
+        let model = m.role == "assistant";
+        let continues = i > 0 && model && rest[i - 1].role == "assistant";
+        if !continues {
+            let role = if model { "model" } else { m.role.as_str() };
+            p.push_str(&format!("<|turn>{role}\n"));
+        }
+        if model {
+            p.push_str(&strip_thinking(&m.content));
+        } else {
+            p.push_str(m.content.trim());
+        }
+        let into_next = model && rest.get(i + 1).is_some_and(|n| n.role == "assistant");
+        if !into_next {
+            p.push_str("<turn|>\n");
+        }
+    }
+    p.push_str("<|turn>model\n");
+    p
 }
 
 fn error_json(message: &str) -> Vec<u8> {
@@ -3709,12 +3766,63 @@ Weather in Paris and Rome?<|im_end|>
         );
     }
 
+    /// Gemma 4's template as transformers' `apply_chat_template` renders it
+    /// (`add_generation_prompt=True`) for google/gemma-4-E4B-it's
+    /// `chat_template.jinja`: these strings are its output, not hand-written.
+    #[test]
+    fn gemma4_template_matches_transformers() {
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                vec![msg("user", "Hi there!")],
+                "<bos><|turn>user\nHi there!<turn|>\n<|turn>model\n",
+            ),
+            (
+                vec![msg("system", "  Be brief. "), msg("user", " What is 2+2? ")],
+                "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n\
+                 <|turn>model\n",
+            ),
+            (
+                vec![
+                    msg("system", "S"),
+                    msg("user", "a"),
+                    msg("assistant", "<|channel>thought\nhmm<channel|> b "),
+                    msg("user", "c"),
+                ],
+                "<bos><|turn>system\nS<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n\
+                 <|turn>user\nc<turn|>\n<|turn>model\n",
+            ),
+            (
+                vec![
+                    msg("user", "a"),
+                    msg("assistant", "b"),
+                    msg("assistant", "c"),
+                    msg("user", "d"),
+                ],
+                "<bos><|turn>user\na<turn|>\n<|turn>model\nbc<turn|>\n<|turn>user\nd<turn|>\n\
+                 <|turn>model\n",
+            ),
+        ];
+        for (convo, want) in cases {
+            assert_eq!(ChatTemplate::Gemma4.apply(&convo), want);
+        }
+        assert_eq!(ChatTemplate::Gemma4.end_of_turn(), Some("<turn|>"));
+    }
+
     #[test]
     fn chat_template_detection_by_marker() {
         let cases = [
             ("{{'<|im_start|>' + role}}", Some(ChatTemplate::ChatMl)),
             ("{{'<|start_header_id|>'}}", Some(ChatTemplate::Llama3)),
             ("{{'<start_of_turn>' + role}}", Some(ChatTemplate::Gemma)),
+            (
+                "{{- '<|turn>' + role + '\\n' }}",
+                Some(ChatTemplate::Gemma4),
+            ),
             ("{{'[INST] <<SYS>>\\n'}}", Some(ChatTemplate::Llama2)),
             ("{{'[INST] ' + content}}", Some(ChatTemplate::Mistral)),
             (
