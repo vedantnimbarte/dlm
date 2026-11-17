@@ -110,6 +110,30 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **Gemma 4 E2B and E4B (text).** From the safetensors checkpoint
+  (`Gemma4ForConditionalGeneration`; the vision and audio towers are
+  skipped) and from llama.cpp's `gemma4` GGUF, with its tokenizer and a
+  `gemma4` chat template (`<|turn>`; auto-detected). What is new in the
+  block: values normed per head as well as keys, an attention scale of 1,
+  global layers with heads twice as wide and proportional RoPE on a quarter
+  of each head, a shared-KV tail whose layers attend over an earlier layer's
+  cache and keep none of their own, per-layer inputs, a learned scalar per
+  layer, and E2B's double-wide MLP on the shared tail. The per-layer
+  embedding table (2.8B values on E4B) is read from the mapped file a row per
+  token rather than loaded, and never goes to the GPU. Checked against
+  `transformers` on a tiny random checkpoint with every one of these parts,
+  three windows long (`tests/gemma4_parity.rs`, CPU to 1e-4; the GPU in
+  `tests/gpu_parity.rs`). On the real `gemma-4-E4B-it` Q4_K_M (unsloth) dlm
+  answers "What is the capital of France?" with "The capital of France is
+  Paris." on CPU and GPU, and the file's tokenizer gives transformers' ids
+  (`tests/gemma4_model.rs`, `DLM_GEMMA4_GGUF`). Resident on a GTX 1650
+  (4 GB) it decodes 18.6 tok/s and prefills 31 tok/s (96 greedy tokens after
+  a 20-token prompt), at 3.7 GiB peak VRAM with the desktop's share; on a
+  shared 6-core CPU, 1.1 tok/s. **Known gaps:** resident
+  only (`--stream`, `--gpu-layers` and multi-GPU refuse it); the GPU runs
+  Gemma 4 through its own unfused layer, and prefills a prompt one token at
+  a time through it, so a long prompt costs what decoding it would; the MoE
+  (`enable_moe_block`) and `attention_k_eq_v` variants are refused.
 - **DeepSeek-V3 routing.** V3/R1 checkpoints were refused for their router.
   dlm now routes as V3 does (sigmoid scores, the per-layer
   `e_score_correction_bias` added for the choice only, the best `topk_group`
