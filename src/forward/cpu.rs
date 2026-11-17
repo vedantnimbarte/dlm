@@ -2585,6 +2585,20 @@ fn rope_inplace(
     }
 }
 
+/// RoPE for MLA's rope dims: DeepSeek rotates adjacent pairs `(2i, 2i+1)`
+/// (its reference code views them as `(d/2, 2)`), not the halves
+/// `(i, i + d/2)` [`rope_inplace`] pairs for Llama-style checkpoints. Pairing
+/// the halves leaves q.k wrong. `mla_rope_kernel` in `src/gpu/kernels.cu`
+/// mirrors this.
+fn mla_rope_inplace(v: &mut [f32], position: usize, inv_freq: &[f32]) {
+    for (i, pair) in v.chunks_exact_mut(2).enumerate() {
+        let (sin, cos) = (position as f32 * inv_freq[i]).sin_cos();
+        let (a, b) = (pair[0], pair[1]);
+        pair[0] = a * cos - b * sin;
+        pair[1] = a * sin + b * cos;
+    }
+}
+
 /// Add a projection bias in place, when the checkpoint declares one.
 fn add_bias(v: &mut [f32], bias: Option<&Vec<f32>>) {
     if let Some(b) = bias {
@@ -2691,9 +2705,9 @@ fn mla_attention_sublayer(
     // itself is unscaled (mscale = 1.0) — only the rope sub-dims rotate.
     for hh in 0..nh {
         let base = hh * qk + nope;
-        rope_inplace(&mut q[base..base + rope], 1, rope, position, &inv_freq, 1.0);
+        mla_rope_inplace(&mut q[base..base + rope], position, &inv_freq);
     }
-    rope_inplace(&mut k_pe, 1, rope, position, &inv_freq, 1.0);
+    mla_rope_inplace(&mut k_pe, position, &inv_freq);
 
     // Cache [c_kv ; k_pe] as this token's key (values unused on the MLA path).
     let mut key = c_kv;
