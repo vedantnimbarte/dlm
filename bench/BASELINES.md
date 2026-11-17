@@ -24,53 +24,46 @@ commit only if the binary was built with `DLM_GIT_COMMIT` set, e.g.
 Clocks drift between runs, so measure both sides back to back, and rerun before
 believing a failure near the tolerance.
 
-**These tables are the July 31 development build's baseline (before 0.4.0 was
-tagged) and have not been re-measured since.**
-Several changes have moved them a long way (the GPU kernel work, paged KV,
-batched serving, the batched GEMV rework), each carrying its own before/after in
-`CHANGELOG.md`. Treat the rows below as the starting point they were, not as
-current speeds, until someone reruns the whole set on one machine in one
-sitting. Clocks on this card drift enough between runs that only back-to-back
-comparisons mean anything.
+**These tables were re-measured on 2026-11-17 on `release/0.5.0` (`b0a612e`),
+in one sitting, with the card otherwise idle.** The July 31 numbers (the
+development build before 0.4.0) are kept beside them for comparison. Clocks on
+this card drift between runs, so only back-to-back comparisons mean much.
 
 ## Machine
 
 These numbers come from one machine:
 
-- **GPU:** NVIDIA GeForce GTX 1650, 4 GB (Turing), driver 591.86
+- **GPU:** NVIDIA GeForce GTX 1650, 4 GB (Turing), driver 621.24
 - **CPU:** AMD Ryzen 5 5600GT, 6 cores / 12 threads
 - **RAM:** 16 GB
 - **OS:** Windows 11
-- **Build:** `cargo build --release --features cuda-kernels`, on commit `6259ffd`
-  plus the `dlm bench` change
+- **Build:** `cargo build --release --features cuda-kernels` on `b0a612e`.
+  The Gemma 3 rows used the same commit plus #138, because Gemma GGUF files
+  did not load without that PR.
 
 ## Resident on GPU
 
-Workload: prompt 512 tokens, 64 generated, `--context-length 1024`.
+Workload: prompt 512 tokens, 64 generated, `--context-length 1024`, median of
+3 runs.
 
 ```sh
-dlm bench --model-path <model> [--quant ...] --context-length 1024 \
-          --prompt-len 512 --gen-len 64 --batch 1,4
+dlm bench --model-path <model> [--quant ...] --context-length 1024           --prompt-len 512 --gen-len 64 --batch 1,4
 ```
 
-| Model | Quant | Batch | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | Peak RSS | VRAM in use |
-|---|---|---|---|---|---|---|---|---|
-| Qwen2.5-0.5B | fp16 | 1 | 77.7 | 6,615 | 38.80 | 25.8 | 2.71 GiB | 1.84 GiB |
-| Qwen2.5-0.5B | fp16 | 4 | 78.2 | 6,545 | 38.67 | 103.4 | 2.71 GiB | 1.84 GiB |
-| Qwen2.5-0.5B | int4 | 1 | 70.1 | 7,326 | 35.63 | 28.1 | 2.31 GiB | 1.23 GiB |
-| Qwen2.5-0.5B | int4 | 4 | 70.2 | 7,250 | 35.10 | 113.9 | 2.31 GiB | 1.23 GiB |
-| Qwen2.5-1.5B | int8 | 1 | 22.6 | 22,702 | 14.60 | 68.5 | 5.31 GiB | 2.41 GiB |
-| Qwen2.5-1.5B | int4 | 1 | 22.4 | 22,917 | 14.41 | 69.4 | 5.41 GiB | 1.78 GiB |
-| Gemma 3 4B | int4 | 1 | 10.2 | 50,519 | 6.80 | 147.0 | 7.40 GiB | 3.51 GiB |
+| Model | Quant | Batch | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | Peak RSS | VRAM in use | July decode tok/s |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | bf16 | 1 | 1,676 | 314 | 124.0 | 8.1 | 2.72 GiB | 1.91 GiB | 38.8 |
+| Qwen2.5-0.5B | bf16 | 4 | 1,648 | 319 | 340.6 | 11.7 | 2.72 GiB | 1.91 GiB | 38.7 |
+| Qwen2.5-0.5B | int4 | 1 | 1,723 | 304 | 189.5 | 5.3 | 2.58 GiB | 1.31 GiB | 35.6 |
+| Qwen2.5-0.5B | int4 | 4 | 1,690 | 311 | 523.6 | 7.6 | 2.58 GiB | 1.31 GiB | 35.1 |
+| Gemma 3 4B | GGUF Q4_K_M | 1 | 149 | 3,472 | 30.2 | 33.1 | 6.88 GiB | 4.00 GiB | 6.8 (safetensors int4) |
 
-At batch 4, decode tok/s is the total over all four sequences.
-
-The VRAM figures here were sampled after the run, when the KV caches had
-already been freed, so they show the weights and scratch buffers without KV.
-`dlm bench` now samples at the end of decode.
-
-Gemma 3 4B needs `--safety-margin-gb 0.5` to fit. Under the default 1.5 GiB
-margin, the fit check refuses it: it needs 3.8 GiB and only 3.2 GiB is free.
+At batch 4, decode tok/s is the total over all four sequences. VRAM is now
+sampled at the end of decode, so it includes the KV caches (July's was sampled
+after they were freed). Qwen2.5-1.5B was not re-measured: the checkpoint is no
+longer on this machine. Gemma 3 4B now fits without lowering the safety margin.
+Its prefill is slow next to Qwen's because the GGUF's Q4_K/Q6_K blocks go
+through the GEMV path one token at a time.
 
 ## Streamed through VRAM
 
@@ -78,33 +71,99 @@ Workload: prompt 128 tokens, 16 generated, `--context-length 512`, with
 `--breakdown`.
 
 ```sh
-dlm bench --model-path <model> --stream [--quant ...] --context-length 512 \
-          --prompt-len 128 --gen-len 16 --breakdown
+dlm bench --model-path <model> --stream [--quant ...] --context-length 512           --prompt-len 128 --gen-len 16 --breakdown
 ```
 
-| Model | Quant | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | PinStage ms/tok | H2D ms/tok | Peak RSS | VRAM in use |
-|---|---|---|---|---|---|---|---|---|---|
-| Qwen2.5-1.5B | bf16 | 25.4 | 5,399 | 2.88 | 346.7 | 174.9 | 122.1 | 6.49 GiB | 2.58 GiB |
-| Gemma 3 4B | int4 | 10.9 | 12,293 | 2.07 | 482.3 | 241.0 | 153.2 | 9.06 GiB | 1.98 GiB |
+| Model | Quant | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | Peak RSS | VRAM in use |
+|---|---|---|---|---|---|---|---|
+| Gemma 3 4B | GGUF Q4_K_M | 187 | 714 | 34.1 | 29.3 | 8.42 GiB | 3.80 GiB |
 
-The GPU streaming path emits no `Compute` event, so the breakdown has no compute
-column. Compute is roughly ms/step minus the two transfer columns. Every layer
-was served from the host RAM cache (`RamHit`), so no time went to disk reads.
+At Q4_K_M, Gemma 3 4B fits the card whole, so `--stream` keeps all 34 layers
+resident and nothing is streamed. In July, at int4 from safetensors, it streamed
+at 2.07 tok/s. The first run's prefill (24 tok/s) pays for loading every layer
+into the window.
+
+### Streamed MoE: TinyMixtral 4x248M
+
+```sh
+dlm bench --model-path TinyMixtral-4x248M-MoE --quant int4 --stream --resident-layers 4           --expert-cache-gb <0.05|0.5> --context-length 1024 --prompt-len 256 --gen-len 32           --batch 1,4 --max-batch 4 --runs 3
+```
+
+Measured with three builds, each built on `b0a612e`:
+
+- **HEAD:** `b0a612e` itself;
+- **no #131:** HEAD with #131 (pinned, staged expert uploads) reverted;
+- **no #132:** HEAD with #132 (batched expert rows) reverted.
+
+The builds ran in turn, HEAD first and last. 0.05 GiB of expert cache misses
+constantly; 0.5 GiB holds every expert.
+
+| Expert cache | Build | b1 prefill | b1 decode | b4 prefill | b4 decode |
+|---|---|---|---|---|---|
+| 0.05 GiB | HEAD (first / last) | 400 / 444 | **20.8 / 24.6** | 470 / 464 | **46.4 / 50.4** |
+| 0.05 GiB | no #131 | 388 | 11.5 | 394 | 31.7 |
+| 0.05 GiB | no #132 | 406 | 10.8 | 376 | 32.6 |
+| 0.5 GiB | HEAD (first / last) | 537 / 577 | 29.6 / 32.9 | 592 / 579 | 223 / 224 |
+| 0.5 GiB | no #131 | 574 | 29.6 | 599 | 208 |
+| 0.5 GiB | no #132 | 550 | 31.9 | 591 | 214 |
+
+With the expert cache missing, each of #131 and #132 roughly doubles batch-1
+decode and adds ~50% at batch 4. When every expert stays cached, the three
+builds are within noise. Their own PRs measured within noise, because the RAM
+tier then still re-read cores from disk every token (fixed in #134), which
+hid both.
 
 ## CPU
 
 Workload: prompt 128 tokens, 16 generated, `--context-length 512 --device cpu`.
 
-| Model | Quant | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | Peak RSS |
+| Model | Quant | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | Peak RSS | July decode tok/s |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | bf16 | 15.4 | 8,372 | 12.21 | 81.9 | 2.86 GiB | 7.38 |
+
+## Batch-1 power (2026-11-17)
+
+Why does single-stream decode draw nearly batch-16 power? `bench/power.py`,
+extended to also sample SM and memory clocks and memory-controller
+utilization, on Qwen2.5-0.5B: prompt 256 tokens, 256 generated, batch 1.
+vLLM 0.33 ran the same workload in WSL, sampled the same way.
+
+| Run | Decode tok/s | Board W | tok/J | GPU util | Memory util | SM / mem clock |
 |---|---|---|---|---|---|---|
-| Qwen2.5-0.5B | bf16 | 9.1 | 14,233 | 7.38 | 135.5 | 2.67 GiB |
+| dlm bf16 (int8 KV) | 120–124 | 78.6–79.4 | 1.55 | 95% | 80% | 1905 / 6000 MHz |
+| dlm bf16, `--kv-quant f16` | 122.5–123.2 | 78.7–78.9 | 1.56 | 95% | 80% | 1906 / 6000 MHz |
+| dlm bf16, `--lm-head-int4` | 142.3–142.8 | 78.6–78.7 | 1.81 | 96% | 76% | 1906 / 6000 MHz |
+| dlm `--quant int4` | 181–191 | 73.7–76.3 | **2.5** | 85% | 45% | 1919 / 6000 MHz |
+| vLLM fp16 | 131.1 | 67.6 | 1.94 | 87% | 35% | 1900 / 5974 MHz |
+| idle | | 17.9 | | | | 553 / 584 MHz |
 
-A first CPU run recorded 1.3 prefill / 0.75 decode tok/s. It did not reproduce:
-the same binary, rerun on an idle machine, gave the row above. Something else
-was using the CPU during that run. Rerun any number that looks wrong before
-trusting it.
+The Windows and WSL `nvidia-smi` give the same readings (checked on one dlm
+run sampled from both at once), so the two engines' rows compare directly.
 
-## What the numbers say
+- **What sets batch-1 power is how long the SMs stay busy at full clock, not
+  how many bytes move.**
+  - The card boosts to 1.9 GHz SM and 6 GHz memory whenever decode runs, for
+    every engine and setting.
+  - int4 halves the memory controller's busy time against bf16 (45% vs 80%),
+    yet still draws 74–76 W, because it keeps the SMs as busy dequantizing.
+  - Batch 16 draws 80–81 W: the same clocks, with 97% utilization.
+- **vLLM fp16 spends less SM time per token.** Its kernels are busy for 87% of
+  a 7.6 ms step; dlm's bf16 kernels are busy for 95% of 8.2 ms. That ~20% more
+  busy time per token is most of the 11 W gap. dlm's memory controller is also
+  busy over twice as long for the same ~1 GB of weights, which points at the
+  bf16 GEMV's access pattern rather than its byte count. Without Nsight
+  Compute on this machine, that is as far as counters can go.
+- **dlm cannot lower clocks for a memory-bound step.** That would save power
+  at little speed cost, but locking clocks needs administrator rights, and
+  GeForce cards refuse application clocks. Energy per token falls only as
+  kernel time per token falls.
+- **For low-traffic serving on this card, use a 4-bit model.** At batch 1,
+  `--quant int4` (and GGUF Q4) already gets 2.5 tok/J, 30% better than vLLM
+  fp16's 1.94. On a bf16 model, `--lm-head-int4` gives +17% tok/J for the
+  +0.025 nats its help text states. The next step for bf16 is profiling its
+  GEMV with Nsight Compute.
+
+## What the July numbers said
 
 What the July tables showed, each pointing at a roadmap item. All of them
 have since been worked on; `CHANGELOG.md` has the before and after, and
