@@ -599,8 +599,9 @@ impl GpuExpertCache {
     }
 }
 
-/// A MoE layer's router weights and post-attention norm, on the host.
-type HostRouter = (Weights, Vec<f32>);
+/// A MoE layer's router weights, post-attention norm and score bias, on the
+/// host.
+type HostRouter = (Weights, Vec<f32>, Option<Vec<f32>>);
 
 /// State shared between the compute thread and the prefetch worker.
 struct GpuShared<S: LayerSource> {
@@ -907,7 +908,13 @@ impl<S: LayerSource> GpuShared<S> {
                 .lock()
                 .unwrap()
                 .entry(layer)
-                .or_insert_with(|| Arc::new((router.clone(), t.post_attention_layernorm.clone())));
+                .or_insert_with(|| {
+                    Arc::new((
+                        router.clone(),
+                        t.post_attention_layernorm.clone(),
+                        t.router_bias().map(<[f32]>::to_vec),
+                    ))
+                });
         }
     }
 
@@ -1605,15 +1612,14 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         let Some(r) = self.shared.routers.lock().unwrap().get(&next).cloned() else {
             return;
         };
-        let (router, norm) = &*r;
+        let (router, norm, bias) = &*r;
         let x = crate::forward::cpu::rmsnorm(ffn_inp, norm, cfg.rms_eps);
         let logits =
             crate::forward::cpu::matvec_native(router, &x, m.num_experts as usize, cfg.hidden_size);
-        let experts =
-            crate::forward::cpu::route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob)
-                .into_iter()
-                .map(|(e, _)| e as u32)
-                .collect();
+        let experts = crate::forward::cpu::route(&logits, &m, bias.as_deref())
+            .into_iter()
+            .map(|(e, _)| e as u32)
+            .collect();
         self.shared
             .scores
             .lock()
