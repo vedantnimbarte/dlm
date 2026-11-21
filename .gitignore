@@ -16,3 +16,4 @@
 # roadmaps are safe to publish under docs/ if that is useful; the audit is not.
 AUDIT.md
 ROADMAP-*.md
+__pycache__/
