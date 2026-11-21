@@ -5371,3 +5371,103 @@ extern "C" int dlm_mla_attn(
     }
     return (int)e;
 }
+
+// ---------------------------------------------------------------------------
+// EAGLE-3 draft head: one position of its single decoder layer.
+//
+// The layer's attention reads `[norm(e) ; norm(h)]`, twice the hidden width,
+// while its residual stream is `h` alone, so it cannot go through
+// `dlm_decode_block`. `e` is the target's embedding of the token at the next
+// position and `h` the feature for this one: the target's hidden states
+// entering three of its layers, folded to `hidden` by `fc`, or (from the second
+// draft token on) the previous step's pre-norm output, already in `h_dev`.
+//
+//   h      = feat_host ? fc · feat_host : h_dev
+//   u      = [rms(e)·in_norm ; rms(h)·hidden_norm]
+//   h     += o_proj · attn(q_proj·u, k_proj·u, v_proj·u)     (RoPE, KV append)
+//   h     += down · (silu(gate · n) ⊙ (up · n)),  n = rms(h)·post_norm
+//   h_dev  = h  (the pre-norm output the next step reads)
+//   out    = rms(h)·final_norm
+//
+// The KV is f32, one row per position, addressed through `kv_table` (the
+// identity: the paged kernels take a block table, here of one-row blocks).
+// `out_host` gets `out`;
+// the draft's LM head runs on it separately.
+// ---------------------------------------------------------------------------
+static thread_local float* g_eagle_buf = 0;
+static thread_local int g_eagle_cap = 0;
+
+extern "C" int dlm_eagle3_step(
+    int hidden, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim, int inter,
+    float rms_eps, const int* w_dtype, const int* w_group,  // [8]: fc, q, k, v, o, gate, up, down
+    const void* fc, const void* q_proj, const void* k_proj, const void* v_proj,
+    const void* o_proj, const void* gate_proj, const void* up_proj, const void* down_proj,
+    const float* in_norm, const float* hidden_norm, const float* post_norm,
+    const float* final_norm, const float* inv_freq, const float* embed_host,
+    const float* feat_host, float* h_dev, float* kv_keys, float* kv_values,
+    const int* kv_table, int position, float* out_host) {
+    DLM_ENTER
+    const int B = 256;
+    // Scratch, back to back: e, u (2h), feat (3h), q, k, v, ctx, o, n, gate,
+    // up, act, down, out.
+    const long need = (long)hidden * 10 + 2L * q_dim + 2L * kv_dim + 3L * inter;
+    if (need > g_eagle_cap) {
+        if (g_eagle_buf) cudaFree(g_eagle_buf);
+        g_eagle_buf = 0;
+        g_eagle_cap = 0;
+        cudaError_t e = cudaMalloc(&g_eagle_buf, need * sizeof(float));
+        if (e != cudaSuccess) return (int)e;
+        g_eagle_cap = (int)need;
+    }
+    float* p = g_eagle_buf;
+    float* ev = p; p += hidden;
+    float* u = p; p += 2 * hidden;
+    float* feat = p; p += 3 * hidden;
+    float* q = p; p += q_dim;
+    float* k = p; p += kv_dim;
+    float* v = p; p += kv_dim;
+    float* ctx = p; p += q_dim;
+    float* o = p; p += hidden;
+    float* n = p; p += hidden;
+    float* gate = p; p += inter;
+    float* up = p; p += inter;
+    float* act = p; p += inter;
+    float* down = p; p += hidden;
+    float* out = p;
+
+    cudaError_t e = cudaMemcpy(ev, embed_host, (size_t)hidden * sizeof(float),
+                               cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) return (int)e;
+    if (feat_host) {
+        e = cudaMemcpy(feat, feat_host, (size_t)3 * hidden * sizeof(float),
+                       cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) return (int)e;
+        launch_matvec(w_dtype[0], fc, feat, (const float*)0, h_dev, hidden, 3 * hidden, w_group[0]);
+        q8_done();
+    }
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(ev, in_norm, u, hidden, rms_eps);
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(h_dev, hidden_norm, u + hidden, hidden, rms_eps);
+    launch_matvec(w_dtype[1], q_proj, u, (const float*)0, q, q_dim, 2 * hidden, w_group[1]);
+    launch_matvec(w_dtype[2], k_proj, u, (const float*)0, k, kv_dim, 2 * hidden, w_group[2]);
+    launch_matvec(w_dtype[3], v_proj, u, (const float*)0, v, kv_dim, 2 * hidden, w_group[3]);
+    q8_done();
+    e = launch_attention_post(q, k, v, ctx, (const float*)0, (const float*)0, num_heads,
+                              num_kv_heads, head_dim, position, inv_freq, 1.0f, 1, rms_eps,
+                              kv_keys, kv_values, kv_table, 0, position, 0,
+                              rsqrtf((float)head_dim), 0.0f, 0);
+    if (e != cudaSuccess) return (int)e;
+    launch_matvec(w_dtype[4], o_proj, ctx, (const float*)0, o, hidden, q_dim, w_group[4]);
+    q8_done();
+    add_inplace_kernel<<<grid_for(hidden, B), B>>>(h_dev, o, hidden);
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(h_dev, post_norm, n, hidden, rms_eps);
+    launch_matvec(w_dtype[5], gate_proj, n, (const float*)0, gate, inter, hidden, w_group[5]);
+    launch_matvec(w_dtype[6], up_proj, n, (const float*)0, up, inter, hidden, w_group[6]);
+    q8_done();
+    swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, act, inter, DLM_ACT_SILU);
+    launch_matvec(w_dtype[7], down_proj, act, (const float*)0, down, hidden, inter, w_group[7]);
+    q8_done();
+    add_inplace_kernel<<<grid_for(hidden, B), B>>>(h_dev, down, hidden);
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(h_dev, final_norm, out, hidden, rms_eps);
+    e = cudaMemcpy(out_host, out, (size_t)hidden * sizeof(float), cudaMemcpyDeviceToHost);
+    return (int)e;
+}

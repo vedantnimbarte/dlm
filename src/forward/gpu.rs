@@ -1359,6 +1359,24 @@ pub struct GpuKernel {
     /// MLA decoupled-RoPE frequencies (over `qk_rope_head_dim`); `None` for
     /// standard attention.
     mla_inv_freq: Option<DeviceBuffer>,
+    /// Hidden states recorded for a speculative draft head
+    /// ([`ComputeKernel::capture_next`]).
+    capture: std::sync::Mutex<Capture>,
+}
+
+/// The layers whose input [`GpuKernel`] records, and what it has recorded:
+/// one `[tokens, hidden]` run per layer.
+#[derive(Default)]
+struct Capture {
+    layers: Vec<u32>,
+    rows: Vec<Vec<f32>>,
+}
+
+impl Capture {
+    /// Which recorded run `layer`'s input goes to, if it is recorded.
+    fn slot(&self, layer: u32) -> Option<usize> {
+        self.layers.iter().position(|&l| l == layer)
+    }
 }
 
 impl GpuKernel {
@@ -1418,6 +1436,7 @@ impl GpuKernel {
             kv_capacity_tokens: cap,
             d_hidden,
             d_batch,
+            capture: Default::default(),
             mla_inv_freq,
         })
     }
@@ -1690,6 +1709,26 @@ impl ComputeKernel for GpuKernel {
         Some(self.kv_pools.free_tokens(elem))
     }
 
+    fn capture_next(&self, layers: &[u32]) -> bool {
+        let mut c = self.capture.lock().unwrap();
+        c.layers = layers.to_vec();
+        c.rows = vec![Vec::new(); layers.len()];
+        true
+    }
+
+    fn take_capture(&self) -> Vec<f32> {
+        let c = std::mem::take(&mut *self.capture.lock().unwrap());
+        let h = self.cfg.hidden_size;
+        let tokens = c.rows.first().map_or(0, |r| r.len() / h);
+        let mut out = Vec::with_capacity(tokens * h * c.rows.len());
+        for t in 0..tokens {
+            for run in &c.rows {
+                out.extend_from_slice(&run[t * h..(t + 1) * h]);
+            }
+        }
+        out
+    }
+
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
         let host_from = self.kv_pools.host_from();
         self.kv_pools = crate::forward::kv_pool::KvPools::new(
@@ -1807,6 +1846,7 @@ impl ComputeKernel for GpuKernel {
         }
         let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
         for layer in 0..self.num_layers() {
+            self.record(layer, &d_hiddens, hiddens.len())?;
             let kv = &mut kv_layers[layer as usize];
             // The GEMM prefill takes the layer a big piece at a time; a layer it
             // cannot take (its shape, or the heads) goes 16 tokens per call
@@ -1934,6 +1974,7 @@ impl ComputeKernel for GpuKernel {
         if layer == 0 {
             self.d_hidden.upload(hidden)?;
         }
+        self.record(layer, &self.d_hidden, hidden.len())?;
         self.launch_layer(layer, kv, position, &self.d_hidden)?;
         // `download` is a blocking cudaMemcpy(D2H), so it already waits for the
         // stack's kernels — no separate synchronize() needed.
@@ -1945,6 +1986,21 @@ impl ComputeKernel for GpuKernel {
 }
 
 impl GpuKernel {
+    /// When `layer`'s input is being recorded, copy the first `len` floats of
+    /// `x` (the rows about to enter it) into the record. The copy waits for the
+    /// layers before it, so it costs a sync per recorded layer.
+    fn record(&self, layer: u32, x: &DeviceBuffer, len: usize) -> Result<()> {
+        let mut c = self.capture.lock().unwrap();
+        let Some(i) = c.slot(layer) else {
+            return Ok(());
+        };
+        let mut rows = vec![0.0f32; x.len()];
+        x.download(&mut rows)?;
+        rows.truncate(len);
+        c.rows[i].extend_from_slice(&rows);
+        Ok(())
+    }
+
     /// Enqueue layer `layer` for one token on the hidden vector in `d_hidden`,
     /// appending its K/V to `kv`. Nothing is copied to or from the host.
     fn launch_layer(

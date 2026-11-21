@@ -145,7 +145,7 @@ impl EngineService {
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
-            None,
+            Drafting::None,
             0,
             tokenizer,
             vocab_size,
@@ -176,7 +176,7 @@ impl EngineService {
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
-            Some(draft),
+            Drafting::Model(Box::new(draft)),
             gamma,
             tokenizer,
             vocab_size,
@@ -185,6 +185,35 @@ impl EngineService {
             created,
             max_batch,
             prefix_cache_size,
+        )
+    }
+
+    /// Start the engine speculating with an EAGLE-3 `head`: it proposes `gamma`
+    /// tokens per round from `generator`'s own hidden states, and the target
+    /// verifies them. Output is identical to [`start`](Self::start).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_eagle3<K: ComputeKernel + Send + 'static>(
+        generator: Generator<K>,
+        head: crate::forward::eagle3::Eagle3Head,
+        gamma: usize,
+        tokenizer: BpeTokenizer,
+        vocab_size: usize,
+        model_id: impl Into<String>,
+        default_max_tokens: usize,
+        created: u64,
+        max_batch: usize,
+    ) -> Arc<Self> {
+        Self::start_inner(
+            generator,
+            Drafting::Eagle3(Box::new(head)),
+            gamma.max(1),
+            tokenizer,
+            vocab_size,
+            model_id,
+            default_max_tokens,
+            created,
+            max_batch,
+            0,
         )
     }
 
@@ -205,7 +234,7 @@ impl EngineService {
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
-            None,
+            Drafting::None,
             gamma.max(1),
             tokenizer,
             vocab_size,
@@ -221,7 +250,7 @@ impl EngineService {
     #[allow(clippy::too_many_arguments)]
     fn start_inner<K: ComputeKernel + Send + 'static>(
         generator: Generator<K>,
-        draft: Option<Generator<K>>,
+        draft: Drafting<K>,
         gamma: usize,
         tokenizer: BpeTokenizer,
         vocab_size: usize,
@@ -414,10 +443,17 @@ impl EngineService {
     }
 }
 
+/// What proposes tokens for the engine's speculative rounds, if anything.
+enum Drafting<K: ComputeKernel> {
+    None,
+    Model(Box<Generator<K>>),
+    Eagle3(Box<crate::forward::eagle3::Eagle3Head>),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn engine_loop<K: ComputeKernel>(
     generator: Generator<K>,
-    draft: Option<Generator<K>>,
+    draft: Drafting<K>,
     gamma: usize,
     job_rx: Receiver<Work>,
     max_batch: usize,
@@ -426,11 +462,14 @@ fn engine_loop<K: ComputeKernel>(
     queue_timeout: Arc<AtomicU64>,
 ) {
     let mut sched = match &draft {
-        // Draft-model sessions can't resume, so they get no prefix cache.
-        Some(d) => BatchScheduler::with_speculative(&generator, d, max_batch, gamma),
-        None if gamma > 0 => BatchScheduler::with_ngram(&generator, max_batch, gamma)
+        // Draft sessions can't resume, so they get no prefix cache.
+        Drafting::Model(d) => BatchScheduler::with_speculative(&generator, d, max_batch, gamma),
+        Drafting::Eagle3(h) => BatchScheduler::with_eagle3(&generator, h, max_batch, gamma),
+        Drafting::None if gamma > 0 => BatchScheduler::with_ngram(&generator, max_batch, gamma)
             .with_prefix_cache(prefix_cache_size),
-        None => BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size),
+        Drafting::None => {
+            BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size)
+        }
     };
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
     // The gauges hold from the start, not only after the first request.

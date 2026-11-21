@@ -114,6 +114,21 @@ pub trait ComputeKernel {
         None
     }
 
+    /// Record, from the next prefill or single-sequence step on, the hidden
+    /// state entering each of `layers` for every token run, until
+    /// [`take_capture`](Self::take_capture). How an EAGLE draft head gets the
+    /// target's features. `false` when the kernel cannot (the default).
+    fn capture_next(&self, _layers: &[u32]) -> bool {
+        false
+    }
+
+    /// What was recorded since [`capture_next`](Self::capture_next), token by
+    /// token, each token's states for the layers back to back
+    /// (`tokens × layers × hidden`); recording stops.
+    fn take_capture(&self) -> Vec<f32> {
+        Vec::new()
+    }
+
     /// Size the kernel's shared KV pools to `tokens` tokens (per layer), for
     /// kernels that page KV. Takes effect for pools not yet allocated, so call it
     /// before the first session. A no-op elsewhere.
@@ -183,6 +198,14 @@ impl<K: ComputeKernel> ComputeKernel for &K {
 
     fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
         (**self).kv_free_tokens(elem)
+    }
+
+    fn capture_next(&self, layers: &[u32]) -> bool {
+        (**self).capture_next(layers)
+    }
+
+    fn take_capture(&self) -> Vec<f32> {
+        (**self).take_capture()
     }
 
     fn prefill(
