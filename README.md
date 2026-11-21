@@ -1018,6 +1018,11 @@ inference engine):
   copies (code being rewritten, a document being quoted). `--speculative auto`,
   the default, turns it on for a streamed model, where verifying several tokens
   costs about what generating one does.
+  An **EAGLE-3 head** works as the draft too (`--draft-model-path <head dir>`,
+  resident GPU only). It drafts from the target's own hidden states, so it
+  guesses far better than lookup on free text. AngelSlim's `Qwen3-1.7B_eagle3`
+  keeps 78% of single proposals. Convert a `pytorch_model.bin` head to
+  `model.safetensors` first.
 - **Continuous batching** ([`src/batching.rs`](src/batching.rs)). A scheduler
   keeps up to `--max-batch` generations in flight and admits queued requests as
   slots free. Each request's output is identical to running it alone (tested),

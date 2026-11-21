@@ -1211,8 +1211,10 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
             // Optional draft model for speculative decoding. It must share the
             // target's vocabulary (same tokenizer) for the accept/reject rule to
             // be exact. Loaded as parts so it can take the same kernel as the target.
+            // An EAGLE-3 head is no model of its own: the GPU path loads it
+            // beside the target.
             let draft_parts = match &args.draft_model_path {
-                Some(dir) => {
+                Some(dir) if !is_eagle3_dir(dir) => {
                     let dcfg = dlm::loader::open_model(dir, quant)?.0;
                     if dcfg.vocab_size != config.vocab_size {
                         return Err(DlmError::InvalidConfig(format!(
@@ -1227,7 +1229,7 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                         args.context_length,
                     )?)
                 }
-                None => None,
+                _ => None,
             };
 
             if !args.multi_gpu_ids.is_empty() {
@@ -1893,7 +1895,23 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     // Batched, streaming engine: a background scheduler interleaves concurrent
     // requests a token at a time. Speculating, a draft model or n-gram lookup
     // proposes and the target verifies.
+    let eagle = match &args.draft_model_path {
+        Some(dir) if is_eagle3_dir(dir) => {
+            if !generator.kernel().capture_next(&[]) {
+                return Err(DlmError::InvalidConfig(
+                    "an EAGLE-3 head reads the target's hidden states, which only the resident                      GPU kernel records: drop --stream, --gpu-layers and --device cpu"
+                        .into(),
+                ));
+            }
+            Some(load_eagle3_head(dir, args, config)?)
+        }
+        _ => None,
+    };
     let mode = match (&draft, args.speculative) {
+        _ if eagle.is_some() => format!(
+            "batched + speculative: EAGLE-3 head, gamma {}",
+            args.draft_gamma
+        ),
         (Some(_), _) => format!(
             "batched + speculative: draft model, gamma {}",
             args.draft_gamma
@@ -1904,7 +1922,23 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         ),
         _ => "batched".into(),
     };
+    // Without GPU kernels `eagle` is always `None`: its type is uninhabited.
+    #[cfg_attr(
+        not(any(feature = "cuda-kernels", feature = "rocm-kernels")),
+        allow(unreachable_code)
+    )]
     let engine = match draft {
+        _ if eagle.is_some() => dlm::server::EngineService::start_eagle3(
+            generator,
+            eagle.expect("checked"),
+            args.draft_gamma,
+            tokenizer,
+            config.vocab_size as usize,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
+            created,
+            args.max_batch.max(1),
+        ),
         Some(d) => dlm::server::EngineService::start_speculative(
             generator,
             d,
@@ -2021,6 +2055,68 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
 /// expert cache see a realistic token mix rather than arbitrary ids.
 const BENCH_TEXT: &str = "The river wound through the valley for many miles before it reached the sea. Along its banks, small towns had grown up over the centuries, each with its own market, its own bridge, and its own stories about floods and dry summers. Farmers brought grain and fruit to the markets every week, and traders carried salt, cloth and tools back upstream. When the railway arrived, the river mattered less for moving goods, but people still gathered by the water in the evenings to talk, to fish, and to watch the light change over the hills. ";
 
+/// Whether `dir` holds an EAGLE-3 draft head rather than a draft model: its
+/// `config.json` names a `*Eagle3` architecture.
+fn is_eagle3_dir(dir: &std::path::Path) -> bool {
+    std::fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v["architectures"].as_array().map(|a| {
+                a.iter()
+                    .any(|x| x.as_str().is_some_and(|s| s.contains("Eagle3")))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Load the EAGLE-3 head in `dir` for `config`'s target: in the target's own
+/// precision when it was quantized at load, else as the head ships.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+fn load_eagle3(
+    dir: &std::path::Path,
+    args: &ServeArgs,
+    config: &ModelConfig,
+) -> Result<dlm::forward::eagle3::Eagle3Head> {
+    let _ = args;
+    let quant = match config.quant {
+        QuantScheme::Int4 | QuantScheme::Int8 => config.quant,
+        _ => QuantScheme::Fp16,
+    };
+    let head = dlm::forward::eagle3::Eagle3Head::load(
+        dir,
+        quant,
+        config.hidden_size as usize,
+        config.vocab_size as usize,
+    )?;
+    println!(
+        "eagle-3 head : {} ({} draft tokens, reads target layers {:?})",
+        dir.display(),
+        head.config().draft_vocab,
+        dlm::forward::eagle3::aux_layers(config.num_layers)
+    );
+    Ok(head)
+}
+
+/// [`load_eagle3`] where GPU kernels exist; refused elsewhere.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+fn load_eagle3_head(
+    dir: &std::path::Path,
+    args: &ServeArgs,
+    config: &ModelConfig,
+) -> Result<dlm::forward::eagle3::Eagle3Head> {
+    load_eagle3(dir, args, config)
+}
+
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+fn load_eagle3_head(
+    _: &std::path::Path,
+    _: &ServeArgs,
+    _: &ModelConfig,
+) -> Result<dlm::forward::eagle3::Eagle3Head> {
+    Err(gpu_compute_unavailable("an EAGLE-3 head"))
+}
+
 /// `dlm bench`: load the model through `serve`'s own path, then measure it
 /// instead of serving it (see [`bench_generator`]).
 fn run_bench(args: BenchArgs) -> Result<()> {
@@ -2030,9 +2126,12 @@ fn run_bench(args: BenchArgs) -> Result<()> {
     if serve.speculative == Speculative::Auto {
         serve.speculative = Speculative::Off;
     }
-    if serve.draft_model_path.is_some() || serve.distributed_mode != DistributedMode::Standalone {
+    let eagle = serve.draft_model_path.as_deref().is_some_and(is_eagle3_dir);
+    if (serve.draft_model_path.is_some() && !eagle)
+        || serve.distributed_mode != DistributedMode::Standalone
+    {
         return Err(DlmError::InvalidConfig(
-            "bench measures a single standalone model, plain or with --speculative ngram; drop --draft-model-path and --distributed-mode"
+            "bench measures a single standalone model, plain, with --speculative ngram, or with an EAGLE-3 head as --draft-model-path; drop the draft model and --distributed-mode"
                 .into(),
         ));
     }
@@ -2071,18 +2170,36 @@ fn bench_generator<K: ComputeKernel>(
             r.prefill_tok_s, r.ttft_ms, r.decode_tok_s, r.ms_per_step
         )
     };
-    // `--speculative ngram`: a lone request speculates by lookup, as served.
-    let ngram_gamma = match args.speculative {
+    // A lone request speculates as served: by lookup, or with an EAGLE-3 head.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    let eagle = match (&args.draft_model_path, args.speculative) {
+        (Some(dir), Speculative::Draft) if is_eagle3_dir(dir) => {
+            Some(load_eagle3(dir, args, config)?)
+        }
+        _ => None,
+    };
+    let spec = match args.speculative {
         Speculative::Ngram => {
             println!(
                 "speculative  : n-gram lookup, gamma {} (batch 1)",
                 args.draft_gamma
             );
-            Some(args.draft_gamma)
+            Some(dlm::bench::BenchSpec::Ngram(args.draft_gamma))
+        }
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        Speculative::Draft if eagle.is_some() => {
+            println!(
+                "speculative  : EAGLE-3 head, gamma {} (batch 1)",
+                args.draft_gamma
+            );
+            Some(dlm::bench::BenchSpec::Eagle3 {
+                head: eagle.as_ref().expect("checked"),
+                gamma: args.draft_gamma,
+            })
         }
         Speculative::Draft => {
             return Err(DlmError::InvalidConfig(
-                "dlm bench measures n-gram speculation; draft-model speculation is serve-only"
+                "dlm bench measures n-gram or EAGLE-3 speculation; a draft model is serve-only"
                     .into(),
             ))
         }
@@ -2101,7 +2218,7 @@ fn bench_generator<K: ComputeKernel>(
         "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, {sampling}",
         opts.prompt_len, opts.gen_len, opts.batch, opts.runs
     );
-    let results = dlm::bench::run(generator, &prompt, opts, ngram_gamma, |r, run| {
+    let results = dlm::bench::run(generator, &prompt, opts, spec, |r, run| {
         println!("  b{:<3} run {:<2}: {}", r.batch, run + 1, row(r));
     })?;
 
