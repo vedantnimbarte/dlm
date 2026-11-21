@@ -238,6 +238,8 @@ extern "C" {
         inter: i32,
         w_dtype: i32,
         w_group_size: i32,
+        down_dtype: i32,
+        down_group: i32,
         gate: *const c_void,
         up: *const c_void,
         down: *const c_void,
@@ -423,6 +425,8 @@ extern "C" {
         n_experts: i32,
         w_dtype: i32,
         w_group_size: i32,
+        down_dtype: i32,
+        down_group: i32,
         gate: *const DlmPtrs,
         up: *const DlmPtrs,
         down: *const DlmPtrs,
@@ -481,6 +485,8 @@ extern "C" {
         inter: i32,
         w_dtype: i32,
         w_group_size: i32,
+        down_dtype: i32,
+        down_group: i32,
         gate: *const c_void,
         up: *const c_void,
         down: *const c_void,
@@ -1199,20 +1205,39 @@ pub(crate) struct GpuExpert {
     pub(crate) gate: DeviceBuffer,
     pub(crate) up: DeviceBuffer,
     pub(crate) down: DeviceBuffer,
+    /// The dtype and group size of gate and up.
     pub(crate) w_dtype: i32,
     pub(crate) w_group_size: i32,
+    /// Those of down, which a GGUF often stores finer (Q6_K beside Q4_K).
+    pub(crate) down_dtype: i32,
+    pub(crate) down_group: i32,
 }
 
 impl GpuExpert {
+    /// `(gate/up dtype, group, down dtype, group)`. Read off `up`, not `gate`:
+    /// an ungated MLP (GPT-2, Falcon) has an empty gate whose default dtype
+    /// says nothing about the real projections. A gate stored unlike up has
+    /// no kernel, and is refused.
+    fn dtypes(e: &crate::forward::cpu::ExpertFfn) -> Result<(i32, i32, i32, i32)> {
+        let up = (e.up.dtype_code(), e.up.group_size() as i32);
+        if !e.gate.is_empty() && (e.gate.dtype_code(), e.gate.group_size() as i32) != up {
+            return Err(DlmError::InvalidConfig(
+                "an expert's gate and up projections are stored in different formats".into(),
+            ));
+        }
+        Ok((up.0, up.1, e.down.dtype_code(), e.down.group_size() as i32))
+    }
+
     pub(crate) fn upload(e: &crate::forward::cpu::ExpertFfn) -> Result<Self> {
+        let (w_dtype, w_group_size, down_dtype, down_group) = Self::dtypes(e)?;
         Ok(Self {
             gate: DeviceBuffer::from_bytes(e.gate.as_bytes(), e.gate.len())?,
             up: DeviceBuffer::from_bytes(e.up.as_bytes(), e.up.len())?,
             down: DeviceBuffer::from_bytes(e.down.as_bytes(), e.down.len())?,
-            // `up`, not `gate`: an ungated MLP (GPT-2, Falcon) has an empty gate
-            // whose default dtype says nothing about the real projections.
-            w_dtype: e.up.dtype_code(),
-            w_group_size: e.up.group_size() as i32,
+            w_dtype,
+            w_group_size,
+            down_dtype,
+            down_group,
         })
     }
 
@@ -1254,14 +1279,17 @@ impl GpuExpert {
             off += bytes.len();
         }
         stream.synchronize()?;
+        let (w_dtype, w_group_size, down_dtype, down_group) = Self::dtypes(e)?;
         let mut bufs = bufs.into_iter();
         let mut next = || bufs.next().expect("one buffer per part");
         Ok(Self {
             gate: next(),
             up: next(),
             down: next(),
-            w_dtype: e.up.dtype_code(),
-            w_group_size: e.up.group_size() as i32,
+            w_dtype,
+            w_group_size,
+            down_dtype,
+            down_group,
         })
     }
 }
@@ -1383,7 +1411,8 @@ impl GpuMoeCore {
         // <= 8). Anything else falls back to the per-expert path rather than
         // silently applying the wrong decode.
         let uniform_dtype = experts.windows(2).all(|w| {
-            w[0].0.w_dtype == w[1].0.w_dtype && w[0].0.w_group_size == w[1].0.w_group_size
+            let key = |e: &GpuExpert| (e.w_dtype, e.w_group_size, e.down_dtype, e.down_group);
+            key(&w[0].0) == key(&w[1].0)
         });
         if !experts.is_empty() && experts.len() <= DLM_MAX_TOPK && uniform_dtype {
             let null = || DlmPtrs {
@@ -1406,6 +1435,8 @@ impl GpuMoeCore {
                     experts.len() as i32,
                     experts[0].0.w_dtype,
                     experts[0].0.w_group_size,
+                    experts[0].0.down_dtype,
+                    experts[0].0.down_group,
                     &gate,
                     &up,
                     &down,
@@ -1488,6 +1519,8 @@ impl GpuMoeCore {
                 inter,
                 expert.w_dtype,
                 expert.w_group_size,
+                expert.down_dtype,
+                expert.down_group,
                 expert.gate.as_ptr() as *const c_void,
                 expert.up.as_ptr() as *const c_void,
                 expert.down.as_ptr() as *const c_void,

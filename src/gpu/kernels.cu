@@ -5040,7 +5040,7 @@ static void launch_grouped_down(int dt, DlmPtrs W, DlmWeights weights, const flo
 // from one checkpoint). `n_experts` must be <= DLM_MAX_TOPK — the caller falls
 // back to the per-expert loop otherwise.
 extern "C" int dlm_apply_experts(int hidden_size, int inter, int n_experts,
-                                 int w_dtype, int w_group_size,
+                                 int w_dtype, int w_group_size, int down_dtype, int down_group,
                                  const DlmPtrs* gate, const DlmPtrs* up, const DlmPtrs* down,
                                  const DlmWeights* weights, float* x, int activation)
 {
@@ -5065,12 +5065,12 @@ extern "C" int dlm_apply_experts(int hidden_size, int inter, int n_experts,
     launch_grouped_matvec(w_dtype, *up, normed2, u, n_experts, inter, hidden_size, w_group_size);
     // Elementwise over the whole (expert, inter) plane in one launch.
     swiglu_kernel<<<grid_for((int)span, B), B>>>(g, u, inter_buf, (int)span, activation);
-    launch_grouped_down(w_dtype, *down, *weights, inter_buf, x, n_experts, hidden_size, inter, w_group_size);
+    launch_grouped_down(down_dtype, *down, *weights, inter_buf, x, n_experts, hidden_size, inter, down_group);
     return (int)cudaGetLastError();
 }
 
 extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_group_size,
-                                const void* gate, const void* up, const void* down,
+                                int down_dtype, int down_group, const void* gate, const void* up, const void* down,
                                 float weight, float* x, int activation)
 {
     DLM_ENTER
@@ -5089,7 +5089,7 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
         launch_matvec(w_dtype, gate, normed2, (const float*)0, g, inter, hidden_size, w_group_size);
         launch_matvec(w_dtype, up, normed2, (const float*)0, u, inter, hidden_size, w_group_size);
         swiglu_kernel<<<grid_for(inter, B), B>>>(g, u, inter_buf, inter, activation);
-        launch_matvec(w_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, w_group_size);
+        launch_matvec(down_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, down_group);
         scaled_add_kernel<<<grid_for(hidden_size, B), B>>>(x, down_out, weight, hidden_size);
         e = cudaGetLastError();
     }
@@ -5134,7 +5134,7 @@ static void expert_matmul(int dt, const void* W, const float* X, float* out, int
 // grouped prefill read the expert's weights once per row. In pieces of 256 rows
 // to bound the scratch.
 extern "C" int dlm_apply_expert_rows(int hidden_size, int inter, int w_dtype, int w_group_size,
-                                     const void* gate, const void* up, const void* down,
+                                     int down_dtype, int down_group, const void* gate, const void* up, const void* down,
                                      const float* norm, const int* rows_host,
                                      const float* weights_host, int T, float* x, int activation)
 {
@@ -5165,7 +5165,7 @@ extern "C" int dlm_apply_expert_rows(int hidden_size, int inter, int w_dtype, in
         expert_matmul(w_dtype, gate, X, G, inter, hidden_size, n, w_group_size);
         expert_matmul(w_dtype, up, X, U, inter, hidden_size, n, w_group_size);
         swiglu_batched_kernel<<<grid_for((int)ni, B), B>>>(G, U, G, ni, activation);
-        expert_matmul(w_dtype, down, G, O, hidden_size, inter, n, w_group_size);
+        expert_matmul(down_dtype, down, G, O, hidden_size, inter, n, down_group);
         scatter_add_rows_kernel<<<grid_for((int)nh, B), B>>>(x, O, idx, W, n, hidden_size);
         e = cudaGetLastError();
     }
