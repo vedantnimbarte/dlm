@@ -259,7 +259,8 @@ struct RawConfig {
     #[serde(default)]
     enable_moe_block: Option<bool>,
     #[serde(default)]
-    use_bidirectional_attention: Option<String>,
+    /// Gemma 4 spells it `null` or `"all"`; Gemma 3 270M ships `false`.
+    use_bidirectional_attention: Option<serde_json::Value>,
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -915,7 +916,15 @@ fn gemma4_settings(raw: &RawConfig) -> Result<Gemma4> {
     if raw.enable_moe_block == Some(true) {
         return refuse("has a Mixture-of-Experts block (enable_moe_block)");
     }
-    if raw.use_bidirectional_attention.as_deref() == Some("all") {
+    if matches!(
+        raw.use_bidirectional_attention,
+        Some(serde_json::Value::Bool(true))
+    ) || raw
+        .use_bidirectional_attention
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        == Some("all")
+    {
         return refuse("attends bidirectionally (use_bidirectional_attention: \"all\")");
     }
     let layers = raw.num_hidden_layers;
@@ -2009,6 +2018,7 @@ mod tests {
             r#","attention_k_eq_v":true"#,
             r#","enable_moe_block":true"#,
             r#","use_bidirectional_attention":"all""#,
+            r#","use_bidirectional_attention":true"#,
         ] {
             let json = gemma4_e4b_json("").replace(r#""attention_k_eq_v":false,"#, "");
             let json = json.replace(r#""enable_moe_block":false,"#, "");
