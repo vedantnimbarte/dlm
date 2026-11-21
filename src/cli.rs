@@ -476,7 +476,7 @@ pub struct ServeArgs {
 
     /// Chat prompt template applied to chat messages. `auto` (default) detects it
     /// from the checkpoint's tokenizer_config.json; or name one: `plain`,
-    /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `phi3`, `deepseek`.
+    /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `gemma4`, `phi3`, `deepseek`.
     #[arg(long, value_name = "NAME", default_value = "auto")]
     pub chat_template: String,
 

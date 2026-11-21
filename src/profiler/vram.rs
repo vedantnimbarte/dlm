@@ -149,6 +149,10 @@ impl VramProfiler {
     /// `2 (K,V) × N_kv_heads × D_head × bytes per element × L_context`. int8
     /// takes 1.125 bytes a value (a 4-byte scale per 32), and only where a
     /// head is a whole number of 32-value groups; elsewhere the pool is fp16.
+    ///
+    /// Gemma 4's layers differ (wider global heads, a tail that keeps no KV of
+    /// its own), so for it this is the average over the layers: times the layer
+    /// count, it is what they hold together.
     pub fn kv_bytes_per_layer(&self, config: &ModelConfig) -> u64 {
         use crate::forward::cpu::KvElem;
         let values = 2 * config.num_kv_heads as u64 * config.head_dim() as u64;
@@ -159,6 +163,11 @@ impl VramProfiler {
             KvElem::I4 if config.head_dim() % 32 == 0 => 5,
             KvElem::I8 | KvElem::I4 => 16,
         };
+        let all_layers = config.kv_values_per_token();
+        let layers = config.num_layers.max(1) as u64;
+        if all_layers != values * layers {
+            return (all_layers * eighths).div_ceil(8) * self.target_context as u64 / layers;
+        }
         (values * eighths).div_ceil(8) * self.target_context as u64
     }
 

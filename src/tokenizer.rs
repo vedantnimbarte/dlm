@@ -482,10 +482,41 @@ impl BpeTokenizer {
                         byte_fallback,
                     })
             }
+            // Gemma 4: the same SentencePiece-style BPE as its `tokenizer.json`
+            // (▁ for a space, no prefix, byte fallback), with the merges listed.
+            // A merge is "left right" split at its one space: the pieces carry
+            // ▁ for spaces but may hold newlines and tabs, which
+            // `split_whitespace` would cut through.
+            "gemma4" => {
+                let merges = get("merges").and_then(Value::as_strings).ok_or_else(|| {
+                    DlmError::InvalidConfig(
+                        "gguf: a gemma4 tokenizer with no tokenizer.ggml.merges".into(),
+                    )
+                })?;
+                let vocab: HashMap<String, u32> = tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(id, t)| (t.clone(), id as u32))
+                    .collect();
+                let merges = merges
+                    .iter()
+                    .filter_map(|m| {
+                        let (a, b) = m.split_once(' ')?;
+                        Some((a.to_string(), b.to_string()))
+                    })
+                    .collect();
+                Self::new(vocab, merges)
+                    .with_special(specials)
+                    .with_spm(SpmBpe {
+                        prepend: false,
+                        byte_fallback: true,
+                    })
+            }
             other => {
                 return Err(DlmError::InvalidConfig(format!(
                     "gguf: tokenizer {other:?} is not one dlm implements. It reads the \
-                     byte-level BPE (\"gpt2\") and SentencePiece (\"llama\") tokenizers."
+                     byte-level BPE (\"gpt2\"), SentencePiece (\"llama\") and Gemma 4 \
+                     (\"gemma4\") tokenizers."
                 )))
             }
         };

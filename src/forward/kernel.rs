@@ -29,6 +29,28 @@ pub trait ComputeKernel {
     /// Key/value width per token (`num_kv_heads × head_dim`).
     fn kv_dim(&self) -> usize;
 
+    /// Values at the end of each row that are not the hidden state: Gemma 4's
+    /// per-layer inputs, which the generator gathers per token and every layer
+    /// reads its slice of. `hidden_size` is the whole row; the model's own width
+    /// is `hidden_size - per_layer_input_width`. 0 everywhere else.
+    fn per_layer_input_width(&self) -> usize {
+        0
+    }
+
+    /// The layer whose KV history `layer` attends over. Itself, except in
+    /// Gemma 4's shared-KV tail, whose layers read an earlier layer's cache and
+    /// keep none of their own. Whoever hands a kernel a layer's KV hands it this
+    /// layer's.
+    fn kv_source(&self, layer: u32) -> u32 {
+        layer
+    }
+
+    /// Key/value width of `layer`'s history, which Gemma 4 varies by layer (its
+    /// global layers have wider heads).
+    fn layer_kv_dim(&self, _layer: u32) -> usize {
+        self.kv_dim()
+    }
+
     /// Run block `layer` for one token at absolute `position`, updating `hidden`
     /// and appending to `kv`.
     fn run_block(
@@ -82,7 +104,8 @@ pub trait ComputeKernel {
             hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
         {
             for layer in 0..self.num_layers() {
-                self.run_block(layer, hidden, &mut kvs[layer as usize], position)?;
+                let kv = &mut kvs[self.kv_source(layer) as usize];
+                self.run_block(layer, hidden, kv, position)?;
             }
         }
         Ok(())
@@ -184,6 +207,18 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         (**self).kv_dim()
     }
 
+    fn per_layer_input_width(&self) -> usize {
+        (**self).per_layer_input_width()
+    }
+
+    fn kv_source(&self, layer: u32) -> u32 {
+        (**self).kv_source(layer)
+    }
+
+    fn layer_kv_dim(&self, layer: u32) -> usize {
+        (**self).layer_kv_dim(layer)
+    }
+
     fn run_block(
         &self,
         layer: u32,
@@ -256,7 +291,8 @@ pub fn prefill_token_by_token<K: ComputeKernel + ?Sized>(
 ) -> Result<()> {
     for (i, hidden) in hiddens.chunks_mut(kernel.hidden_size()).enumerate() {
         for layer in 0..kernel.num_layers() {
-            kernel.run_block(layer, hidden, &mut kv_layers[layer as usize], start + i)?;
+            let kv = &mut kv_layers[kernel.kv_source(layer) as usize];
+            kernel.run_block(layer, hidden, kv, start + i)?;
         }
     }
     Ok(())
@@ -276,7 +312,7 @@ pub fn prefill_layer_by_layer<K: ComputeKernel + ?Sized>(
     start: usize,
 ) -> Result<()> {
     for layer in 0..kernel.num_layers() {
-        let kv = &mut kv_layers[layer as usize];
+        let kv = &mut kv_layers[kernel.kv_source(layer) as usize];
         for (i, hidden) in hiddens.chunks_mut(kernel.hidden_size()).enumerate() {
             kernel.run_block(layer, hidden, kv, start + i)?;
         }

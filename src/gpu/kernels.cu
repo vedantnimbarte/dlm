@@ -1642,7 +1642,8 @@ __global__ void rope_kernel(float* v, int num_heads, int head_dim, int position,
 
 // Per-head RMSNorm over `head_dim` (Qwen3 Q/K norm), applied after projection and
 // before RoPE. One block per head; `w` is `[head_dim]` shared across heads.
-// Mirrors `head_rmsnorm` / `rmsnorm` in src/forward/cpu.rs.
+// Mirrors `head_rmsnorm` / `rmsnorm` in src/forward/cpu.rs. A NULL `w` is a scale
+// of 1 (Gemma 4's value norm has none).
 __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int head_dim,
                                     float eps) {
     int h = blockIdx.x;
@@ -1651,7 +1652,7 @@ __global__ void head_rmsnorm_kernel(float* v, const float* w, int num_heads, int
     float ss = 0.0f;
     for (int i = 0; i < head_dim; ++i) ss += head[i] * head[i];
     float inv = rsqrtf(ss / (float)head_dim + eps);
-    for (int i = 0; i < head_dim; ++i) head[i] = head[i] * inv * w[i];
+    for (int i = 0; i < head_dim; ++i) head[i] = head[i] * inv * (w ? w[i] : 1.0f);
 }
 
 // Grouped-query attention over `positions` cached tokens, in three launches so
@@ -5523,4 +5524,139 @@ extern "C" int dlm_eagle3_step(
     rmsnorm_kernel<<<1, RMS_THREADS>>>(h_dev, final_norm, out, hidden, rms_eps);
     e = cudaMemcpy(out_host, out, (size_t)hidden * sizeof(float), cudaMemcpyDeviceToHost);
     return (int)e;
+}
+
+// ── Gemma 4 ─────────────────────────────────────────────────────────────────
+//
+// Gemma 4 runs its own layer, put together from the kernels above rather than
+// through the fused decode block, because it differs from that block in four
+// places at once: it normalizes the values as well as the keys, its windowed
+// and global layers have different head widths, the layers of its shared-KV
+// tail attend over another layer's cache and write none, and every layer ends
+// by adding its per-layer input. One token per call. `decode_block`,
+// `project_per_layer_inputs` and `apply_per_layer_input` in src/forward/cpu.rs
+// are the reference.
+
+// x[i] *= s
+__global__ void scale_kernel(float* x, float s, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= s;
+}
+
+// x[i] = (x[i] + y[i]) * s
+__global__ void add_scale_kernel(float* x, const float* y, float s, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = (x[i] + y[i]) * s;
+}
+
+// Before layer 0: turn `ple` (`layers x ple_dim`, each layer's token-id half
+// of its input) into what the layers read, from the token's embedding `x`:
+// ple = (norm(proj . x / sqrt(hidden)) + ple) / sqrt(2), the norm per layer.
+extern "C" int dlm_gemma4_project(int hidden_size, int ple_dim, int layers, float rms_eps,
+                                  int w_dtype, int w_group_size, const void* proj,
+                                  const float* norm, const float* x, float* ple) {
+    DLM_ENTER
+    const int B = 256, n = ple_dim * layers;
+    cudaError_t e = scratch_ensure(9, n);
+    if (e != cudaSuccess) return (int)e;
+    float* p = g_scratch[9];
+    q8_done();
+    launch_matvec(w_dtype, proj, x, (const float*)0, p, n, hidden_size, w_group_size);
+    scale_kernel<<<grid_for(n, B), B>>>(p, rsqrtf((float)hidden_size), n);
+    head_rmsnorm_kernel<<<layers, 1>>>(p, norm, layers, ple_dim, rms_eps);
+    add_scale_kernel<<<grid_for(n, B), B>>>(ple, p, 0.70710678118654752f, n);
+    return (int)cudaGetLastError();
+}
+
+// One Gemma 4 layer for one token, up to its per-layer input: attention with
+// Q/K/V norms (V unscaled) and RoPE, then the Gemma 2 norm sandwich around a
+// gated MLP. `shared` != 0: the layer projects only its query and attends over
+// rows 0..num_positions of the KV it is handed (another layer's), writing none;
+// otherwise it writes its K/V at row num_positions and attends over the same
+// rows. Weight dtypes come per projection from `ext`, as do the KV element type
+// and block table.
+extern "C" int dlm_gemma4_block(
+    int hidden_size, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim,
+    int inter, float rms_eps, int w_dtype, int w_group_size,
+    const void* q_proj, const void* k_proj, const void* v_proj, const void* o_proj,
+    const void* gate_proj, const void* up_proj, const void* down_proj,
+    const float* in_norm, const float* post_attn_norm, const float* pre_ffn_norm,
+    const float* post_ffn_norm, const float* q_norm, const float* k_norm,
+    const float* inv_freq, float* x, void* kv_keys, void* kv_values,
+    int num_positions, int position, int sliding_window, int activation, float attn_scale,
+    int shared, const DlmBlockExt* ext)
+{
+    DLM_ENTER
+    const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    const int B = 256;
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(0, hidden_size)
+    DLM_ALLOC(1, q_dim)
+    DLM_ALLOC(2, kv_dim)
+    DLM_ALLOC(3, kv_dim)
+    DLM_ALLOC(4, q_dim)
+    DLM_ALLOC(5, hidden_size)
+    DLM_ALLOC(7, inter)
+    DLM_ALLOC(8, inter)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+    float *normed = g_scratch[0], *q = g_scratch[1], *k = g_scratch[2], *v = g_scratch[3];
+    float *ctx = g_scratch[4], *out = g_scratch[5], *gate = g_scratch[7], *up = g_scratch[8];
+    q8_done();
+
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    launch_matvec(DLM_WDT(DLM_W_Q), q_proj, normed, (const float*)0, q, q_dim, hidden_size, DLM_WGRP(DLM_W_Q));
+    head_rmsnorm_kernel<<<num_heads, 1>>>(q, q_norm, num_heads, head_dim, rms_eps);
+    rope_kernel<<<grid_for(num_heads * (head_dim / 2), B), B>>>(q, num_heads, head_dim, position, inv_freq, 1.0f);
+    if (!shared) {
+        launch_matvec(DLM_WDT(DLM_W_K), k_proj, normed, (const float*)0, k, kv_dim, hidden_size, DLM_WGRP(DLM_W_K));
+        launch_matvec(DLM_WDT(DLM_W_V), v_proj, normed, (const float*)0, v, kv_dim, hidden_size, DLM_WGRP(DLM_W_V));
+        head_rmsnorm_kernel<<<num_kv_heads, 1>>>(k, k_norm, num_kv_heads, head_dim, rms_eps);
+        head_rmsnorm_kernel<<<num_kv_heads, 1>>>(v, (const float*)0, num_kv_heads, head_dim, rms_eps);
+        rope_kernel<<<grid_for(num_kv_heads * (head_dim / 2), B), B>>>(k, num_kv_heads, head_dim, position, inv_freq, 1.0f);
+        launch_kv_append(k, v, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_positions,
+                         kv_dim, o->kv_half);
+    }
+    e = launch_attention(q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, ctx, num_heads,
+                         num_kv_heads, head_dim, num_positions + 1, sliding_window, attn_scale,
+                         0.0f, o->kv_half);
+    if (e != cudaSuccess) return (int)e;
+    launch_matvec(DLM_WDT(DLM_W_O), o_proj, ctx, (const float*)0, out, hidden_size, q_dim, DLM_WGRP(DLM_W_O));
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(out, post_attn_norm, out, hidden_size, rms_eps);
+    add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, out, hidden_size);
+
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(x, pre_ffn_norm, normed, hidden_size, rms_eps);
+    launch_matvec(DLM_WDT(DLM_W_GATE), gate_proj, normed, (const float*)0, gate, inter, hidden_size, DLM_WGRP(DLM_W_GATE));
+    launch_matvec(DLM_WDT(DLM_W_UP), up_proj, normed, (const float*)0, up, inter, hidden_size, DLM_WGRP(DLM_W_UP));
+    swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, gate, inter, activation);
+    launch_matvec(DLM_WDT(DLM_W_DOWN), down_proj, gate, (const float*)0, out, hidden_size, inter, DLM_WGRP(DLM_W_DOWN));
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(out, post_ffn_norm, out, hidden_size, rms_eps);
+    add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, out, hidden_size);
+    return (int)cudaGetLastError();
+}
+
+// The end of a Gemma 4 layer: x += norm(proj . (act(gate . x) * input)), then
+// x *= scalar. A NULL `gate` skips the first part (a layer without inputs).
+extern "C" int dlm_gemma4_ple(int hidden_size, int ple_dim, float rms_eps, int activation,
+                              int gate_dtype, int gate_group, const void* gate,
+                              int proj_dtype, int proj_group, const void* proj,
+                              const float* post_norm, const float* input, float scalar,
+                              float* x) {
+    DLM_ENTER
+    const int B = 256;
+    cudaError_t e = scratch_ensure(5, hidden_size);
+    if (e == cudaSuccess) e = scratch_ensure(7, ple_dim > 0 ? ple_dim : 1);
+    if (e != cudaSuccess) return (int)e;
+    float *out = g_scratch[5], *g = g_scratch[7];
+    q8_done();
+    if (gate) {
+        launch_matvec(gate_dtype, gate, x, (const float*)0, g, ple_dim, hidden_size, gate_group);
+        swiglu_kernel<<<grid_for(ple_dim, B), B>>>(g, input, g, ple_dim, activation);
+        launch_matvec(proj_dtype, proj, g, (const float*)0, out, hidden_size, ple_dim, proj_group);
+        rmsnorm_kernel<<<1, RMS_THREADS>>>(out, post_norm, out, hidden_size, rms_eps);
+        add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, out, hidden_size);
+    }
+    if (scalar != 1.0f) scale_kernel<<<grid_for(hidden_size, B), B>>>(x, scalar, hidden_size);
+    return (int)cudaGetLastError();
 }

@@ -20,18 +20,23 @@ use std::path::{Path, PathBuf};
 /// tower dropped. A no-op for a text-only checkpoint.
 ///
 /// Gemma 3 4B+ stores its language model as `language_model.model.*` (or, from
-/// newer transformers, `model.language_model.*`) beside a SigLIP vision tower.
+/// newer transformers, `model.language_model.*`) beside a SigLIP vision tower;
+/// Gemma 4 the same, beside vision and audio towers.
 /// dlm serves text, so the tower is not merely unused: its encoder blocks are
 /// named `...layers.N...`, which the catalog would count as transformer layers,
 /// and its bytes would be planned into VRAM as pinned overhead.
 fn text_model_view(
     tensors: std::collections::BTreeMap<String, TensorInfo>,
 ) -> std::collections::BTreeMap<String, TensorInfo> {
-    const VISION: [&str; 4] = [
+    // Gemma 4 adds an audio tower and an embedder for each tower's output.
+    const VISION: [&str; 7] = [
         "vision_tower.",
         "multi_modal_projector.",
         "model.vision_tower.",
         "model.multi_modal_projector.",
+        "model.audio_tower.",
+        "model.embed_vision.",
+        "model.embed_audio.",
     ];
     const TEXT: [(&str, &str); 3] = [
         ("language_model.model.", "model."),
