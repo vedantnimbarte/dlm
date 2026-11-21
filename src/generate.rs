@@ -696,6 +696,23 @@ impl Pooling {
     }
 }
 
+/// An image in a prompt: the embeddings that take the place of its tokens
+/// (`rows` is `[n, hidden]`, from [`crate::vision`]), starting at prompt index
+/// `start`. The `n` tokens attend to each other in both directions, as Gemma 3
+/// runs an image's tokens; the ids at those positions are never looked up.
+#[derive(Debug, Clone)]
+pub struct ImageEmbeds {
+    pub start: usize,
+    pub rows: Vec<f32>,
+}
+
+impl ImageEmbeds {
+    /// Tokens the image covers.
+    pub fn len(&self, hidden: usize) -> usize {
+        self.rows.len() / hidden.max(1)
+    }
+}
+
 /// A CPU text generator: a transformer kernel plus the embedding, final norm,
 /// and LM head that turn token ids into logits and back.
 pub struct Generator<K: ComputeKernel> {
@@ -841,6 +858,11 @@ impl<K: ComputeKernel> Generator<K> {
     /// Vocabulary size.
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    /// Residual-stream width: an image embedding's row length.
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
     }
 
     /// Embed a token id into a fresh hidden vector.
@@ -1041,16 +1063,64 @@ impl<K: ComputeKernel> Generator<K> {
         &self,
         orch: &mut ForwardOrchestrator<&K>,
         tokens: &[u32],
+        each: impl FnMut(&[f32]),
+    ) -> Result<Vec<f32>> {
+        self.prefill_images(orch, tokens, &[], each)
+    }
+
+    /// [`prefill_with`](Self::prefill_with), with `images` in place of the
+    /// tokens they cover. Image starts count from the beginning of the prompt,
+    /// whose first `orch.position()` tokens are already in; each image's run
+    /// must lie wholly inside `tokens` or wholly before it.
+    fn prefill_images(
+        &self,
+        orch: &mut ForwardOrchestrator<&K>,
+        tokens: &[u32],
+        images: &[ImageEmbeds],
         mut each: impl FnMut(&[f32]),
     ) -> Result<Vec<f32>> {
+        let first = orch.position();
+        let end = first + tokens.len();
         let mut hiddens = Vec::new();
-        for chunk in tokens.chunks(PREFILL_CHUNK) {
+        let mut at = first;
+        while at < end {
+            if let Some(img) = images.iter().find(|m| m.start == at) {
+                let n = img.len(self.hidden_size);
+                if at + n > end || n == 0 || n > PREFILL_CHUNK {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "an image's {n} tokens at {at} do not fit the prompt piece {first}..{end}"
+                    )));
+                }
+                hiddens.clear();
+                hiddens.extend_from_slice(&img.rows);
+                orch.prefill_bidirectional(&mut hiddens)?;
+                each(&hiddens);
+                at += n;
+                continue;
+            }
+            // Text up to the next image, a chunk at a time.
+            let next = images
+                .iter()
+                .map(|m| m.start)
+                .filter(|&s| s > at)
+                .min()
+                .unwrap_or(usize::MAX);
+            if images
+                .iter()
+                .any(|m| m.start < at && m.start + m.len(self.hidden_size) > at)
+            {
+                return Err(DlmError::InvalidConfig(format!(
+                    "prompt piece {first}..{end} starts inside an image"
+                )));
+            }
+            let stop = end.min(next).min(at + PREFILL_CHUNK);
             hiddens.clear();
-            for (i, &token) in chunk.iter().enumerate() {
-                hiddens.extend(self.embed(token, orch.position() + i)?);
+            for (i, &token) in tokens[at - first..stop - first].iter().enumerate() {
+                hiddens.extend(self.embed(token, at + i)?);
             }
             orch.prefill(&mut hiddens)?;
             each(&hiddens);
+            at = stop;
         }
         Ok(hiddens.split_off(hiddens.len() - self.hidden_size))
     }
@@ -1075,27 +1145,50 @@ impl<K: ComputeKernel> Generator<K> {
     /// than raw logits, since a constant shift across the vocabulary changes
     /// every logit and no probability.
     pub fn score_and_next(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        self.score_with_images(tokens, &[])
+    }
+
+    /// [`score_and_next`](Self::score_and_next) for a prompt with `images` in
+    /// it (see [`ImageEmbeds`]).
+    pub fn score_with_images(
+        &self,
+        tokens: &[u32],
+        images: &[ImageEmbeds],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        if tokens.is_empty() {
+            return Err(DlmError::InvalidConfig("nothing to score".into()));
+        }
         let mut orch = self.orchestrator();
         let mut out = Vec::with_capacity(tokens.len().saturating_sub(1));
         let mut next = Vec::new();
-        for (c, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
-            let mut hiddens = Vec::with_capacity(chunk.len() * self.hidden_size);
-            for (i, &token) in chunk.iter().enumerate() {
-                hiddens.extend(self.embed(token, orch.position() + i)?);
-            }
-            orch.prefill(&mut hiddens)?;
-            for (i, hidden) in hiddens.chunks(self.hidden_size).enumerate() {
-                let mut logprobs = self.logits(hidden)?;
+        let mut i = 0;
+        let mut failed = None;
+        self.prefill_images(&mut orch, tokens, images, |hiddens| {
+            for hidden in hiddens.chunks(self.hidden_size) {
+                i += 1;
+                if failed.is_some() {
+                    continue;
+                }
+                let mut logprobs = match self.logits(hidden) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        failed = Some(e);
+                        continue;
+                    }
+                };
                 log_softmax_f64(&mut logprobs);
-                match tokens.get(c * PREFILL_CHUNK + i + 1) {
+                match tokens.get(i) {
                     Some(&next_token) => out.push(logprobs[next_token as usize]),
                     // The last token: no next token to score, so this is the
                     // distribution the model would generate from.
-                    None => next = logprobs,
+                    None => next = std::mem::take(&mut logprobs),
                 }
             }
+        })?;
+        match failed {
+            Some(e) => Err(e),
+            None => Ok((out, next)),
         }
-        Ok((out, next))
     }
 
     /// [`score_and_next`](Self::score_and_next), with every token run through
@@ -1473,6 +1566,8 @@ pub struct GenerationSession<'a, K: ComputeKernel> {
     /// Prompt tokens not yet run through the model (see
     /// [`prefill_some`](GenerationSession::prefill_some)).
     pending: Vec<u32>,
+    /// Images in the prompt, in place of the tokens they cover.
+    images: Vec<ImageEmbeds>,
     /// How many alternatives to report with each token, if any (see
     /// [`Decoding::logprobs`]).
     logprobs: Option<usize>,
@@ -1521,6 +1616,7 @@ impl<K: ComputeKernel> Generator<K> {
             logprobs: None,
             last_logprobs: None,
             pending: prompt.to_vec(),
+            images: Vec::new(),
         })
     }
 
@@ -1586,6 +1682,7 @@ impl<K: ComputeKernel> Generator<K> {
             logprobs: None,
             last_logprobs: None,
             pending: suffix.to_vec(),
+            images: Vec::new(),
         })
     }
 }
@@ -1697,14 +1794,53 @@ impl<K: ComputeKernel> GenerationSession<'_, K> {
     /// Pass a multiple of 16 (or `usize::MAX`): the GPU kernels prefill in groups
     /// of 16, so pieces of that size split the work exactly as one call would,
     /// and the result is bit-identical however the prompt was divided.
+    ///
+    /// A piece never cuts an image in two: it stops short of one, or takes the
+    /// whole of one it starts with, whatever `max_tokens` says.
     pub fn prefill_some(&mut self, max_tokens: usize) -> Result<bool> {
         if self.pending.is_empty() {
             return Ok(true);
         }
-        let rest = self.pending.split_off(max_tokens.min(self.pending.len()));
+        let at = self.orchestrator.position();
+        let mut take = max_tokens.min(self.pending.len()).max(1);
+        let hidden = self.generator.hidden_size;
+        for img in &self.images {
+            let (s, e) = (img.start, img.start + img.len(hidden));
+            if s < at + take && at + take < e {
+                take = if s > at { s - at } else { e - at };
+            }
+        }
+        let rest = self.pending.split_off(take.min(self.pending.len()));
         let piece = std::mem::replace(&mut self.pending, rest);
-        self.last_hidden = self.generator.prefill(&mut self.orchestrator, &piece)?;
+        self.last_hidden =
+            self.generator
+                .prefill_images(&mut self.orchestrator, &piece, &self.images, |_| {})?;
         Ok(self.pending.is_empty())
+    }
+
+    /// Put `images` in the prompt, in place of the tokens they cover. Call
+    /// before the prompt goes in; every image must lie in the part of the
+    /// prompt not yet run (a resumed session's cached prefix is text).
+    pub fn with_images(mut self, images: Vec<ImageEmbeds>) -> Result<Self> {
+        let hidden = self.generator.hidden_size;
+        let (from, to) = (self.orchestrator.position(), self.prompt_len);
+        let mut spans: Vec<(usize, usize)> = images
+            .iter()
+            .map(|m| (m.start, m.start + m.len(hidden)))
+            .collect();
+        spans.sort_unstable();
+        let fits = images
+            .iter()
+            .all(|m| !m.rows.is_empty() && m.rows.len() % hidden == 0)
+            && spans.iter().all(|&(s, e)| s >= from && e <= to)
+            && spans.windows(2).all(|w| w[0].1 <= w[1].0);
+        if !fits || from != to - self.pending.len() {
+            return Err(DlmError::InvalidConfig(format!(
+                "images {spans:?} do not fit the unprefilled prompt {from}..{to}"
+            )));
+        }
+        self.images = images;
+        Ok(self)
     }
 
     /// Emit the next token and advance the internal state by one step.

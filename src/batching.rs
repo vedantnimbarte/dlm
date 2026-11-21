@@ -32,7 +32,9 @@
 
 use crate::error::Result;
 use crate::forward::{ComputeKernel, KvSnapshot};
-use crate::generate::{Decoding, GenerationSession, Generator, Sampler, TokenLogprobs};
+use crate::generate::{
+    Decoding, GenerationSession, Generator, ImageEmbeds, Sampler, TokenLogprobs,
+};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -243,6 +245,8 @@ impl PrefixCache {
 struct Pending {
     id: u64,
     prompt: Vec<u32>,
+    /// Images in the prompt (see [`ImageEmbeds`]).
+    images: Vec<ImageEmbeds>,
     max_new_tokens: usize,
     /// Stop when any of these token ids is produced; empty means run to length.
     eos: Vec<u32>,
@@ -252,6 +256,28 @@ struct Pending {
     priority: i32,
     /// When it was queued, for [`expire_pending`](BatchScheduler::expire_pending).
     queued: std::time::Instant,
+}
+
+impl Pending {
+    /// What the prefix cache may match this prompt on: all of it, or with
+    /// images, its text up to the first image plus that image's first token
+    /// (which no cached prefix can match past, so a resumed request reuses text
+    /// only, and the image's own KV never enters the cache).
+    fn cache_key(&self) -> &[u32] {
+        match self.images.first() {
+            Some(m) => &self.prompt[..m.start + 1],
+            None => &self.prompt,
+        }
+    }
+
+    /// The part of the prompt whose KV the cache may keep: all of it, or its
+    /// text before the first image.
+    fn cacheable(&self) -> &[u32] {
+        match self.images.first() {
+            Some(m) => &self.prompt[..m.start],
+            None => &self.prompt,
+        }
+    }
 }
 
 /// An EAGLE-3 session for `p`, with draft KV room for its whole budget.
@@ -282,6 +308,8 @@ fn eagle3_session<'a, K: ComputeKernel>(
 
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
 /// speculative session that emits a whole round's accepted tokens per step.
+// One per in-flight request: boxing the larger variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum Decoder<'a, K: ComputeKernel> {
     Plain(GenerationSession<'a, K>),
     Speculative(SpeculativeSession<'a, K>),
@@ -541,10 +569,48 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         decoding: Decoding,
         priority: i32,
     ) -> Result<()> {
+        self.submit_with_images(
+            id,
+            prompt,
+            Vec::new(),
+            max_new_tokens,
+            eos,
+            decoding,
+            priority,
+        )
+    }
+
+    /// [`submit_prioritized`](Self::submit_prioritized) for a prompt with
+    /// images in it. Such a request decodes plainly (no draft model), and the
+    /// prefix cache sees only its text before the first image: two prompts that
+    /// differ only in their pictures share no cached KV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_images(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        mut images: Vec<ImageEmbeds>,
+        max_new_tokens: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+        priority: i32,
+    ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::DlmError::InvalidConfig(
                 "prompt is empty".into(),
             ));
+        }
+        images.sort_by_key(|m| m.start);
+        let hidden = self.generator.hidden_size();
+        let mut end = 0;
+        for m in &images {
+            let n = m.len(hidden);
+            if m.start < end || n == 0 || m.rows.len() != n * hidden || m.start + n > prompt.len() {
+                return Err(crate::error::DlmError::InvalidConfig(
+                    "an image does not fit its prompt".into(),
+                ));
+            }
+            end = m.start + n;
         }
         let at = self
             .pending
@@ -556,6 +622,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             Pending {
                 id,
                 prompt,
+                images,
                 max_new_tokens,
                 eos,
                 decoding,
@@ -668,7 +735,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 break;
             };
             let reserved = self.reservation(front);
-            if self.shares_a_prompt_in_flight(&front.prompt) {
+            if self.shares_a_prompt_in_flight(front.cache_key()) {
                 break;
             }
             if front.max_new_tokens > 0 {
@@ -684,11 +751,13 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     break;
                 }
             }
-            let p = self.pending.pop_front().expect("front exists");
+            let mut p = self.pending.pop_front().expect("front exists");
             if p.max_new_tokens == 0 {
                 zero_finished.push(p.id);
                 continue;
             }
+            let (key_len, cacheable_len) = (p.cache_key().len(), p.cacheable().len());
+            let images = std::mem::take(&mut p.images);
             let Decoding {
                 sampler,
                 penalties,
@@ -696,8 +765,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 logprobs,
             } = p.decoding;
             // A constrained request decodes plainly even when speculating, and
-            // so does one that reports log-probabilities: see `Decoding`.
-            let plain_only = grammar.is_some() || logprobs.is_some();
+            // so does one that reports log-probabilities: see `Decoding`. So
+            // does one with images, which a draft cannot see.
+            let plain_only = grammar.is_some() || logprobs.is_some() || !images.is_empty();
             let ngram = !self.has_draft() && self.gamma > 0 && !plain_only;
             let decoder = match (self.draft, self.eagle) {
                 (Some(draft), _) if !plain_only => Decoder::Speculative(
@@ -727,7 +797,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     let resume = self
                         .prefix_cache
                         .as_ref()
-                        .and_then(|c| c.longest_prefix(&p.prompt, align));
+                        .and_then(|c| c.longest_prefix(&p.prompt[..key_len], align));
                     // The prompt goes in over the next ticks (see `step`).
                     let session = match resume {
                         Some(snap) => {
@@ -739,7 +809,10 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         }
                         None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    let session = session.with_penalties(penalties).with_logprobs(logprobs);
+                    let session = session
+                        .with_penalties(penalties)
+                        .with_logprobs(logprobs)
+                        .with_images(images)?;
                     Decoder::Plain(match grammar {
                         Some(g) => session.with_grammar(g),
                         None => session,
@@ -750,7 +823,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             // through the prefix cache like any other, and turns speculative
             // once it is in (see `step`).
             let cache_prompt = match (&decoder, &self.prefix_cache) {
-                (Decoder::Plain(_), Some(_)) => Some(p.prompt),
+                (Decoder::Plain(_), Some(_)) => {
+                    let mut prompt = p.prompt;
+                    prompt.truncate(cacheable_len);
+                    Some(prompt)
+                }
                 _ => None,
             };
             self.active.push(Active {

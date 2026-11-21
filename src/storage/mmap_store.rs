@@ -52,6 +52,33 @@ fn text_model_view(
         .collect()
 }
 
+/// The other half of [`text_model_view`]: only a multimodal checkpoint's vision
+/// tower and projector, under the names Google's checkpoints use
+/// (`vision_tower.vision_model.*`, `multi_modal_projector.*`) whichever way
+/// the file spells them.
+fn vision_view(tensors: BTreeMap<String, TensorInfo>) -> BTreeMap<String, TensorInfo> {
+    tensors
+        .into_iter()
+        .filter_map(|(name, mut info)| {
+            let bare = name.strip_prefix("model.").unwrap_or(&name);
+            // transformers 5 also drops the tower's own `vision_model.` level.
+            let bare = match bare.strip_prefix("vision_tower.") {
+                Some(rest) if !rest.starts_with("vision_model.") => {
+                    format!("vision_tower.vision_model.{rest}")
+                }
+                Some(_) => bare.to_string(),
+                None if bare.starts_with("multi_modal_projector.") => bare.to_string(),
+                None => return None,
+            };
+            info.name = bare.clone();
+            Some((bare, info))
+        })
+        .collect()
+}
+
+/// Which tensors of a file a shard exposes.
+type View = fn(BTreeMap<String, TensorInfo>) -> BTreeMap<String, TensorInfo>;
+
 /// A single memory-mapped safetensors shard plus its parsed header.
 pub struct MmapShard {
     path: PathBuf,
@@ -70,7 +97,11 @@ impl MmapShard {
     /// scheduler jumps between layer blocks rather than reading front-to-back,
     /// so aggressive readahead would only evict pages we still need.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_view(path.as_ref(), text_model_view)
+    }
+
+    fn open_view(path: &Path, view: View) -> Result<Self> {
+        let path = path.to_path_buf();
         let file = File::open(&path).map_err(|source| DlmError::Io {
             path: path.clone(),
             source,
@@ -115,7 +146,7 @@ impl MmapShard {
         } else {
             (SafetensorsHeader::parse(&mmap, file_len)?, None)
         };
-        header.tensors = text_model_view(std::mem::take(&mut header.tensors));
+        header.tensors = view(std::mem::take(&mut header.tensors));
 
         Ok(MmapShard {
             path,
@@ -245,7 +276,17 @@ impl MmapStore {
     /// Open every `*.safetensors` file in a model directory and map them.
     /// Files are opened in sorted order for deterministic shard indices.
     pub fn open_dir(dir: impl AsRef<Path>) -> Result<Self> {
-        let dir = dir.as_ref();
+        Self::open_dir_view(dir.as_ref(), text_model_view)
+    }
+
+    /// The vision tower and projector of a multimodal safetensors checkpoint
+    /// directory (Gemma 3 4B+), which [`open_dir`](Self::open_dir) leaves out.
+    /// Empty for a text-only checkpoint.
+    pub fn open_vision_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_dir_view(dir.as_ref(), vision_view)
+    }
+
+    fn open_dir_view(dir: &Path, view: View) -> Result<Self> {
         let read_dir = std::fs::read_dir(dir).map_err(|source| DlmError::Io {
             path: dir.to_path_buf(),
             source,
@@ -290,7 +331,7 @@ impl MmapStore {
 
         let mut store = MmapStore::new();
         for path in shard_paths {
-            store.add_shard(MmapShard::open(path)?);
+            store.add_shard(MmapShard::open_view(&path, view)?);
         }
         Ok(store)
     }

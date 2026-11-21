@@ -107,6 +107,24 @@ pub trait ComputeKernel {
         prefill_token_by_token(self, hiddens, kv_layers, start)
     }
 
+    /// [`prefill`](Self::prefill) for tokens that attend to each other in both
+    /// directions, as well as to the history before them: Gemma 3's image
+    /// tokens. Every token of `hiddens` sees every other at each layer, which no
+    /// token-at-a-time order can compute, so a kernel implements it layer by
+    /// layer or not at all. The default refuses.
+    fn prefill_bidirectional(
+        &self,
+        _hiddens: &mut [f32],
+        _kv_layers: &mut [KvLayerCache],
+        _start: usize,
+    ) -> Result<()> {
+        Err(crate::error::DlmError::InvalidConfig(
+            "image input is not supported on this kernel (it runs on the CPU, the single-GPU \
+             kernels and layer streaming)"
+                .into(),
+        ))
+    }
+
     /// Tokens of KV the kernel's shared pools can still take at the given
     /// precision, if it pages KV from a fixed pool (the GPU kernels). `None`
     /// means no fixed limit: the CPU kernels keep KV in growable host memory.
@@ -215,6 +233,15 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         start: usize,
     ) -> Result<()> {
         (**self).prefill(hiddens, kv_layers, start)
+    }
+
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        (**self).prefill_bidirectional(hiddens, kv_layers, start)
     }
 }
 

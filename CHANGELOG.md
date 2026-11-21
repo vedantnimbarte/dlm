@@ -110,6 +110,30 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **Image input for Gemma 3 4B/12B/27B.** The SigLIP vision tower and
+  projector are read from the checkpoint's own safetensors or from a
+  llama.cpp `mmproj` GGUF (`--mmproj`, or the one `mmproj*.gguf` beside the
+  model), and an image's 256 embeddings take the place of its tokens in the
+  prompt, which attend to each other in both directions as Gemma 3 was
+  trained. PNG and JPEG are decoded and resized as `Gemma3ImageProcessor`
+  does (pan-and-scan, off by default there, is not implemented). The encoder
+  runs on the CPU, or layer by layer on the GPU with its buffers freed after
+  each image, so it fits beside a resident or streamed text model.
+  `dlm generate --image photo.jpg --text "..."` for one-shot use; `serve`
+  takes OpenAI `image_url` parts as base64 `data:` URLs (remote URLs are
+  refused, not fetched). Requests with images bypass the prefix cache past
+  their text, so two prompts that differ only in their pictures share no KV.
+  Checked against `transformers` on a tiny random checkpoint
+  (`tests/gemma3_vision.rs`, `tests/gpu_parity.rs`): pixels exact, image
+  embeddings and log-probabilities to about 2e-6 on the CPU.
+  On the GPU the same checks hold to about 1.5e-6, and making the image block
+  causal there moves the log-probabilities by 0.40, which fails the test.
+  - **Real model:** Gemma 3 4B Q4_K_M with ggml-org's f16 `mmproj`, on a
+    GTX 1650. Asked about Windows' blue `img100.jpg`, it describes "a
+    vibrant, abstract design featuring flowing, curved lines in shades of
+    blue".
+  - **Speed:** encoding the image takes 16 s on the GPU (4,096 patches
+    through 27 layers); prefill runs at 82 tok/s and decode at 27 tok/s.
 - **EAGLE-3 speculative decoding.** An EAGLE-3 draft head, a single layer
   that drafts from the target's own hidden states, now proposes for a
   resident GPU target. Give `--draft-model-path` a head directory (its

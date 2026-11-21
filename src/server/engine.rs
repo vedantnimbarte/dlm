@@ -51,6 +51,10 @@ struct Job {
     /// Lower is admitted first.
     priority: i32,
     prompt: Vec<u32>,
+    /// Images in the prompt as `pixel_values`, with where each one's tokens
+    /// start; encoded on the engine thread, which owns the GPU.
+    images: Vec<(usize, Vec<f32>)>,
+    vision: Option<Arc<crate::vision::Vision>>,
     max_new: usize,
     eos: Vec<u32>,
     decoding: Decoding,
@@ -128,6 +132,8 @@ pub struct EngineService {
     /// How long a request may wait to be admitted, in milliseconds; 0 for no
     /// limit. Shared with the engine loop, which enforces it.
     queue_timeout: Arc<AtomicU64>,
+    /// The vision tower, when the model takes images (Gemma 3 4B+).
+    vision: Option<Arc<crate::vision::Vision>>,
 }
 
 impl EngineService {
@@ -293,7 +299,17 @@ impl EngineService {
             stream,
             token_bytes: OnceLock::new(),
             queue_timeout,
+            vision: None,
         })
+    }
+
+    /// Take images in chat requests, encoded by `vision` (called right after
+    /// [`start`](Self::start), while the `Arc` is still unique).
+    pub fn with_vision(mut self: Arc<Self>, vision: crate::vision::Vision) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.vision = Some(Arc::new(vision));
+        }
+        self
     }
 
     /// Each token id's bytes (`None` for special tokens). Requests that look at
@@ -385,6 +401,7 @@ impl EngineService {
     fn submit_at(
         &self,
         prompt: Vec<u32>,
+        images: Vec<(usize, Vec<f32>)>,
         max_new: usize,
         eos: Vec<u32>,
         decoding: Decoding,
@@ -400,6 +417,8 @@ impl EngineService {
                 id,
                 priority,
                 prompt,
+                vision: self.vision.clone().filter(|_| !images.is_empty()),
+                images,
                 max_new,
                 eos,
                 decoding,
@@ -583,12 +602,39 @@ fn enqueue<K: ComputeKernel>(
         id,
         priority,
         prompt,
+        images,
+        vision,
         max_new,
         eos,
         decoding,
         sink,
     } = job;
-    match sched.submit_prioritized(id, prompt, max_new, eos, decoding, priority) {
+    // Images are encoded here, on the thread that owns the GPU: other requests
+    // wait for it, as they wait for a prompt's prefill.
+    let images = match (&vision, images.is_empty()) {
+        (_, true) => Vec::new(),
+        (None, false) => unreachable!("a job with images carries the vision tower"),
+        (Some(v), false) => {
+            let encoded = images
+                .into_iter()
+                .map(|(start, pixels)| {
+                    v.tower
+                        .encode(&pixels, v.gpu)
+                        .map(|rows| crate::generate::ImageEmbeds { start, rows })
+                })
+                .collect::<crate::error::Result<Vec<_>>>();
+            match encoded {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = sink.send(TokenEvent::Rejected(format!(
+                        "cannot encode the image: {e}"
+                    )));
+                    return;
+                }
+            }
+        }
+    };
+    match sched.submit_with_images(id, prompt, images, max_new, eos, decoding, priority) {
         Ok(()) => {
             sinks.insert(id, sink);
         }
@@ -604,15 +650,60 @@ fn enqueue<K: ComputeKernel>(
 /// serving paths. An assistant message may carry the tool calls it made, and a
 /// `tool` message is a call's result.
 #[derive(Deserialize, Default)]
+#[serde(from = "RawChatMessage")]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(deserialize_with = "content_text")]
     pub content: String,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallIn>>,
     /// On a `tool` message, the call it answers (Mistral's format names it).
-    #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// The `image_url` parts of `content`: each one's URL, and the byte offset
+    /// in `content` (the text parts joined) where it stood.
+    pub images: Vec<(usize, String)>,
+}
+
+/// A chat message as it arrives, before its `content` parts are split into
+/// text and images.
+#[derive(Deserialize)]
+struct RawChatMessage {
+    role: String,
+    content: Content,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallIn>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+impl From<RawChatMessage> for ChatMessage {
+    fn from(m: RawChatMessage) -> Self {
+        let (content, images) = m.content.split();
+        Self {
+            role: m.role,
+            content,
+            tool_calls: m.tool_calls,
+            tool_call_id: m.tool_call_id,
+            images,
+        }
+    }
+}
+
+impl ChatMessage {
+    /// The content as Gemma's template writes it: the text trimmed, and with
+    /// images, each text part trimmed and each image a `<start_of_image>`.
+    fn gemma_content(&self) -> String {
+        if self.images.is_empty() {
+            return self.content.trim().to_string();
+        }
+        let mut out = String::new();
+        let mut from = 0;
+        for (at, _) in &self.images {
+            out.push_str(self.content[from..*at].trim());
+            out.push_str(crate::vision::IMAGE_MARKER);
+            from = *at;
+        }
+        out.push_str(self.content[from..].trim());
+        out
+    }
 }
 
 /// JSON as Hugging Face chat templates' `tojson` writes it: `", "` and `": "`
@@ -1049,25 +1140,39 @@ struct ContentPart {
     kind: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    /// `{"url": "..."}`, or the URL as a bare string, which some clients send.
+    #[serde(default)]
+    image_url: Option<serde_json::Value>,
 }
 
-/// The text of a `content` field, whichever form it arrived in. Parts that are
-/// not text (an image) are dropped rather than refused: dlm serves text, and a
-/// conversation that mentions a picture is still worth answering.
-fn content_text<'de, D>(d: D) -> std::result::Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(match Content::deserialize(d)? {
-        Content::Text(s) => s,
-        Content::Null => String::new(),
-        Content::Parts(parts) => parts
-            .iter()
-            .filter(|p| p.kind.as_deref().unwrap_or("text") == "text")
-            .filter_map(|p| p.text.as_deref())
-            .collect::<Vec<_>>()
-            .join(""),
-    })
+impl Content {
+    /// The text of a `content` field, whichever form it arrived in, and the
+    /// URLs of its images with where each stood in that text. A model without
+    /// a vision tower ignores the images: a conversation that mentions a
+    /// picture is still worth answering.
+    fn split(self) -> (String, Vec<(usize, String)>) {
+        match self {
+            Content::Text(s) => (s, Vec::new()),
+            Content::Null => (String::new(), Vec::new()),
+            Content::Parts(parts) => {
+                let (mut text, mut images) = (String::new(), Vec::new());
+                for p in parts {
+                    match p.kind.as_deref().unwrap_or("text") {
+                        "text" => text.push_str(p.text.as_deref().unwrap_or_default()),
+                        "image_url" => {
+                            let url = p
+                                .image_url
+                                .as_ref()
+                                .and_then(|u| u.get("url").and_then(|u| u.as_str()).or(u.as_str()));
+                            images.push((text.len(), url.unwrap_or_default().to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+                (text, images)
+            }
+        }
+    }
 }
 
 /// OpenAI `stop`: either a single string or a list of them.
@@ -1629,6 +1734,15 @@ impl ChatTemplate {
     /// The checkpoint's Jinja chat template, if it ships one. `chat_template` may be
     /// a string or a list of named templates, of which `default` is the chat one.
     pub fn read_jinja(model_path: &std::path::Path) -> Option<String> {
+        // A GGUF file carries it in its metadata.
+        if model_path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            let store = crate::storage::MmapStore::open_path(model_path).ok()?;
+            let meta = store.gguf_metadata()?;
+            return meta
+                .get("tokenizer.chat_template")?
+                .as_str()
+                .map(str::to_string);
+        }
         if let Ok(s) = std::fs::read_to_string(model_path.join("chat_template.jinja")) {
             return Some(s);
         }
@@ -1791,7 +1905,7 @@ impl ChatTemplate {
                     };
                     p.push_str(&format!(
                         "<start_of_turn>{role}\n{prefix}{}<end_of_turn>\n",
-                        m.content.trim()
+                        m.gemma_content()
                     ));
                 }
                 p.push_str("<start_of_turn>model\n");
@@ -2134,7 +2248,8 @@ fn collect_completion(
     decoding: Decoding,
     stops: &[String],
 ) -> Result<Generated, String> {
-    collect_completions(engine, ids, max_tokens, vec![decoding], stops, 0).map(|mut g| g.remove(0))
+    collect_completions(engine, ids, &[], max_tokens, vec![decoding], stops, 0)
+        .map(|mut g| g.remove(0))
 }
 
 /// Each of a request's choices with its first event, once every one has
@@ -2150,11 +2265,25 @@ fn start_choices(
     decodings: Vec<Decoding>,
     priority: i32,
 ) -> Result<Started, String> {
+    start_choices_with(engine, ids, &[], max_tokens, decodings, priority)
+}
+
+/// [`start_choices`] for a prompt with images (`pixel_values`, and where each
+/// one's tokens start).
+fn start_choices_with(
+    engine: &EngineService,
+    ids: &[u32],
+    images: &[(usize, Vec<f32>)],
+    max_tokens: usize,
+    decodings: Vec<Decoding>,
+    priority: i32,
+) -> Result<Started, String> {
     let rxs: Vec<_> = decodings
         .into_iter()
         .map(|d| {
             engine.submit_at(
                 ids.to_vec(),
+                images.to_vec(),
                 max_tokens,
                 engine.eos_tokens.clone(),
                 d,
@@ -2183,13 +2312,14 @@ fn busy(body: Vec<u8>) -> Response {
 fn collect_completions(
     engine: &Arc<EngineService>,
     ids: Vec<u32>,
+    images: &[(usize, Vec<f32>)],
     max_tokens: usize,
     decodings: Vec<Decoding>,
     stops: &[String],
     priority: i32,
 ) -> Result<Vec<Generated>, String> {
     let prompt_tokens = ids.len();
-    let started = start_choices(engine, &ids, max_tokens, decodings, priority)?;
+    let started = start_choices_with(engine, &ids, images, max_tokens, decodings, priority)?;
     let out: Vec<Generated> = started
         .into_iter()
         .map(|(first, rx)| collect_from(engine, first, rx, prompt_tokens, stops))
@@ -2410,6 +2540,51 @@ fn stream_choices(
     Ok(choices)
 }
 
+/// A chat prompt with images: its ids, with each image's tokens laid out as
+/// Gemma 3's processor lays them out, and each image's `pixel_values` with
+/// where its tokens start. Images must arrive inline, as base64 `data:` URLs:
+/// the server fetches nothing on a client's behalf.
+#[allow(clippy::type_complexity)]
+fn image_prompt(
+    engine: &EngineService,
+    vision: &crate::vision::Vision,
+    messages: &[ChatMessage],
+    prompt: &str,
+) -> Result<(Vec<u32>, Vec<(usize, Vec<f32>)>), String> {
+    use crate::vision::image;
+    if engine.chat_template != ChatTemplate::Gemma {
+        return Err(format!(
+            "images need Gemma's chat template; this server uses {} (--chat-template gemma)",
+            engine.chat_template.name()
+        ));
+    }
+    let pixels = messages
+        .iter()
+        .flat_map(|m| &m.images)
+        .map(|(_, url)| {
+            let bytes = image::data_url_bytes(url)?;
+            let img = image::decode(&bytes)?;
+            Ok(image::preprocess(&img, vision.tower.cfg.image_size))
+        })
+        .collect::<crate::error::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    let (ids, starts) = vision
+        .tokens
+        .encode(&engine.tokenizer, prompt)
+        .map_err(|e| format!("tokenize: {e}"))?;
+    if starts.len() != pixels.len() {
+        return Err(format!(
+            "the prompt has {} image markers for {} images (is <start_of_image> in the text?)",
+            starts.len(),
+            pixels.len()
+        ));
+    }
+    if ids.iter().any(|&id| id as usize >= engine.vocab_size) {
+        return Err("prompt token out of model vocab range".into());
+    }
+    Ok((ids, starts.into_iter().zip(pixels).collect()))
+}
+
 fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let mut parsed: ChatRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
@@ -2430,6 +2605,17 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             )
         }
     };
+    // Images go to a model with a vision tower; any other drops them, as it
+    // always has.
+    let vision = engine
+        .vision
+        .as_deref()
+        .filter(|_| parsed.messages.iter().any(|m| !m.images.is_empty()));
+    if vision.is_none() {
+        for m in &mut parsed.messages {
+            m.images.clear();
+        }
+    }
     let prompt = match engine
         .chat_template
         .apply_with_tools(&parsed.messages, &tools)
@@ -2437,9 +2623,15 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Ok(p) => p,
         Err(e) => return Response::json(400, error_json(&e)),
     };
-    let ids = match engine.encode_prompt(&prompt) {
-        Ok(ids) => ids,
-        Err(e) => return Response::json(400, error_json(&e)),
+    let (ids, images) = match vision {
+        None => match engine.encode_prompt(&prompt) {
+            Ok(ids) => (ids, Vec::new()),
+            Err(e) => return Response::json(400, error_json(&e)),
+        },
+        Some(v) => match image_prompt(engine, v, &parsed.messages, &prompt) {
+            Ok(p) => p,
+            Err(e) => return Response::json(400, error_json(&e)),
+        },
     };
     let requested = parsed.max_tokens.unwrap_or(engine.default_max_tokens);
     let max_tokens = match fit_max_tokens(engine, ids.len(), requested) {
@@ -2462,7 +2654,14 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
 
     if parsed.stream {
         let tools = !tools.is_empty();
-        let started = match start_choices(engine, &ids, max_tokens, decodings, parsed.priority) {
+        let started = match start_choices_with(
+            engine,
+            &ids,
+            &images,
+            max_tokens,
+            decodings,
+            parsed.priority,
+        ) {
             Ok(s) => s,
             Err(why) => return busy(error_json(&why)),
         };
@@ -2482,6 +2681,7 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         let gs = match collect_completions(
             engine,
             ids,
+            &images,
             max_tokens,
             decodings,
             &stops,
@@ -2834,6 +3034,7 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
         let gs = match collect_completions(
             engine,
             ids,
+            &[],
             max_tokens,
             decodings,
             &stops,

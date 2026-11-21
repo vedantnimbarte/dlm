@@ -26,7 +26,7 @@ use dlm::storage::{LayerCatalog, MmapStore};
 use dlm::swap::LayerSwapPlan;
 use dlm::tokenizer::BpeTokenizer;
 use dlm::{gpu, DlmError, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -346,10 +346,35 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         None
     };
 
-    // Prompt token ids: tokenized text, or raw --prompt ids.
-    let prompt_ids: Vec<u32> = match (&args.text, &tokenizer) {
-        (Some(text), Some(tok)) => tok.encode(text)?,
-        _ => args.prompt.clone(),
+    // Images are encoded first, before the text model is loaded: on a 4 GB
+    // card the vision tower and the text model need not fit at once.
+    let mut gen_cfg = gen_cfg;
+    let (prompt_ids, images) = if args.image.is_empty() {
+        // Prompt token ids: tokenized text, or raw --prompt ids.
+        let ids: Vec<u32> = match (&args.text, &tokenizer) {
+            (Some(text), Some(tok)) => tok.encode(text)?,
+            _ => args.prompt.clone(),
+        };
+        (ids, Vec::new())
+    } else {
+        let (Some(dir), Some(tok)) = (&args.model_path, &tokenizer) else {
+            return Err(DlmError::InvalidConfig(
+                "--image needs --model-path and --text".into(),
+            ));
+        };
+        let (ids, images) = encode_images(
+            dir,
+            args.mmproj.as_deref(),
+            tok,
+            args.text.as_deref().unwrap_or_default(),
+            &args.image,
+            resolve_device(args.device) == Device::Gpu,
+        )?;
+        // Gemma ends its turn with <end_of_turn>; stop there unless told otherwise.
+        if gen_cfg.eos_token.is_none() {
+            gen_cfg.eos_token = tok.id_of("<end_of_turn>");
+        }
+        (ids, images)
     };
     if prompt_ids.is_empty() {
         return Err(DlmError::InvalidConfig("prompt is empty".into()));
@@ -406,9 +431,24 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     if let Some(text) = &args.text {
         println!("prompt text  : {text:?}");
     }
-    println!("prompt ids   : {prompt_ids:?}");
+    if images.is_empty() {
+        println!("prompt ids   : {prompt_ids:?}");
+    } else {
+        println!(
+            "prompt ids   : {} ids, {} image(s)",
+            prompt_ids.len(),
+            images.len()
+        );
+    }
 
-    generate_on_device(parts, device, &prompt_ids, &gen_cfg, tokenizer.as_ref())?;
+    generate_on_device(
+        parts,
+        device,
+        &prompt_ids,
+        images,
+        &gen_cfg,
+        tokenizer.as_ref(),
+    )?;
 
     if is_synthetic {
         println!();
@@ -568,35 +608,97 @@ fn generate_on_device(
     parts: ModelParts,
     device: Device,
     prompt_ids: &[u32],
+    images: Vec<dlm::generate::ImageEmbeds>,
     gen_cfg: &GenerationConfig,
     tokenizer: Option<&BpeTokenizer>,
 ) -> Result<()> {
     match device {
         Device::Cpu => {
             let generator = parts.into_cpu_generator()?;
-            run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
+            run_generation(&generator, prompt_ids, images, gen_cfg, tokenizer)
         }
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
         Device::Gpu => {
             let generator = parts.into_gpu_generator()?;
-            run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
+            run_generation(&generator, prompt_ids, images, gen_cfg, tokenizer)
         }
         #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
     }
 }
 
+/// `dlm generate --image`: find the model's vision tower, render `text` as a
+/// Gemma user turn with the images in it, and encode them. Returns the prompt
+/// ids and the images' embeddings.
+fn encode_images(
+    model: &Path,
+    mmproj: Option<&Path>,
+    tokenizer: &BpeTokenizer,
+    text: &str,
+    files: &[PathBuf],
+    gpu: bool,
+) -> Result<(Vec<u32>, Vec<dlm::generate::ImageEmbeds>)> {
+    use dlm::vision::{ImageTokens, Vision, VisionTower, IMAGE_MARKER};
+    let tower = VisionTower::find(model, mmproj)?.ok_or_else(|| {
+        DlmError::InvalidConfig(format!(
+            "{} has no vision tower: --image needs a Gemma 3 4B+ checkpoint, or a GGUF \
+             with its mmproj (--mmproj)",
+            model.display()
+        ))
+    })?;
+    println!("vision       : {}", tower.source.display());
+    let tokens = ImageTokens::new(
+        tokenizer,
+        tokenizer.vocab_size(),
+        tower.cfg.tokens_per_image,
+    )?;
+    let vision = Vision { tower, tokens, gpu };
+    let content = if text.contains(IMAGE_MARKER) {
+        text.to_string()
+    } else {
+        format!("{}{text}", IMAGE_MARKER.repeat(files.len()))
+    };
+    let prompt =
+        dlm::server::engine::ChatTemplate::Gemma.apply(&[dlm::server::engine::ChatMessage {
+            role: "user".into(),
+            content,
+            ..Default::default()
+        }]);
+    let bytes = files
+        .iter()
+        .map(|f| {
+            std::fs::read(f).map_err(|source| DlmError::Io {
+                path: f.clone(),
+                source,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let start = std::time::Instant::now();
+    let out = vision.prompt(tokenizer, &prompt, &bytes)?;
+    eprintln!(
+        "timing       : encoded {} image(s) in {:.2} s on the {}",
+        files.len(),
+        start.elapsed().as_secs_f64(),
+        if gpu { "GPU" } else { "CPU" }
+    );
+    Ok(out)
+}
+
 /// Generate and print ids, plus decoded text when a tokenizer is present.
 fn run_generation<K: ComputeKernel>(
     generator: &Generator<K>,
     prompt_ids: &[u32],
+    images: Vec<dlm::generate::ImageEmbeds>,
     gen_cfg: &GenerationConfig,
     tokenizer: Option<&BpeTokenizer>,
 ) -> Result<()> {
     // Step a session rather than calling `generate`, so prefill and decode can
     // be timed apart: a long prompt would otherwise hide the decode speed.
     let start = std::time::Instant::now();
-    let mut session = generator.start_session(prompt_ids, gen_cfg.sampler)?;
+    let mut session = generator
+        .start_session_deferred(prompt_ids, gen_cfg.sampler)?
+        .with_images(images)?;
+    session.prefill_some(usize::MAX)?;
     let prefill = start.elapsed().as_secs_f64();
     let decode_start = std::time::Instant::now();
     let mut generated = Vec::with_capacity(gen_cfg.max_new_tokens);
@@ -1838,6 +1940,50 @@ fn serve_distributed(
 /// `kv_pool_tokens`: the KV tokens a GPU kernel's shared pools hold across all
 /// concurrent requests; `None` sizes them for `--max-batch` full contexts, which
 /// is what the streaming planner reserves. No effect on the CPU kernels.
+/// The served model's vision tower, if it has one: `--mmproj`, the checkpoint's
+/// own (Gemma 3 4B+ safetensors), or an `mmproj*.gguf` beside a GGUF file. A
+/// tower found by looking that cannot be used is a warning, not a failure: the
+/// model still serves text.
+fn serve_vision(
+    args: &ServeArgs,
+    tokenizer: &BpeTokenizer,
+    config: &ModelConfig,
+) -> Result<Option<dlm::vision::Vision>> {
+    use dlm::vision::{ImageTokens, Vision, VisionTower};
+    let found = VisionTower::find(&args.model_path, args.mmproj.as_deref()).and_then(|t| {
+        t.map(|tower| {
+            let tokens = ImageTokens::new(
+                tokenizer,
+                config.vocab_size as usize,
+                tower.cfg.tokens_per_image,
+            )?;
+            Ok(Vision {
+                tower,
+                tokens,
+                gpu: args.device == Device::Gpu
+                    && cfg!(any(feature = "cuda-kernels", feature = "rocm-kernels")),
+            })
+        })
+        .transpose()
+    });
+    match found {
+        Ok(Some(v)) => {
+            println!(
+                "vision       : {} (images as data: URLs, encoded on the {})",
+                v.tower.source.display(),
+                if v.gpu { "GPU" } else { "CPU" }
+            );
+            Ok(Some(v))
+        }
+        Ok(None) => Ok(None),
+        Err(e) if args.mmproj.is_none() => {
+            eprintln!("warning: serving text only; the vision tower found is unusable: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn start_batched_server<K: ComputeKernel + Send + 'static>(
     generator: Generator<K>,
     draft: Option<Generator<K>>,
@@ -1870,6 +2016,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             }
         }
     }
+
+    let vision = serve_vision(args, &tokenizer, config)?;
 
     // Optional KV-cache quantization (int8/int4) — shrinks the KV memory.
     let kv_quant = args.kv_quant.to_kv_quant();
@@ -1989,6 +2137,10 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
             engine.with_prefix_cache_dir(dir.join(prefix_cache_fingerprint(args)?))
         }
         _ => engine,
+    };
+    let engine = match vision {
+        Some(v) => engine.with_vision(v),
+        None => engine,
     };
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
