@@ -29,6 +29,7 @@ pub mod swap;
 pub mod telemetry;
 pub mod tokenizer;
 mod unicode_class;
+pub mod vision;
 
 pub use activation::{ActivationBuffer, ActivationPool};
 pub use cache::{KvCacheConfig, LayerRamCache, PagedKvCache};

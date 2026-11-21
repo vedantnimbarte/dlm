@@ -568,6 +568,9 @@ pub(crate) struct DlmBlockExt {
     /// are wrong and still generate fluent text.
     w_dtype: [i32; 7],
     w_group: [i32; 7],
+    /// 1: a prefill chunk whose tokens attend to each other in both directions
+    /// (Gemma 3's image tokens).
+    bidi: i32,
 }
 
 /// Where each projection's dtype sits in [`DlmBlockExt`]'s arrays.
@@ -607,6 +610,7 @@ impl DlmBlockExt {
             // kernel to use the call's single dtype for every projection.
             w_dtype: [-1; 7],
             w_group: [0; 7],
+            bidi: 0,
         }
     }
 
@@ -614,6 +618,12 @@ impl DlmBlockExt {
     pub(crate) fn with_weight_dtypes(mut self, w: &WeightDtypes) -> Self {
         self.w_dtype = w.dtype;
         self.w_group = w.group;
+        self
+    }
+
+    /// Make a prefill chunk attend bidirectionally (see the `bidi` field).
+    pub(crate) fn bidirectional(mut self, on: bool) -> Self {
+        self.bidi = on as i32;
         self
     }
 }
@@ -1607,6 +1617,7 @@ impl GpuKernel {
         kv: &mut KvLayerCache,
         position: usize,
         t: usize,
+        bidi: bool,
     ) -> Result<bool> {
         let w = &self.layers[layer as usize];
         let history = kv.len();
@@ -1668,7 +1679,8 @@ impl GpuKernel {
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
                 &DlmBlockExt::new(&cfg, &w.biases, dkv.elem, dkv.table)
-                    .with_weight_dtypes(&w.dtypes),
+                    .with_weight_dtypes(&w.dtypes)
+                    .bidirectional(bidi),
             )
         };
         match code {
@@ -1819,7 +1831,7 @@ impl ComputeKernel for GpuKernel {
             while n - done > DLM_MAX_BATCH {
                 let t = (n - done).min(DLM_PREFILL_T);
                 let x = unsafe { d_hiddens.as_mut_ptr().add(done * hidden_size) };
-                if !self.launch_prefill_block(layer, x, kv, start + done, t)? {
+                if !self.launch_prefill_block(layer, x, kv, start + done, t, false)? {
                     break;
                 }
                 done += t;
@@ -1850,6 +1862,33 @@ impl ComputeKernel for GpuKernel {
                 let x = unsafe { d_hiddens.as_mut_ptr().add(chunk * hidden_size) };
                 self.launch_block_batched(layer, x, &slots)?;
                 kv.advance(batch);
+            }
+        }
+        d_hiddens.download(hiddens)
+    }
+
+    /// The whole run through each layer in one GEMM prefill call, whose
+    /// attention lets every token of it see every other.
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let n = hiddens.len() / self.cfg.hidden_size;
+        if n > DLM_PREFILL_T || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
+            return Err(DlmError::InvalidConfig(format!(
+                "a bidirectional block of {n} tokens needs a dense model and at most \
+                 {DLM_PREFILL_T} tokens"
+            )));
+        }
+        let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
+        for layer in 0..self.num_layers() {
+            let kv = &mut kv_layers[layer as usize];
+            if !self.launch_prefill_block(layer, d_hiddens.as_mut_ptr(), kv, start, n, true)? {
+                return Err(DlmError::InvalidConfig(format!(
+                    "layer {layer}'s shape does not fit the GPU prefill, which image input needs"
+                )));
             }
         }
         d_hiddens.download(hiddens)

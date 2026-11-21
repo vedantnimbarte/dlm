@@ -15,7 +15,7 @@ pub mod kv_pool;
 pub mod multigpu;
 pub mod orchestrator;
 pub(crate) mod pool;
-mod simd;
+pub(crate) mod simd;
 pub mod split;
 pub mod streaming;
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
