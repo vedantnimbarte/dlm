@@ -949,6 +949,11 @@ impl<K: ComputeKernel> Generator<K> {
 
     /// A fresh single-sequence orchestrator over this generator's kernel and KV
     /// budget.
+    /// The compute kernel under this generator.
+    pub fn kernel(&self) -> &K {
+        &self.kernel
+    }
+
     pub(crate) fn orchestrator(&self) -> ForwardOrchestrator<&K> {
         ForwardOrchestrator::new(
             &self.kernel,
@@ -1009,7 +1014,10 @@ impl<K: ComputeKernel> Generator<K> {
             .collect()
     }
 
-    pub(crate) fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
+    /// The hidden state token `token` enters the first layer with at
+    /// `position`: its embedding row, scaled and position-embedded as the
+    /// model does.
+    pub fn embed(&self, token: u32, position: usize) -> Result<Vec<f32>> {
         let idx = token as usize;
         if idx >= self.vocab_size {
             return Err(DlmError::InvalidConfig(format!(

@@ -280,6 +280,32 @@ impl Pending {
     }
 }
 
+/// An EAGLE-3 session for `p`, with draft KV room for its whole budget.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+fn eagle3_session<'a, K: ComputeKernel>(
+    target: &'a Generator<K>,
+    head: &'a crate::forward::eagle3::Eagle3Head,
+    gamma: usize,
+    prompt: &[u32],
+    max_new_tokens: usize,
+    sampler: crate::generate::Sampler,
+) -> Result<SpeculativeSession<'a, K>> {
+    let room = prompt.len() + max_new_tokens + gamma + 1;
+    SpeculativeSession::eagle3(target, head, gamma, prompt, sampler, room)
+}
+
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+fn eagle3_session<'a, K: ComputeKernel>(
+    _: &'a Generator<K>,
+    head: &'a crate::forward::eagle3::Eagle3Head,
+    _: usize,
+    _: &[u32],
+    _: usize,
+    _: crate::generate::Sampler,
+) -> Result<SpeculativeSession<'a, K>> {
+    match *head {}
+}
+
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
 /// speculative session that emits a whole round's accepted tokens per step.
 // One per in-flight request: boxing the larger variant would buy nothing.
@@ -373,6 +399,8 @@ pub struct BatchScheduler<'a, K: ComputeKernel> {
     generator: &'a Generator<K>,
     /// Draft model proposing for every slot, if speculating with one.
     draft: Option<&'a Generator<K>>,
+    /// EAGLE-3 head proposing for every slot, if speculating with one.
+    eagle: Option<&'a crate::forward::eagle3::Eagle3Head>,
     /// Tokens proposed per round; 0 when not speculating. Without a draft model
     /// slots propose by n-gram lookup.
     gamma: usize,
@@ -394,6 +422,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         Self {
             generator,
             draft: None,
+            eagle: None,
             gamma: 0,
             max_batch: max_batch.max(1),
             pending: VecDeque::new(),
@@ -410,7 +439,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// snapshot, skipping the shared prefix's prefill. No effect with a draft
     /// model (its sessions can't resume). `0` disables it.
     pub fn with_prefix_cache(mut self, max_entries: usize) -> Self {
-        self.prefix_cache = if max_entries > 0 && self.draft.is_none() {
+        self.prefix_cache = if max_entries > 0 && !self.has_draft() {
             Some(PrefixCache::new(max_entries))
         } else {
             None
@@ -432,6 +461,27 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             draft: Some(draft),
             ..Self::with_ngram(generator, max_batch, gamma)
         }
+    }
+
+    /// Create a scheduler that decodes every request speculatively, an EAGLE-3
+    /// `head` proposing `gamma` tokens per round from the target's own hidden
+    /// states. Output is identical to [`new`](Self::new). The target's kernel
+    /// must record hidden states (the resident GPU kernel does).
+    pub fn with_eagle3(
+        generator: &'a Generator<K>,
+        head: &'a crate::forward::eagle3::Eagle3Head,
+        max_batch: usize,
+        gamma: usize,
+    ) -> Self {
+        Self {
+            eagle: Some(head),
+            ..Self::with_ngram(generator, max_batch, gamma)
+        }
+    }
+
+    /// Whether a draft model or head proposes, rather than n-gram lookup.
+    fn has_draft(&self) -> bool {
+        self.draft.is_some() || self.eagle.is_some()
     }
 
     /// Create a scheduler that speculates with no draft model: each request
@@ -716,13 +766,24 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             } = p.decoding;
             // A constrained request decodes plainly even when speculating, and
             // so does one that reports log-probabilities: see `Decoding`. So
-            // does one with images, which a draft model cannot see.
+            // does one with images, which a draft cannot see.
             let plain_only = grammar.is_some() || logprobs.is_some() || !images.is_empty();
-            let ngram = self.draft.is_none() && self.gamma > 0 && !plain_only;
-            let decoder = match self.draft {
-                Some(draft) if !plain_only => Decoder::Speculative(
+            let ngram = !self.has_draft() && self.gamma > 0 && !plain_only;
+            let decoder = match (self.draft, self.eagle) {
+                (Some(draft), _) if !plain_only => Decoder::Speculative(
                     SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
                         .with_penalties(penalties),
+                ),
+                (_, Some(head)) if !plain_only => Decoder::Speculative(
+                    eagle3_session(
+                        self.generator,
+                        head,
+                        self.gamma,
+                        &p.prompt,
+                        p.max_new_tokens,
+                        sampler,
+                    )?
+                    .with_penalties(penalties),
                 ),
                 _ => {
                     // Resume from the longest cached prefix if one exists;
@@ -857,7 +918,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             .iter()
             .filter(|a| matches!(a.decoder, Decoder::Speculative(_)))
             .count();
-        let fuse = self.draft.is_none() && speculating > 1;
+        // EAGLE slots always propose, and must each run their own pass: the
+        // target records hidden states for one session at a time.
+        let fuse = !self.has_draft() && speculating > 1;
         let mut fused: Vec<&mut SpeculativeSession<'a, K>> = self
             .active
             .iter_mut()

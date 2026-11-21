@@ -134,6 +134,27 @@ fork that runs large MoE models from SSD.
     blue".
   - **Speed:** encoding the image takes 16 s on the GPU (4,096 patches
     through 27 layers); prefill runs at 82 tok/s and decode at 27 tok/s.
+- **EAGLE-3 speculative decoding.** An EAGLE-3 draft head, a single layer
+  that drafts from the target's own hidden states, now proposes for a
+  resident GPU target. Give `--draft-model-path` a head directory (its
+  `config.json` names a `*Eagle3` architecture, with `model.safetensors`);
+  heads shipped as `pytorch_model.bin` need converting first.
+  - **Output is unchanged.** On Qwen3-1.7B at int4 with AngelSlim's
+    `Qwen3-1.7B_eagle3`, greedy output is token for token what plain
+    decoding gives, at gamma 1, 3 and 5.
+  - **Acceptance:** 78% of proposals at gamma 1, 49% at 3, 34% at 5.
+  - **Checked against a reference.** The head's prediction at each position
+    matches a plain-torch EAGLE-3 layer over transformers' hidden states at
+    every confident position (44 of 44), in `tests/eagle3_model.rs`
+    (`tools/eagle3_ref.py` writes the reference).
+  - **How it runs.** The resident GPU kernel copies the residual stream
+    entering layers 2, L/2 and L−3 to the host during each verify pass, and a
+    new CUDA entry runs one draft position.
+  - **Speed:** batch-1 decode went from 71 to 77 tok/s at gamma 3, measured
+    while other builds were loading the machine. A clean measurement is
+    still owed.
+  - **Where it works:** `serve` and `bench`, each request with its own draft
+    KV. It is refused with `--stream`, `--gpu-layers` and on the CPU.
 - **DeepSeek-V3 routing.** V3/R1 checkpoints were refused for their router.
   dlm now routes as V3 does (sigmoid scores, the per-layer
   `e_score_correction_bias` added for the choice only, the best `topk_group`

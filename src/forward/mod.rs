@@ -7,6 +7,14 @@
 
 pub mod cpu;
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+pub mod eagle3;
+/// Without GPU kernels there is no EAGLE-3 head to hold: the type exists so
+/// the scheduler's signatures stay the same, and nothing can construct it.
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+pub mod eagle3 {
+    pub enum Eagle3Head {}
+}
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub mod gpu;
 pub mod kernel;
 pub(crate) mod key_balance;

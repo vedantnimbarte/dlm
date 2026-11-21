@@ -179,16 +179,26 @@ pub fn sampler(opts: &BenchOpts, seed: u64) -> Sampler {
     }
 }
 
+/// How [`run`] decodes a batch of one speculatively.
+pub enum BenchSpec<'a> {
+    /// N-gram lookup proposing this many tokens a round.
+    Ngram(usize),
+    /// An EAGLE-3 head proposing `gamma` tokens a round.
+    Eagle3 {
+        head: &'a crate::forward::eagle3::Eagle3Head,
+        gamma: usize,
+    },
+}
+
 /// Run every batch size in `opts.batch`, `opts.runs` times each, greedily or
-/// with the sampler `opts` asks for. With `ngram_gamma`, a batch of one decodes
-/// speculatively, proposing that many tokens a round by n-gram lookup, as a
-/// lone served request does under `--speculative ngram`; larger batches decode
-/// plainly, as the scheduler runs them.
+/// with the sampler `opts` asks for. With `spec`, a batch of one decodes
+/// speculatively, as a lone served request does under `--speculative`; larger
+/// batches decode plainly, as the scheduler runs them.
 pub fn run<K: ComputeKernel>(
     generator: &Generator<K>,
     prompt: &[u32],
     opts: &BenchOpts,
-    ngram_gamma: Option<usize>,
+    spec: Option<BenchSpec<'_>>,
     mut on_result: impl FnMut(&RunResult, usize),
 ) -> Result<Vec<RunResult>> {
     if prompt.is_empty() || opts.gen_len == 0 || opts.runs == 0 {
@@ -203,9 +213,9 @@ pub fn run<K: ComputeKernel>(
         let mut results = Vec::new();
         for &batch in &opts.batch {
             for run in 0..opts.runs {
-                let r = match ngram_gamma {
-                    Some(gamma) if batch <= 1 => {
-                        run_speculative(generator, prompt, opts.gen_len, gamma, sampler(opts, 1))?
+                let r = match &spec {
+                    Some(spec) if batch <= 1 => {
+                        run_speculative(generator, prompt, opts.gen_len, spec, sampler(opts, 1))?
                     }
                     _ => run_once(
                         generator,
@@ -289,21 +299,34 @@ fn run_once<K: ComputeKernel>(
     })
 }
 
-/// One sequence decoded speculatively by n-gram lookup ([`SpeculativeSession`]):
-/// rounds until `gen_len` tokens are out. `ms_per_step` is per token, and
-/// `accept_rate` the share of proposals the target kept.
+/// One sequence decoded speculatively ([`SpeculativeSession`]): rounds until
+/// `gen_len` tokens are out. `ms_per_step` is per token, and `accept_rate` the
+/// share of proposals the target kept.
 ///
 /// [`SpeculativeSession`]: crate::speculative::SpeculativeSession
 fn run_speculative<K: ComputeKernel>(
     generator: &Generator<K>,
     prompt: &[u32],
     gen_len: usize,
-    gamma: usize,
+    spec: &BenchSpec<'_>,
     sampler: Sampler,
 ) -> Result<RunResult> {
+    use crate::speculative::SpeculativeSession;
     let prefill_start = Instant::now();
-    let mut session =
-        crate::speculative::SpeculativeSession::ngram(generator, gamma, prompt, sampler)?;
+    let mut session = match *spec {
+        BenchSpec::Ngram(gamma) => SpeculativeSession::ngram(generator, gamma, prompt, sampler)?,
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        BenchSpec::Eagle3 { head, gamma } => SpeculativeSession::eagle3(
+            generator,
+            head,
+            gamma,
+            prompt,
+            sampler,
+            prompt.len() + gen_len + gamma + 1,
+        )?,
+        #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+        BenchSpec::Eagle3 { head, .. } => match *head {},
+    };
     let prefill = prefill_start.elapsed().as_secs_f64();
     let decode_start = Instant::now();
     let mut first_round = 0.0;
