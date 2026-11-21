@@ -82,6 +82,18 @@ impl<K: ComputeKernel> ComputeKernel for PipelineParallelKernel<K> {
         self.inner.recurrent()
     }
 
+    fn per_layer_input_width(&self) -> usize {
+        self.inner.per_layer_input_width()
+    }
+
+    fn kv_source(&self, layer: u32) -> u32 {
+        self.inner.kv_source(layer)
+    }
+
+    fn layer_kv_dim(&self, layer: u32) -> usize {
+        self.inner.layer_kv_dim(layer)
+    }
+
     fn run_block(
         &self,
         layer: u32,

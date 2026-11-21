@@ -3553,6 +3553,137 @@ fn gpu_scheduler_prefix_cache_preserves_output() {
     );
 }
 
+/// Gemma 3 image input on the GPU, against `transformers` on the tiny random
+/// checkpoint in `tests/fixtures/gemma3_vision` (see `tests/gemma3_vision.rs`
+/// for the CPU case): the vision tower through `dlm_vit_block`, then the
+/// image's tokens through the GEMM prefill with its bidirectional mask.
+#[test]
+fn gpu_gemma3_image_prompt_matches_transformers() {
+    use dlm::generate::ImageEmbeds;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gemma3_vision");
+    let r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+    let floats = |v: &serde_json::Value| -> Vec<f32> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    };
+    let max_diff = |a: &[f32], b: &[f32]| {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let ids: Vec<u32> = r["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let pixels: Vec<f32> = floats(&r["pixels_u8"])
+        .into_iter()
+        .map(|u| (u - 127.5) / 127.5)
+        .collect();
+
+    let tower = dlm::vision::VisionTower::find(&dir, None).unwrap().unwrap();
+    let rows = tower.encode(&pixels, true).unwrap();
+    let d = max_diff(&rows, &floats(&r["image_embeds"]));
+    eprintln!("GPU image embeddings: max abs difference {d:e}");
+    assert!(d < prefill_tol(), "GPU image embeddings off by {d}");
+
+    let (config, store) = dlm::loader::open_model(&dir, dlm::model::QuantScheme::Fp16).unwrap();
+    let generator = dlm::loader::load_model_parts(&store, &config, 64)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    let (got, next) = generator
+        .score_with_images(&ids, &[ImageEmbeds { start: 6, rows }])
+        .unwrap();
+    let d = max_diff(&got, &floats(&r["token_logprobs"]));
+    eprintln!("GPU token logprobs: max abs difference {d:e}");
+    assert!(d < prefill_tol(), "GPU token logprobs off by {d}");
+    let d = max_diff(&next, &floats(&r["next_logprobs"]));
+    eprintln!("GPU next-token logprobs: max abs difference {d:e}");
+    assert!(d < prefill_tol(), "GPU next-token logprobs off by {d}");
+}
+
+/// The Gemma 4 fixture (`tests/fixtures/gemma4`) as host parts at `quant`, with
+/// its token ids and transformers' log-probability for each next token.
+fn gemma4_parts(quant: dlm::model::QuantScheme) -> (dlm::loader::ModelParts, Vec<u32>, Vec<f32>) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gemma4");
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+    let ids: Vec<u32> = reference["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let want = reference["token_logprobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let (config, store) = dlm::loader::open_model(&dir, quant).unwrap();
+    let parts = dlm::loader::load_model_parts(&store, &config, 64).unwrap();
+    (parts, ids, want)
+}
+
+/// Gemma 4 on the GPU against transformers, through prefill and decode: its
+/// own layer kernel (V norm, wider global heads, the shared-KV tail reading
+/// another layer's paged cache, per-layer inputs and scalars).
+#[test]
+fn gpu_gemma4_matches_transformers() {
+    let (parts, ids, want) = gemma4_parts(dlm::model::QuantScheme::Fp16);
+    let g = parts.into_gpu_generator().unwrap();
+    for (path, got) in [
+        ("prefill", g.score(&ids).unwrap()),
+        ("decode", g.score_and_next_decoding(&ids).unwrap().0),
+    ] {
+        assert_eq!(got.len(), want.len());
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (a - b).abs() < 2e-3,
+                "{path} token {i}: gpu {a}, transformers {b}"
+            );
+        }
+    }
+}
+
+/// Gemma 4 on the GPU matches the CPU on the same weights row for row, and a
+/// batch of sequences decodes as each does alone (the batched paths fall back
+/// to one sequence at a time, each handing its shared-KV layers their source's
+/// cache). The fixture is too narrow for an int8 run: its rows are shorter than
+/// a 128-value quantization group; the real GGUF's quantized blocks are checked
+/// by `tests/gemma4_model.rs`.
+#[test]
+fn gpu_gemma4_batch_matches_cpu() {
+    let (parts, ids, _) = gemma4_parts(dlm::model::QuantScheme::Fp16);
+    let cpu = parts.into_cpu_generator().unwrap();
+    let (parts, _, _) = gemma4_parts(dlm::model::QuantScheme::Fp16);
+    let gpu = parts.into_gpu_generator().unwrap();
+    let (c, g) = (
+        cpu.score_and_next(&ids).unwrap(),
+        gpu.score_and_next(&ids).unwrap(),
+    );
+    for (i, (a, b)) in g.1.iter().zip(&c.1).enumerate() {
+        assert!((a - b).abs() < 2e-3, "next token {i}: gpu {a}, cpu {b}");
+    }
+    let cfg = dlm::generate::GenerationConfig {
+        max_new_tokens: 6,
+        ..Default::default()
+    };
+    let prompts: [&[u32]; 2] = [&ids[..5], &ids[3..10]];
+    let batch = gpu.generate_batch(&prompts, &cfg).unwrap();
+    for (p, b) in prompts.iter().zip(&batch) {
+        assert_eq!(&gpu.generate(p, &cfg).unwrap(), b);
+    }
+}
+
 // ── Qwen3.5/3.6: Gated DeltaNet linear attention + gated, partly rotated
 // full attention, all MoE ──────────────────────────────────────────────────
 

@@ -23,12 +23,19 @@ pub enum TensorRole {
     /// Shipped beside the model but not run: the multi-token-prediction head
     /// (`mtp.*`). Neither streamed nor pinned.
     Unused,
+    /// Read from the mapped file a row at a time and never placed in VRAM:
+    /// Gemma 4's per-layer token embeddings, a table as large as the rest of
+    /// the model.
+    HostOnly,
 }
 
 impl TensorRole {
     /// True if this tensor stays resident in VRAM for the whole run.
     pub fn is_pinned(self) -> bool {
-        !matches!(self, TensorRole::Layer(_) | TensorRole::Unused)
+        !matches!(
+            self,
+            TensorRole::Layer(_) | TensorRole::Unused | TensorRole::HostOnly
+        )
     }
 }
 
@@ -43,6 +50,9 @@ pub fn classify(name: &str) -> TensorRole {
     }
     if let Some(index) = layer_index(name) {
         return TensorRole::Layer(index);
+    }
+    if name.contains("embed_tokens_per_layer") {
+        return TensorRole::HostOnly;
     }
     if name.contains("embed_tokens") || name.contains("wte") || name.contains("embeddings") {
         return TensorRole::Embedding;

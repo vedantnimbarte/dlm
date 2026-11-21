@@ -168,11 +168,13 @@ impl<'a> Reader<'a> {
         }
         let mut out = Vec::with_capacity(len.min(1 << 20));
         for _ in 0..len {
-            out.push(
-                self.value(kind)?
-                    .as_f64()
-                    .ok_or_else(|| bad("array element is neither a number nor a string"))?,
-            );
+            // Booleans count as 0/1: Gemma 4 marks its windowed layers with an
+            // array of them.
+            let v = match self.value(kind)? {
+                Value::Bool(b) => Some(b as u8 as f64),
+                other => other.as_f64(),
+            };
+            out.push(v.ok_or_else(|| bad("array element is neither a number nor a string"))?);
         }
         Ok(Value::Numbers(out))
     }
@@ -250,7 +252,13 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
     }
     let data_len = file_len - data_offset;
 
+    // Gemma 2, 3 and 4 norm the FFN input with their own norm and keep
+    // `post_attention_norm` for the attention output, so their `ffn_norm` is
+    // `pre_feedforward_layernorm`; everywhere else `ffn_norm` is the one norm
+    // between attention and FFN, `post_attention_layernorm`.
     let arch = metadata.get("general.architecture").and_then(Value::as_str);
+    let sandwich = matches!(arch, Some("gemma2" | "gemma3" | "gemma4"));
+    let gemma4 = arch == Some("gemma4");
     // llama.cpp numbers a model's MTP layers after its own; they are read as
     // `mtp.layers.{i}`, as transformers names them.
     let arch_int = |key: &str| {
@@ -284,7 +292,10 @@ pub fn parse(bytes: &[u8], file_len: usize) -> Result<GgufHeader> {
         let qwen35 = (arch == Some("qwen35moe"))
             .then(|| qwen35_name(&gguf_name))
             .flatten();
-        let name = match qwen35.or_else(|| hf_name(&gguf_name)) {
+        let name = match qwen35
+            .or_else(|| gemma4_name(gemma4, &gguf_name))
+            .or_else(|| hf_name(&gguf_name, sandwich))
+        {
             Some(name) => mtp_layer_name(name, mtp_from),
             // Tensors dlm has no use for (llama.cpp's rope frequency tables, for
             // instance) keep their own name rather than being dropped: the loader
@@ -400,13 +411,41 @@ fn dtype_of(kind: u32, name: &str) -> Result<Dtype> {
     })
 }
 
+/// The Hugging Face name of a Gemma 4 tensor `hf_name` does not cover, when
+/// `gemma4`: its per-layer-input tensors and its per-layer output scale.
+fn gemma4_name(gemma4: bool, gguf: &str) -> Option<String> {
+    if !gemma4 {
+        return None;
+    }
+    match gguf {
+        "per_layer_token_embd.weight" => return Some("model.embed_tokens_per_layer.weight".into()),
+        "per_layer_model_proj.weight" => {
+            return Some("model.per_layer_model_projection.weight".into())
+        }
+        "per_layer_proj_norm.weight" => {
+            return Some("model.per_layer_projection_norm.weight".into())
+        }
+        _ => {}
+    }
+    let (layer, rest) = gguf.strip_prefix("blk.")?.split_once('.')?;
+    layer.parse::<u32>().ok()?;
+    let hf = match rest {
+        "inp_gate.weight" => "per_layer_input_gate.weight",
+        "proj.weight" => "per_layer_projection.weight",
+        "post_norm.weight" => "post_per_layer_input_norm.weight",
+        "layer_output_scale.weight" => "layer_scalar",
+        _ => return None,
+    };
+    Some(format!("model.layers.{layer}.{hf}"))
+}
+
 /// llama.cpp's tensor name as the Hugging Face name dlm's loader looks up, or
 /// `None` for one it has no equivalent for.
 ///
 /// This is the whole of GGUF's "different architecture" for a dense model: the
 /// same tensors under different names. Keeping the translation here means every
 /// family the loader already supports arrives at it unchanged.
-fn hf_name(gguf: &str) -> Option<String> {
+fn hf_name(gguf: &str, sandwich: bool) -> Option<String> {
     // Model-level tensors.
     match gguf {
         "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
@@ -430,6 +469,7 @@ fn hf_name(gguf: &str) -> Option<String> {
         "attn_output" => "self_attn.o_proj",
         "attn_q_norm" => "self_attn.q_norm",
         "attn_k_norm" => "self_attn.k_norm",
+        "ffn_norm" if sandwich => "pre_feedforward_layernorm",
         "ffn_norm" => "post_attention_layernorm",
         "ffn_gate" => "mlp.gate_proj",
         "ffn_up" => "mlp.up_proj",
@@ -441,9 +481,6 @@ fn hf_name(gguf: &str) -> Option<String> {
         "ffn_post_norm" => "post_feedforward_layernorm",
         _ => return None,
     };
-    // Gemma writes `attn_norm` for the pre-attention norm and `post_attention_norm`
-    // for the one after it; both map above, and the loader tells them apart by
-    // which names are present, exactly as it does for a safetensors Gemma.
     Some(format!("model.layers.{layer}.{hf}.{suffix}"))
 }
 
@@ -613,10 +650,37 @@ mod tests {
             ),
         ];
         for (gguf, hf) in cases {
-            assert_eq!(hf_name(gguf).as_deref(), Some(hf), "{gguf}");
+            assert_eq!(hf_name(gguf, false).as_deref(), Some(hf), "{gguf}");
         }
         // Not a tensor dlm knows: kept under its own name rather than guessed at.
-        assert_eq!(hf_name("rope_freqs.weight"), None);
+        assert_eq!(hf_name("rope_freqs.weight", false), None);
+        // Gemma 2/3 carry four norms per layer; `ffn_norm` is the pre-FFN one,
+        // and must not land on top of `post_attention_norm`.
+        let gemma = [
+            (
+                "blk.2.attn_norm.weight",
+                "model.layers.2.input_layernorm.weight",
+            ),
+            (
+                "blk.2.post_attention_norm.weight",
+                "model.layers.2.post_attention_layernorm.weight",
+            ),
+            (
+                "blk.2.ffn_norm.weight",
+                "model.layers.2.pre_feedforward_layernorm.weight",
+            ),
+            (
+                "blk.2.post_ffw_norm.weight",
+                "model.layers.2.post_feedforward_layernorm.weight",
+            ),
+        ];
+        for (gguf, hf) in gemma {
+            assert_eq!(hf_name(gguf, true).as_deref(), Some(hf), "{gguf}");
+        }
+        assert_eq!(
+            hf_name("blk.2.ffn_norm.weight", false).as_deref(),
+            Some("model.layers.2.post_attention_layernorm.weight")
+        );
     }
 
     /// Qwen3.5/3.6's linear attention, stacked experts and MTP head arrive under

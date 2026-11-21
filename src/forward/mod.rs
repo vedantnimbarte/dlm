@@ -7,6 +7,14 @@
 
 pub mod cpu;
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+pub mod eagle3;
+/// Without GPU kernels there is no EAGLE-3 head to hold: the type exists so
+/// the scheduler's signatures stay the same, and nothing can construct it.
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+pub mod eagle3 {
+    pub enum Eagle3Head {}
+}
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub mod gpu;
 pub mod kernel;
 pub(crate) mod key_balance;
@@ -15,7 +23,7 @@ pub mod kv_pool;
 pub mod multigpu;
 pub mod orchestrator;
 pub(crate) mod pool;
-mod simd;
+pub(crate) mod simd;
 pub mod split;
 pub mod streaming;
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
@@ -23,7 +31,8 @@ pub mod streaming_gpu;
 
 pub use cpu::{
     decode_block, rope_inv_freqs, Activation, BlockConfig, CpuKernel, ExpertFfn, Ffn, KvLayerCache,
-    KvQuant, LayerTensors, MlaWeights, QuantLayout, RopeScaling, Weights, QUANT_GROUP_SIZE,
+    KvQuant, LayerTensors, MlaWeights, PleWeights, QuantLayout, RopeScaling, Weights,
+    QUANT_GROUP_SIZE,
 };
 #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
 pub use gpu::{GpuKernel, GpuLmHead, MultiGpuKernel, TOP_CANDIDATES_MAX};

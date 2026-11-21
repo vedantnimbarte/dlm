@@ -749,6 +749,29 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         crate::forward::kernel::prefill_layer_by_layer(self, hiddens, kv_layers, start)
     }
 
+    /// Layer by layer too, which is the only order a bidirectional block has.
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        for layer in 0..self.num_layers {
+            let tensors = self.shared.fetch(layer)?;
+            if let Some(tx) = &self.prefetch_tx {
+                let _ = tx.send((layer + 1) % self.num_layers);
+            }
+            crate::forward::cpu::decode_block_bidirectional(
+                &self.shared.cfg.for_layer(layer),
+                &tensors,
+                hiddens,
+                &mut kv_layers[layer as usize],
+                start,
+            )?;
+        }
+        Ok(())
+    }
+
     fn run_block(
         &self,
         layer: u32,

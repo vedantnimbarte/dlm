@@ -2223,6 +2223,107 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
         Ok(())
     }
 
+    /// Each streamed layer over the whole run in one GEMM prefill call
+    /// (`dlm_prefill_block`, as the resident kernel prefills), whose attention
+    /// lets every token of the run see every other.
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let cfg = &self.shared.cfg;
+        let n = hiddens.len() / cfg.hidden_size;
+        let refuse = |why: &str| Err(DlmError::InvalidConfig(format!("image input: {why}")));
+        if n > 512 || cfg.mla.is_some() || cfg.moe.is_some() {
+            return refuse("needs a dense model and at most 512 image tokens");
+        }
+        if kv_layers.first().map_or(0, |kv| kv.len()) + n > self.kv_capacity_tokens {
+            return refuse("the GPU KV capacity is exceeded");
+        }
+        let d_x = DeviceBuffer::from_slice(hiddens)?;
+        for layer in 0..self.num_layers {
+            let w = self.shared.fetch(layer)?;
+            if let Some(tx) = &self.prefetch_tx {
+                let _ = tx.send((layer + 1) % self.num_layers);
+            }
+            let GpuFfn::Dense(f) = &w.ffn else {
+                return refuse("needs a dense FFN");
+            };
+            let kv = &mut kv_layers[layer as usize];
+            let history = kv.len();
+            let dkv = kv.device_kv(
+                &self.kv_pools,
+                layer as usize,
+                history + n,
+                self.kv_capacity_tokens,
+                true,
+            )?;
+            let lcfg = cfg.for_layer(layer);
+            let ptr = |b: &DeviceBuffer| b.as_ptr() as *const std::ffi::c_void;
+            // SAFETY: live device buffers of the sizes the kernel expects; the
+            // KV holds `history + n` rows for this sequence.
+            let code = unsafe {
+                crate::forward::gpu::dlm_prefill_block(
+                    lcfg.hidden_size as i32,
+                    lcfg.q_dim() as i32,
+                    lcfg.kv_dim() as i32,
+                    lcfg.num_heads as i32,
+                    lcfg.num_kv_heads as i32,
+                    lcfg.head_dim as i32,
+                    lcfg.intermediate_size as i32,
+                    lcfg.rms_eps,
+                    w.w_dtype,
+                    w.w_group_size,
+                    ptr(&w.q_proj),
+                    ptr(&w.k_proj),
+                    ptr(&w.v_proj),
+                    ptr(&w.o_proj),
+                    ptr(&f.gate),
+                    ptr(&f.up),
+                    ptr(&f.down),
+                    w.input_layernorm.as_ptr(),
+                    w.post_attention_layernorm.as_ptr(),
+                    bias_ptr(&w.q_bias),
+                    bias_ptr(&w.k_bias),
+                    bias_ptr(&w.v_bias),
+                    bias_ptr(&w.q_norm),
+                    bias_ptr(&w.k_norm),
+                    self.inv_freq_for(layer),
+                    d_x.as_mut_ptr(),
+                    dkv.keys as *mut std::ffi::c_void,
+                    dkv.values as *mut std::ffi::c_void,
+                    history as i32,
+                    start as i32,
+                    n as i32,
+                    lcfg.sliding_window.unwrap_or(0) as i32,
+                    lcfg.activation.code(),
+                    crate::forward::cpu::rope_mscale(lcfg.rope_scaling),
+                    lcfg.attn_scale(),
+                    lcfg.attn_logit_softcap.unwrap_or(0.0),
+                    bias_ptr(&w.pre_ffn_norm),
+                    bias_ptr(&w.post_ffn_norm),
+                    &DlmBlockExt::new(&lcfg, &w.biases, dkv.elem, dkv.table)
+                        .with_weight_dtypes(&w.dtypes)
+                        .bidirectional(true),
+                )
+            };
+            match code {
+                0 => kv.advance(n),
+                801 => return refuse("this layer's shape does not fit the GPU prefill"),
+                code => {
+                    return Err(DlmError::Gpu {
+                        api: "dlm_prefill_block",
+                        code,
+                    })
+                }
+            }
+            // Finish with this layer's weights before the cache may reuse them.
+            synchronize_default()?;
+        }
+        d_x.download(hiddens)
+    }
+
     fn run_block(
         &self,
         layer: u32,

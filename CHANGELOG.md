@@ -24,6 +24,21 @@ fork that runs large MoE models from SSD.
   Qwen3.6-35B-A3B every streamed log-probability came out NaN. The expert
   kernels now take down's dtype and group size separately, and a gate stored
   unlike up is refused rather than misread.
+- **Gemma GGUF files did not load, and would not have read right if they
+  had.** Three faults, each enough on its own:
+  - **The pre-FFN norm was mapped onto the post-attention norm.** Gemma 2
+    and 3 files name it `ffn_norm`, which dlm mapped as Llama's, so it
+    overwrote `post_attention_norm` and loading stopped at the missing pair.
+  - **The `1 + w` was added twice.** llama.cpp's converter already writes
+    `1 + w` into every Gemma norm weight, and dlm added the 1 again.
+  - **The GGUF tokenizer split text into letters and byte pieces.** Its
+    SentencePiece scores are merge priorities, and dlm read them as unigram
+    log-probabilities. It now merges the way llama.cpp does.
+  Gemma 3 4B Q4_K_M (ggml-org) now answers "What is the capital of France?"
+  with "The capital of France is Paris." at probability ~1 on CPU and GPU.
+  `tests/gguf_model.rs` checks the tokenizer against Hugging Face's on four
+  texts (`DLM_TEST_GGUF_GEMMA3`). Llama 2 and Mistral GGUF files read
+  through the same tokenizer path.
 - **DeepSeek MLA rotated the wrong pairs of its RoPE dimensions.** DeepSeek's
   reference code rotates adjacent values `(2i, 2i+1)` of `q_pe` and `k_pe`;
   dlm rotated the halves `(i, i + d/2)`, as for Llama-style checkpoints, so
@@ -128,6 +143,75 @@ fork that runs large MoE models from SSD.
     0.09 nats a token (`tests/qwen36_model.rs`, `DLM_QWEN36_GGUF`).
   - **Speed:** decode runs at 2.5–2.9 tok/s and prefill at 3–4 tok/s. The 22
     GB of experts do not fit the RAM cache, so most misses read the SSD.
+- **Gemma 4 E2B and E4B (text).** From the safetensors checkpoint
+  (`Gemma4ForConditionalGeneration`; the vision and audio towers are
+  skipped) and from llama.cpp's `gemma4` GGUF, with its tokenizer and a
+  `gemma4` chat template (`<|turn>`; auto-detected). What is new in the
+  block: values normed per head as well as keys, an attention scale of 1,
+  global layers with heads twice as wide and proportional RoPE on a quarter
+  of each head, a shared-KV tail whose layers attend over an earlier layer's
+  cache and keep none of their own, per-layer inputs, a learned scalar per
+  layer, and E2B's double-wide MLP on the shared tail. The per-layer
+  embedding table (2.8B values on E4B) is read from the mapped file a row per
+  token rather than loaded, and never goes to the GPU. Checked against
+  `transformers` on a tiny random checkpoint with every one of these parts,
+  three windows long (`tests/gemma4_parity.rs`, CPU to 1e-4; the GPU in
+  `tests/gpu_parity.rs`). On the real `gemma-4-E4B-it` Q4_K_M (unsloth) dlm
+  answers "What is the capital of France?" with "The capital of France is
+  Paris." on CPU and GPU, and the file's tokenizer gives transformers' ids
+  (`tests/gemma4_model.rs`, `DLM_GEMMA4_GGUF`). Resident on a GTX 1650
+  (4 GB) it decodes 18.6 tok/s and prefills 31 tok/s (96 greedy tokens after
+  a 20-token prompt), at 3.7 GiB peak VRAM with the desktop's share; on a
+  shared 6-core CPU, 1.1 tok/s. **Known gaps:** resident
+  only (`--stream`, `--gpu-layers` and multi-GPU refuse it); the GPU runs
+  Gemma 4 through its own unfused layer, and prefills a prompt one token at
+  a time through it, so a long prompt costs what decoding it would; the MoE
+  (`enable_moe_block`) and `attention_k_eq_v` variants are refused.
+- **Image input for Gemma 3 4B/12B/27B.** The SigLIP vision tower and
+  projector are read from the checkpoint's own safetensors or from a
+  llama.cpp `mmproj` GGUF (`--mmproj`, or the one `mmproj*.gguf` beside the
+  model), and an image's 256 embeddings take the place of its tokens in the
+  prompt, which attend to each other in both directions as Gemma 3 was
+  trained. PNG and JPEG are decoded and resized as `Gemma3ImageProcessor`
+  does (pan-and-scan, off by default there, is not implemented). The encoder
+  runs on the CPU, or layer by layer on the GPU with its buffers freed after
+  each image, so it fits beside a resident or streamed text model.
+  `dlm generate --image photo.jpg --text "..."` for one-shot use; `serve`
+  takes OpenAI `image_url` parts as base64 `data:` URLs (remote URLs are
+  refused, not fetched). Requests with images bypass the prefix cache past
+  their text, so two prompts that differ only in their pictures share no KV.
+  Checked against `transformers` on a tiny random checkpoint
+  (`tests/gemma3_vision.rs`, `tests/gpu_parity.rs`): pixels exact, image
+  embeddings and log-probabilities to about 2e-6 on the CPU.
+  On the GPU the same checks hold to about 1.5e-6, and making the image block
+  causal there moves the log-probabilities by 0.40, which fails the test.
+  - **Real model:** Gemma 3 4B Q4_K_M with ggml-org's f16 `mmproj`, on a
+    GTX 1650. Asked about Windows' blue `img100.jpg`, it describes "a
+    vibrant, abstract design featuring flowing, curved lines in shades of
+    blue".
+  - **Speed:** encoding the image takes 16 s on the GPU (4,096 patches
+    through 27 layers); prefill runs at 82 tok/s and decode at 27 tok/s.
+- **EAGLE-3 speculative decoding.** An EAGLE-3 draft head, a single layer
+  that drafts from the target's own hidden states, now proposes for a
+  resident GPU target. Give `--draft-model-path` a head directory (its
+  `config.json` names a `*Eagle3` architecture, with `model.safetensors`);
+  heads shipped as `pytorch_model.bin` need converting first.
+  - **Output is unchanged.** On Qwen3-1.7B at int4 with AngelSlim's
+    `Qwen3-1.7B_eagle3`, greedy output is token for token what plain
+    decoding gives, at gamma 1, 3 and 5.
+  - **Acceptance:** 78% of proposals at gamma 1, 49% at 3, 34% at 5.
+  - **Checked against a reference.** The head's prediction at each position
+    matches a plain-torch EAGLE-3 layer over transformers' hidden states at
+    every confident position (44 of 44), in `tests/eagle3_model.rs`
+    (`tools/eagle3_ref.py` writes the reference).
+  - **How it runs.** The resident GPU kernel copies the residual stream
+    entering layers 2, L/2 and L−3 to the host during each verify pass, and a
+    new CUDA entry runs one draft position.
+  - **Speed:** batch-1 decode went from 71 to 77 tok/s at gamma 3, measured
+    while other builds were loading the machine. A clean measurement is
+    still owed.
+  - **Where it works:** `serve` and `bench`, each request with its own draft
+    KV. It is refused with `--stream`, `--gpu-layers` and on the CPU.
 - **DeepSeek-V3 routing.** V3/R1 checkpoints were refused for their router.
   dlm now routes as V3 does (sigmoid scores, the per-layer
   `e_score_correction_bias` added for the choice only, the best `topk_group`

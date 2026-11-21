@@ -52,7 +52,9 @@ impl LayerCatalog {
                         .or_default()
                         .push(info.name.clone());
                 }
-                // Every non-layer tensor is resident overhead.
+                // Never in VRAM, so no part of the plan.
+                TensorRole::HostOnly => {}
+                // Every other non-layer tensor is resident overhead.
                 _ => {
                     pinned_bytes += bytes;
                     pinned_tensors.push(info.name.clone());

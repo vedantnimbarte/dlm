@@ -351,6 +351,13 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     pub lora: Option<PathBuf>,
 
+    /// The vision tower for a GGUF model: a llama.cpp `mmproj` GGUF (Gemma 3's).
+    /// Without it, an `mmproj*.gguf` beside the model file is used if there is
+    /// exactly one; a safetensors Gemma 3 4B+ carries its own tower. With a
+    /// tower, chat requests may include `image_url` parts as `data:` URLs.
+    #[arg(long, value_name = "FILE")]
+    pub mmproj: Option<PathBuf>,
+
     /// Tokens proposed per speculative round, by the draft model or n-gram
     /// lookup.
     #[arg(long, default_value_t = 4)]
@@ -469,7 +476,7 @@ pub struct ServeArgs {
 
     /// Chat prompt template applied to chat messages. `auto` (default) detects it
     /// from the checkpoint's tokenizer_config.json; or name one: `plain`,
-    /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `phi3`, `deepseek`.
+    /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `gemma4`, `phi3`, `deepseek`.
     #[arg(long, value_name = "NAME", default_value = "auto")]
     pub chat_template: String,
 
@@ -653,6 +660,18 @@ pub struct GenerateArgs {
     /// Prompt as text, tokenized with the BPE tokenizer. Overrides `--prompt`.
     #[arg(long)]
     pub text: Option<String>,
+
+    /// An image (PNG or JPEG) for a model with a vision tower (Gemma 3 4B+);
+    /// repeat for several. `--text` is then the user's message, rendered with
+    /// Gemma's chat template, with the images where it says `<start_of_image>`
+    /// or else before the text.
+    #[arg(long, value_name = "FILE")]
+    pub image: Vec<std::path::PathBuf>,
+
+    /// The vision tower for a GGUF model: a llama.cpp `mmproj` GGUF. Defaults
+    /// to the one `mmproj*.gguf` beside the model file, if there is one.
+    #[arg(long, value_name = "FILE")]
+    pub mmproj: Option<std::path::PathBuf>,
 
     /// Tokenizer directory (`vocab.json` + `merges.txt`). Defaults to the model
     /// directory if it has them, else a raw byte tokenizer.

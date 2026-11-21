@@ -92,7 +92,12 @@ impl KvSnapshot {
         let kv_layers = (0..layers)
             .map(|_| KvLayerCache::read_host(r))
             .collect::<std::io::Result<Vec<_>>>()?;
-        if kv_layers.iter().any(|kv| kv.len() != position) {
+        // A layer may hold nothing: Gemma 4's shared-KV layers keep no history of
+        // their own. `resume` checks which layers those are against the kernel.
+        if kv_layers
+            .iter()
+            .any(|kv| kv.len() != position && !kv.is_empty())
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "layer length differs from the snapshot position",
@@ -121,9 +126,8 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
     /// [`KvLayerCache`] is allocated per layer at precision `kv_quant` (int8/int4
     /// shrink the KV memory, approximate).
     pub fn new(kernel: K, budget: PagedKvCache, kv_quant: crate::forward::KvQuant) -> Self {
-        let kv_dim = kernel.kv_dim();
         let kv_layers = (0..kernel.num_layers())
-            .map(|_| KvLayerCache::new_quant(kv_dim, kv_quant))
+            .map(|layer| KvLayerCache::new_quant(kernel.layer_kv_dim(layer), kv_quant))
             .collect();
         Self {
             kernel,
@@ -169,7 +173,15 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
             let shared: Option<Vec<KvLayerCache>> = self
                 .kv_layers
                 .iter()
-                .map(|kv| kv.share_device_prefix(rows))
+                // A layer with no history of its own (Gemma 4's shared-KV
+                // layers) has nothing to share and stays empty.
+                .map(|kv| {
+                    if kv.is_empty() {
+                        Some(kv.clone())
+                    } else {
+                        kv.share_device_prefix(rows)
+                    }
+                })
                 .collect();
             if let Some(kv_layers) = shared {
                 return Ok(KvSnapshot {
@@ -197,6 +209,18 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
                 snapshot.kv_layers.len(),
                 kernel.num_layers()
             )));
+        }
+        // Every layer holds the snapshot's tokens, except the ones that read
+        // another layer's KV and hold none.
+        for (layer, kv) in snapshot.kv_layers.iter().enumerate() {
+            let own = kernel.kv_source(layer as u32) as usize == layer;
+            let want = if own { snapshot.position } else { 0 };
+            if kv.len() != want {
+                return Err(DlmError::InvalidConfig(format!(
+                    "snapshot layer {layer} holds {} rows; this model needs {want}",
+                    kv.len()
+                )));
+            }
         }
         // Reserve KV budget matching the tokens already in the snapshot so the
         // pool accounting stays consistent with the restored history.
@@ -228,7 +252,7 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
             self.kernel.run_block(
                 layer,
                 hidden,
-                &mut self.kv_layers[layer as usize],
+                &mut self.kv_layers[self.kernel.kv_source(layer) as usize],
                 self.position,
             )?;
         }
@@ -279,6 +303,16 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
     /// is identical to calling [`decode_token`](Self::decode_token) on each in
     /// turn, but the kernel chooses the order ([`ComputeKernel::prefill`]).
     pub fn prefill(&mut self, hiddens: &mut [f32]) -> Result<()> {
+        self.prefill_as(hiddens, false)
+    }
+
+    /// [`prefill`](Self::prefill) for a run of tokens that attend to each other
+    /// in both directions ([`ComputeKernel::prefill_bidirectional`]).
+    pub fn prefill_bidirectional(&mut self, hiddens: &mut [f32]) -> Result<()> {
+        self.prefill_as(hiddens, true)
+    }
+
+    fn prefill_as(&mut self, hiddens: &mut [f32], bidirectional: bool) -> Result<()> {
         let hidden_size = self.kernel.hidden_size();
         if hiddens.is_empty() || hiddens.len() % hidden_size != 0 {
             return Err(DlmError::ShapeMismatch {
@@ -288,8 +322,13 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         }
         let n = hiddens.len() / hidden_size;
         self.budget.append_tokens(SEQ_ID, n as u64)?;
-        self.kernel
-            .prefill(hiddens, &mut self.kv_layers, self.position)?;
+        if bidirectional {
+            self.kernel
+                .prefill_bidirectional(hiddens, &mut self.kv_layers, self.position)?;
+        } else {
+            self.kernel
+                .prefill(hiddens, &mut self.kv_layers, self.position)?;
+        }
         self.position += n;
         Ok(())
     }

@@ -75,6 +75,13 @@ pub enum RopeScaling {
         /// Attention scaling `mscale` (`0.1·ln(factor)+1`), applied to cos/sin.
         mscale: f32,
     },
+    /// Gemma 4's "proportional" RoPE (`partial_rotary_factor` inside its
+    /// `rope_parameters`): the frequencies are those of the whole head, but only
+    /// the first `fraction` of each head's rotation pairs turn; the rest get
+    /// frequency 0, so cos 1 and sin 0 leave them as they are. Unlike the partial
+    /// rotary factor dlm refuses, the pairs stay `(i, i + head_dim / 2)` across
+    /// the full head, so the rotation kernels need nothing new.
+    Partial { fraction: f32 },
 }
 
 /// Shape + hyperparameters of one decoder block.
@@ -167,6 +174,29 @@ pub struct BlockConfig {
     /// [`rope_freqs`](Self::rope_freqs) gives every other pair frequency 0, so
     /// every kernel's whole-head RoPE rotates exactly the right ones.
     pub rotary_dim: Option<usize>,
+    /// Gemma 4: the head width of the global (full-attention) layers, when it
+    /// differs from `head_dim`, which is then the windowed layers' (256 and 512
+    /// on E2B/E4B). Resolved per layer by [`Self::for_layer`].
+    pub global_head_dim: Option<usize>,
+    /// Gemma 4: layers from this one on compute no K/V of their own and attend
+    /// over the cache of the last earlier layer of the same kind (windowed or
+    /// global); see [`Self::kv_source`]. `None`: every layer has its own.
+    pub kv_shared_from: Option<u32>,
+    /// Resolved by [`Self::for_layer`]: this layer reads another layer's KV
+    /// (Gemma 4's shared-KV tail) instead of projecting and appending its own.
+    pub shared_kv: bool,
+    /// Gemma 4 RMS-normalizes each value head, with no learned scale.
+    pub v_norm: bool,
+    /// Gemma 4's per-layer inputs: each layer gets `ple_dim` extra values per
+    /// token, which travel after the hidden state in the row the kernel is
+    /// handed (see [`Self::row_width`]). 0 for every other family.
+    pub ple_dim: usize,
+    /// Layers in the whole model, which is how many per-layer inputs a row
+    /// carries. Only read when `ple_dim > 0`.
+    pub ple_layers: usize,
+    /// Gemma 4 E2B (`use_double_wide_mlp`): the KV-shared layers' MLP is twice
+    /// `intermediate_size` wide. Resolved per layer by [`Self::for_layer`].
+    pub double_wide_shared_mlp: bool,
 }
 
 impl BlockConfig {
@@ -219,7 +249,23 @@ impl BlockConfig {
             Some(local) if self.uses_local_rope(layer) => (local, None),
             _ => (self.rope_theta, self.rope_scaling),
         };
+        let global = self.window_for_layer(layer).is_none();
+        let shared_kv = self.kv_source(layer).is_some();
         Self {
+            head_dim: match self.global_head_dim {
+                Some(g) if global => g,
+                _ => self.head_dim,
+            },
+            intermediate_size: if self.double_wide_shared_mlp && shared_kv {
+                2 * self.intermediate_size
+            } else {
+                self.intermediate_size
+            },
+            shared_kv,
+            // Resolved above; a resolved config must not resolve again.
+            global_head_dim: None,
+            kv_shared_from: None,
+            double_wide_shared_mlp: false,
             sliding_window: self.window_for_layer(layer),
             rope_theta,
             rope_scaling,
@@ -249,6 +295,29 @@ impl BlockConfig {
                 f
             }
         }
+    }
+
+    /// The layer whose KV cache `layer` attends over, when it has none of its
+    /// own (Gemma 4's shared-KV tail): the last layer before
+    /// [`kv_shared_from`](Self::kv_shared_from) of the same kind, windowed or
+    /// global, as transformers' `store_full_length_kv` picks it. `None` for a
+    /// layer with its own KV. Asked of the unresolved config.
+    pub fn kv_source(&self, layer: u32) -> Option<u32> {
+        let first = self.kv_shared_from?;
+        if layer < first {
+            return None;
+        }
+        let global = self.window_for_layer(layer).is_none();
+        (0..first)
+            .rev()
+            .find(|&l| self.window_for_layer(l).is_none() == global)
+    }
+
+    /// Values per token the kernel exchanges: the hidden state, then Gemma 4's
+    /// per-layer inputs for every layer (`ple_layers × ple_dim`). The hidden
+    /// state alone everywhere else.
+    pub fn row_width(&self) -> usize {
+        self.hidden_size + self.ple_layers * self.ple_dim
     }
 
     /// Attention score scale: `1/sqrt(query_pre_attn_scalar)` when the model
@@ -805,6 +874,11 @@ pub struct LayerTensors {
     /// The attention output gate (`[q_dim, hidden]`): the half of Qwen3.5's
     /// query projection that is not the query. `None` elsewhere.
     pub attn_gate: Option<Weights>,
+    /// Gemma 4's per-layer-input block; `None` on every other family.
+    pub ple: Option<PleWeights>,
+    /// Gemma 4 multiplies the layer's whole output by this (`layer_scalar`);
+    /// `None` elsewhere.
+    pub layer_scalar: Option<f32>,
 }
 
 /// One Gated DeltaNet layer's weights (Qwen3.5/3.6), beside the layer's
@@ -857,6 +931,25 @@ impl LinearAttnWeights {
         self.weights().map(|w| w.as_bytes().len()).sum::<usize>()
             + 4 * (self.conv1d.len() + self.a_neg.len() + self.dt_bias.len() + self.norm.len())
     }
+}
+
+/// Gemma 4's per-layer input (PLE) weights for one layer. After the FFN the
+/// layer adds `post_norm(proj · (gelu(gate · h) ⊙ input))`, where `input` is
+/// this layer's slice of the token's per-layer inputs.
+#[derive(Debug, Clone, Default)]
+pub struct PleWeights {
+    /// `per_layer_input_gate`, `[ple_dim, hidden]`.
+    pub gate: Weights,
+    /// `per_layer_projection`, `[hidden, ple_dim]`.
+    pub proj: Weights,
+    /// `post_per_layer_input_norm`, `[hidden]`.
+    pub post_norm: Vec<f32>,
+    /// Layer 0 only: the model's `per_layer_model_projection`
+    /// (`[layers × ple_dim, hidden]`) and `per_layer_projection_norm`
+    /// (`[ple_dim]`), which turn the token's embedding into the half of every
+    /// layer's input that depends on context rather than the token id. Held by
+    /// the first layer because that is where the embedding is in hand.
+    pub model: Option<(Weights, Vec<f32>)>,
 }
 
 /// Multi-head Latent Attention projection weights (DeepSeek). The layer's
@@ -918,6 +1011,8 @@ impl LayerTensors {
             mla: None,
             linear: None,
             attn_gate: None,
+            ple: self.ple.clone(),
+            layer_scalar: self.layer_scalar,
         })
     }
 
@@ -943,11 +1038,20 @@ impl LayerTensors {
                     + shared_gate.as_ref().map_or(0, |g| g.as_bytes().len())
             }
         };
+        let ple = self.ple.as_ref().map_or(0, |p| {
+            p.gate.as_bytes().len()
+                + p.proj.as_bytes().len()
+                + std::mem::size_of_val(&p.post_norm[..])
+                + p.model.as_ref().map_or(0, |(w, n)| {
+                    w.as_bytes().len() + std::mem::size_of_val(&n[..])
+                })
+        });
         self.q_proj.as_bytes().len()
             + self.k_proj.as_bytes().len()
             + self.v_proj.as_bytes().len()
             + self.o_proj.as_bytes().len()
             + ffn
+            + ple
             + std::mem::size_of_val(&self.input_layernorm[..])
             + std::mem::size_of_val(&self.post_attention_layernorm[..])
             + bias(&self.q_bias)
@@ -980,10 +1084,16 @@ impl LayerTensors {
         let attn = [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj].into_iter();
         let mla = self.mla.iter().flat_map(|m| m.weights());
         let linear = self.linear.iter().flat_map(|l| l.weights());
+        let ple = self.ple.iter().flat_map(|p| {
+            [&p.gate, &p.proj]
+                .into_iter()
+                .chain(p.model.iter().map(|(w, _)| w))
+        });
         attn.chain(mla)
             .chain(linear)
             .chain(self.attn_gate.iter())
             .chain(self.ffn.weights())
+            .chain(ple)
     }
 
     /// The same, to modify: used to re-pack a layer's quantized weights.
@@ -997,10 +1107,16 @@ impl LayerTensors {
         .into_iter();
         let mla = self.mla.iter_mut().flat_map(|m| m.weights_mut());
         let linear = self.linear.iter_mut().flat_map(|l| l.weights_mut());
+        let ple = self.ple.iter_mut().flat_map(|p| {
+            [&mut p.gate, &mut p.proj]
+                .into_iter()
+                .chain(p.model.iter_mut().map(|(w, _)| w))
+        });
         attn.chain(mla)
             .chain(linear)
             .chain(self.attn_gate.iter_mut())
             .chain(self.ffn.weights_mut())
+            .chain(ple)
     }
 
     /// The dense FFN triple, or an error if this layer is MoE. Both GPU kernels
@@ -1112,10 +1228,15 @@ impl LayerTensors {
                 )))
             }
         }
+        self.validate_ple(cfg)?;
+        // A layer reading another layer's KV (Gemma 4's shared tail) has no K/V
+        // projections of its own; one that carries them would be ignored, which
+        // is a config/checkpoint mismatch worth stopping on.
+        let own_kv = if cfg.shared_kv { 0 } else { cfg.kv_dim() };
         let checks = [
             ("q_proj", self.q_proj.len(), cfg.q_dim() * cfg.hidden_size),
-            ("k_proj", self.k_proj.len(), cfg.kv_dim() * cfg.hidden_size),
-            ("v_proj", self.v_proj.len(), cfg.kv_dim() * cfg.hidden_size),
+            ("k_proj", self.k_proj.len(), own_kv * cfg.hidden_size),
+            ("v_proj", self.v_proj.len(), own_kv * cfg.hidden_size),
             ("o_proj", self.o_proj.len(), cfg.hidden_size * cfg.q_dim()),
             (
                 "input_layernorm",
@@ -1248,6 +1369,45 @@ impl LayerTensors {
             }
         }
         self.validate_ffn(cfg)?;
+        Ok(())
+    }
+
+    /// Validate Gemma 4's per-layer-input block: present exactly when the
+    /// config gives the layers inputs, and shaped `[ple_dim, hidden]` /
+    /// `[hidden, ple_dim]`, with the model-level projection when it rides along.
+    fn validate_ple(&self, cfg: &BlockConfig) -> Result<()> {
+        let (h, p) = (cfg.hidden_size, cfg.ple_dim);
+        let Some(ple) = &self.ple else {
+            return if p == 0 {
+                Ok(())
+            } else {
+                Err(DlmError::InvalidConfig(
+                    "config gives every layer a per-layer input, but the layer has no \
+                     per_layer_input_gate/per_layer_projection"
+                        .into(),
+                ))
+            };
+        };
+        let mut checks = vec![
+            ("per_layer_input_gate", ple.gate.len(), p * h),
+            ("per_layer_projection", ple.proj.len(), h * p),
+            ("post_per_layer_input_norm", ple.post_norm.len(), h),
+        ];
+        if let Some((w, norm)) = &ple.model {
+            checks.push((
+                "per_layer_model_projection",
+                w.len(),
+                cfg.ple_layers * p * h,
+            ));
+            checks.push(("per_layer_projection_norm", norm.len(), p));
+        }
+        for (name, got, expected) in checks {
+            if got != expected || expected == 0 {
+                return Err(DlmError::QuantLayout(format!(
+                    "{name}: expected {expected} elements, got {got}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2638,7 +2798,7 @@ fn silu(x: f32) -> f32 {
 }
 
 /// tanh-approximate GELU (`gelu_pytorch_tanh`), Gemma's gate activation.
-fn gelu_tanh(x: f32) -> f32 {
+pub(crate) fn gelu_tanh(x: f32) -> f32 {
     const C: f32 = 0.797_884_6; // sqrt(2/pi)
     0.5 * x * (1.0 + (C * (x + 0.044715 * x * x * x)).tanh())
 }
@@ -2939,6 +3099,15 @@ pub fn rope_inv_freqs(head_dim: usize, theta: f32, scaling: Option<RopeScaling>)
             match scaling {
                 None => base,
                 Some(RopeScaling::Linear { factor }) => base / factor,
+                // transformers' proportional RoPE: `int(fraction * head_dim // 2)`
+                // pairs rotate, at the whole head's frequencies; the rest stay put.
+                Some(RopeScaling::Partial { fraction }) => {
+                    if i < ((fraction * head_dim as f32) / 2.0).floor() as usize {
+                        base
+                    } else {
+                        0.0
+                    }
+                }
                 Some(RopeScaling::Yarn { .. }) => {
                     let (factor, low, high) = yarn.unwrap();
                     let ramp = if (high - low).abs() < 1e-6 {
@@ -3040,18 +3209,35 @@ fn add_bias(v: &mut [f32], bias: Option<&Vec<f32>>) {
     }
 }
 
-/// Grouped-query attention over the cached history for a single query vector.
-/// Returns the concatenated per-head context (`q_dim` long).
-fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
+/// Grouped-query attention over the cached history for a single query vector,
+/// the query being KV row `row`. Returns the concatenated per-head context
+/// (`q_dim` long).
+///
+/// The query sees every cached row up to the last, which is itself when
+/// decoding; an image token in a bidirectional block also sees the block's
+/// rows after it.
+fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache, row: usize) -> Vec<f32> {
+    attention_span(cfg, q, kv, row, kv.len())
+}
+
+/// [`attention`] over the cached rows before `end` only: a layer reading
+/// another layer's cache (Gemma 4's shared-KV tail) sees the rows up to its
+/// own token, though the source may already hold the rest of a prefill chunk.
+fn attention_span(
+    cfg: &BlockConfig,
+    q: &[f32],
+    kv: &KvLayerCache,
+    row: usize,
+    end: usize,
+) -> Vec<f32> {
     let d = cfg.head_dim;
     let scale = cfg.attn_scale();
     let group = cfg.group_size();
-    let positions = kv.len();
     // Sliding-window attention (Mistral): a query attends only the most recent
-    // `window` positions (itself included). `None` — or a window at least as long
-    // as the history — is ordinary full causal attention.
+    // `window` positions counted back from itself (itself included). `None` —
+    // or a window at least as long as the history — is full attention.
     let start = match cfg.sliding_window {
-        Some(w) if w > 0 => positions.saturating_sub(w),
+        Some(w) if w > 0 => (row + 1).saturating_sub(w),
         _ => 0,
     };
     let mut context = vec![0.0f32; cfg.q_dim()];
@@ -3060,8 +3246,8 @@ fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache) -> Vec<f32> {
         let kv_head = h / group;
         let qh = &q[h * d..(h + 1) * d];
 
-        // Scores over the attended window `[start, positions)`, then softmax.
-        let mut scores = vec![0.0f32; positions - start];
+        // Scores over the attended window `[start, end)`, then softmax.
+        let mut scores = vec![0.0f32; end - start];
         for (j, score) in scores.iter_mut().enumerate() {
             *score = kv.key_head_dot(start + j, kv_head, d, qh) * scale;
         }
@@ -3204,8 +3390,53 @@ pub fn decode_block(
     position: usize,
 ) -> Result<Vec<f32>> {
     w.validate(cfg)?;
-    let mut h1 = token_mixer(cfg, w, hidden, kv, position)?;
+    let h1 = token_mixer(cfg, w, hidden, kv, position)?;
+    ffn_sublayer(cfg, w, hidden, h1)
+}
 
+/// Run one decoder block over a run of tokens that attend to each other in
+/// both directions as well as to the history before them: Gemma 3's image
+/// tokens. `hiddens` is `[n, hidden]`, token `i` at `position + i`.
+///
+/// Every token's K/V goes in first, then each token attends over all of
+/// them; the window, if any, still counts back from the token itself.
+pub fn decode_block_bidirectional(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hiddens: &mut [f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+) -> Result<()> {
+    w.validate(cfg)?;
+    if w.mla.is_some() || !matches!(w.ffn, Ffn::Dense(_)) {
+        return Err(DlmError::InvalidConfig(
+            "a bidirectional (image) block needs standard attention and a dense FFN".into(),
+        ));
+    }
+    let first = kv.len();
+    let mut queries = Vec::with_capacity(hiddens.len() / cfg.hidden_size);
+    for (i, hidden) in hiddens.chunks(cfg.hidden_size).enumerate() {
+        let (q, k, v) = qkv(cfg, w, hidden, position + i)?;
+        kv.append(&k, &v)?;
+        queries.push(q);
+    }
+    for (i, hidden) in hiddens.chunks_mut(cfg.hidden_size).enumerate() {
+        let ctx = attention(cfg, &queries[i], kv, first + i);
+        let h1 = attn_residual(cfg, w, hidden, &ctx);
+        let out = ffn_sublayer(cfg, w, hidden, h1)?;
+        hidden.copy_from_slice(&out);
+    }
+    Ok(())
+}
+
+/// The FFN half of a block: `h1` is the post-attention residual, `hidden` the
+/// block's input (which Falcon's parallel FFN reads instead).
+fn ffn_sublayer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    mut h1: Vec<f32>,
+) -> Result<Vec<f32>> {
     // Falcon runs attention and the FFN **in parallel** off the same normalized
     // input, summing both into one residual:
     //
@@ -3428,6 +3659,49 @@ fn attention_sublayer(
     kv: &mut KvLayerCache,
     position: usize,
 ) -> Result<Vec<f32>> {
+    let (q, k, v) = qkv(cfg, w, hidden, position)?;
+    let ctx = if cfg.shared_kv {
+        // The source layer already holds this token's row: it ran first in this
+        // token's sweep, or (layer-major prefill) for every token of the chunk.
+        // Rows are positions, so this token sees rows `0..=position`.
+        if position >= kv.len() {
+            return Err(DlmError::InvalidConfig(format!(
+                "shared-KV layer at position {position}, but its source layer holds {} rows",
+                kv.len()
+            )));
+        }
+        attention_span(cfg, &q, kv, position, position + 1)
+    } else {
+        kv.append(&k, &v)?;
+        attention(cfg, &q, kv, kv.len() - 1)
+    };
+    // Qwen3.5 gates every head's output by its own half of the query projection.
+    let mut ctx = ctx;
+    if let Some(g) = &w.attn_gate {
+        let normed = norm(
+            hidden,
+            &w.input_layernorm,
+            w.input_layernorm_bias.as_deref(),
+            cfg.rms_eps,
+            cfg.norm_kind,
+        );
+        let gate = matvec_native(g, &normed, cfg.q_dim(), cfg.hidden_size);
+        for (c, g) in ctx.iter_mut().zip(&gate) {
+            *c *= sigmoid(*g);
+        }
+    }
+    Ok(attn_residual(cfg, w, hidden, &ctx))
+}
+
+/// One token's query, key and value: input norm, projections (+bias), Q/K
+/// norm, RoPE at `position`.
+#[allow(clippy::type_complexity)]
+fn qkv(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    position: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     if hidden.len() != cfg.hidden_size {
         return Err(DlmError::ShapeMismatch {
             expected: cfg.hidden_size,
@@ -3442,8 +3716,15 @@ fn attention_sublayer(
         cfg.norm_kind,
     );
     let mut q = matvec_native(&w.q_proj, &normed, cfg.q_dim(), cfg.hidden_size);
-    let mut k = matvec_native(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
-    let mut v = matvec_native(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size);
+    // A layer reading another layer's KV (Gemma 4) projects only its query.
+    let (mut k, mut v) = if cfg.shared_kv {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            matvec_native(&w.k_proj, &normed, cfg.kv_dim(), cfg.hidden_size),
+            matvec_native(&w.v_proj, &normed, cfg.kv_dim(), cfg.hidden_size),
+        )
+    };
 
     add_bias(&mut q, w.q_bias.as_ref());
     add_bias(&mut k, w.k_bias.as_ref());
@@ -3453,8 +3734,13 @@ fn attention_sublayer(
     if let Some(qn) = &w.q_norm {
         head_rmsnorm(&mut q, cfg.num_heads, cfg.head_dim, qn, cfg.rms_eps);
     }
-    if let Some(kn) = &w.k_norm {
+    if let (Some(kn), false) = (&w.k_norm, cfg.shared_kv) {
         head_rmsnorm(&mut k, cfg.num_kv_heads, cfg.head_dim, kn, cfg.rms_eps);
+    }
+    // Gemma 4 normalizes each value head too, with no learned scale.
+    if cfg.v_norm && !cfg.shared_kv {
+        let ones = vec![1.0; cfg.head_dim];
+        head_rmsnorm(&mut v, cfg.num_kv_heads, cfg.head_dim, &ones, cfg.rms_eps);
     }
 
     // GPT-2 encodes position by *adding* a learned embedding to the token
@@ -3472,26 +3758,25 @@ fn attention_sublayer(
             &inv_freq,
             mscale,
         );
-        rope_inplace(
-            &mut k,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-            position,
-            &inv_freq,
-            mscale,
-        );
-    }
-
-    kv.append(&k, &v)?;
-    let mut ctx = attention(cfg, &q, kv);
-    // Qwen3.5 gates every head's output by its own half of the query projection.
-    if let Some(g) = &w.attn_gate {
-        let gate = matvec_native(g, &normed, cfg.q_dim(), cfg.hidden_size);
-        for (c, g) in ctx.iter_mut().zip(&gate) {
-            *c *= sigmoid(*g);
+        if !cfg.shared_kv {
+            rope_inplace(
+                &mut k,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                position,
+                &inv_freq,
+                mscale,
+            );
         }
     }
-    let mut attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
+
+    Ok((q, k, v))
+}
+
+/// The attention context's output projection folded into the residual: the
+/// post-attention hidden `h1`.
+fn attn_residual(cfg: &BlockConfig, w: &LayerTensors, hidden: &[f32], ctx: &[f32]) -> Vec<f32> {
+    let mut attn_out = matvec_native(&w.o_proj, ctx, cfg.hidden_size, cfg.q_dim());
     add_bias(&mut attn_out, w.o_bias.as_ref());
 
     // Gemma2 normalizes the attention *output* before folding it into the
@@ -3500,7 +3785,7 @@ fn attention_sublayer(
     if w.is_gemma2_style() {
         attn_out = rmsnorm(&attn_out, &w.post_attention_layernorm, cfg.rms_eps);
     }
-    Ok(hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect())
+    hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect()
 }
 
 /// Run one decoder block whose layer is a **streamed MoE core** — attention +
@@ -3545,6 +3830,63 @@ where
         *h += *d;
     }
     Ok(h1)
+}
+
+/// Gemma 4, before layer 0: turn a row's per-layer inputs from the token-id half
+/// alone (the per-layer embedding row the generator gathered, already scaled by
+/// `sqrt(ple_dim)`) into what every layer reads,
+/// `(norm(W · e / sqrt(hidden)) + inputs) / sqrt(2)` per layer, where `e` is the
+/// token's scaled embedding: the hidden state entering layer 0. transformers'
+/// `project_per_layer_inputs`.
+pub(crate) fn project_per_layer_inputs(
+    cfg: &BlockConfig,
+    model: &(Weights, Vec<f32>),
+    hidden: &[f32],
+    inputs: &mut [f32],
+) {
+    let (w, norm_w) = model;
+    let mut proj = matvec_native(w, hidden, cfg.ple_layers * cfg.ple_dim, cfg.hidden_size);
+    let scale = (cfg.hidden_size as f32).powf(-0.5);
+    for x in &mut proj {
+        *x *= scale;
+    }
+    head_rmsnorm(&mut proj, cfg.ple_layers, cfg.ple_dim, norm_w, cfg.rms_eps);
+    for (x, p) in inputs.iter_mut().zip(&proj) {
+        *x = (p + *x) * std::f32::consts::FRAC_1_SQRT_2;
+    }
+}
+
+/// Gemma 4, after a layer's FFN: add its per-layer input's contribution,
+/// `post_norm(proj · (act(gate · h) ⊙ input))`, then scale the whole output by
+/// `layer_scalar`. A no-op for a layer with neither.
+pub(crate) fn apply_per_layer_input(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &mut [f32],
+    input: &[f32],
+) {
+    if let Some(ple) = &w.ple {
+        let (h, p) = (cfg.hidden_size, cfg.ple_dim);
+        let gate = matvec_native(&ple.gate, hidden, p, h);
+        let gated: Vec<f32> = gate
+            .iter()
+            .zip(input)
+            .map(|(&g, &x)| activate(cfg.activation, g) * x)
+            .collect();
+        let out = rmsnorm(
+            &matvec_native(&ple.proj, &gated, h, p),
+            &ple.post_norm,
+            cfg.rms_eps,
+        );
+        for (x, d) in hidden.iter_mut().zip(&out) {
+            *x += d;
+        }
+    }
+    if let Some(s) = w.layer_scalar {
+        for x in hidden.iter_mut() {
+            *x *= s;
+        }
+    }
 }
 
 /// A real CPU [`ComputeKernel`] holding a model's per-layer weights.
@@ -3602,7 +3944,7 @@ impl ComputeKernel for CpuKernel {
     }
 
     fn hidden_size(&self) -> usize {
-        self.cfg.hidden_size
+        self.cfg.row_width()
     }
 
     fn kv_dim(&self) -> usize {
@@ -3613,6 +3955,21 @@ impl ComputeKernel for CpuKernel {
         self.cfg.linear.is_some()
     }
 
+    fn per_layer_input_width(&self) -> usize {
+        self.cfg.row_width() - self.cfg.hidden_size
+    }
+
+    fn kv_source(&self, layer: u32) -> u32 {
+        self.cfg
+            .kv_source(self.first_layer + layer)
+            .and_then(|s| s.checked_sub(self.first_layer))
+            .unwrap_or(layer)
+    }
+
+    fn layer_kv_dim(&self, layer: u32) -> usize {
+        self.cfg.for_layer(self.first_layer + layer).kv_dim()
+    }
+
     fn run_block(
         &self,
         layer: u32,
@@ -3621,9 +3978,43 @@ impl ComputeKernel for CpuKernel {
         position: usize,
     ) -> Result<()> {
         // Resolve Gemma2's alternating window for this layer; a no-op elsewhere.
-        let cfg = self.cfg.for_layer(self.first_layer + layer);
-        let out = decode_block(&cfg, &self.layers[layer as usize], hidden, kv, position)?;
-        hidden.copy_from_slice(&out);
+        let model_layer = self.first_layer + layer;
+        let cfg = self.cfg.for_layer(model_layer);
+        let w = &self.layers[layer as usize];
+        if cfg.ple_dim == 0 {
+            let mut out = decode_block(&cfg, w, hidden, kv, position)?;
+            apply_per_layer_input(&cfg, w, &mut out, &[]);
+            hidden.copy_from_slice(&out);
+            return Ok(());
+        }
+        // Gemma 4: the row is the hidden state, then every layer's input.
+        if hidden.len() != cfg.row_width() {
+            return Err(DlmError::ShapeMismatch {
+                expected: cfg.row_width(),
+                got: hidden.len(),
+            });
+        }
+        let (hid, inputs) = hidden.split_at_mut(cfg.hidden_size);
+        if let Some(model) = w.ple.as_ref().and_then(|p| p.model.as_ref()) {
+            project_per_layer_inputs(&cfg, model, hid, inputs);
+        }
+        let mut out = decode_block(&cfg, w, hid, kv, position)?;
+        let at = model_layer as usize * cfg.ple_dim;
+        apply_per_layer_input(&cfg, w, &mut out, &inputs[at..at + cfg.ple_dim]);
+        hid.copy_from_slice(&out);
+        Ok(())
+    }
+
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        for (l, (w, kv)) in self.layers.iter().zip(kv_layers.iter_mut()).enumerate() {
+            let cfg = self.cfg.for_layer(self.first_layer + l as u32);
+            decode_block_bidirectional(&cfg, w, hiddens, kv, start)?;
+        }
         Ok(())
     }
 }
@@ -3664,6 +4055,47 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-6, "{got:?} vs {want:?}");
         }
+    }
+
+    /// Gemma 3 windows five layers in six and rotates those with their own base,
+    /// Gemma 4 E2B's layout: the shared-KV tail reads the last layer of its own
+    /// kind before it, global layers are wider and rotate a quarter of their
+    /// pairs, and E2B doubles the tail's MLP.
+    #[test]
+    fn gemma4_layers_resolve_kv_source_width_and_rope() {
+        let cfg = BlockConfig {
+            hidden_size: 16,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 8,
+            intermediate_size: 32,
+            sliding_window: Some(4),
+            sliding_window_pattern: Some(5),
+            rope_theta: 1e6,
+            rope_scaling: Some(RopeScaling::Partial { fraction: 0.25 }),
+            rope_local_theta: Some(1e4),
+            global_head_dim: Some(16),
+            kv_shared_from: Some(15),
+            double_wide_shared_mlp: true,
+            ple_dim: 4,
+            ple_layers: 35,
+            ..Default::default()
+        };
+        // E2B: 35 layers, every fifth global, layers 15.. share.
+        assert_eq!(cfg.kv_source(14), None);
+        assert_eq!(cfg.kv_source(15), Some(13)); // windowed: last windowed before 15
+        assert_eq!(cfg.kv_source(19), Some(14)); // global: layer 14
+        assert_eq!(cfg.kv_source(34), Some(14));
+        let (g, l, s) = (cfg.for_layer(14), cfg.for_layer(13), cfg.for_layer(19));
+        assert_eq!((g.head_dim, g.kv_dim(), g.sliding_window), (16, 16, None));
+        assert_eq!((l.head_dim, l.rope_theta, l.rope_scaling), (8, 1e4, None));
+        assert!(!g.shared_kv && s.shared_kv);
+        assert_eq!((g.intermediate_size, s.intermediate_size), (32, 64));
+        assert_eq!(cfg.row_width(), 16 + 35 * 4);
+        // A 16-wide global head has 8 pairs; a quarter of the head is 2 of them.
+        let f = rope_inv_freqs(16, 1e6, g.rope_scaling);
+        assert_eq!(f.iter().filter(|&&x| x > 0.0).count(), 2);
+        assert_eq!(f[1], 1e6f32.powf(-2.0 / 16.0));
     }
 
     /// Gemma 3 windows five layers in six and rotates those with their own base,
@@ -3801,8 +4233,8 @@ mod tests {
             ..Default::default()
         };
         approx(
-            &attention(&cfg, &[1.0, 0.0], &kv),
-            &attention(&cfg, &[1.0, 0.0], &fresh),
+            &attention(&cfg, &[1.0, 0.0], &kv, kv.len() - 1),
+            &attention(&cfg, &[1.0, 0.0], &fresh, fresh.len() - 1),
             1e-6,
         );
         kv.truncate(10); // beyond len → no-op
@@ -3853,22 +4285,26 @@ mod tests {
         let kv_all = fill(0);
         let q = [1.0f32, 0.0];
 
-        let full = attention(&base, &q, &kv_all);
+        let full = attention(&base, &q, &kv_all, kv_all.len() - 1);
         let mut win2 = base;
         win2.sliding_window = Some(2);
-        let windowed = attention(&win2, &q, &kv_all);
+        let windowed = attention(&win2, &q, &kv_all, kv_all.len() - 1);
         assert_ne!(
             full, windowed,
             "window of 2 over 4 positions should differ from full"
         );
 
         // window=2 over all 4 positions == full attention over just the last 2.
-        approx(&windowed, &attention(&base, &q, &fill(2)), 1e-6);
+        approx(&windowed, &attention(&base, &q, &fill(2), 1), 1e-6);
 
         // A window >= the history is exactly full attention.
         let mut win_big = base;
         win_big.sliding_window = Some(10);
-        approx(&attention(&win_big, &q, &kv_all), &full, 1e-6);
+        approx(
+            &attention(&win_big, &q, &kv_all, kv_all.len() - 1),
+            &full,
+            1e-6,
+        );
     }
 
     /// `matvec_rows` runs single-threaded below its size threshold and split
@@ -4009,8 +4445,8 @@ mod tests {
             ..plain
         };
 
-        let a = attention(&plain, &q, &kv);
-        let b = attention(&capped, &q, &kv);
+        let a = attention(&plain, &q, &kv, kv.len() - 1);
+        let b = attention(&capped, &q, &kv, kv.len() - 1);
         // Uncapped, position 0 wins almost totally; capped, the gap is squashed
         // so position 1 keeps real weight.
         assert!(
@@ -4031,7 +4467,7 @@ mod tests {
             attn_logit_softcap: Some(1e6),
             ..plain
         };
-        approx(&attention(&loose, &q, &kv), &a, 1e-4);
+        approx(&attention(&loose, &q, &kv, kv.len() - 1), &a, 1e-4);
     }
 
     /// Build a tiny dense layer; `gemma2` adds the FFN norm pair that switches
@@ -4445,7 +4881,7 @@ mod tests {
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
         // Softmax over a single score is 1.0, so context == the stored value.
-        let ctx = attention(&cfg, &[0.5, -0.5], &kv);
+        let ctx = attention(&cfg, &[0.5, -0.5], &kv, kv.len() - 1);
         approx(&ctx, &[7.0, 8.0], 1e-6);
     }
 
@@ -4469,7 +4905,7 @@ mod tests {
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
         // Both query heads map to the one kv head → both get value 9.0.
-        let ctx = attention(&cfg, &[0.1, 0.2], &kv);
+        let ctx = attention(&cfg, &[0.1, 0.2], &kv, kv.len() - 1);
         approx(&ctx, &[9.0, 9.0], 1e-6);
     }
 
@@ -4562,8 +4998,8 @@ mod tests {
         let q: Vec<f32> = (0..cfg.q_dim()).map(|i| (i % 3) as f32 * 0.2).collect();
         // int8 KV attention stays well within a small tolerance of exact f32.
         approx(
-            &attention(&cfg, &q, &full),
-            &attention(&cfg, &q, &quant),
+            &attention(&cfg, &q, &full, full.len() - 1),
+            &attention(&cfg, &q, &quant, quant.len() - 1),
             0.05,
         );
     }
@@ -4616,7 +5052,11 @@ mod tests {
         assert_eq!(full.len(), q4.len());
         let q: Vec<f32> = (0..cfg.q_dim()).map(|i| (i % 3) as f32 * 0.2).collect();
         // int4 is lossier than int8, but still tracks the exact output closely.
-        approx(&attention(&cfg, &q, &full), &attention(&cfg, &q, &q4), 0.3);
+        approx(
+            &attention(&cfg, &q, &full, full.len() - 1),
+            &attention(&cfg, &q, &q4, q4.len() - 1),
+            0.3,
+        );
     }
 
     #[test]

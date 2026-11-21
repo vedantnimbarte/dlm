@@ -60,6 +60,10 @@ memmap2 = "0.9"
 # only to keep a formatting-and-CI branch from moving dependency versions.
 prost = "=0.14.1"
 serde = { version = "1", features = ["derive"] }
+# Image input (Gemma 3's vision tower): PNG and JPEG decoding, pure Rust and
+# permissively licensed. Resizing and normalization are dlm's own (src/vision).
+png = "0.18"
+zune-jpeg = "0.5"
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
 

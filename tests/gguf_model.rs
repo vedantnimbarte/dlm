@@ -193,3 +193,52 @@ fn gpu_streamed_and_resident_agree() {
         "GPU-streamed scores differ from resident: mean {mean}, max {max}"
     );
 }
+
+/// A GGUF's SentencePiece vocabulary ("llama" in `tokenizer.ggml.model`) must
+/// split text the way the model's own tokenizer does. Its scores are merge
+/// priorities; read as unigram log-probabilities they spell every word in
+/// letters and every space as three byte pieces, and the model answers in
+/// noise. The expected ids are Hugging Face `tokenizers` on Gemma 3's
+/// `tokenizer.json`, for the Gemma 3 file `DLM_TEST_GGUF_GEMMA3` names
+/// (e.g. ggml-org/gemma-3-4b-it-GGUF's Q4_K_M).
+#[test]
+fn gemma3_gguf_tokenizes_like_hugging_face() {
+    let Some(path) = env_path("DLM_TEST_GGUF_GEMMA3") else {
+        eprintln!("skipping: set DLM_TEST_GGUF_GEMMA3");
+        return;
+    };
+    let tok = dlm::tokenizer::BpeTokenizer::from_gguf_path(&path).expect("read the tokenizer");
+    let cases: [(&str, &[u32]); 4] = [
+        (
+            "The capital of France is Paris. The capital of Germany is Berlin.",
+            &[
+                2, 818, 5279, 529, 7001, 563, 9079, 236761, 669, 5279, 529, 9405, 563, 15687,
+                236761,
+            ],
+        ),
+        (
+            "def fib(n):\n    return n if n < 2 else fib(n-1) + fib(n-2)\n\n\nprint(fib(10))",
+            &[
+                2, 2063, 10779, 236769, 236749, 1473, 107, 140, 2060, 538, 768, 538, 655, 236743,
+                236778, 1663, 10779, 236769, 236749, 236772, 236770, 236768, 900, 10779, 236769,
+                236749, 236772, 236778, 236768, 109, 1995, 236769, 73368, 236769, 236770, 236771,
+                1223,
+            ],
+        ),
+        (
+            "Ünïcödé — naïve café 東京 🙂 tokens   with   spaces",
+            &[
+                2, 238194, 236749, 238527, 236755, 55515, 236859, 2192, 120362, 33443, 86459,
+                57235, 21739, 139, 4060, 139, 35220,
+            ],
+        ),
+        (
+            "<start_of_turn>user\nHi there<end_of_turn>\n<start_of_turn>model\n",
+            &[2, 105, 2364, 107, 10979, 993, 106, 107, 105, 4368, 107],
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(tok.encode(text).unwrap(), want, "{text:?}");
+        assert_eq!(tok.decode(&want[1..]).unwrap(), text, "decode {text:?}");
+    }
+}
