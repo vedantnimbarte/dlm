@@ -4,11 +4,12 @@
 
 Runs the command, echoing its output, while sampling `nvidia-smi` every
 100 ms. Every output line containing MARK opens a window; the next such line,
-or the end of the command, closes it. For each window it prints the mean
-power and utilization of the samples inside it, so model loading and other
-set-up stay out of the energy figures:
+or the end of the command, closes it. For each window it prints the means of
+the samples inside it, so model loading and other set-up stay out of the
+energy figures: board power, GPU and memory-controller utilization, and the
+SM and memory clocks (which show whether the card ran boosted):
 
-    WINDOW <label> seconds=<s> watts=<mean W> util=<mean %> samples=<n>
+    WINDOW <label> seconds=<s> watts=<W> util=<%> memutil=<%> sm=<MHz> mem=<MHz> samples=<n>
 
 `<label>` is the text after MARK on the line that opened it. Sampler and
 command share a clock because the sampler times the lines as they arrive, so
@@ -36,9 +37,9 @@ def main():
         sys.exit(__doc__)
     split = sys.argv.index("--")
     mark, cmd = sys.argv[1], sys.argv[split + 1 :]
-    samples = []  # (time, watts, util)
+    samples = []  # (time, watts, util, memutil, sm MHz, mem MHz)
     smi = subprocess.Popen(
-        [nvidia_smi(), "--query-gpu=power.draw,utilization.gpu", "--format=csv,noheader,nounits", "-lms", "100"],
+        [nvidia_smi(), "--query-gpu=power.draw,utilization.gpu,utilization.memory,clocks.sm,clocks.mem", "--format=csv,noheader,nounits", "-lms", "100"],
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -46,10 +47,10 @@ def main():
     def sample():
         for line in smi.stdout:
             try:
-                watts, util = (float(x) for x in line.split(","))
+                watts, util, mutil, sm, mem = (float(x) for x in line.split(","))
             except ValueError:
                 continue
-            samples.append((time.time(), watts, util))
+            samples.append((time.time(), watts, util, mutil, sm, mem))
 
     threading.Thread(target=sample, daemon=True).start()
     windows = []  # (label, start, end)
@@ -67,13 +68,14 @@ def main():
     smi.terminate()
     for label, start, stop in windows:
         stop = stop or end
-        inside = [(w, u) for t, w, u in samples if start <= t <= stop]
+        inside = [x[1:] for x in samples if start <= x[0] <= stop]
         if not inside:
             continue
         print(
             f"WINDOW {label} seconds={stop - start:.1f} "
-            f"watts={statistics.mean(w for w, _ in inside):.1f} "
-            f"util={statistics.mean(u for _, u in inside):.0f} samples={len(inside)}",
+            f"watts={statistics.mean(x[0] for x in inside):.1f} "
+            f"util={statistics.mean(x[1] for x in inside):.0f} memutil={statistics.mean(x[2] for x in inside):.0f} "
+            f"sm={statistics.mean(x[3] for x in inside):.0f} mem={statistics.mean(x[4] for x in inside):.0f} samples={len(inside)}",
             flush=True,
         )
     sys.exit(child.returncode)
