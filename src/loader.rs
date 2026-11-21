@@ -95,7 +95,7 @@ fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec
 }
 
 /// Read a float tensor of unknown length.
-fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;

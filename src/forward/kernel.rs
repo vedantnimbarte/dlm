@@ -130,11 +130,44 @@ pub trait ComputeKernel {
         prefill_token_by_token(self, hiddens, kv_layers, start)
     }
 
+    /// [`prefill`](Self::prefill) for tokens that attend to each other in both
+    /// directions, as well as to the history before them: Gemma 3's image
+    /// tokens. Every token of `hiddens` sees every other at each layer, which no
+    /// token-at-a-time order can compute, so a kernel implements it layer by
+    /// layer or not at all. The default refuses.
+    fn prefill_bidirectional(
+        &self,
+        _hiddens: &mut [f32],
+        _kv_layers: &mut [KvLayerCache],
+        _start: usize,
+    ) -> Result<()> {
+        Err(crate::error::DlmError::InvalidConfig(
+            "image input is not supported on this kernel (it runs on the CPU, the single-GPU \
+             kernels and layer streaming)"
+                .into(),
+        ))
+    }
+
     /// Tokens of KV the kernel's shared pools can still take at the given
     /// precision, if it pages KV from a fixed pool (the GPU kernels). `None`
     /// means no fixed limit: the CPU kernels keep KV in growable host memory.
     fn kv_free_tokens(&self, _elem: crate::forward::cpu::KvElem) -> Option<usize> {
         None
+    }
+
+    /// Record, from the next prefill or single-sequence step on, the hidden
+    /// state entering each of `layers` for every token run, until
+    /// [`take_capture`](Self::take_capture). How an EAGLE draft head gets the
+    /// target's features. `false` when the kernel cannot (the default).
+    fn capture_next(&self, _layers: &[u32]) -> bool {
+        false
+    }
+
+    /// What was recorded since [`capture_next`](Self::capture_next), token by
+    /// token, each token's states for the layers back to back
+    /// (`tokens × layers × hidden`); recording stops.
+    fn take_capture(&self) -> Vec<f32> {
+        Vec::new()
     }
 
     /// Size the kernel's shared KV pools to `tokens` tokens (per layer), for
@@ -220,6 +253,14 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         (**self).kv_free_tokens(elem)
     }
 
+    fn capture_next(&self, layers: &[u32]) -> bool {
+        (**self).capture_next(layers)
+    }
+
+    fn take_capture(&self) -> Vec<f32> {
+        (**self).take_capture()
+    }
+
     fn prefill(
         &self,
         hiddens: &mut [f32],
@@ -227,6 +268,15 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         start: usize,
     ) -> Result<()> {
         (**self).prefill(hiddens, kv_layers, start)
+    }
+
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        (**self).prefill_bidirectional(hiddens, kv_layers, start)
     }
 }
 

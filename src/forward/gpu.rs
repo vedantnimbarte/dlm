@@ -645,6 +645,9 @@ pub(crate) struct DlmBlockExt {
     /// are wrong and still generate fluent text.
     w_dtype: [i32; 7],
     w_group: [i32; 7],
+    /// 1: a prefill chunk whose tokens attend to each other in both directions
+    /// (Gemma 3's image tokens).
+    bidi: i32,
 }
 
 /// Where each projection's dtype sits in [`DlmBlockExt`]'s arrays.
@@ -684,6 +687,7 @@ impl DlmBlockExt {
             // kernel to use the call's single dtype for every projection.
             w_dtype: [-1; 7],
             w_group: [0; 7],
+            bidi: 0,
         }
     }
 
@@ -691,6 +695,12 @@ impl DlmBlockExt {
     pub(crate) fn with_weight_dtypes(mut self, w: &WeightDtypes) -> Self {
         self.w_dtype = w.dtype;
         self.w_group = w.group;
+        self
+    }
+
+    /// Make a prefill chunk attend bidirectionally (see the `bidi` field).
+    pub(crate) fn bidirectional(mut self, on: bool) -> Self {
+        self.bidi = on as i32;
         self
     }
 }
@@ -1492,6 +1502,24 @@ pub struct GpuKernel {
     /// MLA decoupled-RoPE frequencies (over `qk_rope_head_dim`); `None` for
     /// standard attention.
     mla_inv_freq: Option<DeviceBuffer>,
+    /// Hidden states recorded for a speculative draft head
+    /// ([`ComputeKernel::capture_next`]).
+    capture: std::sync::Mutex<Capture>,
+}
+
+/// The layers whose input [`GpuKernel`] records, and what it has recorded:
+/// one `[tokens, hidden]` run per layer.
+#[derive(Default)]
+struct Capture {
+    layers: Vec<u32>,
+    rows: Vec<Vec<f32>>,
+}
+
+impl Capture {
+    /// Which recorded run `layer`'s input goes to, if it is recorded.
+    fn slot(&self, layer: u32) -> Option<usize> {
+        self.layers.iter().position(|&l| l == layer)
+    }
 }
 
 impl GpuKernel {
@@ -1559,6 +1587,7 @@ impl GpuKernel {
             kv_capacity_tokens: cap,
             d_hidden,
             d_batch,
+            capture: Default::default(),
             mla_inv_freq,
         })
     }
@@ -1905,6 +1934,7 @@ impl GpuKernel {
         kv: &mut KvLayerCache,
         position: usize,
         t: usize,
+        bidi: bool,
     ) -> Result<bool> {
         let w = &self.layers[layer as usize];
         let history = kv.len();
@@ -1966,7 +1996,8 @@ impl GpuKernel {
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
                 &DlmBlockExt::new(&cfg, &w.biases, dkv.elem, dkv.table)
-                    .with_weight_dtypes(&w.dtypes),
+                    .with_weight_dtypes(&w.dtypes)
+                    .bidirectional(bidi),
             )
         };
         match code {
@@ -1986,6 +2017,26 @@ impl GpuKernel {
 impl ComputeKernel for GpuKernel {
     fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
         Some(self.kv_pools.free_tokens(elem))
+    }
+
+    fn capture_next(&self, layers: &[u32]) -> bool {
+        let mut c = self.capture.lock().unwrap();
+        c.layers = layers.to_vec();
+        c.rows = vec![Vec::new(); layers.len()];
+        true
+    }
+
+    fn take_capture(&self) -> Vec<f32> {
+        let c = std::mem::take(&mut *self.capture.lock().unwrap());
+        let h = self.cfg.hidden_size;
+        let tokens = c.rows.first().map_or(0, |r| r.len() / h);
+        let mut out = Vec::with_capacity(tokens * h * c.rows.len());
+        for t in 0..tokens {
+            for run in &c.rows {
+                out.extend_from_slice(&run[t * h..(t + 1) * h]);
+            }
+        }
+        out
     }
 
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
@@ -2119,6 +2170,7 @@ impl ComputeKernel for GpuKernel {
         }
         let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
         for layer in 0..self.num_layers() {
+            self.record(layer, &d_hiddens, hiddens.len())?;
             let kv = &mut kv_layers[layer as usize];
             // The GEMM prefill takes the layer a big piece at a time; a layer it
             // cannot take (its shape, or the heads) goes 16 tokens per call
@@ -2131,7 +2183,7 @@ impl ComputeKernel for GpuKernel {
             while n - done > DLM_MAX_BATCH {
                 let t = (n - done).min(DLM_PREFILL_T);
                 let x = unsafe { d_hiddens.as_mut_ptr().add(done * hidden_size) };
-                if !self.launch_prefill_block(layer, x, kv, start + done, t)? {
+                if !self.launch_prefill_block(layer, x, kv, start + done, t, false)? {
                     break;
                 }
                 done += t;
@@ -2162,6 +2214,33 @@ impl ComputeKernel for GpuKernel {
                 let x = unsafe { d_hiddens.as_mut_ptr().add(chunk * hidden_size) };
                 self.launch_block_batched(layer, x, &slots)?;
                 kv.advance(batch);
+            }
+        }
+        d_hiddens.download(hiddens)
+    }
+
+    /// The whole run through each layer in one GEMM prefill call, whose
+    /// attention lets every token of it see every other.
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let n = hiddens.len() / self.cfg.hidden_size;
+        if n > DLM_PREFILL_T || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
+            return Err(DlmError::InvalidConfig(format!(
+                "a bidirectional block of {n} tokens needs a dense model and at most \
+                 {DLM_PREFILL_T} tokens"
+            )));
+        }
+        let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
+        for layer in 0..self.num_layers() {
+            let kv = &mut kv_layers[layer as usize];
+            if !self.launch_prefill_block(layer, d_hiddens.as_mut_ptr(), kv, start, n, true)? {
+                return Err(DlmError::InvalidConfig(format!(
+                    "layer {layer}'s shape does not fit the GPU prefill, which image input needs"
+                )));
             }
         }
         d_hiddens.download(hiddens)
@@ -2247,6 +2326,7 @@ impl ComputeKernel for GpuKernel {
         if layer == 0 {
             self.d_hidden.upload(hidden)?;
         }
+        self.record(layer, &self.d_hidden, hidden.len())?;
         self.launch_layer(layer, kv, position, &self.d_hidden)?;
         // `download` is a blocking cudaMemcpy(D2H), so it already waits for the
         // stack's kernels — no separate synchronize() needed.
@@ -2258,6 +2338,21 @@ impl ComputeKernel for GpuKernel {
 }
 
 impl GpuKernel {
+    /// When `layer`'s input is being recorded, copy the first `len` floats of
+    /// `x` (the rows about to enter it) into the record. The copy waits for the
+    /// layers before it, so it costs a sync per recorded layer.
+    fn record(&self, layer: u32, x: &DeviceBuffer, len: usize) -> Result<()> {
+        let mut c = self.capture.lock().unwrap();
+        let Some(i) = c.slot(layer) else {
+            return Ok(());
+        };
+        let mut rows = vec![0.0f32; x.len()];
+        x.download(&mut rows)?;
+        rows.truncate(len);
+        c.rows[i].extend_from_slice(&rows);
+        Ok(())
+    }
+
     /// Enqueue layer `layer` for one token on the hidden vector in `d_hidden`,
     /// appending its K/V to `kv`. Nothing is copied to or from the host.
     fn launch_layer(

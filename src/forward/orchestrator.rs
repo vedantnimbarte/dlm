@@ -303,6 +303,16 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
     /// is identical to calling [`decode_token`](Self::decode_token) on each in
     /// turn, but the kernel chooses the order ([`ComputeKernel::prefill`]).
     pub fn prefill(&mut self, hiddens: &mut [f32]) -> Result<()> {
+        self.prefill_as(hiddens, false)
+    }
+
+    /// [`prefill`](Self::prefill) for a run of tokens that attend to each other
+    /// in both directions ([`ComputeKernel::prefill_bidirectional`]).
+    pub fn prefill_bidirectional(&mut self, hiddens: &mut [f32]) -> Result<()> {
+        self.prefill_as(hiddens, true)
+    }
+
+    fn prefill_as(&mut self, hiddens: &mut [f32], bidirectional: bool) -> Result<()> {
         let hidden_size = self.kernel.hidden_size();
         if hiddens.is_empty() || hiddens.len() % hidden_size != 0 {
             return Err(DlmError::ShapeMismatch {
@@ -312,8 +322,13 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         }
         let n = hiddens.len() / hidden_size;
         self.budget.append_tokens(SEQ_ID, n as u64)?;
-        self.kernel
-            .prefill(hiddens, &mut self.kv_layers, self.position)?;
+        if bidirectional {
+            self.kernel
+                .prefill_bidirectional(hiddens, &mut self.kv_layers, self.position)?;
+        } else {
+            self.kernel
+                .prefill(hiddens, &mut self.kv_layers, self.position)?;
+        }
         self.position += n;
         Ok(())
     }

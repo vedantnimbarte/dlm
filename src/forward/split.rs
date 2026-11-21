@@ -106,6 +106,17 @@ impl<F: ComputeKernel, B: ComputeKernel> ComputeKernel for SplitKernel<F, B> {
         self.back.prefill(hiddens, back, start)
     }
 
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let (front, back) = kv_layers.split_at_mut(self.split() as usize);
+        self.front.prefill_bidirectional(hiddens, front, start)?;
+        self.back.prefill_bidirectional(hiddens, back, start)
+    }
+
     fn kv_free_tokens(&self, elem: crate::forward::cpu::KvElem) -> Option<usize> {
         match (
             self.front.kv_free_tokens(elem),

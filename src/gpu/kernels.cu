@@ -2068,6 +2068,9 @@ typedef struct {
     // `dtype[0] < 0` means "the call's own w_dtype/w_group_size for all of them".
     int w_dtype[7];
     int w_group[7];
+    // 1: the prefill chunk's tokens attend to each other in both directions
+    // (Gemma 3's image tokens), not causally. `dlm_prefill_block` only.
+    int bidi;
 } DlmBlockExt;
 #define DLM_W_Q 0
 #define DLM_W_K 1
@@ -2078,7 +2081,7 @@ typedef struct {
 #define DLM_W_DOWN 6
 static const DlmBlockExt DLM_BLOCK_DEFAULT = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                               {-1, -1, -1, -1, -1, -1, -1},
-                                              {0, 0, 0, 0, 0, 0, 0}};
+                                              {0, 0, 0, 0, 0, 0, 0}, 0};
 // This projection's dtype and group size: the per-tensor pair when the caller
 // filled them in, else the call's single dtype.
 #define DLM_WDT(i) (o->w_dtype[0] < 0 ? w_dtype : o->w_dtype[(i)])
@@ -3958,13 +3961,16 @@ static bool launch_gemm(int dt, const void* W, const float* X, const float* bias
 // Causal attention for a prefill chunk: one block per (KV head, query token),
 // walking the query's history in chunks of C positions with a running softmax
 // (the split kernel's math, merged as it goes instead of across blocks). Query
-// `t` is at KV row `history + t` and sees rows up to and including it.
+// `t` is at KV row `history + t` and sees rows up to and including it -- or,
+// with `bidi`, every row of the chunk (Gemma 3's image tokens); a sliding
+// window still counts back from the query's own row.
 // <<<dim3(num_kv_heads, T), C>>>, shared as attn_split_kernel's.
 template <int KT>
 __global__ void attn_prefill_kernel(const float* __restrict__ q, const void* keys,
                                     const void* values, const int* table, int shift,
                                     int num_heads, int num_kv_heads, int head_dim, int history,
-                                    int sliding_window, float scale, float softcap, float* ctx) {
+                                    int sliding_window, float scale, float softcap, float* ctx,
+                                    int bidi) {
     extern __shared__ float smem[];
     const int G = num_heads / num_kv_heads, kvh = blockIdx.x, tq = blockIdx.y;
     const int C = blockDim.x, t = threadIdx.x;
@@ -3977,8 +3983,9 @@ __global__ void attn_prefill_kernel(const float* __restrict__ q, const void* key
         ml[3 * t] = -1e30f;
         ml[3 * t + 1] = 0.0f;
     }
-    const int total = history + tq + 1;
-    const int start = (sliding_window > 0 && total > sliding_window) ? total - sliding_window : 0;
+    const int own = history + tq + 1;
+    const int total = bidi ? history + (int)gridDim.y : own;
+    const int start = (sliding_window > 0 && own > sliding_window) ? own - sliding_window : 0;
     const int P = C / head_dim, d = t % head_dim, slice = t / head_dim;
     const int warp = t >> 5, lane = t & 31, warps = C >> 5;
     float acc[FA_MAX_G];
@@ -4084,7 +4091,7 @@ __global__ void __launch_bounds__(FA_PF_THREADS)
 attn_prefill_tiled_kernel(const float* __restrict__ q, const void* keys, const void* values,
                           const int* table, int shift, int num_heads, int num_kv_heads, int T,
                           int history, int sliding_window, float scale, float softcap,
-                          float* __restrict__ ctx) {
+                          float* __restrict__ ctx, int bidi) {
     __shared__ float Qt[HD][R];          // queries, transposed, pre-scaled
     __shared__ float Kt[HD][TK];         // the tile's keys, transposed
     __shared__ float V[TK][HD];          // the tile's values
@@ -4111,8 +4118,8 @@ attn_prefill_tiled_kernel(const float* __restrict__ q, const void* keys, const v
     }
 
     // The positions any row sees: from the first token's window start to the
-    // last token itself.
-    const int last = history + tq0 + nq - 1;
+    // last token itself (with `bidi`, to the chunk's last token).
+    const int last = bidi ? history + T - 1 : history + tq0 + nq - 1;
     const int first_total = history + tq0 + 1;
     const int k_lo = (sliding_window > 0 && first_total > sliding_window) ? first_total - sliding_window : 0;
 
@@ -4179,7 +4186,7 @@ attn_prefill_tiled_kernel(const float* __restrict__ q, const void* keys, const v
                 const int pk = k0 + sk0 + j;
                 float v = s[i][j];
                 if (softcap > 0.0f) v = tanhf(v / softcap) * softcap;
-                S[r][sk0 + j] = (r < rows && pk <= pq && pk >= rs) ? v : -INFINITY;
+                S[r][sk0 + j] = (r < rows && pk <= (bidi ? last : pq) && pk >= rs) ? v : -INFINITY;
             }
         }
         __syncthreads();
@@ -4246,20 +4253,21 @@ template <int KT>
 static bool launch_attn_prefill_tiled(const float* q, const void* keys, const void* values,
                                       const int* table, int shift, int num_heads,
                                       int num_kv_heads, int head_dim, int T, int history,
-                                      int sliding_window, float scale, float softcap, float* ctx) {
+                                      int sliding_window, float scale, float softcap, float* ctx,
+                                      int bidi) {
     const int G = num_heads / num_kv_heads;
     if (head_dim == 64 && G <= 64) {
         dim3 grid(num_kv_heads, (T + 64 / G - 1) / (64 / G));
         attn_prefill_tiled_kernel<KT, 64, 64, 32, 4, 4><<<grid, FA_PF_THREADS>>>(
             q, keys, values, table, shift, num_heads, num_kv_heads, T, history, sliding_window,
-            scale, softcap, ctx);
+            scale, softcap, ctx, bidi);
         return true;
     }
     if (head_dim == 128 && G <= 32) {
         dim3 grid(num_kv_heads, (T + 32 / G - 1) / (32 / G));
         attn_prefill_tiled_kernel<KT, 128, 32, 16, 2, 2><<<grid, FA_PF_THREADS>>>(
             q, keys, values, table, shift, num_heads, num_kv_heads, T, history, sliding_window,
-            scale, softcap, ctx);
+            scale, softcap, ctx, bidi);
         return true;
     }
     return false;
@@ -4351,14 +4359,14 @@ extern "C" int dlm_prefill_block(
         bool done = false;
         DLM_KV_SWITCH(o->kv_half, done = launch_attn_prefill_tiled<KT_>(
                 q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
-                head_dim, T, history, sliding_window, attn_scale, attn_softcap, ctx));
+                head_dim, T, history, sliding_window, attn_scale, attn_softcap, ctx, o->bidi));
         if (!done) {
             const int C = head_dim > 128 ? 256 : 128;
             size_t shmem = (size_t)(G * head_dim + G * C + 3 * G) * sizeof(float);
             dim3 grid(num_kv_heads, T);
             DLM_KV_SWITCH(o->kv_half, attn_prefill_kernel<KT_><<<grid, C, shmem>>>(
                 q, kv_keys, kv_values, o->kv_table, o->kv_block_shift, num_heads, num_kv_heads,
-                head_dim, history, sliding_window, attn_scale, attn_softcap, ctx));
+                head_dim, history, sliding_window, attn_scale, attn_softcap, ctx, o->bidi));
         }
     }
     const long TH = (long)T * hidden_size;
@@ -4391,6 +4399,51 @@ extern "C" int dlm_prefill_block(
         launch_gemm(DLM_WDT(DLM_W_DOWN), down_proj, inter_buf, o->down_bias, x, hidden_size, inter, T, DLM_WGRP(DLM_W_DOWN), true);
     }
     #undef DLM_NORM_B
+    return (int)cudaGetLastError();
+}
+
+// One SigLIP encoder layer (Gemma 3's vision tower) over all `T` patches of an
+// image, which attend to each other without a mask:
+//
+//   x += out(attn(LN1(x)));  x += fc2(gelu_tanh(fc1(LN2(x))))
+//
+// The weights are f32 `[out, in]` with biases. The heads are padded to
+// `head_dim` (64 or 128, what the tiled attention takes) with zero rows of
+// q/k/v and zero columns of `out`, which changes no sum; `attn_scale` is the
+// real head size's. The MLP is padded to `inter` (a multiple of 32) the same
+// way. Every buffer is the caller's, sized `[T, hidden]` (`normed`),
+// `[T, heads * head_dim]` (`q`, `k`, `v`, `ctx`) and `[T, inter]` (`mlp`);
+// `table` holds a single 0, so the keys are read as one unpaged block. Returns
+// cudaErrorNotSupported, launching nothing, for a shape the kernels cannot take.
+extern "C" int dlm_vit_block(
+    int T, int hidden, int heads, int head_dim, int inter, float eps, float attn_scale,
+    const float* ln1_w, const float* ln1_b,
+    const float* wq, const float* bq, const float* wk, const float* bk,
+    const float* wv, const float* bv, const float* wo, const float* bo,
+    const float* ln2_w, const float* ln2_b,
+    const float* w1, const float* b1, const float* w2, const float* b2,
+    float* x, float* normed, float* q, float* k, float* v, float* ctx, float* mlp,
+    const int* table)
+{
+    DLM_ENTER
+    const int qd = heads * head_dim;
+    if ((head_dim != 64 && head_dim != 128) || T <= 0 ||
+        !gemm_fits<DLM_W_F32>(wq, normed, hidden, 0) || !gemm_fits<DLM_W_F32>(wo, ctx, qd, 0) ||
+        !gemm_fits<DLM_W_F32>(w2, mlp, inter, 0))
+        return (int)cudaErrorNotSupported;
+    layernorm_batched_kernel<<<T, RMS_THREADS>>>(x, ln1_w, ln1_b, normed, hidden, eps);
+    launch_gemm(DLM_W_F32, wq, normed, bq, q, qd, hidden, T, 0, false);
+    launch_gemm(DLM_W_F32, wk, normed, bk, k, qd, hidden, T, 0, false);
+    launch_gemm(DLM_W_F32, wv, normed, bv, v, qd, hidden, T, 0, false);
+    // A single unpaged block: row r of the keys is at r.
+    launch_attn_prefill_tiled<DLM_KV_F32>(q, k, v, table, 30, heads, heads, head_dim, T, 0, 0,
+                                          attn_scale, 0.0f, ctx, 1);
+    launch_gemm(DLM_W_F32, wo, ctx, bo, x, hidden, qd, T, 0, true);
+    layernorm_batched_kernel<<<T, RMS_THREADS>>>(x, ln2_w, ln2_b, normed, hidden, eps);
+    launch_gemm(DLM_W_F32, w1, normed, b1, mlp, inter, hidden, T, 0, false);
+    const long TI = (long)T * inter;
+    activate_kernel<<<(int)((TI + 255) / 256), 256>>>(mlp, mlp, TI, DLM_ACT_GELU_TANH);
+    launch_gemm(DLM_W_F32, w2, mlp, b2, x, hidden, inter, T, 0, true);
     return (int)cudaGetLastError();
 }
 
@@ -5370,6 +5423,106 @@ extern "C" int dlm_mla_attn(
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, o, hidden_size);
         e = cudaGetLastError();
     }
+    return (int)e;
+}
+
+// ---------------------------------------------------------------------------
+// EAGLE-3 draft head: one position of its single decoder layer.
+//
+// The layer's attention reads `[norm(e) ; norm(h)]`, twice the hidden width,
+// while its residual stream is `h` alone, so it cannot go through
+// `dlm_decode_block`. `e` is the target's embedding of the token at the next
+// position and `h` the feature for this one: the target's hidden states
+// entering three of its layers, folded to `hidden` by `fc`, or (from the second
+// draft token on) the previous step's pre-norm output, already in `h_dev`.
+//
+//   h      = feat_host ? fc · feat_host : h_dev
+//   u      = [rms(e)·in_norm ; rms(h)·hidden_norm]
+//   h     += o_proj · attn(q_proj·u, k_proj·u, v_proj·u)     (RoPE, KV append)
+//   h     += down · (silu(gate · n) ⊙ (up · n)),  n = rms(h)·post_norm
+//   h_dev  = h  (the pre-norm output the next step reads)
+//   out    = rms(h)·final_norm
+//
+// The KV is f32, one row per position, addressed through `kv_table` (the
+// identity: the paged kernels take a block table, here of one-row blocks).
+// `out_host` gets `out`;
+// the draft's LM head runs on it separately.
+// ---------------------------------------------------------------------------
+static thread_local float* g_eagle_buf = 0;
+static thread_local int g_eagle_cap = 0;
+
+extern "C" int dlm_eagle3_step(
+    int hidden, int q_dim, int kv_dim, int num_heads, int num_kv_heads, int head_dim, int inter,
+    float rms_eps, const int* w_dtype, const int* w_group,  // [8]: fc, q, k, v, o, gate, up, down
+    const void* fc, const void* q_proj, const void* k_proj, const void* v_proj,
+    const void* o_proj, const void* gate_proj, const void* up_proj, const void* down_proj,
+    const float* in_norm, const float* hidden_norm, const float* post_norm,
+    const float* final_norm, const float* inv_freq, const float* embed_host,
+    const float* feat_host, float* h_dev, float* kv_keys, float* kv_values,
+    const int* kv_table, int position, float* out_host) {
+    DLM_ENTER
+    const int B = 256;
+    // Scratch, back to back: e, u (2h), feat (3h), q, k, v, ctx, o, n, gate,
+    // up, act, down, out.
+    const long need = (long)hidden * 10 + 2L * q_dim + 2L * kv_dim + 3L * inter;
+    if (need > g_eagle_cap) {
+        if (g_eagle_buf) cudaFree(g_eagle_buf);
+        g_eagle_buf = 0;
+        g_eagle_cap = 0;
+        cudaError_t e = cudaMalloc(&g_eagle_buf, need * sizeof(float));
+        if (e != cudaSuccess) return (int)e;
+        g_eagle_cap = (int)need;
+    }
+    float* p = g_eagle_buf;
+    float* ev = p; p += hidden;
+    float* u = p; p += 2 * hidden;
+    float* feat = p; p += 3 * hidden;
+    float* q = p; p += q_dim;
+    float* k = p; p += kv_dim;
+    float* v = p; p += kv_dim;
+    float* ctx = p; p += q_dim;
+    float* o = p; p += hidden;
+    float* n = p; p += hidden;
+    float* gate = p; p += inter;
+    float* up = p; p += inter;
+    float* act = p; p += inter;
+    float* down = p; p += hidden;
+    float* out = p;
+
+    cudaError_t e = cudaMemcpy(ev, embed_host, (size_t)hidden * sizeof(float),
+                               cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) return (int)e;
+    if (feat_host) {
+        e = cudaMemcpy(feat, feat_host, (size_t)3 * hidden * sizeof(float),
+                       cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) return (int)e;
+        launch_matvec(w_dtype[0], fc, feat, (const float*)0, h_dev, hidden, 3 * hidden, w_group[0]);
+        q8_done();
+    }
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(ev, in_norm, u, hidden, rms_eps);
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(h_dev, hidden_norm, u + hidden, hidden, rms_eps);
+    launch_matvec(w_dtype[1], q_proj, u, (const float*)0, q, q_dim, 2 * hidden, w_group[1]);
+    launch_matvec(w_dtype[2], k_proj, u, (const float*)0, k, kv_dim, 2 * hidden, w_group[2]);
+    launch_matvec(w_dtype[3], v_proj, u, (const float*)0, v, kv_dim, 2 * hidden, w_group[3]);
+    q8_done();
+    e = launch_attention_post(q, k, v, ctx, (const float*)0, (const float*)0, num_heads,
+                              num_kv_heads, head_dim, position, inv_freq, 1.0f, 1, rms_eps,
+                              kv_keys, kv_values, kv_table, 0, position, 0,
+                              rsqrtf((float)head_dim), 0.0f, 0);
+    if (e != cudaSuccess) return (int)e;
+    launch_matvec(w_dtype[4], o_proj, ctx, (const float*)0, o, hidden, q_dim, w_group[4]);
+    q8_done();
+    add_inplace_kernel<<<grid_for(hidden, B), B>>>(h_dev, o, hidden);
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(h_dev, post_norm, n, hidden, rms_eps);
+    launch_matvec(w_dtype[5], gate_proj, n, (const float*)0, gate, inter, hidden, w_group[5]);
+    launch_matvec(w_dtype[6], up_proj, n, (const float*)0, up, inter, hidden, w_group[6]);
+    q8_done();
+    swiglu_kernel<<<grid_for(inter, B), B>>>(gate, up, act, inter, DLM_ACT_SILU);
+    launch_matvec(w_dtype[7], down_proj, act, (const float*)0, down, hidden, inter, w_group[7]);
+    q8_done();
+    add_inplace_kernel<<<grid_for(hidden, B), B>>>(h_dev, down, hidden);
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(h_dev, final_norm, out, hidden, rms_eps);
+    e = cudaMemcpy(out_host, out, (size_t)hidden * sizeof(float), cudaMemcpyDeviceToHost);
     return (int)e;
 }
 

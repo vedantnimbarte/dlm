@@ -481,7 +481,7 @@ names. That covers:
 | Falcon | supported — parallel attention/FFN, multi-query (`multi_query` is a flag, not a count), LayerNorm, ungated MLP, fused `query_key_value`. **Config-verified, not run**: the smallest RoPE Falcon is 14 GB. `alibi: true` (falcon-rw-*) and `new_decoder_architecture` (Falcon-40B) are **refused** rather than mis-decoded. CPU and GPU; the GPU block is checked against the CPU oracle on synthetic Falcon-shaped weights |
 | DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU, resident or streamed. Routing as V2 (softmax top-k, or `group_limited_greedy`) and as V3/R1 (sigmoid scores, the `e_score_correction_bias`, top-2-sum group-limited top-k, `routed_scaling_factor`), each checked against `transformers` on a tiny random checkpoint; an unknown `scoring_func` or `topk_method` is **refused**, since routing a token through the wrong experts reads as fluent, wrong output. V3's multi-token-prediction layer is not used |
 | Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
-| Gemma 3 (270M, 1B; and the text model of 4B/12B/27B) | supported — Gemma 2's norm layout without softcapping, per-head (1+w) Q/K norms, five sliding-window layers to each global one (from `sliding_window_pattern` or `layer_types`), and a separate RoPE base for the windowed layers. CPU and GPU, resident and streamed; checked on the real `gemma-3-1b-it` by its answers and by the cross-entropy of a passage twice the window. The 4B+ checkpoints are multimodal (`Gemma3ForConditionalGeneration`): dlm reads the language model out of `text_config` and `language_model.*` and ignores the vision tower, so they serve **text only** — checked on the real `gemma-3-4b-it`, whose 8 GB of weights stream through a 4 GB card |
+| Gemma 3 (270M, 1B; and the text model of 4B/12B/27B) | supported — Gemma 2's norm layout without softcapping, per-head (1+w) Q/K norms, five sliding-window layers to each global one (from `sliding_window_pattern` or `layer_types`), and a separate RoPE base for the windowed layers. CPU and GPU, resident and streamed; checked on the real `gemma-3-1b-it` by its answers and by the cross-entropy of a passage twice the window. The 4B+ checkpoints are multimodal (`Gemma3ForConditionalGeneration`): dlm reads the language model out of `text_config` and `language_model.*`, and the SigLIP vision tower beside it (or a GGUF's `mmproj` file) for [image input](#images-gemma-3) — checked on the real `gemma-3-4b-it`, whose 8 GB of weights stream through a 4 GB card |
 | Gemma 4 E2B / E4B (text) | supported — plain-`w` RMSNorm, Q/K/V norms (V unscaled) with an attention scale of 1, five windowed layers to each global one with **wider global heads** (512 against 256) and proportional RoPE on a quarter of each global head, a **shared-KV tail** whose layers attend over an earlier layer's cache and keep none of their own, **per-layer inputs** (the 2.8B-value per-layer embedding table is read from the mapped file a row per token, never loaded or sent to the GPU), layer scalars, E2B's double-wide MLP, and the final-logit softcap. Safetensors (`Gemma4ForConditionalGeneration`, text only: the vision and audio towers are skipped) and GGUF (llama.cpp's `gemma4`, with its tokenizer). CPU and GPU, **resident only** — `--stream`, `--gpu-layers` and multi-GPU refuse it; the GPU prefills a token at a time. Held to `transformers` on a tiny random checkpoint (`tests/gemma4_parity.rs`); run on the real `gemma-4-E4B-it` Q4_K_M on CPU and GPU, which fits resident on a 4 GB GTX 1650 (18.6 tok/s decode). The MoE (`enable_moe_block`) and `attention_k_eq_v` variants are **refused** |
 | anything else | **not supported** — errors on unknown tensor names |
 
@@ -745,6 +745,51 @@ resident (the other way round when streaming: 19 against 16).
 
 **Not yet:** MoE `.gguf` files, whose experts are stacked into one tensor per
 layer.
+
+## Images (Gemma 3)
+
+Gemma 3 4B, 12B and 27B (`Gemma3ForConditionalGeneration`) take images. The
+vision tower comes from the checkpoint itself (safetensors), or for a GGUF model
+from llama.cpp's `mmproj` file: pass `--mmproj <file>`, or leave it beside the
+model as the only `mmproj*.gguf` in that directory and dlm finds it.
+
+```bash
+# One-shot: --text is the user's message; the image goes before it, or where it
+# says <start_of_image>. Gemma's chat template is applied, and generation stops
+# at <end_of_turn>.
+dlm generate --model-path models/gemma-3-4b-it-Q4_K_M.gguf \
+    --image photo.jpg --text "Describe this image." --max-new-tokens 200
+
+# Served: OpenAI chat messages with image_url parts, as base64 data: URLs.
+dlm serve --model-path models/gemma-3-4b-it-Q4_K_M.gguf --mmproj models/mmproj-model-f16.gguf
+curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0..."}},
+  {"type":"text","text":"What is in this picture?"}]}]}'
+```
+
+Each image is decoded (PNG or JPEG), resized to 896x896 and normalized the way
+`Gemma3ImageProcessor` does it (pan-and-scan, off by default there, is not
+implemented), encoded by the SigLIP tower and projector into 256 embeddings, and
+placed in the prompt as Gemma's processor lays it out: `<start_of_image>`, 256
+image tokens, `<end_of_image>`. The image's tokens attend to each other in both
+directions, as Gemma 3 was trained, on the CPU and GPU kernels alike.
+
+The tower's layers are read from the mapped file one at a time as they run; on a
+GPU build each runs on the device with buffers freed when the image is done, so
+it fits beside a resident or a streamed text model. The server encodes on its
+engine thread, so other requests pause for it (a few seconds on the GPU).
+
+Images must arrive inline as `data:` URLs; an `http(s)` URL is refused rather
+than fetched, since a server that fetches whatever URL a client names can be
+pointed at hosts only it can reach. A model without a vision tower ignores
+`image_url` parts, as before. A request with images skips the prefix cache past
+its text: two prompts that differ only in their pictures have the same token
+ids, so their KV is never shared.
+
+**Checked against `transformers`** on a tiny random Gemma 3 vision checkpoint
+(`tests/gemma3_vision.rs`, and on the GPU in `tests/gpu_parity.rs`): the
+preprocessed pixels, the image embeddings, and every log-probability of a prompt
+around the image, which is where a causal mask on the image would show.
 
 ## LoRA adapters (`--lora`)
 
@@ -1019,6 +1064,11 @@ inference engine):
   copies (code being rewritten, a document being quoted). `--speculative auto`,
   the default, turns it on for a streamed model, where verifying several tokens
   costs about what generating one does.
+  An **EAGLE-3 head** works as the draft too (`--draft-model-path <head dir>`,
+  resident GPU only). It drafts from the target's own hidden states, so it
+  guesses far better than lookup on free text. AngelSlim's `Qwen3-1.7B_eagle3`
+  keeps 78% of single proposals. Convert a `pytorch_model.bin` head to
+  `model.safetensors` first.
 - **Continuous batching** ([`src/batching.rs`](src/batching.rs)). A scheduler
   keeps up to `--max-batch` generations in flight and admits queued requests as
   slots free. Each request's output is identical to running it alone (tested),

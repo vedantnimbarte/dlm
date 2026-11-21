@@ -2469,7 +2469,7 @@ fn silu(x: f32) -> f32 {
 }
 
 /// tanh-approximate GELU (`gelu_pytorch_tanh`), Gemma's gate activation.
-fn gelu_tanh(x: f32) -> f32 {
+pub(crate) fn gelu_tanh(x: f32) -> f32 {
     const C: f32 = 0.797_884_6; // sqrt(2/pi)
     0.5 * x * (1.0 + (C * (x + 0.044715 * x * x * x)).tanh())
 }
@@ -2880,19 +2880,35 @@ fn add_bias(v: &mut [f32], bias: Option<&Vec<f32>>) {
     }
 }
 
-/// Grouped-query attention over the cached history for a single query vector.
-/// Returns the concatenated per-head context (`q_dim` long).
-/// `positions` is how many cached rows the query sees: the whole history, or for
-/// a layer reading another layer's cache (Gemma 4) the rows up to its own token.
-fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache, positions: usize) -> Vec<f32> {
+/// Grouped-query attention over the cached history for a single query vector,
+/// the query being KV row `row`. Returns the concatenated per-head context
+/// (`q_dim` long).
+///
+/// The query sees every cached row up to the last, which is itself when
+/// decoding; an image token in a bidirectional block also sees the block's
+/// rows after it.
+fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache, row: usize) -> Vec<f32> {
+    attention_span(cfg, q, kv, row, kv.len())
+}
+
+/// [`attention`] over the cached rows before `end` only: a layer reading
+/// another layer's cache (Gemma 4's shared-KV tail) sees the rows up to its
+/// own token, though the source may already hold the rest of a prefill chunk.
+fn attention_span(
+    cfg: &BlockConfig,
+    q: &[f32],
+    kv: &KvLayerCache,
+    row: usize,
+    end: usize,
+) -> Vec<f32> {
     let d = cfg.head_dim;
     let scale = cfg.attn_scale();
     let group = cfg.group_size();
     // Sliding-window attention (Mistral): a query attends only the most recent
-    // `window` positions (itself included). `None` — or a window at least as long
-    // as the history — is ordinary full causal attention.
+    // `window` positions counted back from itself (itself included). `None` —
+    // or a window at least as long as the history — is full attention.
     let start = match cfg.sliding_window {
-        Some(w) if w > 0 => positions.saturating_sub(w),
+        Some(w) if w > 0 => (row + 1).saturating_sub(w),
         _ => 0,
     };
     let mut context = vec![0.0f32; cfg.q_dim()];
@@ -2901,8 +2917,8 @@ fn attention(cfg: &BlockConfig, q: &[f32], kv: &KvLayerCache, positions: usize) 
         let kv_head = h / group;
         let qh = &q[h * d..(h + 1) * d];
 
-        // Scores over the attended window `[start, positions)`, then softmax.
-        let mut scores = vec![0.0f32; positions - start];
+        // Scores over the attended window `[start, end)`, then softmax.
+        let mut scores = vec![0.0f32; end - start];
         for (j, score) in scores.iter_mut().enumerate() {
             *score = kv.key_head_dot(start + j, kv_head, d, qh) * scale;
         }
@@ -3045,11 +3061,56 @@ pub fn decode_block(
     position: usize,
 ) -> Result<Vec<f32>> {
     w.validate(cfg)?;
-    let mut h1 = match &w.mla {
+    let h1 = match &w.mla {
         Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
         None => attention_sublayer(cfg, w, hidden, kv, position)?,
     };
+    ffn_sublayer(cfg, w, hidden, h1)
+}
 
+/// Run one decoder block over a run of tokens that attend to each other in
+/// both directions as well as to the history before them: Gemma 3's image
+/// tokens. `hiddens` is `[n, hidden]`, token `i` at `position + i`.
+///
+/// Every token's K/V goes in first, then each token attends over all of
+/// them; the window, if any, still counts back from the token itself.
+pub fn decode_block_bidirectional(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hiddens: &mut [f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+) -> Result<()> {
+    w.validate(cfg)?;
+    if w.mla.is_some() || !matches!(w.ffn, Ffn::Dense(_)) {
+        return Err(DlmError::InvalidConfig(
+            "a bidirectional (image) block needs standard attention and a dense FFN".into(),
+        ));
+    }
+    let first = kv.len();
+    let mut queries = Vec::with_capacity(hiddens.len() / cfg.hidden_size);
+    for (i, hidden) in hiddens.chunks(cfg.hidden_size).enumerate() {
+        let (q, k, v) = qkv(cfg, w, hidden, position + i)?;
+        kv.append(&k, &v)?;
+        queries.push(q);
+    }
+    for (i, hidden) in hiddens.chunks_mut(cfg.hidden_size).enumerate() {
+        let ctx = attention(cfg, &queries[i], kv, first + i);
+        let h1 = attn_residual(cfg, w, hidden, &ctx);
+        let out = ffn_sublayer(cfg, w, hidden, h1)?;
+        hidden.copy_from_slice(&out);
+    }
+    Ok(())
+}
+
+/// The FFN half of a block: `h1` is the post-attention residual, `hidden` the
+/// block's input (which Falcon's parallel FFN reads instead).
+fn ffn_sublayer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    mut h1: Vec<f32>,
+) -> Result<Vec<f32>> {
     // Falcon runs attention and the FFN **in parallel** off the same normalized
     // input, summing both into one residual:
     //
@@ -3130,6 +3191,34 @@ fn attention_sublayer(
     kv: &mut KvLayerCache,
     position: usize,
 ) -> Result<Vec<f32>> {
+    let (q, k, v) = qkv(cfg, w, hidden, position)?;
+    let ctx = if cfg.shared_kv {
+        // The source layer already holds this token's row: it ran first in this
+        // token's sweep, or (layer-major prefill) for every token of the chunk.
+        // Rows are positions, so this token sees rows `0..=position`.
+        if position >= kv.len() {
+            return Err(DlmError::InvalidConfig(format!(
+                "shared-KV layer at position {position}, but its source layer holds {} rows",
+                kv.len()
+            )));
+        }
+        attention_span(cfg, &q, kv, position, position + 1)
+    } else {
+        kv.append(&k, &v)?;
+        attention(cfg, &q, kv, kv.len() - 1)
+    };
+    Ok(attn_residual(cfg, w, hidden, &ctx))
+}
+
+/// One token's query, key and value: input norm, projections (+bias), Q/K
+/// norm, RoPE at `position`.
+#[allow(clippy::type_complexity)]
+fn qkv(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    position: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     if hidden.len() != cfg.hidden_size {
         return Err(DlmError::ShapeMismatch {
             expected: cfg.hidden_size,
@@ -3198,23 +3287,13 @@ fn attention_sublayer(
         }
     }
 
-    let positions = if cfg.shared_kv {
-        // The source layer already holds this token's row: it ran first in this
-        // token's sweep, or (layer-major prefill) for every token of the chunk.
-        // Rows are positions, so this token sees rows `0..=position`.
-        if position >= kv.len() {
-            return Err(DlmError::InvalidConfig(format!(
-                "shared-KV layer at position {position}, but its source layer holds {} rows",
-                kv.len()
-            )));
-        }
-        position + 1
-    } else {
-        kv.append(&k, &v)?;
-        kv.len()
-    };
-    let ctx = attention(cfg, &q, kv, positions);
-    let mut attn_out = matvec_native(&w.o_proj, &ctx, cfg.hidden_size, cfg.q_dim());
+    Ok((q, k, v))
+}
+
+/// The attention context's output projection folded into the residual: the
+/// post-attention hidden `h1`.
+fn attn_residual(cfg: &BlockConfig, w: &LayerTensors, hidden: &[f32], ctx: &[f32]) -> Vec<f32> {
+    let mut attn_out = matvec_native(&w.o_proj, ctx, cfg.hidden_size, cfg.q_dim());
     add_bias(&mut attn_out, w.o_bias.as_ref());
 
     // Gemma2 normalizes the attention *output* before folding it into the
@@ -3223,7 +3302,7 @@ fn attention_sublayer(
     if w.is_gemma2_style() {
         attn_out = rmsnorm(&attn_out, &w.post_attention_layernorm, cfg.rms_eps);
     }
-    Ok(hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect())
+    hidden.iter().zip(&attn_out).map(|(&a, &b)| a + b).collect()
 }
 
 /// Run one decoder block whose layer is a **streamed MoE core** — attention +
@@ -3441,6 +3520,19 @@ impl ComputeKernel for CpuKernel {
         hid.copy_from_slice(&out);
         Ok(())
     }
+
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        for (l, (w, kv)) in self.layers.iter().zip(kv_layers.iter_mut()).enumerate() {
+            let cfg = self.cfg.for_layer(self.first_layer + l as u32);
+            decode_block_bidirectional(&cfg, w, hiddens, kv, start)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3623,8 +3715,8 @@ mod tests {
             ..Default::default()
         };
         approx(
-            &attention(&cfg, &[1.0, 0.0], &kv, kv.len()),
-            &attention(&cfg, &[1.0, 0.0], &fresh, fresh.len()),
+            &attention(&cfg, &[1.0, 0.0], &kv, kv.len() - 1),
+            &attention(&cfg, &[1.0, 0.0], &fresh, fresh.len() - 1),
             1e-6,
         );
         kv.truncate(10); // beyond len → no-op
@@ -3675,26 +3767,26 @@ mod tests {
         let kv_all = fill(0);
         let q = [1.0f32, 0.0];
 
-        let full = attention(&base, &q, &kv_all, kv_all.len());
+        let full = attention(&base, &q, &kv_all, kv_all.len() - 1);
         let mut win2 = base;
         win2.sliding_window = Some(2);
-        let windowed = attention(&win2, &q, &kv_all, kv_all.len());
+        let windowed = attention(&win2, &q, &kv_all, kv_all.len() - 1);
         assert_ne!(
             full, windowed,
             "window of 2 over 4 positions should differ from full"
         );
 
         // window=2 over all 4 positions == full attention over just the last 2.
-        approx(
-            &windowed,
-            &attention(&base, &q, &fill(2), fill(2).len()),
-            1e-6,
-        );
+        approx(&windowed, &attention(&base, &q, &fill(2), 1), 1e-6);
 
         // A window >= the history is exactly full attention.
         let mut win_big = base;
         win_big.sliding_window = Some(10);
-        approx(&attention(&win_big, &q, &kv_all, kv_all.len()), &full, 1e-6);
+        approx(
+            &attention(&win_big, &q, &kv_all, kv_all.len() - 1),
+            &full,
+            1e-6,
+        );
     }
 
     /// `matvec_rows` runs single-threaded below its size threshold and split
@@ -3835,8 +3927,8 @@ mod tests {
             ..plain
         };
 
-        let a = attention(&plain, &q, &kv, kv.len());
-        let b = attention(&capped, &q, &kv, kv.len());
+        let a = attention(&plain, &q, &kv, kv.len() - 1);
+        let b = attention(&capped, &q, &kv, kv.len() - 1);
         // Uncapped, position 0 wins almost totally; capped, the gap is squashed
         // so position 1 keeps real weight.
         assert!(
@@ -3857,7 +3949,7 @@ mod tests {
             attn_logit_softcap: Some(1e6),
             ..plain
         };
-        approx(&attention(&loose, &q, &kv, kv.len()), &a, 1e-4);
+        approx(&attention(&loose, &q, &kv, kv.len() - 1), &a, 1e-4);
     }
 
     /// Build a tiny dense layer; `gemma2` adds the FFN norm pair that switches
@@ -4271,7 +4363,7 @@ mod tests {
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[1.0, 2.0], &[7.0, 8.0]).unwrap();
         // Softmax over a single score is 1.0, so context == the stored value.
-        let ctx = attention(&cfg, &[0.5, -0.5], &kv, kv.len());
+        let ctx = attention(&cfg, &[0.5, -0.5], &kv, kv.len() - 1);
         approx(&ctx, &[7.0, 8.0], 1e-6);
     }
 
@@ -4295,7 +4387,7 @@ mod tests {
         let mut kv = KvLayerCache::new(cfg.kv_dim());
         kv.append(&[3.0], &[9.0]).unwrap();
         // Both query heads map to the one kv head → both get value 9.0.
-        let ctx = attention(&cfg, &[0.1, 0.2], &kv, kv.len());
+        let ctx = attention(&cfg, &[0.1, 0.2], &kv, kv.len() - 1);
         approx(&ctx, &[9.0, 9.0], 1e-6);
     }
 
@@ -4388,8 +4480,8 @@ mod tests {
         let q: Vec<f32> = (0..cfg.q_dim()).map(|i| (i % 3) as f32 * 0.2).collect();
         // int8 KV attention stays well within a small tolerance of exact f32.
         approx(
-            &attention(&cfg, &q, &full, full.len()),
-            &attention(&cfg, &q, &quant, quant.len()),
+            &attention(&cfg, &q, &full, full.len() - 1),
+            &attention(&cfg, &q, &quant, quant.len() - 1),
             0.05,
         );
     }
@@ -4443,8 +4535,8 @@ mod tests {
         let q: Vec<f32> = (0..cfg.q_dim()).map(|i| (i % 3) as f32 * 0.2).collect();
         // int4 is lossier than int8, but still tracks the exact output closely.
         approx(
-            &attention(&cfg, &q, &full, full.len()),
-            &attention(&cfg, &q, &q4, q4.len()),
+            &attention(&cfg, &q, &full, full.len() - 1),
+            &attention(&cfg, &q, &q4, q4.len() - 1),
             0.3,
         );
     }
