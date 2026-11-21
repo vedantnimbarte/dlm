@@ -21,7 +21,29 @@
 
 use crate::error::{DlmError, Result};
 use crate::forward::kernel::ComputeKernel;
-use crate::model::{MlaConfig, MoeConfig};
+use crate::model::{LinearAttnConfig, MlaConfig, MoeConfig};
+
+/// Where each of a head's `head_dim` dimensions comes from in the checkpoint
+/// under partial RoPE: `order[p]` is the checkpoint dimension dlm keeps at `p`.
+///
+/// Transformers rotates the first `rotary_dim` dimensions by halves (`j` with
+/// `j + rotary_dim/2`) and passes the rest through. dlm's kernels rotate a whole
+/// head by halves (`p` with `p + head_dim/2`), so the rotated halves go to the
+/// starts of dlm's halves and the passed-through dimensions fill the rest. q·k
+/// is unchanged by reordering both alike, and V is not reordered.
+pub fn partial_rope_order(head_dim: usize, rotary_dim: usize) -> Vec<usize> {
+    let (half, r2) = (head_dim / 2, rotary_dim / 2);
+    (0..head_dim)
+        .map(|p| {
+            let (side, i) = (p / half, p % half);
+            if i < r2 {
+                side * r2 + i
+            } else {
+                rotary_dim + side * (half - r2) + (i - r2)
+            }
+        })
+        .collect()
+}
 
 /// RoPE frequency scaling, as declared by `rope_scaling` in `config.json`.
 ///
@@ -138,6 +160,20 @@ pub struct BlockConfig {
     /// kind of default that produces wrong numbers instead of a compile error,
     /// and it broke a Gemma2 test the moment it was introduced.
     pub ffn_kind: FfnKind,
+    /// Gated DeltaNet linear attention (Qwen3.5/3.6). On a model's config,
+    /// `Some` marks it hybrid; [`for_layer`](Self::for_layer) keeps it only on
+    /// the linear-attention layers, which then take
+    /// [`linear_attention_sublayer`] instead of attention.
+    pub linear: Option<LinearAttnConfig>,
+    /// The attention output is multiplied by `sigmoid(attn_gate · normed)`
+    /// before `o_proj` (Qwen3.5/3.6).
+    pub attn_output_gate: bool,
+    /// RoPE rotates only `rotary_dim` of each head's dimensions. The loader
+    /// reorders q/k so those sit as the pairs `(i, i + head_dim/2)`,
+    /// `i < rotary_dim/2` ([`partial_rope_order`]), and
+    /// [`rope_freqs`](Self::rope_freqs) gives every other pair frequency 0, so
+    /// every kernel's whole-head RoPE rotates exactly the right ones.
+    pub rotary_dim: Option<usize>,
     /// Gemma 4: the head width of the global (full-attention) layers, when it
     /// differs from `head_dim`, which is then the windowed layers' (256 and 512
     /// on E2B/E4B). Resolved per layer by [`Self::for_layer`].
@@ -241,7 +277,23 @@ impl BlockConfig {
             // must look dense to everything downstream — loader, validation and
             // the FFN dispatch alike.
             moe: self.moe.filter(|m| layer >= m.first_k_dense),
+            // A hybrid model's full-attention layers are ordinary attention.
+            linear: self.linear.filter(|l| l.is_linear(layer)),
             ..*self
+        }
+    }
+
+    /// The RoPE inverse frequencies, `head_dim / 2` of them: [`rope_inv_freqs`]
+    /// over the rotated dimensions, then zeros (no rotation) for the pairs
+    /// partial RoPE leaves alone.
+    pub fn rope_freqs(&self, theta: f32, scaling: Option<RopeScaling>) -> Vec<f32> {
+        match self.rotary_dim.filter(|&r| r < self.head_dim) {
+            None => rope_inv_freqs(self.head_dim, theta, scaling),
+            Some(r) => {
+                let mut f = rope_inv_freqs(r, theta, scaling);
+                f.resize(self.head_dim / 2, 0.0);
+                f
+            }
         }
     }
 
@@ -815,11 +867,70 @@ pub struct LayerTensors {
     /// Multi-head Latent Attention projections (DeepSeek). When set, the attention
     /// sublayer takes the MLA path and `q_proj`/`k_proj`/`v_proj` are unused.
     pub mla: Option<MlaWeights>,
+    /// Gated DeltaNet projections (a Qwen3.5/3.6 linear-attention layer). When
+    /// set, `q_proj`/`k_proj`/`v_proj` are empty and `o_proj` is the layer's
+    /// `out_proj` (`[hidden, value_dim]`).
+    pub linear: Option<LinearAttnWeights>,
+    /// The attention output gate (`[q_dim, hidden]`): the half of Qwen3.5's
+    /// query projection that is not the query. `None` elsewhere.
+    pub attn_gate: Option<Weights>,
     /// Gemma 4's per-layer-input block; `None` on every other family.
     pub ple: Option<PleWeights>,
     /// Gemma 4 multiplies the layer's whole output by this (`layer_scalar`);
     /// `None` elsewhere.
     pub layer_scalar: Option<f32>,
+}
+
+/// One Gated DeltaNet layer's weights (Qwen3.5/3.6), beside the layer's
+/// `o_proj` (the `out_proj`) and `input_layernorm`.
+#[derive(Debug, Clone, Default)]
+pub struct LinearAttnWeights {
+    /// q, k and v in one projection, `[2·key_dim + value_dim, hidden]`.
+    pub in_proj_qkv: Weights,
+    /// The output gate, `[value_dim, hidden]`.
+    pub in_proj_z: Weights,
+    /// Per value head: the write strength `beta` before its sigmoid, and the
+    /// decay's input, `[num_v_heads, hidden]` each.
+    pub in_proj_b: Weights,
+    pub in_proj_a: Weights,
+    /// Depthwise causal conv over q, k and v: `[conv_dim, conv_kernel]`.
+    pub conv1d: Vec<f32>,
+    /// `-exp(A_log)`, `[num_v_heads]`: the decay's per-head rate.
+    pub a_neg: Vec<f32>,
+    /// `[num_v_heads]`, added before the decay's softplus.
+    pub dt_bias: Vec<f32>,
+    /// The gated RMSNorm's weight, `[v_head_dim]`, shared by every head. Plain
+    /// `w`, unlike the layer's `(1 + w)` norms.
+    pub norm: Vec<f32>,
+}
+
+impl LinearAttnWeights {
+    /// The four projection matrices.
+    pub fn weights(&self) -> impl Iterator<Item = &Weights> {
+        [
+            &self.in_proj_qkv,
+            &self.in_proj_z,
+            &self.in_proj_b,
+            &self.in_proj_a,
+        ]
+        .into_iter()
+    }
+
+    /// The same, to modify.
+    pub fn weights_mut(&mut self) -> impl Iterator<Item = &mut Weights> {
+        [
+            &mut self.in_proj_qkv,
+            &mut self.in_proj_z,
+            &mut self.in_proj_b,
+            &mut self.in_proj_a,
+        ]
+        .into_iter()
+    }
+
+    fn byte_size(&self) -> usize {
+        self.weights().map(|w| w.as_bytes().len()).sum::<usize>()
+            + 4 * (self.conv1d.len() + self.a_neg.len() + self.dt_bias.len() + self.norm.len())
+    }
 }
 
 /// Gemma 4's per-layer input (PLE) weights for one layer. After the FFN the
@@ -870,7 +981,7 @@ impl LayerTensors {
         let Ffn::Dense(f) = &self.ffn else {
             return None;
         };
-        if self.mla.is_some() {
+        if self.mla.is_some() || self.linear.is_some() || self.attn_gate.is_some() {
             return None;
         }
         Some(Self {
@@ -898,6 +1009,8 @@ impl LayerTensors {
             pre_feedforward_layernorm: self.pre_feedforward_layernorm.clone(),
             post_feedforward_layernorm: self.post_feedforward_layernorm.clone(),
             mla: None,
+            linear: None,
+            attn_gate: None,
             ple: self.ple.clone(),
             layer_scalar: self.layer_scalar,
         })
@@ -944,6 +1057,8 @@ impl LayerTensors {
             + bias(&self.q_bias)
             + bias(&self.k_bias)
             + bias(&self.v_bias)
+            + self.linear.as_ref().map_or(0, LinearAttnWeights::byte_size)
+            + self.attn_gate.as_ref().map_or(0, |g| g.as_bytes().len())
     }
 
     /// Whether this layer uses the **Gemma2 block structure** — norms on each
@@ -968,12 +1083,17 @@ impl LayerTensors {
     pub fn weights(&self) -> impl Iterator<Item = &Weights> {
         let attn = [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj].into_iter();
         let mla = self.mla.iter().flat_map(|m| m.weights());
+        let linear = self.linear.iter().flat_map(|l| l.weights());
         let ple = self.ple.iter().flat_map(|p| {
             [&p.gate, &p.proj]
                 .into_iter()
                 .chain(p.model.iter().map(|(w, _)| w))
         });
-        attn.chain(mla).chain(self.ffn.weights()).chain(ple)
+        attn.chain(mla)
+            .chain(linear)
+            .chain(self.attn_gate.iter())
+            .chain(self.ffn.weights())
+            .chain(ple)
     }
 
     /// The same, to modify: used to re-pack a layer's quantized weights.
@@ -986,12 +1106,17 @@ impl LayerTensors {
         ]
         .into_iter();
         let mla = self.mla.iter_mut().flat_map(|m| m.weights_mut());
+        let linear = self.linear.iter_mut().flat_map(|l| l.weights_mut());
         let ple = self.ple.iter_mut().flat_map(|p| {
             [&mut p.gate, &mut p.proj]
                 .into_iter()
                 .chain(p.model.iter_mut().map(|(w, _)| w))
         });
-        attn.chain(mla).chain(self.ffn.weights_mut()).chain(ple)
+        attn.chain(mla)
+            .chain(linear)
+            .chain(self.attn_gate.iter_mut())
+            .chain(self.ffn.weights_mut())
+            .chain(ple)
     }
 
     /// The dense FFN triple, or an error if this layer is MoE. Both GPU kernels
@@ -1080,6 +1205,29 @@ impl LayerTensors {
         if let Some(m) = &cfg.mla {
             return self.validate_mla(cfg, m);
         }
+        if let Some(l) = &cfg.linear {
+            return self.validate_linear(cfg, l);
+        }
+        if self.linear.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "linear-attention weights on a layer configured for attention".into(),
+            ));
+        }
+        match (&self.attn_gate, cfg.attn_output_gate) {
+            (Some(g), true) if g.len() == cfg.q_dim() * cfg.hidden_size => {}
+            (None, false) => {}
+            (g, _) => {
+                return Err(DlmError::QuantLayout(format!(
+                    "attention output gate: the config {} one, the layer has {} elements",
+                    if cfg.attn_output_gate {
+                        "declares"
+                    } else {
+                        "declares no"
+                    },
+                    g.as_ref().map_or(0, |g| g.len())
+                )))
+            }
+        }
         self.validate_ple(cfg)?;
         // A layer reading another layer's KV (Gemma 4's shared tail) has no K/V
         // projections of its own; one that carries them would be ignored, which
@@ -1128,6 +1276,46 @@ impl LayerTensors {
         }
         self.validate_ffn(cfg)?;
         Ok(())
+    }
+
+    /// Validate a Gated DeltaNet layer's weights against its geometry.
+    fn validate_linear(&self, cfg: &BlockConfig, l: &LinearAttnConfig) -> Result<()> {
+        let lw = self.linear.as_ref().ok_or_else(|| {
+            DlmError::QuantLayout(
+                "layer configured for linear attention has no such weights".into(),
+            )
+        })?;
+        let h = cfg.hidden_size;
+        let nv = l.num_v_heads as usize;
+        let checks = [
+            ("in_proj_qkv", lw.in_proj_qkv.len(), l.conv_dim() * h),
+            ("in_proj_z", lw.in_proj_z.len(), l.value_dim() * h),
+            ("in_proj_b", lw.in_proj_b.len(), nv * h),
+            ("in_proj_a", lw.in_proj_a.len(), nv * h),
+            (
+                "conv1d",
+                lw.conv1d.len(),
+                l.conv_dim() * l.conv_kernel as usize,
+            ),
+            ("A", lw.a_neg.len(), nv),
+            ("dt_bias", lw.dt_bias.len(), nv),
+            ("norm", lw.norm.len(), l.v_head_dim as usize),
+            ("out_proj", self.o_proj.len(), h * l.value_dim()),
+            ("input_layernorm", self.input_layernorm.len(), h),
+            (
+                "post_attention_layernorm",
+                self.post_attention_layernorm.len(),
+                h,
+            ),
+        ];
+        for (name, got, expected) in checks {
+            if got != expected {
+                return Err(DlmError::QuantLayout(format!(
+                    "linear attention {name}: expected {expected} elements, got {got}"
+                )));
+            }
+        }
+        self.validate_ffn(cfg)
     }
 
     /// Validate the MLA projection weights against the latent-attention geometry
@@ -1408,6 +1596,28 @@ pub struct KvLayerCache {
     /// Paged device K/V for standard attention (MLA keeps `gpu`).
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     paged: Option<crate::forward::kv_pool::PagedKv>,
+    /// A linear-attention layer's state on the host, in place of K/V; its
+    /// positions are counted in `device_tokens`. `None` while the state lives
+    /// only on the device, or before the first token.
+    linear: Option<LinearState>,
+    /// The layer was cut back to fewer positions than its state has seen. A
+    /// recurrent state cannot be rewound, so the next step refuses.
+    linear_stale: bool,
+    /// The same state on the device (conv window, delta-rule state).
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    linear_gpu: Option<(
+        crate::gpu::device::DeviceBuffer,
+        crate::gpu::device::DeviceBuffer,
+    )>,
+}
+
+/// A Gated DeltaNet layer's per-sequence state: the last `conv_kernel - 1`
+/// inputs of every conv channel (`[conv_dim, kernel - 1]`, oldest first), and
+/// each value head's `k_head_dim × v_head_dim` matrix.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LinearState {
+    pub(crate) conv: Vec<f32>,
+    pub(crate) ssm: Vec<f32>,
 }
 
 impl Clone for KvLayerCache {
@@ -1435,6 +1645,12 @@ impl Clone for KvLayerCache {
                         && p.rows() >= self.device_tokens
                 })
                 .map(|p| p.share_prefix(self.device_tokens)),
+            linear: self.linear.clone(),
+            linear_stale: self.linear_stale,
+            // Device state is the session's own; a clone carries the host copy
+            // (`sync_from_device` makes one) and uploads it on next GPU use.
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            linear_gpu: None,
         }
     }
 }
@@ -1559,10 +1775,7 @@ impl KvLayerCache {
             store,
             device_tokens: 0,
             device_elem,
-            #[cfg(any(feature = "cuda", feature = "rocm"))]
-            gpu: None,
-            #[cfg(any(feature = "cuda", feature = "rocm"))]
-            paged: None,
+            ..Default::default()
         })
     }
 }
@@ -1696,10 +1909,7 @@ impl KvLayerCache {
             store,
             device_tokens: 0,
             device_elem: KvElem::for_quant(quant),
-            #[cfg(any(feature = "cuda", feature = "rocm"))]
-            gpu: None,
-            #[cfg(any(feature = "cuda", feature = "rocm"))]
-            paged: None,
+            ..Default::default()
         }
     }
 
@@ -1835,6 +2045,7 @@ impl KvLayerCache {
             device_elem: self.device_elem,
             gpu: None,
             paged: Some(p.share_prefix(rows)),
+            ..Default::default()
         })
     }
 
@@ -1910,6 +2121,97 @@ impl KvLayerCache {
         })
     }
 
+    /// Whether this is a linear-attention layer's state rather than K/V.
+    fn is_linear(&self) -> bool {
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if self.linear_gpu.is_some() {
+            return true;
+        }
+        self.linear.is_some() || self.linear_stale
+    }
+
+    /// Refuse a step on a state that cannot continue: one cut back to fewer
+    /// positions, or one whose positions are on a device this copy lacks.
+    fn check_linear_usable(&self, have_device: bool) -> Result<()> {
+        if self.linear_stale {
+            return Err(DlmError::InvalidConfig(
+                "a linear-attention layer was rolled back to an earlier position, which its \
+                 recurrent state cannot do; speculative decoding and partial prefix reuse are \
+                 not supported for hybrid (Qwen3.5/3.6) models"
+                    .into(),
+            ));
+        }
+        if self.linear.is_none() && !have_device && !self.is_empty() {
+            return Err(DlmError::InvalidConfig(
+                "KV snapshot holds device-only linear-attention state; take it with \
+                 snapshot_synced"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// This linear-attention layer's host state, zeroed (a conv window of
+    /// `conv_len` floats, a recurrent state of `ssm_len`) before the first token.
+    pub(crate) fn linear_state(
+        &mut self,
+        conv_len: usize,
+        ssm_len: usize,
+    ) -> Result<&mut LinearState> {
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if self.linear_gpu.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "linear-attention state is on the device; a CPU kernel cannot step it".into(),
+            ));
+        }
+        self.check_linear_usable(false)?;
+        let st = self.linear.get_or_insert_with(|| LinearState {
+            conv: vec![0.0; conv_len],
+            ssm: vec![0.0; ssm_len],
+        });
+        if st.conv.len() != conv_len || st.ssm.len() != ssm_len {
+            return Err(DlmError::ShapeMismatch {
+                expected: conv_len + ssm_len,
+                got: st.conv.len() + st.ssm.len(),
+            });
+        }
+        Ok(st)
+    }
+
+    /// Device pointers to this linear-attention layer's `(conv, recurrent)`
+    /// state, allocated (zeroed, or holding a resumed snapshot's host state) on
+    /// first use. The kernel updates them in place, so the host copy is dropped:
+    /// it would be stale after this step.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn linear_device_state(
+        &mut self,
+        conv_len: usize,
+        ssm_len: usize,
+    ) -> Result<(*mut f32, *mut f32)> {
+        self.check_linear_usable(self.linear_gpu.is_some())?;
+        if self.linear_gpu.is_none() {
+            use crate::gpu::device::DeviceBuffer;
+            let host = self.linear.take().unwrap_or_else(|| LinearState {
+                conv: vec![0.0; conv_len],
+                ssm: vec![0.0; ssm_len],
+            });
+            if host.conv.len() != conv_len || host.ssm.len() != ssm_len {
+                return Err(DlmError::ShapeMismatch {
+                    expected: conv_len + ssm_len,
+                    got: host.conv.len() + host.ssm.len(),
+                });
+            }
+            // A zero-length buffer is refused by the allocator (kernel 1 has
+            // no conv window); one float stands in.
+            let up =
+                |v: &[f32]| DeviceBuffer::from_slice(if v.is_empty() { &[0.0f32][..] } else { v });
+            self.linear_gpu = Some((up(&host.conv)?, up(&host.ssm)?));
+        }
+        self.linear = None;
+        let (conv, ssm) = self.linear_gpu.as_ref().expect("set above");
+        Ok((conv.as_mut_ptr(), ssm.as_mut_ptr()))
+    }
+
     /// Empty (exact `f32`) history for a layer whose K/V width is `kv_dim`.
     pub fn new(kv_dim: usize) -> Self {
         Self::new_quant(kv_dim, KvQuant::None)
@@ -1956,6 +2258,22 @@ impl KvLayerCache {
     /// the GPU path the device slots are simply overwritten at the reduced length,
     /// so only the host length (which drives `num_positions`) needs shrinking.
     pub fn truncate(&mut self, n: usize) {
+        if self.is_linear() && n < self.len() {
+            if n == 0 {
+                // Back to the start: an empty state is exact.
+                self.linear = None;
+                self.linear_stale = false;
+                self.device_tokens = 0;
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
+                {
+                    self.linear_gpu = None;
+                }
+            } else {
+                self.linear_stale = true;
+                self.device_tokens = n;
+            }
+            return;
+        }
         let host = self.host_len();
         if n >= host {
             self.device_tokens = self.device_tokens.min(n - host);
@@ -2143,6 +2461,17 @@ impl KvLayerCache {
     /// Call before snapshotting.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub fn sync_from_device(&mut self) -> Result<()> {
+        if let Some((conv, ssm)) = &self.linear_gpu {
+            crate::gpu::device::synchronize_default()?;
+            let mut st = LinearState {
+                conv: vec![0.0; conv.len()],
+                ssm: vec![0.0; ssm.len()],
+            };
+            conv.download(&mut st.conv)?;
+            ssm.download(&mut st.ssm)?;
+            self.linear = Some(st);
+            return Ok(());
+        }
         let n = self.len();
         if n == 0 {
             return Ok(());
@@ -3061,10 +3390,7 @@ pub fn decode_block(
     position: usize,
 ) -> Result<Vec<f32>> {
     w.validate(cfg)?;
-    let h1 = match &w.mla {
-        Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
-        None => attention_sublayer(cfg, w, hidden, kv, position)?,
-    };
+    let h1 = token_mixer(cfg, w, hidden, kv, position)?;
     ffn_sublayer(cfg, w, hidden, h1)
 }
 
@@ -3180,6 +3506,148 @@ fn ffn_sublayer(
     Ok(h1)
 }
 
+/// The layer's token mixer, by the weights it carries: Gated DeltaNet linear
+/// attention, MLA, or standard attention. Returns the post-mixer hidden `h1`.
+fn token_mixer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+    position: usize,
+) -> Result<Vec<f32>> {
+    match (&w.linear, &w.mla) {
+        (Some(lw), _) => linear_attention_sublayer(cfg, w, lw, hidden, kv),
+        (None, Some(mw)) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position),
+        (None, None) => attention_sublayer(cfg, w, hidden, kv, position),
+    }
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// `softplus` as torch computes it: linear above 20.
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
+/// Scale `x` to unit L2 norm (`x / sqrt(Σx² + 1e-6)`, as the FLA kernels and
+/// transformers' fallback do), times `scale`.
+fn l2norm_scaled(x: &mut [f32], scale: f32) {
+    let inv = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
+    for v in x {
+        *v *= inv * scale;
+    }
+}
+
+/// One token through a Gated DeltaNet layer (Qwen3.5/3.6), following
+/// transformers' `Qwen3_5MoeGatedDeltaNet` and its recurrent fallback:
+///
+/// ```text
+///   qkv = conv1d_causal(in_proj_qkv · norm(x)) then SiLU      (state: last K-1 inputs)
+///   q, k = l2norm per key head; q /= sqrt(k_head_dim)
+///   per value head j (key head k_head_of(j)):
+///     decay = exp(-exp(A_log) · softplus(in_proj_a·x + dt_bias)),  beta = sigmoid(in_proj_b·x)
+///     S = decay·S;  S += k ⊗ beta·(v − Sᵀk);  o = Sᵀq
+///   o = rmsnorm(o) · w · silu(in_proj_z · x)                   (per value head)
+///   x += out_proj · o
+/// ```
+///
+/// A prompt runs through it token by token, which is the chunked form's exact
+/// result up to float rounding. Returns the post-mixer hidden `h1`.
+fn linear_attention_sublayer(
+    cfg: &BlockConfig,
+    w: &LayerTensors,
+    lw: &LinearAttnWeights,
+    hidden: &[f32],
+    kv: &mut KvLayerCache,
+) -> Result<Vec<f32>> {
+    let l = cfg.linear.ok_or_else(|| {
+        DlmError::InvalidConfig("linear attention on a layer configured for attention".into())
+    })?;
+    let h = cfg.hidden_size;
+    let (nk, nv) = (l.num_k_heads as usize, l.num_v_heads as usize);
+    let (dk, dv) = (l.k_head_dim as usize, l.v_head_dim as usize);
+    let (key_dim, value_dim, conv_dim) = (l.key_dim(), l.value_dim(), l.conv_dim());
+    let kern = l.conv_kernel as usize;
+    let win = kern - 1;
+
+    let normed = rmsnorm(hidden, &w.input_layernorm, cfg.rms_eps);
+    let qkv = matvec_native(&lw.in_proj_qkv, &normed, conv_dim, h);
+    let z = matvec_native(&lw.in_proj_z, &normed, value_dim, h);
+    let b = matvec_native(&lw.in_proj_b, &normed, nv, h);
+    let a = matvec_native(&lw.in_proj_a, &normed, nv, h);
+
+    let st = kv.linear_state(l.conv_state_len(), l.recurrent_state_len())?;
+    // Causal depthwise conv: the window is the channel's last `win` inputs, then
+    // this token's; the window then slides by one.
+    let mut mixed = vec![0f32; conv_dim];
+    for (c, m) in mixed.iter_mut().enumerate() {
+        let wts = &lw.conv1d[c * kern..(c + 1) * kern];
+        let past = &mut st.conv[c * win..(c + 1) * win];
+        let mut acc = wts[win] * qkv[c];
+        for (wt, p) in wts.iter().zip(past.iter()) {
+            acc += wt * p;
+        }
+        if win > 0 {
+            past.rotate_left(1);
+            past[win - 1] = qkv[c];
+        }
+        *m = silu(acc);
+    }
+    let (q, rest) = mixed.split_at_mut(key_dim);
+    let (k, v) = rest.split_at_mut(key_dim);
+    let q_scale = 1.0 / (dk as f32).sqrt();
+    for hh in 0..nk {
+        l2norm_scaled(&mut q[hh * dk..(hh + 1) * dk], q_scale);
+        l2norm_scaled(&mut k[hh * dk..(hh + 1) * dk], 1.0);
+    }
+
+    let mut core = vec![0f32; value_dim];
+    let mut delta = vec![0f32; dv];
+    for j in 0..nv {
+        let kh = l.k_head_of(j);
+        let (qj, kj) = (&q[kh * dk..(kh + 1) * dk], &k[kh * dk..(kh + 1) * dk]);
+        let vj = &v[j * dv..(j + 1) * dv];
+        let decay = (lw.a_neg[j] * softplus(a[j] + lw.dt_bias[j])).exp();
+        let beta = sigmoid(b[j]);
+        // S is `[k_head_dim][v_head_dim]`, row-major.
+        let s = &mut st.ssm[j * dk * dv..(j + 1) * dk * dv];
+        for x in s.iter_mut() {
+            *x *= decay;
+        }
+        delta.fill(0.0);
+        for (row, &kv_) in s.chunks_exact(dv).zip(kj) {
+            for (d, &sv) in delta.iter_mut().zip(row) {
+                *d += sv * kv_;
+            }
+        }
+        for (d, &vv) in delta.iter_mut().zip(vj) {
+            *d = (vv - *d) * beta;
+        }
+        let out = &mut core[j * dv..(j + 1) * dv];
+        for ((row, &kv_), &qv) in s.chunks_exact_mut(dv).zip(kj).zip(qj) {
+            for ((sv, &d), o) in row.iter_mut().zip(&delta).zip(out.iter_mut()) {
+                *sv += kv_ * d;
+                *o += qv * *sv;
+            }
+        }
+        // Gated RMSNorm: norm the head, then its plain weight, then silu(z).
+        let normed_out = rmsnorm(out, &lw.norm, cfg.rms_eps);
+        for ((o, n), &zz) in out.iter_mut().zip(normed_out).zip(&z[j * dv..(j + 1) * dv]) {
+            *o = n * silu(zz);
+        }
+    }
+    kv.advance(1);
+
+    let out = matvec_native(&w.o_proj, &core, h, value_dim);
+    Ok(hidden.iter().zip(&out).map(|(&x, &o)| x + o).collect())
+}
+
 /// The attention sublayer: RMSNorm → Q/K/V (+bias) → RoPE → append K/V → GQA over
 /// history → output projection, folded into the residual. Returns the post-attn
 /// hidden `h1` (the FFN sublayer's input before its own norm). Shared by
@@ -3207,6 +3675,21 @@ fn attention_sublayer(
         kv.append(&k, &v)?;
         attention(cfg, &q, kv, kv.len() - 1)
     };
+    // Qwen3.5 gates every head's output by its own half of the query projection.
+    let mut ctx = ctx;
+    if let Some(g) = &w.attn_gate {
+        let normed = norm(
+            hidden,
+            &w.input_layernorm,
+            w.input_layernorm_bias.as_deref(),
+            cfg.rms_eps,
+            cfg.norm_kind,
+        );
+        let gate = matvec_native(g, &normed, cfg.q_dim(), cfg.hidden_size);
+        for (c, g) in ctx.iter_mut().zip(&gate) {
+            *c *= sigmoid(*g);
+        }
+    }
     Ok(attn_residual(cfg, w, hidden, &ctx))
 }
 
@@ -3265,7 +3748,7 @@ fn qkv(
     // Rotating anyway would apply position twice — which does not error, it
     // just makes every long-range dependency wrong.
     if !cfg.learned_positions {
-        let inv_freq = rope_inv_freqs(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling);
+        let inv_freq = cfg.rope_freqs(cfg.rope_theta, cfg.rope_scaling);
         let mscale = rope_mscale(cfg.rope_scaling);
         rope_inplace(
             &mut q,
@@ -3327,12 +3810,9 @@ where
     E: std::ops::Deref<Target = ExpertFfn>,
 {
     let (router, _experts, shared, shared_gate) = w.moe()?;
-    // DeepSeek-V3 is MLA + MoE, so the streamed-MoE core takes the MLA attention
-    // path too when the layer declares it.
-    let mut h1 = match &w.mla {
-        Some(mw) => mla_attention_sublayer(cfg, w, mw, hidden, kv, position)?,
-        None => attention_sublayer(cfg, w, hidden, kv, position)?,
-    };
+    // DeepSeek-V3 is MLA + MoE and Qwen3.5 linear attention + MoE, so the
+    // streamed-MoE core takes whichever token mixer the layer declares.
+    let mut h1 = token_mixer(cfg, w, hidden, kv, position)?;
     let normed2 = rmsnorm(&h1, w.ffn_input_norm(), cfg.rms_eps);
     let mut ffn_out = moe_ffn_streaming(
         router,
@@ -3471,6 +3951,10 @@ impl ComputeKernel for CpuKernel {
         self.cfg.kv_dim()
     }
 
+    fn recurrent(&self) -> bool {
+        self.cfg.linear.is_some()
+    }
+
     fn per_layer_input_width(&self) -> usize {
         self.cfg.row_width() - self.cfg.hidden_size
     }
@@ -3538,6 +4022,40 @@ impl ComputeKernel for CpuKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Partial RoPE as dlm runs it -- the head reordered by
+    /// `partial_rope_order`, then the whole-head rotation with zero frequency
+    /// past the rotated pairs -- is transformers' rotation of the first
+    /// `rotary_dim` dimensions by halves, reordered the same way.
+    #[test]
+    fn partial_rope_by_reordering_matches_rotating_the_prefix() {
+        let (d, r, pos, theta) = (16usize, 4usize, 7usize, 10_000.0f32);
+        let x: Vec<f32> = (0..d).map(|i| (i as f32 * 0.37).sin() + 0.1).collect();
+        // transformers: rotate_half over x[..r] with inv_freq of the r dims.
+        let inv = rope_inv_freqs(r, theta, None);
+        let mut want = x.clone();
+        for i in 0..r / 2 {
+            let (s, c) = (pos as f32 * inv[i]).sin_cos();
+            let (a, b) = (x[i], x[i + r / 2]);
+            want[i] = a * c - b * s;
+            want[i + r / 2] = a * s + b * c;
+        }
+        let order = partial_rope_order(d, r);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert!(sorted.into_iter().eq(0..d), "a permutation");
+        let cfg = BlockConfig {
+            head_dim: d,
+            rotary_dim: Some(r),
+            ..Default::default()
+        };
+        let mut got: Vec<f32> = order.iter().map(|&i| x[i]).collect();
+        rope_inplace(&mut got, 1, d, pos, &cfg.rope_freqs(theta, None), 1.0);
+        let want: Vec<f32> = order.iter().map(|&i| want[i]).collect();
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "{got:?} vs {want:?}");
+        }
+    }
 
     /// Gemma 3 windows five layers in six and rotates those with their own base,
     /// Gemma 4 E2B's layout: the shared-KV tail reads the last layer of its own

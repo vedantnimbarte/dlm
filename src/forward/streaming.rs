@@ -730,6 +730,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         self.shared.cfg.kv_dim()
     }
 
+    fn recurrent(&self) -> bool {
+        self.shared.cfg.linear.is_some()
+    }
+
     fn stream_stats(&self) -> Option<StreamStats> {
         Some(self.stats())
     }

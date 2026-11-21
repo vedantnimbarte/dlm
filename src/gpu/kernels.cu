@@ -1957,7 +1957,11 @@ static inline int grid_for(int n, int block) { return (n + block - 1) / block; }
 // Slots 22-23 are MLA's per-head latent query and latent value mix.
 // Slots 24-25 are the int8 activation codes and their block scales (dp4a).
 // Slot 28 holds the LM head's sampling candidates (`dlm_lm_head_top`).
-enum { SCRATCH_N = 35 };
+// Slots 35-42 are Gated DeltaNet's (`dlm_linear_attn`) and the attention output
+// gate's (Qwen3.5/3.6).
+enum { SCRATCH_N = 43 };
+enum { LIN_NORMED = 35, LIN_QKV = 36, LIN_Z = 37, LIN_B = 38, LIN_A = 39, LIN_CORE = 40,
+       LIN_OUT = 41, ATTN_GATE = 42 };
 enum { Q8_XQ = 24, Q8_XDS = 25, GEMM_SCALE = 26, LM_TOP = 28 };   // 26: fp16 tensor-core row scales
 enum { ATTN_SCORES = 19, LM_X = 20, LM_LOGITS = 21, MLA_U = 22, MLA_M = 23 };
 enum { MOE_NORMED2 = 11, MOE_MATVEC = 12, MOE_NORMED2B = 27 };   // 27: a batch's FFN inputs
@@ -2068,6 +2072,12 @@ typedef struct {
     // `dtype[0] < 0` means "the call's own w_dtype/w_group_size for all of them".
     int w_dtype[7];
     int w_group[7];
+    // Qwen3.5/3.6's attention output gate, `[q_dim, hidden]`: the context is
+    // multiplied by sigmoid(gate · normed) before o_proj. NULL elsewhere. Only
+    // the MoE attention calls take it; the dense blocks refuse it.
+    const void* attn_gate;
+    int attn_gate_dtype;
+    int attn_gate_group;
     // 1: the prefill chunk's tokens attend to each other in both directions
     // (Gemma 3's image tokens), not causally. `dlm_prefill_block` only.
     int bidi;
@@ -2081,7 +2091,35 @@ typedef struct {
 #define DLM_W_DOWN 6
 static const DlmBlockExt DLM_BLOCK_DEFAULT = {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                               {-1, -1, -1, -1, -1, -1, -1},
-                                              {0, 0, 0, 0, 0, 0, 0}, 0};
+                                              {0, 0, 0, 0, 0, 0, 0}, 0, 0, 0, 0};
+
+// x[i] *= sigmoid(g[i]): the attention output gate.
+__global__ void sigmoid_mul_kernel(float* x, const float* g, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= 1.0f / (1.0f + expf(-g[i]));
+}
+
+static void launch_matvec_batched(int dt, const void* W, const float* x, const float* bias,
+                                  float* out, int out_dim, int in_dim, int group_size, int batch);
+
+// Gate `rows` rows of attention context (`[rows, q_dim]`) by sigmoid(attn_gate ·
+// normed), when the block has a gate. Scratch slot ATTN_GATE holds the gate.
+static cudaError_t apply_attn_gate(const DlmBlockExt* o, const float* normed, float* ctx,
+                                   int q_dim, int hidden_size, int rows) {
+    if (!o->attn_gate) return cudaSuccess;
+    cudaError_t e = scratch_ensure(ATTN_GATE, rows * q_dim);
+    if (e != cudaSuccess) return e;
+    float* gate = g_scratch[ATTN_GATE];
+    if (rows == 1)
+        launch_matvec(o->attn_gate_dtype, o->attn_gate, normed, (const float*)0, gate, q_dim,
+                      hidden_size, o->attn_gate_group);
+    else
+        launch_matvec_batched(o->attn_gate_dtype, o->attn_gate, normed, (const float*)0, gate,
+                              q_dim, hidden_size, o->attn_gate_group, rows);
+    long n = (long)rows * q_dim;
+    sigmoid_mul_kernel<<<(int)((n + 255) / 256), 256>>>(ctx, gate, n);
+    return cudaSuccess;
+}
 // This projection's dtype and group size: the per-tensor pair when the caller
 // filled them in, else the call's single dtype.
 #define DLM_WDT(i) (o->w_dtype[0] < 0 ? w_dtype : o->w_dtype[(i)])
@@ -2924,6 +2962,7 @@ extern "C" int dlm_decode_block(
     DLM_ENTER
     const int B = 256;
     const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    if (o->attn_gate) return (int)cudaErrorNotSupported;  // dense blocks have no output gate
     #define DLM_NORM(src, w, bias, dst) { \
         if (o->layer_norm) layernorm_kernel<<<1, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
         else rmsnorm_kernel<<<1, RMS_THREADS>>>((src), (w), (dst), hidden_size, rms_eps); }
@@ -3584,6 +3623,7 @@ extern "C" int dlm_decode_block_batched(
     const int B = 256;
     if (batch <= 0) return 0;
     const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    if (o->attn_gate) return (int)cudaErrorNotSupported;  // dense blocks have no output gate
     #define DLM_NORM_B(src, w, bias, dst) { \
         if (o->layer_norm) layernorm_batched_kernel<<<batch, RMS_THREADS>>>((src), (w), (bias), (dst), hidden_size, rms_eps); \
         else rmsnorm_batched_kernel<<<batch, RMS_THREADS>>>((src), (w), (dst), hidden_size, rms_eps); }
@@ -4299,6 +4339,7 @@ extern "C" int dlm_prefill_block(
     DLM_ENTER
     const int B = 256;
     const DlmBlockExt* o = ext ? ext : &DLM_BLOCK_DEFAULT;
+    if (o->attn_gate) return (int)cudaErrorNotSupported;  // dense blocks have no output gate
     if (T <= 0) return 0;
     if (T > DLM_PREFILL_T) return (int)cudaErrorInvalidValue;
     if (attn_scale <= 0.0f) attn_scale = rsqrtf((float)head_dim);
@@ -4521,6 +4562,8 @@ extern "C" int dlm_moe_attn(
                          kv_dim, kv_half);
         e = launch_attention(q, kv_keys, kv_values, kv_table, kv_block_shift, ctx, num_heads, num_kv_heads, head_dim, total_pos, sliding_window, attn_scale, attn_softcap, kv_half);
         if (e != cudaSuccess) return (int)e;
+        e = apply_attn_gate(o, normed, ctx, q_dim, hidden_size, 1);
+        if (e != cudaSuccess) return (int)e;
         launch_matvec(DLM_WDT(DLM_W_O), o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O));
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, attn_out, hidden_size);
         // FFN input, reused by the router matvec and every expert.
@@ -4577,6 +4620,8 @@ extern "C" int dlm_moe_attn_batched(
                                inv_freq, rope_mscale, 1, rms_eps, kv_keys, kv_values, kv_tables,
                                o->kv_block_shift, num_positions, positions, batch, sliding_window,
                                attn_scale, attn_softcap, o->kv_half);
+    if (e != cudaSuccess) return (int)e;
+    e = apply_attn_gate(o, normed, ctx, q_dim, hidden_size, batch);
     if (e != cudaSuccess) return (int)e;
     launch_matvec_batched(DLM_WDT(DLM_W_O), o_proj, ctx, (const float*)0, attn_out, hidden_size, q_dim, DLM_WGRP(DLM_W_O), batch);
     add_inplace_batched_kernel<<<grid_for(batch * hidden_size, B), B>>>(x, attn_out, (long)batch * hidden_size);
@@ -5049,7 +5094,7 @@ static void launch_grouped_down(int dt, DlmPtrs W, DlmWeights weights, const flo
 // from one checkpoint). `n_experts` must be <= DLM_MAX_TOPK — the caller falls
 // back to the per-expert loop otherwise.
 extern "C" int dlm_apply_experts(int hidden_size, int inter, int n_experts,
-                                 int w_dtype, int w_group_size,
+                                 int w_dtype, int w_group_size, int down_dtype, int down_group,
                                  const DlmPtrs* gate, const DlmPtrs* up, const DlmPtrs* down,
                                  const DlmWeights* weights, float* x, int activation)
 {
@@ -5074,12 +5119,12 @@ extern "C" int dlm_apply_experts(int hidden_size, int inter, int n_experts,
     launch_grouped_matvec(w_dtype, *up, normed2, u, n_experts, inter, hidden_size, w_group_size);
     // Elementwise over the whole (expert, inter) plane in one launch.
     swiglu_kernel<<<grid_for((int)span, B), B>>>(g, u, inter_buf, (int)span, activation);
-    launch_grouped_down(w_dtype, *down, *weights, inter_buf, x, n_experts, hidden_size, inter, w_group_size);
+    launch_grouped_down(down_dtype, *down, *weights, inter_buf, x, n_experts, hidden_size, inter, down_group);
     return (int)cudaGetLastError();
 }
 
 extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_group_size,
-                                const void* gate, const void* up, const void* down,
+                                int down_dtype, int down_group, const void* gate, const void* up, const void* down,
                                 float weight, float* x, int activation)
 {
     DLM_ENTER
@@ -5098,7 +5143,7 @@ extern "C" int dlm_apply_expert(int hidden_size, int inter, int w_dtype, int w_g
         launch_matvec(w_dtype, gate, normed2, (const float*)0, g, inter, hidden_size, w_group_size);
         launch_matvec(w_dtype, up, normed2, (const float*)0, u, inter, hidden_size, w_group_size);
         swiglu_kernel<<<grid_for(inter, B), B>>>(g, u, inter_buf, inter, activation);
-        launch_matvec(w_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, w_group_size);
+        launch_matvec(down_dtype, down, inter_buf, (const float*)0, down_out, hidden_size, inter, down_group);
         scaled_add_kernel<<<grid_for(hidden_size, B), B>>>(x, down_out, weight, hidden_size);
         e = cudaGetLastError();
     }
@@ -5143,7 +5188,7 @@ static void expert_matmul(int dt, const void* W, const float* X, float* out, int
 // grouped prefill read the expert's weights once per row. In pieces of 256 rows
 // to bound the scratch.
 extern "C" int dlm_apply_expert_rows(int hidden_size, int inter, int w_dtype, int w_group_size,
-                                     const void* gate, const void* up, const void* down,
+                                     int down_dtype, int down_group, const void* gate, const void* up, const void* down,
                                      const float* norm, const int* rows_host,
                                      const float* weights_host, int T, float* x, int activation)
 {
@@ -5174,7 +5219,7 @@ extern "C" int dlm_apply_expert_rows(int hidden_size, int inter, int w_dtype, in
         expert_matmul(w_dtype, gate, X, G, inter, hidden_size, n, w_group_size);
         expert_matmul(w_dtype, up, X, U, inter, hidden_size, n, w_group_size);
         swiglu_batched_kernel<<<grid_for((int)ni, B), B>>>(G, U, G, ni, activation);
-        expert_matmul(w_dtype, down, G, O, hidden_size, inter, n, w_group_size);
+        expert_matmul(down_dtype, down, G, O, hidden_size, inter, n, down_group);
         scatter_add_rows_kernel<<<grid_for((int)nh, B), B>>>(x, O, idx, W, n, hidden_size);
         e = cudaGetLastError();
     }
@@ -5426,6 +5471,7 @@ extern "C" int dlm_mla_attn(
     return (int)e;
 }
 
+
 // ---------------------------------------------------------------------------
 // EAGLE-3 draft head: one position of its single decoder layer.
 //
@@ -5658,5 +5704,294 @@ extern "C" int dlm_gemma4_ple(int hidden_size, int ple_dim, float rms_eps, int a
         add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, out, hidden_size);
     }
     if (scalar != 1.0f) scale_kernel<<<grid_for(hidden_size, B), B>>>(x, scalar, hidden_size);
+    return (int)cudaGetLastError();
+}
+
+
+// ── Gated DeltaNet linear attention (Qwen3.5/3.6) ──────────────────────────
+//
+// One token through a linear-attention layer's token mixer, mirroring
+// `linear_attention_sublayer` in src/forward/cpu.rs: input norm, the four
+// projections, the causal conv step (+SiLU), the gated delta rule against the
+// sequence's recurrent state, the gated RMSNorm and `out_proj` folded into the
+// residual. The caller then norms for the FFN (`dlm_moe_norm`), as on the MLA
+// path. The conv window and the recurrent state are per-sequence device buffers
+// the caller owns (`KvLayerCache::linear_device_state`), updated in place.
+
+// Weights of one Gated DeltaNet layer. Must match `DlmLinear` in src/forward/gpu.rs.
+typedef struct {
+    const void* w[5];      // in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj
+    int dtype[5];
+    int group[5];
+    const float* conv;     // [conv_dim, kern]
+    const float* a_neg;    // [nv]: -exp(A_log)
+    const float* dt_bias;  // [nv]
+    const float* norm;     // [dv]: the gated norm's plain weight
+} DlmLinear;
+
+// Sum of `v` over the block (a multiple of 32 threads); `red` holds >= 32 floats.
+// Every thread gets the total.
+__device__ float lin_block_sum(float v, float* red) {
+    v = warp_sum(v);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    const int warps = (blockDim.x + 31) >> 5;
+    v = (int)threadIdx.x < warps ? red[threadIdx.x] : 0.0f;
+    if (warp == 0) v = warp_sum(v);
+    if (threadIdx.x == 0) red[0] = v;
+    __syncthreads();
+    v = red[0];
+    __syncthreads();
+    return v;
+}
+
+// The causal depthwise conv for one token, in place on `x` ([channels]): each
+// channel's window is its `kern - 1` past inputs (`state`, oldest first) and
+// this one; the result goes through SiLU and the window slides.
+__global__ void lin_conv_step_kernel(float* x, const float* w, float* state, int channels,
+                                     int kern) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int win = kern - 1;
+    float* s = state + (long)c * win;
+    const float* wc = w + (long)c * kern;
+    const float xc = x[c];
+    float acc = wc[win] * xc;
+    for (int j = 0; j < win; ++j) acc += wc[j] * s[j];
+    for (int j = 0; j + 1 < win; ++j) s[j] = s[j + 1];
+    if (win > 0) s[win - 1] = xc;
+    x[c] = acc / (1.0f + expf(-acc));
+}
+
+// The gated delta rule for one token, one block per value head `j`
+// (<<<nv, 128, (2*dk + 32) floats>>>). `mixed` is the conv output [q | k | v];
+// q and k of the head's key head are L2-normalized (q also by 1/sqrt(dk)). Each
+// thread owns columns of the head's `[dk][dv]` state S:
+//   S *= decay;  delta = beta * (v - Sᵀk);  S += k ⊗ delta;  out = Sᵀq.
+__global__ void lin_delta_step_kernel(const float* mixed, const float* b, const float* a,
+                                      const float* a_neg, const float* dt_bias, float* ssm,
+                                      float* out, int nk, int nv, int dk, int dv, int v_tiled) {
+    extern __shared__ float sh[];
+    float* qs = sh;
+    float* ks = sh + dk;
+    float* red = sh + 2 * dk;
+    const int j = blockIdx.x;
+    const int kh = v_tiled ? j % nk : j / (nv / nk);
+    const float* q = mixed + (long)kh * dk;
+    const float* k = mixed + (long)nk * dk + (long)kh * dk;
+    const float* v = mixed + 2L * nk * dk + (long)j * dv;
+    float sq = 0.0f, sk = 0.0f;
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        const float qi = q[i], ki = k[i];
+        qs[i] = qi;
+        ks[i] = ki;
+        sq += qi * qi;
+        sk += ki * ki;
+    }
+    sq = lin_block_sum(sq, red);
+    sk = lin_block_sum(sk, red);
+    const float q_scale = rsqrtf(sq + 1e-6f) * rsqrtf((float)dk);
+    const float k_scale = rsqrtf(sk + 1e-6f);
+    const float xa = a[j] + dt_bias[j];
+    const float softplus = xa > 20.0f ? xa : log1pf(expf(xa));
+    const float decay = expf(a_neg[j] * softplus);
+    const float beta = 1.0f / (1.0f + expf(-b[j]));
+    float* S = ssm + (long)j * dk * dv;
+    for (int c = threadIdx.x; c < dv; c += blockDim.x) {
+        float mem = 0.0f;
+        for (int i = 0; i < dk; ++i) {
+            const float s = S[(long)i * dv + c] * decay;
+            S[(long)i * dv + c] = s;
+            mem += s * (ks[i] * k_scale);
+        }
+        const float delta = (v[c] - mem) * beta;
+        float o = 0.0f;
+        for (int i = 0; i < dk; ++i) {
+            const float s = S[(long)i * dv + c] + (ks[i] * k_scale) * delta;
+            S[(long)i * dv + c] = s;
+            o += s * (qs[i] * q_scale);
+        }
+        out[(long)j * dv + c] = o;
+    }
+}
+
+// Gated RMSNorm per value head, in place on `o` ([nv, dv]): rmsnorm(o_j) · w ·
+// silu(z_j). One block (128 threads) per head.
+__global__ void lin_gated_norm_kernel(float* o, const float* z, const float* w, int dv, float eps) {
+    __shared__ float red[32];
+    float* oh = o + (long)blockIdx.x * dv;
+    const float* zh = z + (long)blockIdx.x * dv;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dv; i += blockDim.x) ss += oh[i] * oh[i];
+    ss = lin_block_sum(ss, red);
+    const float inv = rsqrtf(ss / (float)dv + eps);
+    for (int i = threadIdx.x; i < dv; i += blockDim.x) {
+        const float zz = zh[i];
+        oh[i] = oh[i] * inv * w[i] * (zz / (1.0f + expf(-zz)));
+    }
+}
+
+extern "C" int dlm_linear_attn(int hidden_size, int nk, int nv, int dk, int dv, int kern,
+                               int v_tiled, float rms_eps, const DlmLinear* L,
+                               const float* in_norm, float* x, float* conv_state,
+                               float* ssm_state)
+{
+    DLM_ENTER
+    const int B = 256;
+    const int key_dim = nk * dk, value_dim = nv * dv, conv_dim = 2 * key_dim + value_dim;
+    if (nk <= 0 || nv % nk != 0 || kern < 1) return (int)cudaErrorInvalidValue;
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(LIN_NORMED, hidden_size)
+    DLM_ALLOC(LIN_QKV, conv_dim)
+    DLM_ALLOC(LIN_Z, value_dim)
+    DLM_ALLOC(LIN_B, nv)
+    DLM_ALLOC(LIN_A, nv)
+    DLM_ALLOC(LIN_CORE, value_dim)
+    DLM_ALLOC(LIN_OUT, hidden_size)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+    float *normed = g_scratch[LIN_NORMED], *qkv = g_scratch[LIN_QKV], *z = g_scratch[LIN_Z];
+    float *b = g_scratch[LIN_B], *a = g_scratch[LIN_A], *core = g_scratch[LIN_CORE];
+    float *out = g_scratch[LIN_OUT];
+
+    rmsnorm_kernel<<<1, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    launch_matvec(L->dtype[0], L->w[0], normed, (const float*)0, qkv, conv_dim, hidden_size, L->group[0]);
+    launch_matvec(L->dtype[1], L->w[1], normed, (const float*)0, z, value_dim, hidden_size, L->group[1]);
+    launch_matvec(L->dtype[2], L->w[2], normed, (const float*)0, b, nv, hidden_size, L->group[2]);
+    launch_matvec(L->dtype[3], L->w[3], normed, (const float*)0, a, nv, hidden_size, L->group[3]);
+    lin_conv_step_kernel<<<grid_for(conv_dim, B), B>>>(qkv, L->conv, conv_state, conv_dim, kern);
+    const size_t shmem = (size_t)(2 * dk + 32) * sizeof(float);
+    lin_delta_step_kernel<<<nv, 128, shmem>>>(qkv, b, a, L->a_neg, L->dt_bias, ssm_state, core,
+                                              nk, nv, dk, dv, v_tiled);
+    lin_gated_norm_kernel<<<nv, 128>>>(core, z, L->norm, dv, rms_eps);
+    launch_matvec(L->dtype[4], L->w[4], core, (const float*)0, out, hidden_size, value_dim, L->group[4]);
+    add_inplace_kernel<<<grid_for(hidden_size, B), B>>>(x, out, hidden_size);
+    return (int)cudaGetLastError();
+}
+
+// `dlm_linear_attn` for up to DLM_MAX_BATCH rows of `x`, each read once per
+// projection. Row `r` steps the state at `conv_states.p[r]` / `ssm_states.p[r]`,
+// and rows are taken in order: rows of one sequence (a prompt chunk, every slot
+// the same state) chain through it token by token, rows of different sequences
+// (a batched decode) each step their own. Like `dlm_moe_attn_batched`, it ends
+// with each row's FFN input normed into scratch MOE_NORMED2B, for
+// `dlm_moe_take_row`.
+__global__ void lin_conv_rows_kernel(float* x, const float* w, DlmSlots states, int channels,
+                                     int kern, int rows) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const int win = kern - 1;
+    const float* wc = w + (long)c * kern;
+    for (int r = 0; r < rows; ++r) {
+        float* s = states.p[r] + (long)c * win;
+        float* xr = x + (long)r * channels;
+        const float xc = xr[c];
+        float acc = wc[win] * xc;
+        for (int j = 0; j < win; ++j) acc += wc[j] * s[j];
+        for (int j = 0; j + 1 < win; ++j) s[j] = s[j + 1];
+        if (win > 0) s[win - 1] = xc;
+        xr[c] = acc / (1.0f + expf(-acc));
+    }
+}
+
+__global__ void lin_delta_rows_kernel(const float* mixed, const float* b, const float* a,
+                                      const float* a_neg, const float* dt_bias, DlmSlots states,
+                                      float* out, int nk, int nv, int dk, int dv, int v_tiled,
+                                      int rows) {
+    extern __shared__ float sh[];
+    float* qs = sh;
+    float* ks = sh + dk;
+    float* red = sh + 2 * dk;
+    const int j = blockIdx.x;
+    const int kh = v_tiled ? j % nk : j / (nv / nk);
+    const long conv_dim = 2L * nk * dk + (long)nv * dv;
+    for (int r = 0; r < rows; ++r) {
+        const float* mr = mixed + r * conv_dim;
+        const float* q = mr + (long)kh * dk;
+        const float* k = mr + (long)nk * dk + (long)kh * dk;
+        const float* v = mr + 2L * nk * dk + (long)j * dv;
+        float sq = 0.0f, sk = 0.0f;
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            const float qi = q[i], ki = k[i];
+            qs[i] = qi;
+            ks[i] = ki;
+            sq += qi * qi;
+            sk += ki * ki;
+        }
+        sq = lin_block_sum(sq, red);
+        sk = lin_block_sum(sk, red);
+        const float q_scale = rsqrtf(sq + 1e-6f) * rsqrtf((float)dk);
+        const float k_scale = rsqrtf(sk + 1e-6f);
+        const float xa = a[(long)r * nv + j] + dt_bias[j];
+        const float softplus = xa > 20.0f ? xa : log1pf(expf(xa));
+        const float decay = expf(a_neg[j] * softplus);
+        const float beta = 1.0f / (1.0f + expf(-b[(long)r * nv + j]));
+        float* S = states.p[r] + (long)j * dk * dv;
+        for (int c = threadIdx.x; c < dv; c += blockDim.x) {
+            float mem = 0.0f;
+            for (int i = 0; i < dk; ++i) {
+                const float s = S[(long)i * dv + c] * decay;
+                S[(long)i * dv + c] = s;
+                mem += s * (ks[i] * k_scale);
+            }
+            const float delta = (v[c] - mem) * beta;
+            float o = 0.0f;
+            for (int i = 0; i < dk; ++i) {
+                const float s = S[(long)i * dv + c] + (ks[i] * k_scale) * delta;
+                S[(long)i * dv + c] = s;
+                o += s * (qs[i] * q_scale);
+            }
+            out[(long)r * nv * dv + (long)j * dv + c] = o;
+        }
+        // The next row overwrites qs/ks, and may read state columns another
+        // thread just wrote (the same sequence's next token).
+        __syncthreads();
+    }
+}
+
+extern "C" int dlm_linear_attn_batched(int hidden_size, int nk, int nv, int dk, int dv, int kern,
+                                       int v_tiled, float rms_eps, const DlmLinear* L,
+                                       const float* in_norm, const float* post_norm, float* x,
+                                       int rows, const DlmSlots* conv_states,
+                                       const DlmSlots* ssm_states)
+{
+    DLM_ENTER
+    const int B = 256;
+    const int key_dim = nk * dk, value_dim = nv * dv, conv_dim = 2 * key_dim + value_dim;
+    if (rows <= 0) return 0;
+    if (rows > DLM_MAX_BATCH || nk <= 0 || nv % nk != 0 || kern < 1)
+        return (int)cudaErrorInvalidValue;
+    cudaError_t e = cudaSuccess;
+    #define DLM_ALLOC(idx, n) if (e == cudaSuccess) { e = scratch_ensure((idx), (n)); }
+    DLM_ALLOC(LIN_NORMED, rows * hidden_size)
+    DLM_ALLOC(LIN_QKV, rows * conv_dim)
+    DLM_ALLOC(LIN_Z, rows * value_dim)
+    DLM_ALLOC(LIN_B, rows * nv)
+    DLM_ALLOC(LIN_A, rows * nv)
+    DLM_ALLOC(LIN_CORE, rows * value_dim)
+    DLM_ALLOC(LIN_OUT, rows * hidden_size)
+    DLM_ALLOC(MOE_NORMED2B, rows * hidden_size)
+    #undef DLM_ALLOC
+    if (e != cudaSuccess) return (int)e;
+    float *normed = g_scratch[LIN_NORMED], *qkv = g_scratch[LIN_QKV], *z = g_scratch[LIN_Z];
+    float *b = g_scratch[LIN_B], *a = g_scratch[LIN_A], *core = g_scratch[LIN_CORE];
+    float *out = g_scratch[LIN_OUT];
+
+    rmsnorm_batched_kernel<<<rows, RMS_THREADS>>>(x, in_norm, normed, hidden_size, rms_eps);
+    launch_matvec_batched(L->dtype[0], L->w[0], normed, (const float*)0, qkv, conv_dim, hidden_size, L->group[0], rows);
+    launch_matvec_batched(L->dtype[1], L->w[1], normed, (const float*)0, z, value_dim, hidden_size, L->group[1], rows);
+    launch_matvec_batched(L->dtype[2], L->w[2], normed, (const float*)0, b, nv, hidden_size, L->group[2], rows);
+    launch_matvec_batched(L->dtype[3], L->w[3], normed, (const float*)0, a, nv, hidden_size, L->group[3], rows);
+    lin_conv_rows_kernel<<<grid_for(conv_dim, B), B>>>(qkv, L->conv, *conv_states, conv_dim, kern, rows);
+    const size_t shmem = (size_t)(2 * dk + 32) * sizeof(float);
+    lin_delta_rows_kernel<<<nv, 128, shmem>>>(qkv, b, a, L->a_neg, L->dt_bias, *ssm_states, core,
+                                              nk, nv, dk, dv, v_tiled, rows);
+    // [rows, nv, dv] is rows·nv heads back to back.
+    lin_gated_norm_kernel<<<rows * nv, 128>>>(core, z, L->norm, dv, rms_eps);
+    launch_matvec_batched(L->dtype[4], L->w[4], core, (const float*)0, out, hidden_size, value_dim, L->group[4], rows);
+    add_inplace_batched_kernel<<<grid_for(rows * hidden_size, B), B>>>(x, out, (long)rows * hidden_size);
+    rmsnorm_batched_kernel<<<rows, RMS_THREADS>>>(x, post_norm, g_scratch[MOE_NORMED2B], hidden_size, rms_eps);
     return (int)cudaGetLastError();
 }

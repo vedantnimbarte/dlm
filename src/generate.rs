@@ -888,6 +888,12 @@ impl<K: ComputeKernel> Generator<K> {
         self.vocab_size
     }
 
+    /// Whether the model keeps recurrent state (Qwen3.5/3.6's linear attention),
+    /// which cannot be rolled back: see [`ComputeKernel::recurrent`].
+    pub fn recurrent(&self) -> bool {
+        self.kernel.recurrent()
+    }
+
     /// Residual-stream width: an image embedding's row length.
     pub fn hidden_size(&self) -> usize {
         self.hidden_size

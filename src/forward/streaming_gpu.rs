@@ -48,7 +48,7 @@ use crate::forward::gpu::{
     bias_ptr, dlm_apply_expert_rows, dlm_decode_block, dlm_decode_block_batched, dlm_dense_ffn,
     dlm_mla_attn, dlm_moe_attn, dlm_moe_attn_batched, dlm_moe_load_normed, dlm_moe_norm,
     dlm_moe_save_normed, dlm_moe_take_row, upload_bias, upload_weight, DlmBlockExt, GpuBlockBiases,
-    GpuExpert, GpuMla, GpuMoeCore, SlotKv, DLM_MAX_BATCH,
+    GpuExpert, GpuGate, GpuLinear, GpuMla, GpuMoeCore, SlotKv, DLM_MAX_BATCH, W_O,
 };
 
 /// A layer's feed-forward weights in VRAM: a single dense MLP, or the MoE core
@@ -85,6 +85,11 @@ struct GpuWeights {
     post_ffn_norm: Option<DeviceBuffer>,
     /// LayerNorm, output-projection and MLP biases (GPT-2, Falcon).
     biases: GpuBlockBiases,
+    /// Gated DeltaNet weights (a Qwen3.5/3.6 linear-attention layer); when set,
+    /// `q/k/v_proj` are dummies and `o_proj` is the layer's `out_proj`.
+    linear: Option<GpuLinear>,
+    /// A Qwen3.5/3.6 full-attention layer's output gate.
+    attn_gate: Option<GpuGate>,
     /// Native dtype of the attention projection weights (see `Weights::dtype_code`).
     w_dtype: i32,
     /// Group size for int4 weights; 0 for the float dtypes.
@@ -274,6 +279,8 @@ impl GpuWeights {
                 down,
                 w_dtype: t.q_proj.dtype_code(),
                 w_group_size: t.q_proj.group_size() as i32,
+                down_dtype: t.q_proj.dtype_code(),
+                down_group: t.q_proj.group_size() as i32,
             }),
             input_layernorm: it.next().unwrap(),
             post_attention_layernorm: it.next().unwrap(),
@@ -288,6 +295,8 @@ impl GpuWeights {
             pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
             post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
             biases: GpuBlockBiases::upload(t)?,
+            linear: None,
+            attn_gate: None,
             w_dtype: t.q_proj.dtype_code(),
             w_group_size: t.q_proj.group_size() as i32,
             dtypes: crate::forward::gpu::WeightDtypes::of(t),
@@ -356,6 +365,8 @@ impl GpuWeights {
             pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
             post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
             biases: GpuBlockBiases::upload(t)?,
+            linear: t.linear.as_ref().map(GpuLinear::upload).transpose()?,
+            attn_gate: GpuGate::upload(t.attn_gate.as_ref())?,
             w_dtype,
             w_group_size,
             dtypes: crate::forward::gpu::WeightDtypes::of(t),
@@ -1147,13 +1158,46 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 &DlmBlockExt::new(&cfg, &w.biases, slots.elem, std::ptr::null())
-                    .with_weight_dtypes(&w.dtypes),
+                    .with_weight_dtypes(&w.dtypes)
+                    .with_attn_gate(&w.attn_gate),
             )
         };
         gpu_ok("dlm_moe_attn_batched", code)?;
         for b in 0..slots.len() {
             // SAFETY: row `b` of the scratch the batched call filled, and of
             // `norm`'s rows.
+            gpu_ok("dlm_moe_take_row", unsafe {
+                dlm_moe_take_row(h as i32, b as i32)
+            })?;
+            gpu_ok("dlm_moe_save_normed", unsafe {
+                dlm_moe_save_normed(h as i32, norm.add(b * h))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A linear-attention layer's token mixer for `states.len()` rows at `x`,
+    /// row `r` against state `states[r]`, in row order, each row's FFN input
+    /// saved to the same row of `norm` for
+    /// [`moe_ffn_grouped`](Self::moe_ffn_grouped).
+    fn linear_rows(
+        &self,
+        w: &GpuWeights,
+        x: *mut f32,
+        states: &[(*mut f32, *mut f32)],
+        norm: *mut f32,
+    ) -> Result<()> {
+        let lin = w.linear.as_ref().expect("a linear-attention layer");
+        let h = self.shared.cfg.hidden_size;
+        lin.run_rows(
+            &self.shared.cfg,
+            (&w.input_layernorm, &w.post_attention_layernorm),
+            (&w.o_proj, w.dtypes.dtype[W_O], w.dtypes.group[W_O]),
+            x,
+            states,
+        )?;
+        for b in 0..states.len() {
+            // SAFETY: row `b` of the scratch the call filled, and of `norm`.
             gpu_ok("dlm_moe_take_row", unsafe {
                 dlm_moe_take_row(h as i32, b as i32)
             })?;
@@ -1206,7 +1250,9 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
         // describe them anyway. One byte (rounded to a page) rather than zero:
         // `PinnedBuffer::with_len(0)` is an error, and a spare page is cheaper
         // than making the field optional for a buffer nothing reads.
-        let staging_bytes = if cfg.mla.is_some() {
+        // MoE cores take `upload_sync` as well, and a hybrid MoE config's
+        // defaulted `intermediate_size` would size a large buffer for nothing.
+        let staging_bytes = if cfg.mla.is_some() || cfg.moe.is_some() {
             1
         } else {
             GpuWeights::f32_count(&cfg) * std::mem::size_of::<f32>()
@@ -1259,21 +1305,11 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 }
             })
         };
-        let inv_freq = DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
-            cfg.head_dim,
-            cfg.rope_theta,
-            cfg.rope_scaling,
-        ))?;
+        let inv_freq = DeviceBuffer::from_slice(&cfg.rope_freqs(cfg.rope_theta, cfg.rope_scaling))?;
         // Gemma3's windowed layers rotate with their own base, unscaled.
         let local_inv_freq = cfg
             .rope_local_theta
-            .map(|theta| {
-                DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
-                    cfg.head_dim,
-                    theta,
-                    None,
-                ))
-            })
+            .map(|theta| DeviceBuffer::from_slice(&cfg.rope_freqs(theta, None)))
             .transpose()?;
         // MLA rotates only its decoupled qk_rope sub-dimension (same rule as the
         // resident `GpuKernel`).
@@ -1381,7 +1417,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                 dkv.table,
                 crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
                 &DlmBlockExt::new(cfg, &w.biases, dkv.elem, dkv.table)
-                    .with_weight_dtypes(&w.dtypes),
+                    .with_weight_dtypes(&w.dtypes)
+                    .with_attn_gate(&w.attn_gate),
             )
         };
         if code != 0 {
@@ -1413,6 +1450,28 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
     ) -> Result<()> {
         let kv_dim = self.shared.cfg.kv_dim();
         let cfg = &self.shared.cfg;
+        // Gated DeltaNet (Qwen3.5/3.6): the token mixer against this sequence's
+        // recurrent state, then the post-attention norm and the routed experts,
+        // as MLA + MoE runs. No KV for this layer.
+        if let Some(lin) = &w.linear {
+            lin.run(
+                cfg,
+                &w.input_layernorm,
+                (&w.o_proj, w.dtypes.dtype[W_O], w.dtypes.group[W_O]),
+                d_hidden,
+                kv,
+            )?;
+            // SAFETY: `d_hidden` is a live device row of `hidden_size` floats.
+            gpu_ok("dlm_moe_norm", unsafe {
+                dlm_moe_norm(
+                    cfg.hidden_size as i32,
+                    cfg.rms_eps,
+                    w.post_attention_layernorm.as_ptr(),
+                    d_hidden,
+                )
+            })?;
+            return self.run_moe_ffn(layer, w, d_hidden, defer);
+        }
         let num_positions = kv.len();
         // Per-session K/V (owned by this sequence's KvLayerCache), so batched
         // requests sharing this kernel keep independent history.
@@ -1700,7 +1759,23 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                     )));
                 }
             }
-            if moe && self.shared.cfg.mla.is_none() {
+            if let (true, Some(l)) = (moe && w.linear.is_some(), self.shared.cfg.linear) {
+                // Each sequence its own recurrent state, up to DLM_MAX_BATCH a call.
+                for c in (0..b).step_by(DLM_MAX_BATCH) {
+                    let end = (c + DLM_MAX_BATCH).min(b);
+                    let states = kv_layers[c..end]
+                        .iter_mut()
+                        .map(|kvs| {
+                            kvs[layer as usize]
+                                .linear_device_state(l.conv_state_len(), l.recurrent_state_len())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    self.linear_rows(&w, row(&d_x, c), &states, row(&d_norm, c))?;
+                }
+                for kvs in kv_layers.iter_mut() {
+                    kvs[layer as usize].advance(1);
+                }
+            } else if moe && self.shared.cfg.mla.is_none() {
                 // Up to DLM_MAX_BATCH sequences per call, each with its own KV.
                 for c in (0..b).step_by(DLM_MAX_BATCH) {
                     let end = (c + DLM_MAX_BATCH).min(b);
@@ -1836,6 +1911,8 @@ impl<S: LayerSource + 'static> StreamingGpuKernel<S> {
                     inter,
                     e.w_dtype,
                     e.w_group_size,
+                    e.down_dtype,
+                    e.down_group,
                     e.gate.as_ptr() as *const std::ffi::c_void,
                     e.up.as_ptr() as *const std::ffi::c_void,
                     e.down.as_ptr() as *const std::ffi::c_void,
@@ -1909,6 +1986,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
 
     fn kv_dim(&self) -> usize {
         self.shared.cfg.kv_dim()
+    }
+
+    fn recurrent(&self) -> bool {
+        self.shared.cfg.linear.is_some()
     }
 
     fn stream_stats(&self) -> Option<StreamStats> {
@@ -2045,18 +2126,33 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingGpuKernel<S> {
             if let (GpuFfn::Moe(_), Some((d_x, d_norm))) = (&w.ffn, &moe_rows) {
                 // Attention token by token, then each expert once for the prompt.
                 // Reserve the KV up front so no token grows it under queued work.
-                kv.device_kv(
-                    &self.kv_pools,
-                    layer as usize,
-                    kv.len() + n,
-                    self.kv_capacity_tokens,
-                    cfg.mla.is_none(),
-                )?;
+                // A linear-attention layer keeps no KV.
+                if w.linear.is_none() {
+                    kv.device_kv(
+                        &self.kv_pools,
+                        layer as usize,
+                        kv.len() + n,
+                        self.kv_capacity_tokens,
+                        cfg.mla.is_none(),
+                    )?;
+                }
                 d_x.upload(hiddens)?;
                 // SAFETY (every `row`): both buffers hold `n` rows of `hidden_size`.
                 let row =
                     |d: &DeviceBuffer, i: usize| unsafe { d.as_mut_ptr().add(i * hidden_size) };
-                if cfg.mla.is_none() {
+                // ponytail: a linear-attention layer prefills DLM_MAX_BATCH
+                // tokens a call (batched GEMVs, the state stepped token by
+                // token); a chunked delta-rule kernel with GEMMs would read each
+                // projection once per prompt.
+                if let (Some(_), Some(l)) = (&w.linear, cfg.linear) {
+                    for c in (0..n).step_by(DLM_MAX_BATCH) {
+                        let batch = (n - c).min(DLM_MAX_BATCH);
+                        let state =
+                            kv.linear_device_state(l.conv_state_len(), l.recurrent_state_len())?;
+                        self.linear_rows(&w, row(d_x, c), &vec![state; batch], row(d_norm, c))?;
+                        kv.advance(batch);
+                    }
+                } else if cfg.mla.is_none() {
                     // Every slot aliases the one layer KV, as the dense chunks do.
                     for c in (0..n).step_by(DLM_MAX_BATCH) {
                         let batch = (n - c).min(DLM_MAX_BATCH);

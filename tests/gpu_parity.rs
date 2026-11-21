@@ -3683,3 +3683,274 @@ fn gpu_gemma4_batch_matches_cpu() {
         assert_eq!(&gpu.generate(p, &cfg).unwrap(), b);
     }
 }
+
+// ── Qwen3.5/3.6: Gated DeltaNet linear attention + gated, partly rotated
+// full attention, all MoE ──────────────────────────────────────────────────
+
+fn qwen35_fixture() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_moe")
+}
+
+/// The fixture's tokens and transformers' log-probabilities for them.
+fn qwen35_reference() -> (Vec<u32>, Vec<f32>) {
+    let r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(qwen35_fixture().join("reference.json")).unwrap())
+            .unwrap();
+    let ids = r["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let lp = r["token_logprobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    (ids, lp)
+}
+
+fn assert_logprobs_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    let worst = got
+        .iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < tol, "{what}: off transformers by {worst}");
+}
+
+/// The resident GPU kernel scores the fixture as transformers does, through a
+/// prefill and through token-by-token decoding.
+#[test]
+fn gpu_qwen35_matches_transformers() {
+    let (ids, want) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    let gen = dlm::loader::load_model_parts(&store, &config, 256)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    let (got, _) = gen.score_and_next(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "resident GPU prefill");
+    let (got, _) = gen.score_and_next_decoding(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "resident GPU decode");
+}
+
+/// The streamed path the real 22 GB model takes: a two-layer window of layer
+/// cores and a routed-expert cache smaller than the experts the prompt touches,
+/// so cores and experts are evicted and fetched again mid-sequence.
+#[test]
+fn streaming_gpu_qwen35_matches_transformers() {
+    let (ids, want) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    // Three experts' worth of cache: under one layer's four.
+    let expert_bytes = 3 * config.expert_params().unwrap() as usize * 2;
+    let gen =
+        dlm::loader::build_streaming_gpu_generator(store, &config, 256, 2, 0, expert_bytes, false)
+            .unwrap();
+    let (got, _) = gen.score_and_next(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "streamed GPU prefill");
+    let (got, _) = gen.score_and_next_decoding(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "streamed GPU decode");
+    let stats = gen.stream_stats().unwrap();
+    assert!(
+        stats.expert_misses > 0 && stats.expert_hits > 0,
+        "{stats:?}"
+    );
+}
+
+/// Several sequences decoded together keep their own recurrent states: each
+/// matches the same prompt decoded alone, on both GPU kernels.
+#[test]
+fn gpu_qwen35_batched_decode_keeps_states_apart() {
+    use dlm::generate::Sampler;
+    let (ids, _) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    let prompts = [&ids[..12], &ids[3..23], &ids[40..47]];
+    fn check<K: ComputeKernel>(gen: &dlm::Generator<K>, prompts: &[&[u32]], what: &str) {
+        let alone: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| {
+                let mut s = gen.start_session(p, Sampler::Greedy).unwrap();
+                (0..8).map(|_| s.step().unwrap()).collect()
+            })
+            .collect();
+        let mut sessions: Vec<_> = prompts
+            .iter()
+            .map(|p| gen.start_session(p, Sampler::Greedy).unwrap())
+            .collect();
+        let mut together = vec![Vec::new(); prompts.len()];
+        for _ in 0..8 {
+            let mut refs: Vec<_> = sessions.iter_mut().collect();
+            for (t, tok) in together
+                .iter_mut()
+                .zip(gen.step_sessions(&mut refs).unwrap())
+            {
+                t.push(tok);
+            }
+        }
+        assert_eq!(together, alone, "{what}");
+    }
+    let resident = dlm::loader::load_model_parts(&store, &config, 256)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    check(&resident, &prompts, "resident");
+    let streamed =
+        dlm::loader::build_streaming_gpu_generator(store, &config, 256, 2, 0, 1 << 20, false)
+            .unwrap();
+    check(&streamed, &prompts, "streamed");
+}
+
+/// A snapshot taken on the GPU (`snapshot_synced` pulls the device state back)
+/// resumes exactly, on the GPU, as the uninterrupted session.
+#[test]
+fn gpu_qwen35_snapshot_resumes_exactly() {
+    use dlm::generate::Sampler;
+    let (ids, _) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    let gen = dlm::loader::load_model_parts(&store, &config, 256)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    let mut full = gen.start_session(&ids[..40], Sampler::Greedy).unwrap();
+    let want: Vec<u32> = (0..6).map(|_| full.step().unwrap()).collect();
+    let snap = gen
+        .start_session(&ids[..30], Sampler::Greedy)
+        .unwrap()
+        .snapshot_synced()
+        .unwrap();
+    let mut resumed = gen
+        .resume_session(snap.clone(), &ids[..40], Sampler::Greedy)
+        .unwrap();
+    let got: Vec<u32> = (0..6).map(|_| resumed.step().unwrap()).collect();
+    assert_eq!(got, want);
+    // A plain snapshot holds no device state, and says so rather than resuming
+    // from zeros.
+    let plain = gen
+        .start_session(&ids[..30], Sampler::Greedy)
+        .unwrap()
+        .snapshot();
+    let err = gen
+        .resume_session(plain, &ids[..40], Sampler::Greedy)
+        .err()
+        .expect("a snapshot without the device state must not resume");
+    assert!(err.to_string().contains("snapshot_synced"), "{err}");
+}
+
+/// Random weights at the real model's head shapes (key/value heads of 128, 32
+/// value heads over 16 key heads, a 256-wide attention head rotated on 64
+/// dimensions), so the kernels run their real thread counts and loops: CPU vs
+/// resident and streamed GPU over 24 tokens of decode.
+#[test]
+fn gpu_qwen35_matches_cpu_at_real_head_shapes() {
+    use dlm::forward::cpu::LinearAttnWeights;
+    use dlm::model::LinearAttnConfig;
+    let l = LinearAttnConfig {
+        num_k_heads: 16,
+        num_v_heads: 32,
+        k_head_dim: 128,
+        v_head_dim: 128,
+        conv_kernel: 4,
+        full_attention_interval: 2,
+        v_heads_tiled: false,
+    };
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 64,
+        shared_intermediate_size: Some(64),
+        norm_topk_prob: true,
+        naming: MoeNaming::Qwen,
+        first_k_dense: 0,
+        routing: Default::default(),
+    };
+    let cfg = BlockConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 256,
+        intermediate_size: 64,
+        rope_theta: 1e7,
+        rms_eps: 1e-6,
+        moe: Some(m),
+        linear: Some(l),
+        attn_output_gate: true,
+        rotary_dim: Some(64),
+        ..Default::default()
+    };
+    let h = cfg.hidden_size;
+    let base = random_moe_layers(&cfg, 4, 0x0035);
+    let mut rng = Rng::new(0x3535);
+    let layers: Vec<LayerTensors> = base
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut t)| {
+            t.q_norm = Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect());
+            t.k_norm = Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect());
+            if l.is_linear(i as u32) {
+                t.q_proj = Weights::default();
+                t.k_proj = Weights::default();
+                t.v_proj = Weights::default();
+                t.q_norm = None;
+                t.k_norm = None;
+                t.o_proj = Weights::from_f32(rng.vec(h * l.value_dim(), 0.05));
+                t.linear = Some(LinearAttnWeights {
+                    in_proj_qkv: Weights::from_f32(rng.vec(l.conv_dim() * h, 0.05)),
+                    in_proj_z: Weights::from_f32(rng.vec(l.value_dim() * h, 0.05)),
+                    in_proj_b: Weights::from_f32(rng.vec(32 * h, 0.1)),
+                    in_proj_a: Weights::from_f32(rng.vec(32 * h, 0.1)),
+                    conv1d: rng.vec(l.conv_dim() * 4, 0.5),
+                    a_neg: rng.vec(32, 0.5).iter().map(|v| -(0.55 + v)).collect(),
+                    dt_bias: rng.vec(32, 0.5),
+                    norm: rng.vec(128, 0.2).iter().map(|v| 1.0 + v).collect(),
+                });
+            } else {
+                t.attn_gate = Some(Weights::from_f32(rng.vec(cfg.q_dim() * h, 0.05)));
+            }
+            t
+        })
+        .collect();
+    let kv_cfg = KvCacheConfig {
+        num_layers: 4,
+        num_kv_heads: 2,
+        head_dim: 256,
+        block_size: 16,
+    };
+    let mut cpu = ForwardOrchestrator::new(
+        CpuKernel::new(cfg, layers.clone()).unwrap(),
+        PagedKvCache::new(kv_cfg, 8),
+        dlm::forward::KvQuant::None,
+    );
+    let mut res = ForwardOrchestrator::new(
+        GpuKernel::new(cfg, layers.clone(), 64).unwrap(),
+        PagedKvCache::new(kv_cfg, 8),
+        dlm::forward::KvQuant::None,
+    );
+    let mut st = ForwardOrchestrator::new(
+        StreamingGpuKernel::new(cfg, MoeVecSource(layers), 64, 2, None).unwrap(),
+        PagedKvCache::new(kv_cfg, 8),
+        dlm::forward::KvQuant::None,
+    );
+    let mut rng = Rng::new(7);
+    for step in 0..24 {
+        let x = rng.vec(h, 1.0);
+        let (mut a, mut b, mut c) = (x.clone(), x.clone(), x);
+        cpu.decode_token(&mut a).unwrap();
+        res.decode_token(&mut b).unwrap();
+        st.decode_token(&mut c).unwrap();
+        for (what, g) in [("resident", &b), ("streamed", &c)] {
+            let diff = a
+                .iter()
+                .zip(g)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(diff < 2e-3, "{what}: step {step}: off the CPU by {diff}");
+        }
+    }
+}

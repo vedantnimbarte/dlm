@@ -439,7 +439,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// snapshot, skipping the shared prefix's prefill. No effect with a draft
     /// model (its sessions can't resume). `0` disables it.
     pub fn with_prefix_cache(mut self, max_entries: usize) -> Self {
-        self.prefix_cache = if max_entries > 0 && !self.has_draft() {
+        // A recurrent model's state is only valid at the very position it was
+        // taken, and the cache resumes from prefixes of what it holds.
+        self.prefix_cache = if max_entries > 0 && !self.has_draft() && !self.generator.recurrent() {
             Some(PrefixCache::new(max_entries))
         } else {
             None

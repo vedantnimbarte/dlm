@@ -17,6 +17,13 @@ fork that runs large MoE models from SSD.
 
 ### Fixed
 
+- **MoE experts in a GGUF whose down projection is stored differently were
+  decoded as the wrong format on the GPU.** A Q4_K_M file keeps an expert's
+  gate and up in Q4_K and its down in Q6_K, but the GPU expert kept one dtype
+  for all three, read off up, and decoded down's Q6_K blocks as Q4_K. On
+  Qwen3.6-35B-A3B every streamed log-probability came out NaN. The expert
+  kernels now take down's dtype and group size separately, and a gate stored
+  unlike up is refused rather than misread.
 - **Gemma GGUF files did not load, and would not have read right if they
   had.** Three faults, each enough on its own:
   - **The pre-FFN norm was mapped onto the post-attention norm.** Gemma 2
@@ -110,6 +117,32 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **Qwen3.5/3.6 MoE (Qwen3.6-35B-A3B), text only.** The hybrid layout:
+  three Gated DeltaNet linear-attention layers (causal conv, the gated delta
+  rule over a per-head recurrent state, a gated RMSNorm) to every
+  full-attention layer (an output gate, per-head Q/K norms, RoPE on a quarter
+  of each head), every layer routed MoE with a sigmoid-gated shared expert.
+  From the multimodal safetensors checkpoint (its language model; the vision
+  tower is skipped) or llama.cpp's `qwen35moe` GGUF (value heads tiled, `A`
+  stored as `-exp(A_log)`, `+1` in the norms, stacked experts). CPU and GPU,
+  resident or streamed with the routed experts through the expert cache; new
+  CUDA kernels for the conv step, the delta rule, the gated norm and the output
+  gate; a prompt's linear layers run 16 tokens per call. Checked against
+  `transformers` on a tiny random checkpoint, prefill and token-by-token decode
+  (`tests/qwen35_parity.rs`, `tests/gpu_parity.rs`). The chat template is
+  Qwen3.6's own (`qwen3.5`: thinking on, earlier answers' `<think>` dropped);
+  its XML tool calls are refused for now. The tokenizer's pre-split keeps
+  combining marks with their letters. Since a linear-attention layer keeps a
+  recurrent state rather than a KV history, speculative decoding is refused and
+  the prefix cache stays off for these models; a snapshot resumes only at the
+  position it was taken. The MTP head loads (`loader::load_mtp`) but is not
+  run. Dense Qwen3.5 and Qwen3-Next are refused.
+  - **Real model:** bartowski's 22 GB Qwen3.6-35B-A3B Q4_K_M, streamed on a
+    GTX 1650 4 GB with 16 GB of RAM. It reasons in `<think>`, then answers
+    "The capital of France is Paris.", and its scores match the CPU's within
+    0.09 nats a token (`tests/qwen36_model.rs`, `DLM_QWEN36_GGUF`).
+  - **Speed:** decode runs at 2.5–2.9 tok/s and prefill at 3–4 tok/s. The 22
+    GB of experts do not fit the RAM cache, so most misses read the SSD.
 - **Gemma 4 E2B and E4B (text).** From the safetensors checkpoint
   (`Gemma4ForConditionalGeneration`; the vision and audio towers are
   skipped) and from llama.cpp's `gemma4` GGUF, with its tokenizer and a

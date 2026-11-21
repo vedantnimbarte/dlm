@@ -29,6 +29,14 @@ pub trait ComputeKernel {
     /// Key/value width per token (`num_kv_heads × head_dim`).
     fn kv_dim(&self) -> usize;
 
+    /// Whether some layers keep a recurrent state (a hybrid model's linear
+    /// attention) instead of a KV history. Such a sequence cannot be rolled back
+    /// to an earlier position, so speculative decoding and partial prefix reuse
+    /// refuse it.
+    fn recurrent(&self) -> bool {
+        false
+    }
+
     /// Values at the end of each row that are not the hidden state: Gemma 4's
     /// per-layer inputs, which the generator gathers per token and every layer
     /// reads its slice of. `hidden_size` is the whole row; the model's own width
@@ -205,6 +213,10 @@ impl<K: ComputeKernel> ComputeKernel for &K {
 
     fn kv_dim(&self) -> usize {
         (**self).kv_dim()
+    }
+
+    fn recurrent(&self) -> bool {
+        (**self).recurrent()
     }
 
     fn per_layer_input_width(&self) -> usize {

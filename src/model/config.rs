@@ -261,6 +261,136 @@ struct RawConfig {
     #[serde(default)]
     /// Gemma 4 spells it `null` or `"all"`; Gemma 3 270M ships `false`.
     use_bidirectional_attention: Option<serde_json::Value>,
+    // ── Qwen3.5/3.6 hybrid layers (Gated DeltaNet linear attention between
+    // full-attention layers); absent on every other family. ──
+    #[serde(default)]
+    linear_num_key_heads: Option<u32>,
+    #[serde(default)]
+    linear_num_value_heads: Option<u32>,
+    #[serde(default)]
+    linear_key_head_dim: Option<u32>,
+    #[serde(default)]
+    linear_value_head_dim: Option<u32>,
+    #[serde(default)]
+    linear_conv_kernel_dim: Option<u32>,
+    /// Every n-th layer is full attention, the rest linear.
+    #[serde(default)]
+    full_attention_interval: Option<u32>,
+    /// Multi-token-prediction layers shipped beside the model (`mtp.*`).
+    #[serde(default)]
+    mtp_num_hidden_layers: Option<u32>,
+    /// Set by [`ModelConfig::from_gguf`]: llama.cpp writes Qwen3.5's `(1 + w)`
+    /// norms with the `+1` already added.
+    #[serde(default, rename = "_dlm_norms_baked")]
+    norms_baked: Option<bool>,
+    /// Set by [`ModelConfig::from_gguf`]: llama.cpp reorders the linear
+    /// attention's value heads from grouped-by-key-head to tiled.
+    #[serde(default, rename = "_dlm_v_heads_tiled")]
+    v_heads_tiled: Option<bool>,
+}
+
+/// Gated DeltaNet linear attention (Qwen3.5/3.6): the token mixer of every layer
+/// that is not a full-attention one. A layer keeps a causal-conv window and a
+/// per-head `k_head_dim × v_head_dim` recurrent state instead of a KV history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearAttnConfig {
+    pub num_k_heads: u32,
+    pub num_v_heads: u32,
+    pub k_head_dim: u32,
+    pub v_head_dim: u32,
+    /// Causal depthwise conv width (4).
+    pub conv_kernel: u32,
+    /// Layer `l` is full attention when `(l + 1) % full_attention_interval == 0`.
+    pub full_attention_interval: u32,
+    /// Value head `j` reads key head `j % num_k_heads` (llama.cpp's GGUF order)
+    /// rather than `j / (num_v_heads / num_k_heads)` (Hugging Face's).
+    pub v_heads_tiled: bool,
+}
+
+impl LinearAttnConfig {
+    /// `num_k_heads × k_head_dim`: the width of q and of k.
+    pub fn key_dim(&self) -> usize {
+        (self.num_k_heads * self.k_head_dim) as usize
+    }
+    /// `num_v_heads × v_head_dim`.
+    pub fn value_dim(&self) -> usize {
+        (self.num_v_heads * self.v_head_dim) as usize
+    }
+    /// Channels through the conv: q, k and v side by side.
+    pub fn conv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+    /// Floats of conv window one sequence keeps per layer.
+    pub fn conv_state_len(&self) -> usize {
+        self.conv_dim() * (self.conv_kernel as usize).saturating_sub(1)
+    }
+    /// Floats of recurrent state one sequence keeps per layer.
+    pub fn recurrent_state_len(&self) -> usize {
+        (self.num_v_heads * self.k_head_dim * self.v_head_dim) as usize
+    }
+    /// Whether `layer` is a linear-attention one.
+    pub fn is_linear(&self, layer: u32) -> bool {
+        (layer + 1) % self.full_attention_interval.max(1) != 0
+    }
+    /// The key head value head `j` reads.
+    pub fn k_head_of(&self, j: usize) -> usize {
+        let (nk, nv) = (self.num_k_heads as usize, self.num_v_heads as usize);
+        if self.v_heads_tiled {
+            j % nk
+        } else {
+            j / (nv / nk).max(1)
+        }
+    }
+}
+
+/// Qwen3.5/3.6's linear-attention geometry and layer pattern, or `None` for a
+/// model without linear layers. Every dimension is required once one is seen,
+/// and `layer_types` must be the regular "every n-th layer full" shape.
+fn build_linear_config(raw: &RawConfig) -> Result<Option<LinearAttnConfig>> {
+    let Some(num_v_heads) = raw.linear_num_value_heads else {
+        return Ok(None);
+    };
+    let need = |v: Option<u32>, name: &str| -> Result<u32> {
+        v.filter(|&v| v > 0).ok_or_else(|| {
+            DlmError::InvalidConfig(format!(
+                "linear-attention config (linear_num_value_heads set) is missing {name}"
+            ))
+        })
+    };
+    let num_k_heads = need(raw.linear_num_key_heads, "linear_num_key_heads")?;
+    if num_v_heads % num_k_heads != 0 {
+        return Err(DlmError::InvalidConfig(format!(
+            "linear_num_value_heads ({num_v_heads}) is not a multiple of linear_num_key_heads \
+             ({num_k_heads})"
+        )));
+    }
+    let interval = raw.full_attention_interval.unwrap_or(4).max(1);
+    if let Some(types) = &raw.layer_types {
+        let regular = types.len() == raw.num_hidden_layers as usize
+            && types.iter().enumerate().all(|(i, t)| {
+                let full = (i as u32 + 1) % interval == 0;
+                t == if full {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            });
+        if !regular {
+            return Err(DlmError::InvalidConfig(format!(
+                "layer_types {types:?} is not every {interval}-th layer full attention; dlm runs \
+                 that one hybrid layout, and a different one would run layers as the wrong kind"
+            )));
+        }
+    }
+    Ok(Some(LinearAttnConfig {
+        num_k_heads,
+        num_v_heads,
+        k_head_dim: need(raw.linear_key_head_dim, "linear_key_head_dim")?,
+        v_head_dim: need(raw.linear_value_head_dim, "linear_value_head_dim")?,
+        conv_kernel: need(raw.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+        full_attention_interval: interval,
+        v_heads_tiled: raw.v_heads_tiled.unwrap_or(false),
+    }))
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -822,6 +952,17 @@ pub struct ModelConfig {
     /// changes where the other two norms apply (see
     /// [`LayerTensors::is_gemma2_style`](crate::forward::LayerTensors::is_gemma2_style)).
     pub gemma2_norms: bool,
+    /// Qwen3.5/3.6: Gated DeltaNet layers between the full-attention ones.
+    pub linear_attn: Option<LinearAttnConfig>,
+    /// The full-attention output is multiplied by `sigmoid(gate)`, where the
+    /// gate is a second half of the query projection (Qwen3.5/3.6).
+    pub attn_output_gate: bool,
+    /// RoPE rotates only the first `rotary_dim` dimensions of each head
+    /// (`partial_rotary_factor`); `None` rotates all of them.
+    pub rotary_dim: Option<u32>,
+    /// Multi-token-prediction layers the checkpoint ships (`mtp.*`), loaded
+    /// beside the model but not run.
+    pub mtp_layers: u32,
     /// Gemma 4: the full-attention layers' head width (`global_head_dim`), when
     /// it differs from `head_dim`, which is then the windowed layers'.
     pub global_head_dim: Option<u32>,
@@ -1029,6 +1170,21 @@ fn gemma4_settings(raw: &RawConfig) -> Result<Gemma4> {
 /// unless `text_config` sets them itself.
 fn gemma3_text_config(json: serde_json::Value) -> serde_json::Value {
     use serde_json::{json, Value};
+    // Qwen3.5/3.6 nest their text model the same way, complete, beside a vision
+    // tower; only the top-level ids are carried over.
+    if matches!(
+        json.get("model_type").and_then(Value::as_str),
+        Some("qwen3_5_moe" | "qwen3_5")
+    ) {
+        if let Some(Value::Object(mut text)) = json.get("text_config").cloned() {
+            for key in ["eos_token_id", "bos_token_id", "tie_word_embeddings"] {
+                if let (false, Some(v)) = (text.contains_key(key), json.get(key)) {
+                    text.insert(key.to_string(), v.clone());
+                }
+            }
+            return Value::Object(text);
+        }
+    }
     let is_multimodal_gemma3 = json.get("model_type").and_then(Value::as_str) == Some("gemma3");
     let Some(Value::Object(mut text)) = json
         .get("text_config")
@@ -1144,9 +1300,12 @@ impl ModelConfig {
             "gemma" => "gemma",
             "gemma2" => "gemma2",
             "gemma3" | "gemma3_text" => "gemma3_text",
+            "qwen35moe" => "qwen3_5_moe_text",
             other => {
                 return Err(DlmError::InvalidConfig(format!(
-                    "gguf: architecture {other:?} is not one dlm implements. It reads llama,                      mistral, qwen2, qwen3, phi3, starcoder2 and gemma/gemma2/gemma3 files."
+                    "gguf: architecture {other:?} is not one dlm implements. It reads llama, \
+                     mistral, qwen2, qwen3, qwen35moe, phi3, starcoder2 and \
+                     gemma/gemma2/gemma3 files."
                 )))
             }
         };
@@ -1155,10 +1314,20 @@ impl ModelConfig {
                 .get(&format!("{arch}.{key}"))
                 .and_then(Value::as_f64)
         };
+        // A hybrid model may store a per-layer array where others store one
+        // value (KV heads: 0 on its recurrent layers); the largest is the
+        // attention layers' value.
         let int = |key: &str| {
-            metadata
-                .get(&format!("{arch}.{key}"))
-                .and_then(Value::as_u64)
+            let v = metadata.get(&format!("{arch}.{key}"))?;
+            v.as_u64().or_else(|| {
+                v.as_numbers()
+                    .and_then(|n| {
+                        n.iter()
+                            .copied()
+                            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))))
+                    })
+                    .map(|x| x as u64)
+            })
         };
         let need = |key: &str| {
             int(key).ok_or_else(|| {
@@ -1175,10 +1344,12 @@ impl ModelConfig {
                 DlmError::InvalidConfig("gguf: metadata has no tokenizer.ggml.tokens".into())
             })?;
 
+        // llama.cpp counts the MTP layers in `block_count`; they follow the model's.
+        let mtp = int("nextn_predict_layers").unwrap_or(0);
         let mut cfg = json!({
             "model_type": model_type,
             "hidden_size": need("embedding_length")?,
-            "num_hidden_layers": need("block_count")?,
+            "num_hidden_layers": need("block_count")?.saturating_sub(mtp),
             "num_attention_heads": need("attention.head_count")?,
             "vocab_size": vocab,
             "tie_word_embeddings": !has_lm_head,
@@ -1238,6 +1409,49 @@ impl ModelConfig {
                 .and_then(Value::as_u64)
                 .map(Into::into),
         );
+        if arch == "qwen35moe" {
+            // llama.cpp's names for the MoE and Gated DeltaNet geometry; the
+            // value head width is the inner size over the value head count.
+            put("num_experts", int("expert_count").map(Into::into));
+            put(
+                "num_experts_per_tok",
+                int("expert_used_count").map(Into::into),
+            );
+            put(
+                "moe_intermediate_size",
+                int("expert_feed_forward_length").map(Into::into),
+            );
+            put(
+                "shared_expert_intermediate_size",
+                int("expert_shared_feed_forward_length").map(Into::into),
+            );
+            put(
+                "linear_conv_kernel_dim",
+                int("ssm.conv_kernel").map(Into::into),
+            );
+            put("linear_key_head_dim", int("ssm.state_size").map(Into::into));
+            put(
+                "linear_num_key_heads",
+                int("ssm.group_count").map(Into::into),
+            );
+            let nv = int("ssm.time_step_rank");
+            put("linear_num_value_heads", nv.map(Into::into));
+            put(
+                "linear_value_head_dim",
+                int("ssm.inner_size")
+                    .zip(nv)
+                    .map(|(inner, nv)| (inner / nv.max(1)).into()),
+            );
+            put(
+                "full_attention_interval",
+                int("full_attention_interval").map(Into::into),
+            );
+            put("mtp_num_hidden_layers", Some(mtp.into()));
+            // The converter adds Qwen3.5's `+1` into its norms and tiles the
+            // value heads (see `LinearAttnConfig::v_heads_tiled`).
+            put("_dlm_norms_baked", Some(true.into()));
+            put("_dlm_v_heads_tiled", Some(true.into()));
+        }
         // llama.cpp spells RoPE scaling as a type plus a factor, the same two
         // fields `rope_scaling` holds.
         if let (Some(kind), Some(factor)) = (
@@ -1534,14 +1748,77 @@ impl ModelConfig {
                 )));
             }
         }
-        // RoPE on part of each head (Phi, GPT-NeoX, GLM): dlm rotates all of it.
-        if let Some(factor) = raw.partial_rotary_factor.filter(|f| *f < 1.0) {
+        let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
+        // Qwen3.5/3.6 MoE: Gated DeltaNet layers, three in four, between gated
+        // full-attention ones with partial RoPE and (1 + w) norms.
+        let is_qwen35 = matches!(model_type.as_str(), "qwen3_5_moe_text" | "qwen3_5_moe");
+        if matches!(
+            model_type.as_str(),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_next"
+        ) {
             return Err(DlmError::InvalidConfig(format!(
-                "config sets partial_rotary_factor {factor}, so RoPE covers only that \
-                 fraction of each head's dimensions. dlm rotates the whole head; doing that \
-                 to a model trained this way mis-places every token without erroring."
+                "model_type {model_type:?} is not supported: dlm runs the Qwen3.5/3.6 hybrid \
+                 layers for the MoE checkpoints (qwen3_5_moe). Qwen3-Next fuses its linear \
+                 attention projections in another layout, and the dense Qwen3.5 has not been \
+                 checked against transformers."
             )));
         }
+        let linear_attn = if is_qwen35 {
+            build_linear_config(&raw)?
+        } else {
+            None
+        };
+        if is_qwen35 && linear_attn.is_none() {
+            return Err(DlmError::InvalidConfig(
+                "a qwen3_5_moe config without linear_num_value_heads; dlm will not guess the \
+                 linear-attention geometry"
+                    .into(),
+            ));
+        }
+        // `rope_parameters` (newer transformers) holds what older configs keep at
+        // the top level; a top-level key wins.
+        let rope_params = raw.rope_parameters.as_ref();
+        let rope_param_f32 = |key: &str| {
+            rope_params
+                .and_then(|p| p.get(key))
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32)
+        };
+        let rope_scaling_raw: Option<RawRopeScaling> = match (&raw.rope_scaling, rope_params) {
+            (Some(_), _) | (None, None) => None,
+            (None, Some(p)) => serde_json::from_value(p.clone()).ok(),
+        };
+        let rope_scaling_raw = raw.rope_scaling.as_ref().or(rope_scaling_raw.as_ref());
+        // RoPE on part of each head: dlm rotates the first `rotary_dim` of a
+        // hybrid Qwen3.5 head (as transformers does, by halves) and refuses it
+        // elsewhere (Phi, GPT-NeoX, GLM), whose loaders it has not been wired into.
+        let partial = raw
+            .partial_rotary_factor
+            .or_else(|| rope_param_f32("partial_rotary_factor"))
+            .filter(|f| *f < 1.0);
+        let head_dim_for_rope = raw
+            .head_dim
+            .unwrap_or(raw.hidden_size / raw.num_attention_heads.max(1));
+        let rotary_dim = match partial {
+            None => None,
+            Some(factor) if linear_attn.is_some() => {
+                let dim = (head_dim_for_rope as f32 * factor) as u32;
+                if dim == 0 || dim % 2 != 0 {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "partial_rotary_factor {factor} leaves {dim} rotated dimensions of \
+                         {head_dim_for_rope}; RoPE needs an even, non-zero count"
+                    )));
+                }
+                Some(dim)
+            }
+            Some(factor) => {
+                return Err(DlmError::InvalidConfig(format!(
+                    "config sets partial_rotary_factor {factor}, so RoPE covers only that \
+                     fraction of each head's dimensions. dlm rotates the whole head; doing that \
+                     to a model trained this way mis-places every token without erroring."
+                )));
+            }
+        };
 
         // Gemma architecture variants: (1+w) RMSNorm, embedding scaling, GeGLU.
         // Gemma2 adds logit softcapping, alternating window layers, a decoupled
@@ -1629,9 +1906,12 @@ impl ModelConfig {
                 Some(EosField::Many(ids)) => ids,
                 None => Vec::new(),
             },
-            rope_theta: raw.rope_theta.unwrap_or(10000.0),
+            rope_theta: raw
+                .rope_theta
+                .or_else(|| rope_param_f32("rope_theta"))
+                .unwrap_or(10000.0),
             rms_eps: raw.rms_norm_eps.unwrap_or(1e-5),
-            rope_scaling: match &raw.rope_scaling {
+            rope_scaling: match rope_scaling_raw {
                 Some(r) => parse_rope_scaling(r)?,
                 None => None,
             },
@@ -1644,7 +1924,9 @@ impl ModelConfig {
             // attention; keep it as declared and let the kernel no-op it.
             sliding_window,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
-            norm_add_one: is_gemma,
+            // Qwen3.5's norms are zero-centered `(1 + w)` too, except the linear
+            // attention's gated norm, which the loader reads plainly.
+            norm_add_one: is_gemma || (is_qwen35 && !raw.norms_baked.unwrap_or(false)),
             norm_kind,
             parallel_residual: is_falcon && raw.parallel_attn.unwrap_or(true),
             learned_positions: is_gpt2,
@@ -1679,12 +1961,24 @@ impl ModelConfig {
             final_logit_softcap: raw.final_logit_softcapping.filter(|c| *c > 0.0),
             query_pre_attn_scalar: raw.query_pre_attn_scalar.filter(|s| *s > 0.0),
             gemma2_norms: is_gemma2 || is_gemma3,
+            linear_attn,
+            // Qwen3.5's attention class always has the gate.
+            attn_output_gate: is_qwen35,
+            rotary_dim,
+            mtp_layers: raw.mtp_num_hidden_layers.unwrap_or(0),
             global_head_dim: None,
             kv_shared_from: None,
             v_norm: false,
             ple_dim: 0,
             double_wide_shared_mlp: false,
         };
+        if config.rotary_dim.is_some() && config.rope_scaling.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "rope scaling with a partial rotary factor is not implemented: the scaling's \
+                 attention factor would reach the dimensions RoPE leaves alone"
+                    .into(),
+            ));
+        }
         // Gemma 4: Gemma 3's block with plain-`w` RMSNorm, normed values, an
         // attention scale of 1 (the Q/K norms carry it), wider global heads
         // with partial RoPE, a shared-KV tail and per-layer inputs.
@@ -1826,8 +2120,51 @@ impl ModelConfig {
     /// k + v, scaled by the GQA ratio (`2 * kv_ratio * h*h`).
     fn attn_params(&self) -> u64 {
         let h = self.hidden_size as u64;
-        let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
-        (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64
+        let Some(l) = &self.linear_attn else {
+            let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
+            return (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64;
+        };
+        // A hybrid model averages its two kinds of layer.
+        let q = (self.num_attention_heads * self.head_dim()) as u64;
+        let kv = (self.num_kv_heads * self.head_dim()) as u64;
+        let gate = if self.attn_output_gate { q } else { 0 };
+        let full = (q + gate + 2 * kv) * h + h * q;
+        let (kd, vd, nv) = (
+            l.key_dim() as u64,
+            l.value_dim() as u64,
+            l.num_v_heads as u64,
+        );
+        let linear = (2 * kd + 2 * vd + 2 * nv) * h + h * vd;
+        let layers = self.num_layers as u64;
+        let n_full = self.attention_layers() as u64;
+        (full * n_full + linear * (layers - n_full)) / layers.max(1)
+    }
+
+    /// True for a hybrid model, whose linear-attention layers keep a recurrent
+    /// state instead of a KV history.
+    pub fn is_hybrid(&self) -> bool {
+        self.linear_attn.is_some()
+    }
+
+    /// Layers that keep a KV history: all of them, or a hybrid model's
+    /// full-attention ones.
+    pub fn attention_layers(&self) -> u32 {
+        match &self.linear_attn {
+            Some(l) => (0..self.num_layers).filter(|&i| !l.is_linear(i)).count() as u32,
+            None => self.num_layers,
+        }
+    }
+
+    /// Bytes of recurrent state (conv window + delta-rule state, f32) one
+    /// sequence keeps across all linear-attention layers; 0 for other models.
+    pub fn linear_state_bytes(&self) -> u64 {
+        match &self.linear_attn {
+            Some(l) => {
+                let per_layer = (l.conv_state_len() + l.recurrent_state_len()) as u64 * 4;
+                per_layer * (self.num_layers - self.attention_layers()) as u64
+            }
+            None => 0,
+        }
     }
 
     /// Parameters in one routed MoE expert's SwiGLU triple (gate + up + down),
@@ -2131,6 +2468,72 @@ mod tests {
     /// A multimodal Gemma 3 config as Google exports the 27B: the text model is
     /// nested and sparse. Everything omitted must come from Gemma3TextConfig's
     /// defaults, and the EOS id from the top level.
+    /// Qwen3.6-35B-A3B's own config (trimmed of the vision tower and the
+    /// 40-entry `layer_types`, which `full_attention_interval` implies): the
+    /// text model comes out of `text_config`, RoPE out of `rope_parameters`.
+    #[test]
+    fn qwen36_config_reads_its_hybrid_text_model() {
+        let json = br#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],
+            "model_type":"qwen3_5_moe","tie_word_embeddings":false,
+            "text_config":{"attention_bias":false,"attn_output_gate":true,
+              "bos_token_id":248044,"eos_token_id":248044,"full_attention_interval":4,
+              "head_dim":256,"hidden_act":"silu","hidden_size":2048,
+              "linear_conv_kernel_dim":4,"linear_key_head_dim":128,"linear_num_key_heads":16,
+              "linear_num_value_heads":32,"linear_value_head_dim":128,
+              "max_position_embeddings":262144,"model_type":"qwen3_5_moe_text",
+              "moe_intermediate_size":512,"mtp_num_hidden_layers":1,"num_attention_heads":16,
+              "num_experts":256,"num_experts_per_tok":8,"num_hidden_layers":40,
+              "num_key_value_heads":2,"partial_rotary_factor":0.25,"rms_norm_eps":1e-06,
+              "rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],
+                "partial_rotary_factor":0.25,"rope_theta":10000000,"rope_type":"default"},
+              "shared_expert_intermediate_size":512,"tie_word_embeddings":false,
+              "vocab_size":248320},
+            "vision_config":{"depth":27,"hidden_size":1152}}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        assert_eq!(
+            (c.hidden_size, c.num_layers, c.vocab_size),
+            (2048, 40, 248320)
+        );
+        assert_eq!(
+            (c.num_attention_heads, c.num_kv_heads, c.head_dim()),
+            (16, 2, 256)
+        );
+        assert_eq!(c.rope_theta, 1e7);
+        assert_eq!(c.rotary_dim, Some(64));
+        assert!(c.rope_scaling.is_none());
+        let l = c.linear_attn.unwrap();
+        assert_eq!(
+            (l.key_dim(), l.value_dim(), l.conv_dim()),
+            (2048, 4096, 8192)
+        );
+        assert!((0..40)
+            .filter(|&i| !l.is_linear(i))
+            .eq([3, 7, 11, 15, 19, 23, 27, 31, 35, 39]));
+        assert_eq!(
+            (l.k_head_of(0), l.k_head_of(1), l.k_head_of(31)),
+            (0, 0, 15)
+        );
+        let m = c.moe.unwrap();
+        assert!(m.norm_topk_prob && m.routing.is_plain());
+        assert_eq!(m.naming, MoeNaming::Qwen);
+        assert!(c.attn_output_gate && c.norm_add_one && !c.tie_word_embeddings);
+        assert_eq!(c.eos_token_ids, vec![248044]);
+        assert_eq!(c.mtp_layers, 1);
+        // 30 linear layers of a 24 KiB conv window and a 2 MiB state each.
+        assert_eq!(c.linear_state_bytes(), 30 * (8192 * 3 + 32 * 128 * 128) * 4);
+        // A layout other than "every n-th full" is refused, not guessed at.
+        let bad = String::from_utf8_lossy(json).replace(
+            r#""full_attention_interval":4"#,
+            r#""full_attention_interval":4,"layer_types":["full_attention"]"#,
+        );
+        assert!(ModelConfig::from_json_bytes(bad.as_bytes(), QuantScheme::Fp16).is_err());
+        // The dense Qwen3.5 and Qwen3-Next are refused.
+        for other in ["qwen3_5_text", "qwen3_next"] {
+            let j = String::from_utf8_lossy(json).replace("qwen3_5_moe_text", other);
+            assert!(ModelConfig::from_json_bytes(j.as_bytes(), QuantScheme::Fp16).is_err());
+        }
+    }
+
     #[test]
     fn multimodal_gemma3_config_reads_its_sparse_text_config() {
         let json = br#"{"architectures":["Gemma3ForConditionalGeneration"],

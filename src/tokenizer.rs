@@ -444,6 +444,7 @@ impl BpeTokenizer {
                 // `tokenizer.json` gets.
                 tok.split = match get("pre").and_then(Value::as_str).unwrap_or("default") {
                     "qwen2" => ByteLevelSplit::Qwen2,
+                    "qwen35" => ByteLevelSplit::Qwen35,
                     "llama-bpe" | "llama3" | "llama-v3" => ByteLevelSplit::Llama3,
                     _ => ByteLevelSplit::Gpt2,
                 };
@@ -1160,10 +1161,14 @@ enum ByteLevelSplit {
     Qwen2,
     /// Llama 3: [`QWEN2_PATTERN`] with numbers in runs of up to three digits.
     Llama3,
+    /// Qwen3.5/3.6: [`QWEN2_PATTERN`] with combining marks (`\p{M}`) kept in
+    /// the letter runs ([`QWEN35_PATTERN`]).
+    Qwen35,
 }
 
 const QWEN2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const LLAMA3_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+const QWEN35_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// The split a `tokenizer.json` pre-tokenizer graph asks for: the Qwen2 or
 /// Llama 3 pattern when a `Split` step carries it verbatim, else GPT-2's. Other
@@ -1194,6 +1199,8 @@ fn detect_byte_level_split(pre: &serde_json::Value) -> ByteLevelSplit {
         ByteLevelSplit::Qwen2
     } else if found.contains(&LLAMA3_PATTERN) {
         ByteLevelSplit::Llama3
+    } else if found.contains(&QWEN35_PATTERN) {
+        ByteLevelSplit::Qwen35
     } else {
         ByteLevelSplit::Gpt2
     }
@@ -1202,7 +1209,7 @@ fn detect_byte_level_split(pre: &serde_json::Value) -> ByteLevelSplit {
 /// Split `text` the way `split`'s regex does, leftmost alternative first, so
 /// each piece is exactly what the model's tokenizer would merge within.
 fn pretokenize(text: &str, split: ByteLevelSplit) -> Vec<&str> {
-    use crate::unicode_class::{is_letter, is_number};
+    use crate::unicode_class::{is_letter, is_mark, is_number};
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let n = chars.len();
     let at = |i: usize| chars.get(i).map(|&(_, c)| c);
@@ -1210,8 +1217,13 @@ fn pretokenize(text: &str, split: ByteLevelSplit) -> Vec<&str> {
     let number = |i: usize| at(i).is_some_and(is_number);
     let space = |i: usize| at(i).is_some_and(char::is_whitespace);
     let crlf = |i: usize| matches!(at(i), Some('\r' | '\n'));
-    // Other: neither whitespace, letter nor number (`[^\s\p{L}\p{N}]`).
-    let other = |i: usize| i < n && !space(i) && !letter(i) && !number(i);
+    // Qwen3.5 runs letters and combining marks together; elsewhere a mark is
+    // "other".
+    let mark = |i: usize| split == ByteLevelSplit::Qwen35 && at(i).is_some_and(is_mark);
+    let letter_run = |i: usize| letter(i) || mark(i);
+    // Other: neither whitespace, letter nor number (`[^\s\p{L}\p{N}]`), nor a
+    // mark for Qwen3.5 (`[^\s\p{L}\p{M}\p{N}]`).
+    let other = |i: usize| i < n && !space(i) && !letter(i) && !number(i) && !mark(i);
     let run = |mut i: usize, f: &dyn Fn(usize) -> bool| {
         while i < n && f(i) {
             i += 1;
@@ -1257,14 +1269,14 @@ fn pretokenize(text: &str, split: ByteLevelSplit) -> Vec<&str> {
                         .map(|f| run(from, f))
                 })
                 .unwrap_or_else(|| whitespace(i)),
-            ByteLevelSplit::Qwen2 | ByteLevelSplit::Llama3 => {
+            ByteLevelSplit::Qwen2 | ByteLevelSplit::Llama3 | ByteLevelSplit::Qwen35 => {
                 if let Some(end) = contraction(i, true) {
                     end
-                } else if letter(i) {
-                    run(i, &letter)
-                } else if !crlf(i) && !number(i) && letter(i + 1) {
+                } else if letter_run(i) {
+                    run(i, &letter_run)
+                } else if !crlf(i) && !number(i) && letter_run(i + 1) {
                     // `[^\r\n\p{L}\p{N}]?\p{L}+`: one leading non-letter.
-                    run(i + 1, &letter)
+                    run(i + 1, &letter_run)
                 } else if number(i) {
                     let max = if split == ByteLevelSplit::Llama3 {
                         3
@@ -1331,8 +1343,22 @@ mod tests {
                 assert_eq!(pretokenize(text, split), want, "{split:?} {text:?}");
             }
         }
+        // Qwen3.5 keeps combining marks in the letter run they follow, so a
+        // Devanagari word is one piece where Qwen2 cuts it at every vowel sign.
+        let qwen35: [Case; 3] = [
+            ("नमस्ते दुनिया", &["नमस्ते", " दुनिया"]),
+            ("café naïve", &["café", " naïve"]),
+            ("a   b\n\n\tc", &["a", "  ", " b", "\n\n", "\tc"]),
+        ];
+        for (text, want) in qwen35 {
+            assert_eq!(pretokenize(text, ByteLevelSplit::Qwen35), want, "{text:?}");
+        }
         // Digits: one at a time for Qwen2, runs of up to three for Llama 3.
         let digits = "I don't THINK it's 12345!";
+        assert_eq!(
+            pretokenize(digits, ByteLevelSplit::Qwen35),
+            pretokenize(digits, ByteLevelSplit::Qwen2)
+        );
         assert_eq!(
             pretokenize(digits, ByteLevelSplit::Qwen2),
             ["I", " don", "'t", " THINK", " it", "'s", " ", "1", "2", "3", "4", "5", "!"]

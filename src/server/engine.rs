@@ -793,6 +793,70 @@ fn chatml(messages: &[ChatMessage], tools: &[serde_json::Value]) -> String {
     p
 }
 
+/// Qwen3.5/3.6's chat template without tools, followed to the character: every
+/// content trimmed; an assistant turn's `<think>…</think>` block split off its
+/// answer, and shown again (as `<think>\n{reasoning}\n</think>\n\n`) only on
+/// turns after the last user message; the reply opened with thinking on
+/// (`<|im_start|>assistant\n<think>\n`). Tool calls take Qwen3-Coder's XML
+/// format there, which dlm does not render or parse yet, so a request with
+/// tools is refused ([`ChatTemplate::apply_with_tools`]).
+fn qwen35(messages: &[ChatMessage]) -> String {
+    let mut p = String::new();
+    let mut rest = messages;
+    if let Some(system) = messages.first().filter(|m| m.role == "system") {
+        p.push_str(&format!(
+            "<|im_start|>system\n{}<|im_end|>\n",
+            system.content.trim()
+        ));
+        rest = &messages[1..];
+    }
+    // The template's `last_query_index`: the last user turn that is not just a
+    // tool result.
+    let is_query = |m: &ChatMessage| {
+        let c = m.content.trim();
+        m.role == "user" && !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))
+    };
+    let last_query = rest.iter().rposition(is_query);
+    for (i, m) in rest.iter().enumerate() {
+        let content = m.content.trim();
+        match m.role.as_str() {
+            "assistant" => {
+                let (reasoning, answer) = match content.split_once("</think>") {
+                    Some((before, _)) => {
+                        let after = content.rsplit("</think>").next().unwrap_or("");
+                        let reasoning = before.trim_end_matches('\n');
+                        let reasoning = reasoning.rsplit("<think>").next().unwrap_or("");
+                        (
+                            reasoning.trim_start_matches('\n').trim(),
+                            after.trim_start_matches('\n'),
+                        )
+                    }
+                    None => ("", content),
+                };
+                p.push_str("<|im_start|>assistant\n");
+                if last_query.is_some_and(|q| i > q) {
+                    p.push_str(&format!("<think>\n{reasoning}\n</think>\n\n{answer}"));
+                } else {
+                    p.push_str(answer);
+                }
+                p.push_str("<|im_end|>\n");
+            }
+            "tool" => {
+                if i == 0 || rest[i - 1].role != "tool" {
+                    p.push_str("<|im_start|>user");
+                }
+                p.push_str(&format!("\n<tool_response>\n{content}\n</tool_response>"));
+                if rest.get(i + 1).is_none_or(|n| n.role != "tool") {
+                    p.push_str("<|im_end|>\n");
+                }
+            }
+            role => p.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n")),
+        }
+    }
+    p.push_str("<|im_start|>assistant\n<think>\n");
+    p
+}
+
 /// A call's arguments as the model saw them: an object, where OpenAI sends a
 /// JSON string.
 fn call_arguments(c: &ToolCallIn) -> serde_json::Value {
@@ -1698,12 +1762,16 @@ pub enum ChatTemplate {
     Phi3,
     /// DeepSeek-V2 chat (`User: …\n\nAssistant:`).
     DeepSeek,
+    /// Qwen3.5/3.6: ChatML with thinking. Earlier answers lose their
+    /// `<think>` block, turns after the last user query keep it, and the reply
+    /// opens one (`<|im_start|>assistant\n<think>\n`). See [`qwen35`].
+    Qwen35,
 }
 
 impl ChatTemplate {
     /// Every name `--chat-template` accepts, besides `auto`.
     pub const NAMES: &'static str =
-        "plain, chatml, llama3, llama2, mistral, gemma, gemma4, phi3, deepseek";
+        "plain, chatml, llama3, llama2, mistral, gemma, gemma4, phi3, deepseek, qwen3.5";
 
     /// Parse a `--chat-template` value (`auto` is resolved by the caller).
     pub fn parse(s: &str) -> Option<Self> {
@@ -1717,6 +1785,7 @@ impl ChatTemplate {
             "gemma4" => Some(ChatTemplate::Gemma4),
             "phi3" | "phi-3" => Some(ChatTemplate::Phi3),
             "deepseek" => Some(ChatTemplate::DeepSeek),
+            "qwen3.5" | "qwen35" | "qwen3.6" => Some(ChatTemplate::Qwen35),
             _ => None,
         }
     }
@@ -1733,6 +1802,7 @@ impl ChatTemplate {
             ChatTemplate::Gemma4 => "gemma4",
             ChatTemplate::Phi3 => "phi3",
             ChatTemplate::DeepSeek => "deepseek",
+            ChatTemplate::Qwen35 => "qwen3.5",
         }
     }
 
@@ -1775,6 +1845,9 @@ impl ChatTemplate {
         // as plain ChatML would be quietly wrong.
         if has("<|im_sep|>") {
             None
+        } else if has("<|im_start|>") && has("enable_thinking") && has("<function=") {
+            // Qwen3.5/3.6: thinking, with Qwen3-Coder's XML tool calls.
+            Some(ChatTemplate::Qwen35)
         } else if has("<|im_start|>") {
             Some(ChatTemplate::ChatMl)
         } else if has("<|start_header_id|>") {
@@ -1810,7 +1883,7 @@ impl ChatTemplate {
     /// `<eos>` (gemma-1.1 does), or the model runs on into a fabricated next turn.
     pub fn end_of_turn(&self) -> Option<&'static str> {
         match self {
-            ChatTemplate::ChatMl => Some("<|im_end|>"),
+            ChatTemplate::ChatMl | ChatTemplate::Qwen35 => Some("<|im_end|>"),
             ChatTemplate::Llama3 => Some("<|eot_id|>"),
             ChatTemplate::Gemma => Some("<end_of_turn>"),
             ChatTemplate::Gemma4 => Some("<turn|>"),
@@ -1855,6 +1928,7 @@ impl ChatTemplate {
                 p.push_str("assistant:");
             }
             ChatTemplate::ChatMl => p = chatml(messages, &[]),
+            ChatTemplate::Qwen35 => p = qwen35(messages),
             ChatTemplate::Llama3 => {
                 p.push_str("<|begin_of_text|>");
                 for m in messages {
@@ -3932,6 +4006,44 @@ Weather in Paris and Rome?<|im_end|>
         );
         // `content: null` is what a tool-call reply carries.
         assert_eq!(parse(r#"{"role":"assistant","content":null}"#), "");
+    }
+
+    /// Qwen3.6's own Jinja template (`transformers`' `apply_chat_template` on
+    /// Qwen/Qwen3.6-35B-A3B, `add_generation_prompt=True`) gave these strings:
+    /// contents trimmed, an earlier answer's thinking dropped, thinking kept on
+    /// turns after the last real user query, and the reply opening `<think>`.
+    #[test]
+    fn qwen35_renders_as_its_template_does() {
+        let msgs = |json: &str| -> Vec<ChatMessage> { serde_json::from_str(json).unwrap() };
+        let cases = [
+            (
+                r#"[{"role":"user","content":"What is 2+2?"}]"#,
+                "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            ),
+            (
+                r#"[{"role":"system","content":"  You are terse.\n"},
+                    {"role":"user","content":"Hi there "},
+                    {"role":"assistant","content":"<think>\nThe user greets.\n</think>\n\nHello!"},
+                    {"role":"user","content":"Name a color."}]"#,
+                "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nName a color.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            ),
+            (
+                r#"[{"role":"user","content":"Q1"},{"role":"assistant","content":"A1"},
+                    {"role":"user","content":"<tool_response>\nx\n</tool_response>"},
+                    {"role":"assistant","content":"<think>\nhmm\n</think>\n\nA2"}]"#,
+                "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\n<tool_response>\nx\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nhmm\n</think>\n\nA2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            ),
+        ];
+        for (json, want) in cases {
+            assert_eq!(ChatTemplate::Qwen35.apply(&msgs(json)), want);
+        }
+        assert_eq!(ChatTemplate::parse("qwen3.5"), Some(ChatTemplate::Qwen35));
+        assert_eq!(ChatTemplate::Qwen35.end_of_turn(), Some("<|im_end|>"));
+        // Its tool format (Qwen3-Coder's XML) is not one dlm renders yet.
+        let tool: serde_json::Value = serde_json::from_str(WEATHER_TOOL).unwrap();
+        assert!(ChatTemplate::Qwen35
+            .apply_with_tools(&msgs(cases[0].0), &[tool])
+            .is_err());
     }
 
     #[test]
