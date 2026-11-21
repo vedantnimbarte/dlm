@@ -1043,7 +1043,14 @@ impl ModelConfig {
         }
 
         let bytes = serde_json::to_vec(&cfg).expect("config json is serializable");
-        Self::from_json_bytes(&bytes, quant)
+        let mut config = Self::from_json_bytes(&bytes, quant)?;
+        // Gemma's RMSNorm scales by `1 + w`. llama.cpp's converter bakes the 1
+        // into every Gemma, Gemma 2 and Gemma 3 norm weight it writes, so adding
+        // it again at load would scale every norm by `2 + w`.
+        if matches!(arch, "gemma" | "gemma2" | "gemma3" | "gemma3_text") {
+            config.norm_add_one = false;
+        }
+        Ok(config)
     }
 
     /// Load and validate a `config.json` from a model directory or file path.
@@ -1452,6 +1459,38 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A GGUF's metadata for a tiny model of `arch`: just the keys `from_gguf` needs.
+    fn gguf_meta(arch: &str) -> std::collections::BTreeMap<String, crate::storage::gguf::Value> {
+        use crate::storage::gguf::Value;
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("general.architecture".into(), Value::String(arch.into()));
+        for (k, v) in [
+            ("embedding_length", 16),
+            ("block_count", 2),
+            ("attention.head_count", 2),
+            ("attention.head_count_kv", 1),
+            ("feed_forward_length", 32),
+            ("attention.key_length", 8),
+        ] {
+            m.insert(format!("{arch}.{k}"), Value::U64(v));
+        }
+        m.insert(
+            "tokenizer.ggml.tokens".into(),
+            Value::Strings((0..64).map(|i| format!("t{i}")).collect()),
+        );
+        m
+    }
+
+    #[test]
+    fn gguf_gemma_norms_already_carry_the_one() {
+        for arch in ["gemma", "gemma2", "gemma3"] {
+            let c = ModelConfig::from_gguf(&gguf_meta(arch), false, QuantScheme::Int4).unwrap();
+            assert!(!c.norm_add_one, "{arch}: llama.cpp wrote 1 + w already");
+        }
+        let c = ModelConfig::from_gguf(&gguf_meta("llama"), false, QuantScheme::Int4).unwrap();
+        assert!(!c.norm_add_one);
+    }
 
     /// Gemma 3 states its layer layout two ways; both mean "every 6th layer is
     /// global". An irregular list is refused, not approximated.

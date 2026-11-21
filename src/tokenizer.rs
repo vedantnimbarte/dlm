@@ -449,8 +449,15 @@ impl BpeTokenizer {
                 };
                 tok
             }
-            // SentencePiece (Llama 2, Mistral, Gemma): pieces scored against each
-            // other, with ▁ for a space and byte tokens for anything unknown.
+            // SentencePiece BPE (Llama 2, Mistral, Gemma): pieces scored against
+            // each other, with ▁ for a space and byte tokens for anything
+            // unknown. The scores are merge priorities, not unigram
+            // log-probabilities: llama.cpp joins, again and again, the adjacent
+            // pair whose joined text is the highest-scoring token. Read as
+            // unigram scores they make Viterbi prefer letters and byte pieces
+            // (Gemma's `▁` alone scores -236280, a byte piece 0), so the scores
+            // become merge ranks here and the text goes through the same
+            // SentencePiece-BPE path a `tokenizer.json` uses.
             "llama" => {
                 let scores = get("scores").and_then(Value::as_numbers).ok_or_else(|| {
                     DlmError::InvalidConfig(
@@ -458,15 +465,22 @@ impl BpeTokenizer {
                     )
                 })?;
                 let byte_fallback = types.is_some_and(|t| t.contains(&6.0));
-                let pieces: Vec<(String, f32)> = tokens
+                let vocab: HashMap<String, u32> = tokens
                     .iter()
                     .enumerate()
-                    .map(|(id, t)| (t.clone(), scores.get(id).copied().unwrap_or(0.0) as f32))
+                    .map(|(id, t)| (t.clone(), id as u32))
                     .collect();
-                let unk = get("unknown_token_id")
+                let merges = merges_from_scores(tokens, scores, types);
+                // llama.cpp prepends a space unless the file says not to (Gemma does).
+                let prepend = get("add_space_prefix")
                     .and_then(Value::as_u64)
-                    .map(|v| v as u32);
-                Self::from_unigram(pieces, byte_fallback, unk).with_special(specials)
+                    .is_none_or(|v| v != 0);
+                Self::new(vocab, merges)
+                    .with_special(specials)
+                    .with_spm(SpmBpe {
+                        prepend,
+                        byte_fallback,
+                    })
             }
             other => {
                 return Err(DlmError::InvalidConfig(format!(
@@ -1045,6 +1059,42 @@ fn walk_spm_nodes(node: &serde_json::Value, escapes: &mut bool, prepend: &mut bo
 /// changing the result: the only vocabulary pieces that contain ▁ anywhere but
 /// the front are *runs of ▁* (indentation), and a run is never split across
 /// chunks here — so no reachable merge spans a chunk boundary.
+/// The merge list a SentencePiece-BPE vocabulary implies, best first: every
+/// way to split each normal token into two tokens that are themselves in the
+/// vocabulary, ranked by the joined token's score. Merging by these ranks
+/// joins, at each step, the adjacent pair that makes the highest-scoring
+/// token, which is how llama.cpp tokenizes a GGUF's "llama" vocabulary.
+/// Control, user-defined, unused and byte tokens are never merge results.
+fn merges_from_scores(
+    tokens: &[String],
+    scores: &[f64],
+    types: Option<&[f64]>,
+) -> Vec<(String, String)> {
+    let ids: HashMap<&str, usize> = tokens
+        .iter()
+        .enumerate()
+        .map(|(id, t)| (t.as_str(), id))
+        .collect();
+    let normal = |id: usize| types.is_none_or(|t| matches!(t.get(id).copied(), Some(1.0) | None));
+    let mut ranked: Vec<(f64, usize, String, String)> = Vec::new();
+    for (id, tok) in tokens.iter().enumerate() {
+        if !normal(id) || tok.chars().nth(1).is_none() {
+            continue;
+        }
+        let score = scores.get(id).copied().unwrap_or(0.0);
+        for (at, _) in tok.char_indices().skip(1) {
+            let (a, b) = tok.split_at(at);
+            if ids.contains_key(a) && ids.contains_key(b) {
+                ranked.push((score, id, a.to_string(), b.to_string()));
+            }
+        }
+    }
+    // Highest score first; a tie goes to the lower id, the order SentencePiece
+    // learned the pieces in.
+    ranked.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+    ranked.into_iter().map(|(_, _, a, b)| (a, b)).collect()
+}
+
 fn pretokenize_spm(text: &str) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut cur = String::new();

@@ -17,6 +17,21 @@ fork that runs large MoE models from SSD.
 
 ### Fixed
 
+- **Gemma GGUF files did not load, and would not have read right if they
+  had.** Three faults, each enough on its own:
+  - **The pre-FFN norm was mapped onto the post-attention norm.** Gemma 2
+    and 3 files name it `ffn_norm`, which dlm mapped as Llama's, so it
+    overwrote `post_attention_norm` and loading stopped at the missing pair.
+  - **The `1 + w` was added twice.** llama.cpp's converter already writes
+    `1 + w` into every Gemma norm weight, and dlm added the 1 again.
+  - **The GGUF tokenizer split text into letters and byte pieces.** Its
+    SentencePiece scores are merge priorities, and dlm read them as unigram
+    log-probabilities. It now merges the way llama.cpp does.
+  Gemma 3 4B Q4_K_M (ggml-org) now answers "What is the capital of France?"
+  with "The capital of France is Paris." at probability ~1 on CPU and GPU.
+  `tests/gguf_model.rs` checks the tokenizer against Hugging Face's on four
+  texts (`DLM_TEST_GGUF_GEMMA3`). Llama 2 and Mistral GGUF files read
+  through the same tokenizer path.
 - **DeepSeek MLA rotated the wrong pairs of its RoPE dimensions.** DeepSeek's
   reference code rotates adjacent values `(2i, 2i+1)` of `q_pe` and `k_pe`;
   dlm rotated the halves `(i, i + d/2)`, as for Llama-style checkpoints, so
