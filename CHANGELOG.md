@@ -61,6 +61,19 @@ fork that runs large MoE models from SSD.
 
 ### Changed
 
+- **Streamed weights are read from the file, not copied out of the map.** A
+  layer or expert loaded from disk used to be copied out of the memory map,
+  which faults its pages in one at a time. It now arrives in one positioned,
+  unbuffered read (`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux,
+  a plain positioned read elsewhere or when refused). That also leaves the OS
+  page cache, which dlm's RAM tier would only duplicate, alone.
+  - **Raw reads:** on a GTX 1650 box (Windows, NVMe), random expert slices of
+    Qwen3.6-35B-A3B's 22 GB GGUF came in at 1,344 MB/s, against 461 MB/s from
+    the map.
+  - **Streamed Qwen3.6, measured back to back while the SSD slowed across
+    rounds:** prefill 2.4–4.0 tok/s, against 1.1–2.2 from the map; decode
+    0.96–2.92 tok/s, against 0.66–1.09.
+  - **Switching back:** `DLM_MMAP_READS=1` copies from the map as before.
 - **`--kv-quant int4` keeps int4 KV on the GPU.** It used to fall back to
   int8 there; the GPU now has the CPU's int4 store (a scale per 32 values and
   16 bytes of 4-bit codes, 0.625 bytes a value against int8's 1.125), so the

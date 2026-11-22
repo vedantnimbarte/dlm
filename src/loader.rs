@@ -164,7 +164,8 @@ pub(crate) fn load_native(
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
-    let bytes = shard.tensor_bytes(name)?;
+    let owned = shard.read_tensor_range(name, 0..info.byte_len())?;
+    let bytes = &owned[..];
     // A GGUF weight arrives in ggml's blocks, already quantized. It is decoded to
     // dlm's group-affine form and used as it is: re-quantizing what a quantizer
     // already chose would only lose what it chose, so `--quant` does not apply
@@ -1829,7 +1830,6 @@ fn load_rows(
             info.num_elements()
         )));
     }
-    let bytes = shard.tensor_bytes(name)?;
     let kind = crate::storage::ggml_quant::GgmlKind::from_dtype(info.dtype);
     let row_bytes = match (kind, info.dtype) {
         (Some(k), _) if in_features % k.block_elems() == 0 => k.byte_len(in_features),
@@ -1846,17 +1846,23 @@ fn load_rows(
             )))
         }
     };
-    let mut out = Vec::new();
-    let mut count = 0;
-    for r in rows {
-        if r >= total_rows {
-            return Err(DlmError::InvalidConfig(format!(
-                "tensor {name:?}: row {r} of {total_rows}"
-            )));
-        }
-        out.extend_from_slice(&bytes[r * row_bytes..(r + 1) * row_bytes]);
-        count += 1;
+    let rows: Vec<usize> = rows.into_iter().collect();
+    if let Some(&r) = rows.iter().find(|&&r| r >= total_rows) {
+        return Err(DlmError::InvalidConfig(format!(
+            "tensor {name:?}: row {r} of {total_rows}"
+        )));
     }
+    // One read of the span the rows cover: a stacked expert's rows are one run.
+    let (lo, hi) = (
+        rows.iter().copied().min().unwrap_or(0),
+        rows.iter().copied().max().map_or(0, |r| r + 1),
+    );
+    let span = shard.read_tensor_range(name, lo * row_bytes..hi * row_bytes)?;
+    let mut out = Vec::with_capacity(rows.len() * row_bytes);
+    for &r in &rows {
+        out.extend_from_slice(&span[(r - lo) * row_bytes..(r - lo + 1) * row_bytes]);
+    }
+    let count = rows.len();
     if let Some(kind) = kind {
         return Ok(Weights::Ggml {
             blob: out,
