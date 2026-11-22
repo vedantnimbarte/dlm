@@ -94,6 +94,9 @@ pub struct MmapShard {
     /// A GGUF shard's metadata (the model's config and tokenizer); `None` for a
     /// safetensors shard, which keeps those in files of their own.
     gguf: Option<BTreeMap<String, crate::storage::gguf::Value>>,
+    /// Opened on the first [`read_tensor_range`](Self::read_tensor_range);
+    /// `None` when the file cannot be opened for reading again.
+    reader: std::sync::OnceLock<Option<crate::storage::direct::DirectFile>>,
 }
 
 impl MmapShard {
@@ -160,6 +163,7 @@ impl MmapShard {
             mmap,
             header,
             gguf,
+            reader: std::sync::OnceLock::new(),
         })
     }
 
@@ -210,6 +214,37 @@ impl MmapShard {
                 end,
                 len: self.mmap.len(),
             })
+    }
+
+    /// Bytes `range` of tensor `name`, read from the file with one positioned,
+    /// unbuffered read (see `storage::direct`) rather than copied out of the
+    /// map, which faults its pages in one at a time: what a streamed layer or
+    /// expert is loaded with. `DLM_MMAP_READS=1` copies from the map instead.
+    pub fn read_tensor_range(&self, name: &str, range: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        let bytes = self.tensor_bytes(name)?;
+        let wanted = bytes
+            .get(range.clone())
+            .ok_or_else(|| DlmError::TensorOutOfBounds {
+                name: name.to_string(),
+                start: range.start,
+                end: range.end,
+                len: bytes.len(),
+            })?;
+        let reader = self.reader.get_or_init(|| {
+            (std::env::var_os("DLM_MMAP_READS").is_none())
+                .then(|| crate::storage::direct::DirectFile::open(&self.path).ok())
+                .flatten()
+        });
+        let start = self.header.data_offset + self.tensor_info(name).expect("found above").begin;
+        match reader {
+            Some(r) => r
+                .read((start + range.start) as u64, range.len())
+                .map_err(|source| DlmError::Io {
+                    path: self.path.clone(),
+                    source,
+                }),
+            None => Ok(wanted.to_vec()),
+        }
     }
 
     /// Iterate over every tensor in this shard.
@@ -377,6 +412,11 @@ impl MmapStore {
             .locate(name)
             .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
         shard.tensor_bytes(name)
+    }
+
+    /// Every shard, in the order they were opened.
+    pub fn iter_shards(&self) -> impl Iterator<Item = &MmapShard> {
+        self.shards.iter()
     }
 
     /// Iterate over every tensor across all shards.

@@ -61,6 +61,19 @@ fork that runs large MoE models from SSD.
 
 ### Changed
 
+- **Streamed weights are read from the file, not copied out of the map.** A
+  layer or expert loaded from disk used to be copied out of the memory map,
+  which faults its pages in one at a time. It now arrives in one positioned,
+  unbuffered read (`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux,
+  a plain positioned read elsewhere or when refused). That also leaves the OS
+  page cache, which dlm's RAM tier would only duplicate, alone.
+  - **Raw reads:** on a GTX 1650 box (Windows, NVMe), random expert slices of
+    Qwen3.6-35B-A3B's 22 GB GGUF came in at 1,344 MB/s, against 461 MB/s from
+    the map.
+  - **Streamed Qwen3.6, measured back to back while the SSD slowed across
+    rounds:** prefill 2.4–4.0 tok/s, against 1.1–2.2 from the map; decode
+    0.96–2.92 tok/s, against 0.66–1.09.
+  - **Switching back:** `DLM_MMAP_READS=1` copies from the map as before.
 - **`--kv-quant int4` keeps int4 KV on the GPU.** It used to fall back to
   int8 there; the GPU now has the CPU's int4 store (a scale per 32 values and
   16 bytes of 4-bit codes, 0.625 bytes a value against int8's 1.125), so the
@@ -117,6 +130,23 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **`dlm pack`: a model's weights quantized once, ahead of time.** Streaming
+  a safetensors model at `--quant int4`/`int8` re-quantized every layer that
+  missed the RAM cache, from 16-bit weights read off disk.
+  - **What it writes:** `dlm pack --model-path <dir> --quant int4 --out
+    <dir>` runs the loader once and stores every weight it quantized exactly
+    as it came out. The config, tokenizer and other files are copied beside
+    them.
+  - **Loading:** a pack loads those bytes back without converting them, so
+    it scores bit for bit what the original does at that `--quant`
+    (`tests/pack.rs`, on DeepSeek-V3 and Qwen3.5-MoE fixtures at int4 and
+    int8). It refuses another precision.
+  - **Speed:** streaming Qwen3-1.7B on a GTX 1650 with four layers resident
+    and no RAM cache, decode went from 0.06–0.07 to 1.0–1.1 tok/s, and
+    prefill from 4–5 to 48–65 tok/s.
+  - **Size:** the pack is 2.1 GB against the original's 4.1 GB.
+  - **Not packed:** GGUF and GPTQ checkpoints (already quantized), and
+    weights the loader slices by rows, which stay 16-bit.
 - **Qwen3.5/3.6 MoE (Qwen3.6-35B-A3B), text only.** The hybrid layout:
   three Gated DeltaNet linear-attention layers (causal conv, the gated delta
   rule over a per-head recurrent state, a gated RMSNorm) to every

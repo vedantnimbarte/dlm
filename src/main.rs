@@ -42,6 +42,7 @@ fn main() -> Result<()> {
         Command::Doctor(args) => run_doctor(args),
         Command::Search(args) => run_search(args),
         Command::Pull(args) => run_pull(args),
+        Command::Pack(args) => run_pack(args),
         Command::Completions(args) => run_completions(args),
     }
 }
@@ -2285,6 +2286,28 @@ fn load_eagle3_head(
     _: &ModelConfig,
 ) -> Result<dlm::forward::eagle3::Eagle3Head> {
     Err(gpu_compute_unavailable("an EAGLE-3 head"))
+}
+
+/// `dlm pack`: write `args.model_path` with its weights quantized into
+/// `args.out` (see `dlm::pack`).
+fn run_pack(args: dlm::cli::PackArgs) -> Result<()> {
+    let quant = args.quant.to_scheme();
+    println!(
+        "packing {} at {quant:?} into {}",
+        args.model_path.display(),
+        args.out.display()
+    );
+    let start = std::time::Instant::now();
+    dlm::pack::write_pack(&args.model_path, &args.out, quant, |done, total| {
+        print!("\r  layer {done}/{total}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    })?;
+    println!(
+        "\npacked in {:.1} s; serve it with --model-path {}",
+        start.elapsed().as_secs_f64(),
+        args.out.display()
+    );
+    Ok(())
 }
 
 /// `dlm bench`: load the model through `serve`'s own path, then measure it

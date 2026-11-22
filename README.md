@@ -860,10 +860,39 @@ check your model's output rather than assuming. Three caveats worth knowing:
   default applies only when every layer fits under a quarter of physical RAM
   (at least 4 GiB), because a smaller cache never gets a hit on a cyclic scan;
   a quantized model bigger than that re-quantizes on every miss, so raise
-  `--ram-cache-gb`, or drop `--stream` — once quantized, the model often no
-  longer needs it.
+  `--ram-cache-gb`, pack it (below), or drop `--stream` — once quantized, the
+  model often no longer needs it.
 - **A quantized weight is still lossy even if it fits.** Verify on your own
   prompts; a model that fits but answers worse is not obviously a win.
+
+### Packs (`dlm pack`)
+
+A model streamed from disk at `--quant int4`/`int8` pays for quantizing again
+every time a layer misses the RAM cache, and reads the 16-bit weights to do it.
+`dlm pack` does that work once, writing a copy with the weights already
+quantized:
+
+```sh
+dlm pack --model-path models/Qwen3-1.7B --quant int4 --out models/Qwen3-1.7B-int4
+dlm serve --model-path models/Qwen3-1.7B-int4 --stream
+```
+
+The pack is an ordinary model directory: the config, tokenizer and templates,
+beside a `model.safetensors` whose weights are stored exactly as `--quant`
+would have produced them. Loading it hands those bytes back unconverted, so it
+scores **bit for bit** what the original does at the same `--quant`
+(`tests/pack.rs`), from about half the disk. It loads only at the precision it
+was made for (omitting `--quant` picks that).
+
+On the GTX 1650, streaming Qwen3-1.7B with four layers resident and no RAM
+cache (every other layer read again each token), the original at `--quant
+int4` decoded at 0.06–0.07 tok/s and prefilled at 4–5 tok/s; its int4 pack
+decoded at 1.0–1.1 tok/s and prefilled at 48–65 tok/s.
+
+A GGUF needs no pack: its weights are already quantized and are read as they
+are. Neither does a GPTQ checkpoint. Weights the loader takes as row slices of
+a fused tensor (Phi-3's QKV, Qwen3.5's stacked experts) stay 16-bit in a pack
+and are quantized at load as before.
 
 ### Already-quantized checkpoints (GPTQ)
 

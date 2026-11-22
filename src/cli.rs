@@ -43,6 +43,10 @@ pub enum Command {
     Search(SearchArgs),
     /// Download a model from the Hugging Face hub into a local directory.
     Pull(PullArgs),
+    /// Write a copy of a safetensors model with its weights already quantized,
+    /// so a model streamed from disk reads int4/int8 instead of converting at
+    /// every load
+    Pack(PackArgs),
     /// Print a shell completion script to stdout (e.g. `dlm completions bash`).
     Completions(CompletionsArgs),
 }
@@ -69,6 +73,24 @@ pub struct SearchArgs {
     /// List repos that ship `.gguf` files instead of safetensors ones.
     #[arg(long)]
     pub gguf: bool,
+}
+
+/// Arguments for `dlm pack`.
+#[derive(Debug, Args)]
+pub struct PackArgs {
+    /// The safetensors model directory to pack.
+    #[arg(long, value_name = "DIR")]
+    pub model_path: PathBuf,
+
+    /// Precision to store the weights at: the `--quant` the pack is then
+    /// loaded with.
+    #[arg(long, value_enum)]
+    pub quant: QuantArg,
+
+    /// Directory to write the pack into (new, or empty). Serve it with
+    /// `--model-path <out>`.
+    #[arg(long, value_name = "DIR")]
+    pub out: PathBuf,
 }
 
 /// Arguments for `dlm pull`.

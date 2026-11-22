@@ -40,6 +40,10 @@ use std::path::Path;
 /// 4x. Probes a layer-0 projection — every weight matrix in a checkpoint shares
 /// one dtype — and falls back to the first weight tensor it can find.
 pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
+    // A pack's native precision is the one it was made for.
+    if let Some(q) = crate::pack::pack_scheme(store) {
+        return Ok(q);
+    }
     // An already-packed 4-bit checkpoint (GPTQ) has no float `.weight` to probe —
     // its precision is int4 by construction.
     if store
@@ -99,6 +103,12 @@ pub(crate) fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+    if crate::pack::is_packed(shard, name) {
+        return Err(DlmError::InvalidConfig(format!(
+            "{name:?} is a packed quantized weight, read here as floats: this pack does \
+             not fit how dlm now loads the model; pack the original checkpoint again"
+        )));
+    }
     let bytes = shard.tensor_bytes(name)?;
     if info.dtype.is_block_quantized() {
         // GGUF quantizes the embedding matrix too; dlm keeps it as floats, so it
@@ -164,7 +174,19 @@ pub(crate) fn load_native(
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
-    let bytes = shard.tensor_bytes(name)?;
+    // A pack's weight comes back exactly as `dlm pack` recorded it here.
+    if let Some(w) = crate::pack::read_packed(shard, info, name, expected_len, quant)? {
+        if store.lora().is_some() {
+            return Err(DlmError::InvalidConfig(
+                "a LoRA adapter cannot merge into a pack's quantized weights; pack the \
+                 checkpoint the adapter was trained on instead"
+                    .into(),
+            ));
+        }
+        return Ok(w);
+    }
+    let owned = shard.read_tensor_range(name, 0..info.byte_len())?;
+    let bytes = &owned[..];
     // A GGUF weight arrives in ggml's blocks, already quantized. It is decoded to
     // dlm's group-affine form and used as it is: re-quantizing what a quantizer
     // already chose would only lose what it chose, so `--quant` does not apply
@@ -239,10 +261,12 @@ pub(crate) fn load_native(
             )));
         }
         let group = crate::forward::QUANT_GROUP_SIZE;
-        return match quant {
+        let w = match quant {
             QuantScheme::Int4 => Weights::quantize_int4(&floats, group),
             _ => Weights::quantize_int8(&floats, group),
-        };
+        }?;
+        crate::pack::record(name, &w);
+        return Ok(w);
     }
     let w = match info.dtype {
         Dtype::F32 => Weights::F32(bytes_to_f32(bytes, info.dtype)?),
@@ -960,6 +984,11 @@ pub fn load_generator(
 }
 
 /// The per-block geometry a [`ModelConfig`] describes.
+/// The block config the loader builds layers with, for `dlm pack`.
+pub(crate) fn pack_block_config(config: &ModelConfig) -> BlockConfig {
+    block_config(config)
+}
+
 fn block_config(config: &ModelConfig) -> BlockConfig {
     BlockConfig {
         hidden_size: config.hidden_size as usize,
@@ -1829,7 +1858,6 @@ fn load_rows(
             info.num_elements()
         )));
     }
-    let bytes = shard.tensor_bytes(name)?;
     let kind = crate::storage::ggml_quant::GgmlKind::from_dtype(info.dtype);
     let row_bytes = match (kind, info.dtype) {
         (Some(k), _) if in_features % k.block_elems() == 0 => k.byte_len(in_features),
@@ -1846,17 +1874,23 @@ fn load_rows(
             )))
         }
     };
-    let mut out = Vec::new();
-    let mut count = 0;
-    for r in rows {
-        if r >= total_rows {
-            return Err(DlmError::InvalidConfig(format!(
-                "tensor {name:?}: row {r} of {total_rows}"
-            )));
-        }
-        out.extend_from_slice(&bytes[r * row_bytes..(r + 1) * row_bytes]);
-        count += 1;
+    let rows: Vec<usize> = rows.into_iter().collect();
+    if let Some(&r) = rows.iter().find(|&&r| r >= total_rows) {
+        return Err(DlmError::InvalidConfig(format!(
+            "tensor {name:?}: row {r} of {total_rows}"
+        )));
     }
+    // One read of the span the rows cover: a stacked expert's rows are one run.
+    let (lo, hi) = (
+        rows.iter().copied().min().unwrap_or(0),
+        rows.iter().copied().max().map_or(0, |r| r + 1),
+    );
+    let span = shard.read_tensor_range(name, lo * row_bytes..hi * row_bytes)?;
+    let mut out = Vec::with_capacity(rows.len() * row_bytes);
+    for &r in &rows {
+        out.extend_from_slice(&span[(r - lo) * row_bytes..(r - lo + 1) * row_bytes]);
+    }
+    let count = rows.len();
     if let Some(kind) = kind {
         return Ok(Weights::Ggml {
             blob: out,
