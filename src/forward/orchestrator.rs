@@ -347,6 +347,35 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         self.position = len;
     }
 
+    /// Every layer's recurrent state, for [`rollback`](Self::rollback) to
+    /// return to: a hybrid model's linear-attention layers cannot be cut back
+    /// like K/V, so a speculative round keeps their state from before it.
+    pub(crate) fn checkpoint_recurrent(
+        &self,
+    ) -> Result<Vec<Option<crate::forward::cpu::LinearState>>> {
+        self.kv_layers
+            .iter()
+            .map(|kv| kv.linear_checkpoint())
+            .collect()
+    }
+
+    /// Back to the first `len` tokens, where `checkpoint` was taken: the
+    /// linear layers get their state back, the K/V layers are cut.
+    pub(crate) fn rollback(
+        &mut self,
+        checkpoint: Vec<Option<crate::forward::cpu::LinearState>>,
+        len: usize,
+    ) {
+        for (kv, state) in self.kv_layers.iter_mut().zip(checkpoint) {
+            match state {
+                Some(state) => kv.restore_linear(state, len),
+                None => kv.truncate(len),
+            }
+        }
+        self.budget.truncate_sequence(SEQ_ID, len as u64);
+        self.position = len;
+    }
+
     /// Absolute position of the next token (tokens decoded so far).
     pub fn position(&self) -> usize {
         self.position

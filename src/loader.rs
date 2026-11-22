@@ -2070,8 +2070,10 @@ pub struct MtpWeights {
     pub pre_fc_norm_embedding: Vec<f32>,
     pub pre_fc_norm_hidden: Vec<f32>,
     pub norm: Vec<f32>,
-    /// Full-attention layers, configured by [`MtpWeights::block_config`].
+    /// Full-attention layers, configured by [`cfg`](Self::cfg).
     pub layers: Vec<LayerTensors>,
+    /// The block config the layers run with ([`MtpWeights::block_config`]).
+    pub cfg: BlockConfig,
 }
 
 impl MtpWeights {
@@ -2115,6 +2117,7 @@ pub fn load_mtp(store: &MmapStore, config: &ModelConfig) -> Result<Option<MtpWei
         pre_fc_norm_hidden: load_norm(store, "mtp.pre_fc_norm_hidden.weight", h, add_one)?,
         norm: load_norm(store, "mtp.norm.weight", h, add_one)?,
         layers,
+        cfg,
     }))
 }
 

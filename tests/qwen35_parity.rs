@@ -151,19 +151,6 @@ fn a_shorter_prefix_of_a_recurrent_state_is_refused() {
     assert!(err.to_string().contains("rolled back"), "{err}");
 }
 
-/// Speculation rolls back rejected tokens, which a recurrent model cannot: the
-/// session is refused up front.
-#[test]
-fn speculative_decoding_is_refused() {
-    let gen = cpu_generator(&fixture());
-    assert!(gen.recurrent());
-    let (ids, _, _) = reference();
-    let err = dlm::speculative::SpeculativeSession::ngram(&gen, 4, &ids[..10], Sampler::Greedy)
-        .err()
-        .expect("speculation on a recurrent model must be refused");
-    assert!(err.to_string().contains("speculative"), "{err}");
-}
-
 /// The prefix cache stays off for a recurrent model (it resumes from prefixes
 /// of what it holds), and batching still gives each request its own state.
 #[test]

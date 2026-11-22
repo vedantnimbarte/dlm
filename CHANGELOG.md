@@ -130,6 +130,31 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **Speculative decoding for hybrid models, and with Qwen3.5/3.6's own MTP
+  head.**
+  - **Rollback.** A linear-attention layer's recurrent state cannot be cut back
+    past rejected tokens, so speculation used to be refused for these models.
+    A round now checkpoints that state (a host copy, ~60 MB on Qwen3.6) before
+    the target's pass. When it rejects a guess, it restores the state and
+    replays the accepted tokens. This makes n-gram lookup work on Qwen3.6 too.
+  - **`--speculative mtp`** (serve and bench) proposes with the model's own
+    multi-token-prediction layer. It reads the embedding of the next token
+    beside the target's final-normed hidden state, through `fc`, one
+    full-attention MoE layer and a norm, into the target's LM head, as vLLM's
+    `qwen3_5_mtp.py` does. The layer runs on the CPU with its own K/V.
+  - **Exactness.** Greedy output is plain decoding's, token for token, on the
+    CPU and on the resident and streamed GPU kernels. On the fixture's random
+    head almost every round rolls back (`tests/qwen35_speculative.rs`), and
+    without the rollback the test fails.
+  - **Speed on the real model.** Qwen3.6-35B-A3B Q4_K_M streamed on a GTX
+    1650:
+
+    | | Accepted | Decode tok/s |
+    |---|---|---|
+    | Plain | – | 1.51–1.62 |
+    | MTP, gamma 1 | 74% | 2.09–2.56 |
+    | MTP, gamma 2 | 57% | 2.23–2.51 |
+
 - **`dlm pack`: a model's weights quantized once, ahead of time.** Streaming
   a safetensors model at `--quant int4`/`int8` re-quantized every layer that
   missed the RAM cache, from 16-bit weights read off disk.
@@ -163,10 +188,9 @@ fork that runs large MoE models from SSD.
   Qwen3.6's own (`qwen3.5`: thinking on, earlier answers' `<think>` dropped);
   its XML tool calls are refused for now. The tokenizer's pre-split keeps
   combining marks with their letters. Since a linear-attention layer keeps a
-  recurrent state rather than a KV history, speculative decoding is refused and
-  the prefix cache stays off for these models; a snapshot resumes only at the
-  position it was taken. The MTP head loads (`loader::load_mtp`) but is not
-  run. Dense Qwen3.5 and Qwen3-Next are refused.
+  recurrent state rather than a KV history, the prefix cache stays off for
+  these models and a snapshot resumes only at the position it was taken.
+  Dense Qwen3.5 and Qwen3-Next are refused.
   - **Real model:** bartowski's 22 GB Qwen3.6-35B-A3B Q4_K_M, streamed on a
     GTX 1650 4 GB with 16 GB of RAM. It reasons in `<think>`, then answers
     "The capital of France is Paris.", and its scores match the CPU's within

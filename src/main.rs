@@ -2039,16 +2039,10 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     // Cached prefixes share paged device KV and give it back under pressure, so
     // they are on by default where the kernel pages KV. On the CPU each one is a
     // host copy of its KV, so only when asked for.
-    // A recurrent (hybrid) model can neither speculate nor resume from a prefix
-    // of a cached state: refused, and the prefix cache left off.
+    // A recurrent (hybrid) model cannot resume from a prefix of a cached
+    // state, so its prefix cache stays off. It speculates by restoring its
+    // state and replaying what a round accepted.
     let recurrent = generator.recurrent();
-    if recurrent && (draft.is_some() || args.speculative == Speculative::Ngram) {
-        return Err(DlmError::InvalidConfig(
-            "speculative decoding is not supported for this model: its linear-attention layers keep \
-             a recurrent state, which cannot be rolled back past rejected tokens"
-                .into(),
-        ));
-    }
     let prefix_cache = if recurrent {
         0
     } else {
@@ -2066,7 +2060,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         Some(dir) if is_eagle3_dir(dir) => {
             if !generator.kernel().capture_next(&[]) {
                 return Err(DlmError::InvalidConfig(
-                    "an EAGLE-3 head reads the target's hidden states, which only the resident                      GPU kernel records: drop --stream, --gpu-layers and --device cpu"
+                    "an EAGLE-3 head reads the target's hidden states, which only the resident GPU \
+                     kernel records: drop --stream, --gpu-layers and --device cpu"
                         .into(),
                 ));
             }
@@ -2074,7 +2069,15 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         }
         _ => None,
     };
+    let mtp = match args.speculative {
+        Speculative::Mtp => Some(load_mtp_head(&args.model_path, config)?),
+        _ => None,
+    };
     let mode = match (&draft, args.speculative) {
+        _ if mtp.is_some() => format!(
+            "batched + speculative: the model's MTP head, gamma {}",
+            args.draft_gamma
+        ),
         _ if eagle.is_some() => format!(
             "batched + speculative: EAGLE-3 head, gamma {}",
             args.draft_gamma
@@ -2095,6 +2098,17 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         allow(unreachable_code)
     )]
     let engine = match draft {
+        _ if mtp.is_some() => dlm::server::EngineService::start_mtp(
+            generator,
+            mtp.expect("checked"),
+            args.draft_gamma,
+            tokenizer,
+            config.vocab_size as usize,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
+            created,
+            args.max_batch.max(1),
+        ),
         _ if eagle.is_some() => dlm::server::EngineService::start_eagle3(
             generator,
             eagle.expect("checked"),
@@ -2288,6 +2302,18 @@ fn load_eagle3_head(
     Err(gpu_compute_unavailable("an EAGLE-3 head"))
 }
 
+/// The model's own MTP head, for `--speculative mtp`.
+fn load_mtp_head(path: &std::path::Path, config: &ModelConfig) -> Result<dlm::loader::MtpWeights> {
+    let store = MmapStore::open_path(path)?;
+    let mtp = dlm::loader::load_mtp(&store, config)?.ok_or_else(|| {
+        DlmError::InvalidConfig(
+            "--speculative mtp: this checkpoint ships no multi-token-prediction head".into(),
+        )
+    })?;
+    println!("mtp head     : {} layer(s), on the CPU", mtp.layers.len());
+    Ok(mtp)
+}
+
 /// `dlm pack`: write `args.model_path` with its weights quantized into
 /// `args.out` (see `dlm::pack`).
 fn run_pack(args: dlm::cli::PackArgs) -> Result<()> {
@@ -2371,7 +2397,21 @@ fn bench_generator<K: ComputeKernel>(
         }
         _ => None,
     };
+    let mtp = match args.speculative {
+        Speculative::Mtp => Some(load_mtp_head(&args.model_path, config)?),
+        _ => None,
+    };
     let spec = match args.speculative {
+        Speculative::Mtp => {
+            println!(
+                "speculative  : the model's MTP head, gamma {} (batch 1)",
+                args.draft_gamma
+            );
+            Some(dlm::bench::BenchSpec::Mtp {
+                mtp: mtp.as_ref().expect("loaded above"),
+                gamma: args.draft_gamma,
+            })
+        }
         Speculative::Ngram => {
             println!(
                 "speculative  : n-gram lookup, gamma {} (batch 1)",

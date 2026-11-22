@@ -401,6 +401,8 @@ pub struct BatchScheduler<'a, K: ComputeKernel> {
     draft: Option<&'a Generator<K>>,
     /// EAGLE-3 head proposing for every slot, if speculating with one.
     eagle: Option<&'a crate::forward::eagle3::Eagle3Head>,
+    /// The model's own MTP head proposing for every slot, if speculating with it.
+    mtp: Option<&'a crate::loader::MtpWeights>,
     /// Tokens proposed per round; 0 when not speculating. Without a draft model
     /// slots propose by n-gram lookup.
     gamma: usize,
@@ -423,6 +425,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             generator,
             draft: None,
             eagle: None,
+            mtp: None,
             gamma: 0,
             max_batch: max_batch.max(1),
             pending: VecDeque::new(),
@@ -483,7 +486,22 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
 
     /// Whether a draft model or head proposes, rather than n-gram lookup.
     fn has_draft(&self) -> bool {
-        self.draft.is_some() || self.eagle.is_some()
+        self.draft.is_some() || self.eagle.is_some() || self.mtp.is_some()
+    }
+
+    /// Create a scheduler that decodes every request speculatively, the
+    /// model's own MTP head proposing `gamma` tokens per round. Output is
+    /// identical to [`new`](Self::new).
+    pub fn with_mtp(
+        generator: &'a Generator<K>,
+        mtp: &'a crate::loader::MtpWeights,
+        max_batch: usize,
+        gamma: usize,
+    ) -> Self {
+        Self {
+            mtp: Some(mtp),
+            ..Self::with_ngram(generator, max_batch, gamma)
+        }
     }
 
     /// Create a scheduler that speculates with no draft model: each request
@@ -772,6 +790,16 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             let plain_only = grammar.is_some() || logprobs.is_some() || !images.is_empty();
             let ngram = !self.has_draft() && self.gamma > 0 && !plain_only;
             let decoder = match (self.draft, self.eagle) {
+                _ if self.mtp.is_some() && !plain_only => Decoder::Speculative(
+                    SpeculativeSession::mtp(
+                        self.generator,
+                        self.mtp.expect("checked"),
+                        self.gamma,
+                        &p.prompt,
+                        sampler,
+                    )?
+                    .with_penalties(penalties),
+                ),
                 (Some(draft), _) if !plain_only => Decoder::Speculative(
                     SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
                         .with_penalties(penalties),
