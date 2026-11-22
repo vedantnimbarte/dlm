@@ -40,6 +40,10 @@ use std::path::Path;
 /// 4x. Probes a layer-0 projection — every weight matrix in a checkpoint shares
 /// one dtype — and falls back to the first weight tensor it can find.
 pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
+    // A pack's native precision is the one it was made for.
+    if let Some(q) = crate::pack::pack_scheme(store) {
+        return Ok(q);
+    }
     // An already-packed 4-bit checkpoint (GPTQ) has no float `.weight` to probe —
     // its precision is int4 by construction.
     if store
@@ -99,6 +103,12 @@ pub(crate) fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+    if crate::pack::is_packed(shard, name) {
+        return Err(DlmError::InvalidConfig(format!(
+            "{name:?} is a packed quantized weight, read here as floats: this pack does \
+             not fit how dlm now loads the model; pack the original checkpoint again"
+        )));
+    }
     let bytes = shard.tensor_bytes(name)?;
     if info.dtype.is_block_quantized() {
         // GGUF quantizes the embedding matrix too; dlm keeps it as floats, so it
@@ -164,6 +174,17 @@ pub(crate) fn load_native(
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+    // A pack's weight comes back exactly as `dlm pack` recorded it here.
+    if let Some(w) = crate::pack::read_packed(shard, info, name, expected_len, quant)? {
+        if store.lora().is_some() {
+            return Err(DlmError::InvalidConfig(
+                "a LoRA adapter cannot merge into a pack's quantized weights; pack the \
+                 checkpoint the adapter was trained on instead"
+                    .into(),
+            ));
+        }
+        return Ok(w);
+    }
     let owned = shard.read_tensor_range(name, 0..info.byte_len())?;
     let bytes = &owned[..];
     // A GGUF weight arrives in ggml's blocks, already quantized. It is decoded to
@@ -240,10 +261,12 @@ pub(crate) fn load_native(
             )));
         }
         let group = crate::forward::QUANT_GROUP_SIZE;
-        return match quant {
+        let w = match quant {
             QuantScheme::Int4 => Weights::quantize_int4(&floats, group),
             _ => Weights::quantize_int8(&floats, group),
-        };
+        }?;
+        crate::pack::record(name, &w);
+        return Ok(w);
     }
     let w = match info.dtype {
         Dtype::F32 => Weights::F32(bytes_to_f32(bytes, info.dtype)?),
@@ -961,6 +984,11 @@ pub fn load_generator(
 }
 
 /// The per-block geometry a [`ModelConfig`] describes.
+/// The block config the loader builds layers with, for `dlm pack`.
+pub(crate) fn pack_block_config(config: &ModelConfig) -> BlockConfig {
+    block_config(config)
+}
+
 fn block_config(config: &ModelConfig) -> BlockConfig {
     BlockConfig {
         hidden_size: config.hidden_size as usize,

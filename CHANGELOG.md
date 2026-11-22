@@ -130,6 +130,23 @@ fork that runs large MoE models from SSD.
 
 ### Added
 
+- **`dlm pack`: a model's weights quantized once, ahead of time.** Streaming
+  a safetensors model at `--quant int4`/`int8` re-quantized every layer that
+  missed the RAM cache, from 16-bit weights read off disk.
+  - **What it writes:** `dlm pack --model-path <dir> --quant int4 --out
+    <dir>` runs the loader once and stores every weight it quantized exactly
+    as it came out. The config, tokenizer and other files are copied beside
+    them.
+  - **Loading:** a pack loads those bytes back without converting them, so
+    it scores bit for bit what the original does at that `--quant`
+    (`tests/pack.rs`, on DeepSeek-V3 and Qwen3.5-MoE fixtures at int4 and
+    int8). It refuses another precision.
+  - **Speed:** streaming Qwen3-1.7B on a GTX 1650 with four layers resident
+    and no RAM cache, decode went from 0.06–0.07 to 1.0–1.1 tok/s, and
+    prefill from 4–5 to 48–65 tok/s.
+  - **Size:** the pack is 2.1 GB against the original's 4.1 GB.
+  - **Not packed:** GGUF and GPTQ checkpoints (already quantized), and
+    weights the loader slices by rows, which stay 16-bit.
 - **Qwen3.5/3.6 MoE (Qwen3.6-35B-A3B), text only.** The hybrid layout:
   three Gated DeltaNet linear-attention layers (causal conv, the gated delta
   rule over a per-head recurrent state, a gated RMSNorm) to every

@@ -414,6 +414,11 @@ impl MmapStore {
         shard.tensor_bytes(name)
     }
 
+    /// Every shard, in the order they were opened.
+    pub fn iter_shards(&self) -> impl Iterator<Item = &MmapShard> {
+        self.shards.iter()
+    }
+
     /// Iterate over every tensor across all shards.
     pub fn iter_tensors(&self) -> impl Iterator<Item = &TensorInfo> {
         self.shards.iter().flat_map(|s| s.tensors())
