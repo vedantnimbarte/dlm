@@ -183,6 +183,11 @@ pub fn sampler(opts: &BenchOpts, seed: u64) -> Sampler {
 pub enum BenchSpec<'a> {
     /// N-gram lookup proposing this many tokens a round.
     Ngram(usize),
+    /// The model's own MTP head proposing `gamma` tokens a round.
+    Mtp {
+        mtp: &'a crate::loader::MtpWeights,
+        gamma: usize,
+    },
     /// An EAGLE-3 head proposing `gamma` tokens a round.
     Eagle3 {
         head: &'a crate::forward::eagle3::Eagle3Head,
@@ -315,6 +320,9 @@ fn run_speculative<K: ComputeKernel>(
     let prefill_start = Instant::now();
     let mut session = match *spec {
         BenchSpec::Ngram(gamma) => SpeculativeSession::ngram(generator, gamma, prompt, sampler)?,
+        BenchSpec::Mtp { mtp, gamma } => {
+            SpeculativeSession::mtp(generator, mtp, gamma, prompt, sampler)?
+        }
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
         BenchSpec::Eagle3 { head, gamma } => SpeculativeSession::eagle3(
             generator,

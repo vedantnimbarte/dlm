@@ -268,6 +268,9 @@ pub enum Speculative {
     Ngram,
     /// Propose with the `--draft-model-path` model.
     Draft,
+    /// Propose with the model's own multi-token-prediction head (Qwen3.5/3.6
+    /// ship one; it runs on the CPU beside the target).
+    Mtp,
 }
 
 impl Speculative {
@@ -291,13 +294,13 @@ impl Speculative {
             Speculative::Draft if !has_draft => Err(DlmError::InvalidConfig(
                 "--speculative draft needs --draft-model-path".into(),
             )),
-            Speculative::Off | Speculative::Ngram if has_draft => {
+            Speculative::Off | Speculative::Ngram | Speculative::Mtp if has_draft => {
                 Err(DlmError::InvalidConfig(format!(
                     "--draft-model-path would go unused with --speculative {}",
-                    if self == Speculative::Off {
-                        "off"
-                    } else {
-                        "ngram"
+                    match self {
+                        Speculative::Off => "off",
+                        Speculative::Ngram => "ngram",
+                        _ => "mtp",
                     }
                 )))
             }

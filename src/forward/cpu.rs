@@ -2454,6 +2454,43 @@ impl KvLayerCache {
         }
     }
 
+    /// This layer's recurrent state as a host copy that
+    /// [`restore_linear`](Self::restore_linear) can roll back to: how a
+    /// speculative round undoes the tokens it rejects on a hybrid model, whose
+    /// linear-attention state cannot be cut back like K/V. `None` for a K/V
+    /// layer, and for a linear one before its first token (whose rollback is
+    /// to empty, which [`truncate`](Self::truncate) does).
+    pub(crate) fn linear_checkpoint(&self) -> Result<Option<LinearState>> {
+        if !self.is_linear() {
+            return Ok(None);
+        }
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if let Some((conv, ssm)) = &self.linear_gpu {
+            crate::gpu::device::synchronize_default()?;
+            let mut st = LinearState {
+                conv: vec![0.0; conv.len()],
+                ssm: vec![0.0; ssm.len()],
+            };
+            conv.download(&mut st.conv)?;
+            ssm.download(&mut st.ssm)?;
+            return Ok(Some(st));
+        }
+        self.check_linear_usable(false)?;
+        Ok(self.linear.clone())
+    }
+
+    /// Put back a [`linear_checkpoint`](Self::linear_checkpoint) taken when
+    /// this layer had seen `len` tokens. The next GPU step uploads it.
+    pub(crate) fn restore_linear(&mut self, state: LinearState, len: usize) {
+        self.linear = Some(state);
+        self.linear_stale = false;
+        self.device_tokens = len;
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        {
+            self.linear_gpu = None;
+        }
+    }
+
     /// Copy this session's **device** K/V back into the host store.
     ///
     /// On the GPU kernels the real history lives in VRAM and the host only counts

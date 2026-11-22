@@ -1104,7 +1104,7 @@ impl<K: ComputeKernel> Generator<K> {
 
     /// [`prefill`](Self::prefill), handing each chunk's hidden states (every
     /// token's, `[chunk, hidden]`, before the final norm) to `each`.
-    fn prefill_with(
+    pub(crate) fn prefill_with(
         &self,
         orch: &mut ForwardOrchestrator<&K>,
         tokens: &[u32],
@@ -1356,7 +1356,7 @@ impl<K: ComputeKernel> Generator<K> {
 
     /// The final norm of a row's hidden state (a Gemma 4 row's per-layer inputs
     /// after it are not part of it).
-    fn final_norm(&self, hidden: &[f32]) -> Vec<f32> {
+    pub(crate) fn final_norm(&self, hidden: &[f32]) -> Vec<f32> {
         crate::forward::cpu::norm(
             &hidden[..self.hidden_size],
             &self.final_norm,
@@ -1435,6 +1435,27 @@ impl<K: ComputeKernel> Generator<K> {
             .into_iter()
             .map(|h| h.expect("every row filled"))
             .collect())
+    }
+
+    /// The LM head on `normed`, a row already normed by a draft head's own
+    /// norm rather than this model's: the greedy token. (`heads` applies the
+    /// final norm itself.)
+    pub(crate) fn argmax_normed(&self, normed: &[f32]) -> Result<u32> {
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        if let Some(head) = &self.gpu_head {
+            return Ok(head.argmax(normed)?[0]);
+        }
+        Ok(argmax(&self.logits_normed(normed)?))
+    }
+
+    /// [`argmax_normed`](Self::argmax_normed)'s logits.
+    pub(crate) fn logits_normed(&self, normed: &[f32]) -> Result<Vec<f32>> {
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        if let Some(head) = &self.gpu_head {
+            return Ok(self.softcap(head.logits(normed)?));
+        }
+        let l = matvec_native(&self.lm_head, normed, self.vocab_size, self.hidden_size);
+        Ok(self.softcap(l))
     }
 
     fn softcap(&self, mut logits: Vec<f32>) -> Vec<f32> {
