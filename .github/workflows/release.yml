@@ -169,6 +169,12 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           toolset: "14.44"
+      # The upload action builds under Git Bash, whose /usr/bin/link (coreutils)
+      # shadows MSVC's link.exe once the dev shell is on PATH; v0.5.1 lost this
+      # build to it. Name the linker by full path.
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$env:VCToolsInstallDir" + "bin\HostX64\x64\link.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV'
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: dlm

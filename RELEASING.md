@@ -148,13 +148,15 @@ fits that job:
 |---|---|---|
 | Linux CUDA static | `ubuntu-24.04` | The toolkit comes from NVIDIA's per-Ubuntu repo, so the Ubuntu version matters. Move it on once that repo has the pinned CUDA. |
 | Apple Silicon | `macos-latest` | Rust's deployment target (11.0) decides which Macs the binary runs on, not the runner's macOS, so following the image costs nothing and survives retirements. |
-| Windows CUDA static | `windows-latest`, MSVC toolset `14.44` | The runner ships only a few MSVC toolsets, and nvcc's front end crashes on headers newer than its CUDA release knows: CUDA 12.5 on MSVC 14.5x, and CUDA 13.2/13.3 on 14.52 (v0.5.0 lost this build to it). CI never builds CUDA on Windows, so check the toolset is still installed, and whether a newer CUDA handles the newest MSVC, before each release. |
+| Windows CUDA static | `windows-latest`, MSVC toolset `14.44` | The runner ships only a few MSVC toolsets, and nvcc's front end crashes on headers newer than its CUDA release knows: CUDA 12.5 on MSVC 14.5x, and CUDA 13.2/13.3 on 14.52 (v0.5.0 lost this build to it). Selecting a toolset puts MSVC on PATH behind Git Bash's `/usr/bin/link`, so the linker is named by full path (v0.5.1 lost the build to that). CI never builds CUDA on Windows, so check the toolset is still installed, and whether a newer CUDA handles the newest MSVC, before each release. |
 | Linux CPU | `ubuntu-latest` | Safe to float. The binary's glibc floor comes from the symbols it uses: 2.39 on x86_64 and 2.18 on aarch64 at 0.4.1. A newer image could raise it, so check if Linux users report load errors. |
 
 **Before tagging**, check
 [actions/runner-images](https://github.com/actions/runner-images) for images
 being retired, and for `-latest` labels that have moved since the last release.
 A label moving is as much a change to the release as a commit is.
+
+**Before changing a release job, run its exact steps on a branch**: copy the job into a temporary workflow with the upload action's `dry-run: true`. A build that passes outside the action proves nothing about the action (v0.5.1).
 
 **If a release run fails anyway,** don't re-run the failed jobs. A re-run uses
 `release.yml` as it was at the tag, so it hits the same broken runner. Fix the
