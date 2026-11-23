@@ -58,7 +58,7 @@ memmap2 = "0.9"
 # clears comfortably — so this pin is no longer load-bearing and can be relaxed
 # to "0.14" whenever someone wants the newer patch releases. Left exact here
 # only to keep a formatting-and-CI branch from moving dependency versions.
-prost = "=0.14.1"
+prost = "=0.14.4"
 serde = { version = "1", features = ["derive"] }
 # Image input (Gemma 3's vision tower): PNG and JPEG decoding, pure Rust and
 # permissively licensed. Resizing and normalization are dlm's own (src/vision).
