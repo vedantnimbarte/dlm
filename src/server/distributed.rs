@@ -118,12 +118,17 @@ pub fn router(engine: Arc<DistributedEngine>) -> Handler {
 }
 
 fn handle_chat(engine: &Arc<DistributedEngine>, req: &Request) -> Response {
-    let parsed: ChatRequest = match serde_json::from_slice(&req.body) {
+    let mut parsed: ChatRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
         Err(e) => return Response::json(400, error_json(&format!("invalid request: {e}"))),
     };
     if parsed.messages.is_empty() {
         return Response::json(400, error_json("messages must not be empty"));
+    }
+    // A cluster serves text: images are dropped, as on any model without a
+    // vision tower.
+    for m in &mut parsed.messages {
+        m.images.clear();
     }
     let prompt = engine.template.apply(&parsed.messages);
     let ids = match engine.tokenizer.encode(&prompt) {

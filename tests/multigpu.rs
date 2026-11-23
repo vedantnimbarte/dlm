@@ -88,6 +88,7 @@ fn build_parts() -> ModelParts {
         embed_scale: None,
         final_logit_softcap: None,
         head_int4: false,
+        per_layer: None,
     }
 }
 

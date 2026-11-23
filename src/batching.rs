@@ -32,7 +32,9 @@
 
 use crate::error::Result;
 use crate::forward::{ComputeKernel, KvSnapshot};
-use crate::generate::{Decoding, GenerationSession, Generator, Sampler, TokenLogprobs};
+use crate::generate::{
+    Decoding, GenerationSession, Generator, ImageEmbeds, Sampler, TokenLogprobs,
+};
 use crate::speculative::SpeculativeSession;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -57,6 +59,69 @@ struct PrefixCache {
     max_entries: usize,
     /// `(prompt tokens, snapshot after prefilling them)`, oldest first.
     entries: Vec<(Vec<u32>, KvSnapshot)>,
+    /// Where each entry is also written, so it outlives the process
+    /// (`--prefix-cache-dir`); `None` keeps the cache in memory only.
+    dir: Option<std::path::PathBuf>,
+}
+
+/// Cached prefixes read back at start-up stop at this many bytes of files.
+/// On a GPU a restored entry is a host copy of its KV until a request resumes
+/// from it, so the bound is host RAM.
+///
+/// ponytail: a fixed 1 GiB; size it from free RAM if that ever matters.
+const DISK_LOAD_BYTES: u64 = 1 << 30;
+
+/// The file a cached `prompt` is kept in under `dir`. The name only has to be
+/// unique per prompt: the tokens themselves are stored inside.
+fn prefix_file(dir: &std::path::Path, prompt: &[u32]) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut h);
+    dir.join(format!("{:016x}.kv", h.finish()))
+}
+
+/// Write `prompt` and its snapshot to `path`, via a temporary file so a crash
+/// mid-write never leaves a torn entry for the next start to read.
+fn write_prefix(path: &std::path::Path, prompt: &[u32], snapshot: &KvSnapshot) -> Result<()> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(prompt.len() as u64).to_le_bytes());
+    for t in prompt {
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
+    // Pulls device rows to the host: done here, on the scheduler thread that
+    // owns the GPU; only the file write is left to another thread.
+    snapshot.write_to(&mut buf)?;
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let tmp = path.with_extension("tmp");
+        let done = std::fs::write(&tmp, &buf).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = done {
+            eprintln!("prefix cache: could not write {}: {e}", path.display());
+        }
+    });
+    Ok(())
+}
+
+/// A prompt and snapshot written by [`write_prefix`].
+fn read_prefix(path: &std::path::Path) -> std::io::Result<(Vec<u32>, KvSnapshot)> {
+    use std::io::Read;
+    let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    let n = u64::from_le_bytes(b);
+    if n > 1 << 24 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "prompt length out of range",
+        ));
+    }
+    let mut toks = vec![0u8; n as usize * 4];
+    r.read_exact(&mut toks)?;
+    let prompt = toks
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok((prompt, KvSnapshot::read_from(&mut r)?))
 }
 
 impl PrefixCache {
@@ -64,7 +129,52 @@ impl PrefixCache {
         Self {
             max_entries,
             entries: Vec::new(),
+            dir: None,
         }
+    }
+
+    /// Keep entries in `dir` from now on, first loading what an earlier run
+    /// left there: the newest entries, up to the cache's bound and
+    /// [`DISK_LOAD_BYTES`]. Older files are deleted, and so are unreadable ones.
+    /// `dir` must be specific to the model and its settings (the caller's
+    /// fingerprint): a snapshot is only valid for the weights that made it.
+    /// Returns how many entries were loaded.
+    fn persist_in(&mut self, dir: std::path::PathBuf, layers: usize) -> std::io::Result<usize> {
+        std::fs::create_dir_all(&dir)?;
+        let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> =
+            std::fs::read_dir(&dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "kv"))
+                .filter_map(|e| {
+                    let m = e.metadata().ok()?;
+                    Some((m.modified().ok()?, m.len(), e.path()))
+                })
+                .collect();
+        files.sort_by_key(|f| std::cmp::Reverse(f.0)); // newest first
+        let (mut bytes, mut loaded) = (0u64, Vec::new());
+        for (_, len, path) in files {
+            if loaded.len() >= self.max_entries || bytes + len > DISK_LOAD_BYTES {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            match read_prefix(&path) {
+                Ok(entry) if entry.1.layers() == layers => {
+                    bytes += len;
+                    loaded.push(entry);
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        let n = loaded.len();
+        loaded.reverse(); // oldest first, like `entries`
+        self.entries.extend(loaded);
+        while self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
+        self.dir = Some(dir);
+        Ok(n)
     }
 
     /// A snapshot of the longest run of leading tokens `prompt` shares with a
@@ -111,10 +221,22 @@ impl PrefixCache {
         if self.max_entries == 0 {
             return;
         }
+        if let Some(dir) = &self.dir {
+            // Same prompt, same model: a file already there holds the same KV.
+            let path = prefix_file(dir, &prompt);
+            if !path.exists() {
+                if let Err(e) = write_prefix(&path, &prompt, &snapshot) {
+                    eprintln!("prefix cache: could not save a prefix: {e}");
+                }
+            }
+        }
         self.entries.retain(|(toks, _)| toks != &prompt);
         self.entries.push((prompt, snapshot));
         if self.entries.len() > self.max_entries {
-            self.entries.remove(0);
+            let (old, _) = self.entries.remove(0);
+            if let Some(dir) = &self.dir {
+                let _ = std::fs::remove_file(prefix_file(dir, &old));
+            }
         }
     }
 }
@@ -123,6 +245,8 @@ impl PrefixCache {
 struct Pending {
     id: u64,
     prompt: Vec<u32>,
+    /// Images in the prompt (see [`ImageEmbeds`]).
+    images: Vec<ImageEmbeds>,
     max_new_tokens: usize,
     /// Stop when any of these token ids is produced; empty means run to length.
     eos: Vec<u32>,
@@ -134,8 +258,58 @@ struct Pending {
     queued: std::time::Instant,
 }
 
+impl Pending {
+    /// What the prefix cache may match this prompt on: all of it, or with
+    /// images, its text up to the first image plus that image's first token
+    /// (which no cached prefix can match past, so a resumed request reuses text
+    /// only, and the image's own KV never enters the cache).
+    fn cache_key(&self) -> &[u32] {
+        match self.images.first() {
+            Some(m) => &self.prompt[..m.start + 1],
+            None => &self.prompt,
+        }
+    }
+
+    /// The part of the prompt whose KV the cache may keep: all of it, or its
+    /// text before the first image.
+    fn cacheable(&self) -> &[u32] {
+        match self.images.first() {
+            Some(m) => &self.prompt[..m.start],
+            None => &self.prompt,
+        }
+    }
+}
+
+/// An EAGLE-3 session for `p`, with draft KV room for its whole budget.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+fn eagle3_session<'a, K: ComputeKernel>(
+    target: &'a Generator<K>,
+    head: &'a crate::forward::eagle3::Eagle3Head,
+    gamma: usize,
+    prompt: &[u32],
+    max_new_tokens: usize,
+    sampler: crate::generate::Sampler,
+) -> Result<SpeculativeSession<'a, K>> {
+    let room = prompt.len() + max_new_tokens + gamma + 1;
+    SpeculativeSession::eagle3(target, head, gamma, prompt, sampler, room)
+}
+
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+fn eagle3_session<'a, K: ComputeKernel>(
+    _: &'a Generator<K>,
+    head: &'a crate::forward::eagle3::Eagle3Head,
+    _: usize,
+    _: &[u32],
+    _: usize,
+    _: crate::generate::Sampler,
+) -> Result<SpeculativeSession<'a, K>> {
+    match *head {}
+}
+
 /// The decoder backing one in-flight slot: plain single-token stepping, or a
 /// speculative session that emits a whole round's accepted tokens per step.
+// One per in-flight request: boxing the larger variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
 enum Decoder<'a, K: ComputeKernel> {
     Plain(GenerationSession<'a, K>),
     Speculative(SpeculativeSession<'a, K>),
@@ -225,6 +399,10 @@ pub struct BatchScheduler<'a, K: ComputeKernel> {
     generator: &'a Generator<K>,
     /// Draft model proposing for every slot, if speculating with one.
     draft: Option<&'a Generator<K>>,
+    /// EAGLE-3 head proposing for every slot, if speculating with one.
+    eagle: Option<&'a crate::forward::eagle3::Eagle3Head>,
+    /// The model's own MTP head proposing for every slot, if speculating with it.
+    mtp: Option<&'a crate::loader::MtpWeights>,
     /// Tokens proposed per round; 0 when not speculating. Without a draft model
     /// slots propose by n-gram lookup.
     gamma: usize,
@@ -246,6 +424,8 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         Self {
             generator,
             draft: None,
+            eagle: None,
+            mtp: None,
             gamma: 0,
             max_batch: max_batch.max(1),
             pending: VecDeque::new(),
@@ -262,7 +442,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// snapshot, skipping the shared prefix's prefill. No effect with a draft
     /// model (its sessions can't resume). `0` disables it.
     pub fn with_prefix_cache(mut self, max_entries: usize) -> Self {
-        self.prefix_cache = if max_entries > 0 && self.draft.is_none() {
+        // A recurrent model's state is only valid at the very position it was
+        // taken, and the cache resumes from prefixes of what it holds.
+        self.prefix_cache = if max_entries > 0 && !self.has_draft() && !self.generator.recurrent() {
             Some(PrefixCache::new(max_entries))
         } else {
             None
@@ -286,6 +468,42 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         }
     }
 
+    /// Create a scheduler that decodes every request speculatively, an EAGLE-3
+    /// `head` proposing `gamma` tokens per round from the target's own hidden
+    /// states. Output is identical to [`new`](Self::new). The target's kernel
+    /// must record hidden states (the resident GPU kernel does).
+    pub fn with_eagle3(
+        generator: &'a Generator<K>,
+        head: &'a crate::forward::eagle3::Eagle3Head,
+        max_batch: usize,
+        gamma: usize,
+    ) -> Self {
+        Self {
+            eagle: Some(head),
+            ..Self::with_ngram(generator, max_batch, gamma)
+        }
+    }
+
+    /// Whether a draft model or head proposes, rather than n-gram lookup.
+    fn has_draft(&self) -> bool {
+        self.draft.is_some() || self.eagle.is_some() || self.mtp.is_some()
+    }
+
+    /// Create a scheduler that decodes every request speculatively, the
+    /// model's own MTP head proposing `gamma` tokens per round. Output is
+    /// identical to [`new`](Self::new).
+    pub fn with_mtp(
+        generator: &'a Generator<K>,
+        mtp: &'a crate::loader::MtpWeights,
+        max_batch: usize,
+        gamma: usize,
+    ) -> Self {
+        Self {
+            mtp: Some(mtp),
+            ..Self::with_ngram(generator, max_batch, gamma)
+        }
+    }
+
     /// Create a scheduler that speculates with no draft model: each request
     /// proposes up to `gamma` tokens per round by n-gram lookup in its own
     /// context ([`SpeculativeSession::ngram`]). Output is identical to
@@ -301,6 +519,17 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
     /// speculative slots. Zero unless the scheduler speculates.
     pub fn speculative_stats(&self) -> (usize, usize) {
         (self.proposed, self.accepted)
+    }
+
+    /// Also keep the prefix cache in `dir`, loading what an earlier run left
+    /// there (see `PrefixCache::persist_in`). `dir` must be specific to the
+    /// model and its settings. Returns the entries loaded; 0 with the cache off.
+    pub fn persist_prefix_cache(&mut self, dir: std::path::PathBuf) -> std::io::Result<usize> {
+        let layers = self.generator.num_layers();
+        match self.prefix_cache.as_mut() {
+            Some(c) => c.persist_in(dir, layers),
+            None => Ok(0),
+        }
     }
 
     /// How many admitted requests resumed from a cached prefix (prefix-cache
@@ -360,10 +589,48 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
         decoding: Decoding,
         priority: i32,
     ) -> Result<()> {
+        self.submit_with_images(
+            id,
+            prompt,
+            Vec::new(),
+            max_new_tokens,
+            eos,
+            decoding,
+            priority,
+        )
+    }
+
+    /// [`submit_prioritized`](Self::submit_prioritized) for a prompt with
+    /// images in it. Such a request decodes plainly (no draft model), and the
+    /// prefix cache sees only its text before the first image: two prompts that
+    /// differ only in their pictures share no cached KV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_images(
+        &mut self,
+        id: u64,
+        prompt: Vec<u32>,
+        mut images: Vec<ImageEmbeds>,
+        max_new_tokens: usize,
+        eos: Vec<u32>,
+        decoding: Decoding,
+        priority: i32,
+    ) -> Result<()> {
         if prompt.is_empty() {
             return Err(crate::error::DlmError::InvalidConfig(
                 "prompt is empty".into(),
             ));
+        }
+        images.sort_by_key(|m| m.start);
+        let hidden = self.generator.hidden_size();
+        let mut end = 0;
+        for m in &images {
+            let n = m.len(hidden);
+            if m.start < end || n == 0 || m.rows.len() != n * hidden || m.start + n > prompt.len() {
+                return Err(crate::error::DlmError::InvalidConfig(
+                    "an image does not fit its prompt".into(),
+                ));
+            }
+            end = m.start + n;
         }
         let at = self
             .pending
@@ -375,6 +642,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             Pending {
                 id,
                 prompt,
+                images,
                 max_new_tokens,
                 eos,
                 decoding,
@@ -487,7 +755,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 break;
             };
             let reserved = self.reservation(front);
-            if self.shares_a_prompt_in_flight(&front.prompt) {
+            if self.shares_a_prompt_in_flight(front.cache_key()) {
                 break;
             }
             if front.max_new_tokens > 0 {
@@ -503,11 +771,13 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     break;
                 }
             }
-            let p = self.pending.pop_front().expect("front exists");
+            let mut p = self.pending.pop_front().expect("front exists");
             if p.max_new_tokens == 0 {
                 zero_finished.push(p.id);
                 continue;
             }
+            let (key_len, cacheable_len) = (p.cache_key().len(), p.cacheable().len());
+            let images = std::mem::take(&mut p.images);
             let Decoding {
                 sampler,
                 penalties,
@@ -515,13 +785,35 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                 logprobs,
             } = p.decoding;
             // A constrained request decodes plainly even when speculating, and
-            // so does one that reports log-probabilities: see `Decoding`.
-            let plain_only = grammar.is_some() || logprobs.is_some();
-            let ngram = self.draft.is_none() && self.gamma > 0 && !plain_only;
-            let decoder = match self.draft {
-                Some(draft) if !plain_only => Decoder::Speculative(
+            // so does one that reports log-probabilities: see `Decoding`. So
+            // does one with images, which a draft cannot see.
+            let plain_only = grammar.is_some() || logprobs.is_some() || !images.is_empty();
+            let ngram = !self.has_draft() && self.gamma > 0 && !plain_only;
+            let decoder = match (self.draft, self.eagle) {
+                _ if self.mtp.is_some() && !plain_only => Decoder::Speculative(
+                    SpeculativeSession::mtp(
+                        self.generator,
+                        self.mtp.expect("checked"),
+                        self.gamma,
+                        &p.prompt,
+                        sampler,
+                    )?
+                    .with_penalties(penalties),
+                ),
+                (Some(draft), _) if !plain_only => Decoder::Speculative(
                     SpeculativeSession::new(self.generator, draft, self.gamma, &p.prompt, sampler)?
                         .with_penalties(penalties),
+                ),
+                (_, Some(head)) if !plain_only => Decoder::Speculative(
+                    eagle3_session(
+                        self.generator,
+                        head,
+                        self.gamma,
+                        &p.prompt,
+                        p.max_new_tokens,
+                        sampler,
+                    )?
+                    .with_penalties(penalties),
                 ),
                 _ => {
                     // Resume from the longest cached prefix if one exists;
@@ -535,7 +827,7 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                     let resume = self
                         .prefix_cache
                         .as_ref()
-                        .and_then(|c| c.longest_prefix(&p.prompt, align));
+                        .and_then(|c| c.longest_prefix(&p.prompt[..key_len], align));
                     // The prompt goes in over the next ticks (see `step`).
                     let session = match resume {
                         Some(snap) => {
@@ -547,7 +839,10 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
                         }
                         None => self.generator.start_session_deferred(&p.prompt, sampler)?,
                     };
-                    let session = session.with_penalties(penalties).with_logprobs(logprobs);
+                    let session = session
+                        .with_penalties(penalties)
+                        .with_logprobs(logprobs)
+                        .with_images(images)?;
                     Decoder::Plain(match grammar {
                         Some(g) => session.with_grammar(g),
                         None => session,
@@ -558,7 +853,11 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             // through the prefix cache like any other, and turns speculative
             // once it is in (see `step`).
             let cache_prompt = match (&decoder, &self.prefix_cache) {
-                (Decoder::Plain(_), Some(_)) => Some(p.prompt),
+                (Decoder::Plain(_), Some(_)) => {
+                    let mut prompt = p.prompt;
+                    prompt.truncate(cacheable_len);
+                    Some(prompt)
+                }
                 _ => None,
             };
             self.active.push(Active {
@@ -649,7 +948,9 @@ impl<'a, K: ComputeKernel> BatchScheduler<'a, K> {
             .iter()
             .filter(|a| matches!(a.decoder, Decoder::Speculative(_)))
             .count();
-        let fuse = self.draft.is_none() && speculating > 1;
+        // EAGLE slots always propose, and must each run their own pass: the
+        // target records hidden states for one session at a time.
+        let fuse = !self.has_draft() && speculating > 1;
         let mut fused: Vec<&mut SpeculativeSession<'a, K>> = self
             .active
             .iter_mut()
@@ -809,6 +1110,31 @@ mod prefix_cache_tests {
         let mut off = PrefixCache::new(0);
         off.insert(vec![1, 2], snap());
         assert!(off.entries.is_empty());
+    }
+
+    /// Entries written to a directory come back in a new cache, newest first
+    /// within the bound, and the oldest file goes once the bound evicts it.
+    #[test]
+    fn prefix_cache_persists_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("dlm-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = PrefixCache::new(2);
+        a.persist_in(dir.clone(), 1).unwrap();
+        for i in 0..3u32 {
+            a.insert(vec![i, i + 1, i + 2], snap_of(3));
+            std::thread::sleep(std::time::Duration::from_millis(50)); // writes land, mtimes differ
+        }
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(files, 2, "the evicted entry's file is gone");
+
+        let mut b = PrefixCache::new(2);
+        assert_eq!(b.persist_in(dir.clone(), 1).unwrap(), 2);
+        let prompts: Vec<_> = b.entries.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(prompts, vec![vec![1, 2, 3], vec![2, 3, 4]]);
+        assert_eq!(b.entries[1].1.position(), 3);
+        // A model with another layer count reads none of them.
+        assert_eq!(PrefixCache::new(2).persist_in(dir.clone(), 7).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Re-inserting a prompt replaces its entry instead of duplicating it —

@@ -235,6 +235,162 @@ struct RawConfig {
     /// loads plausible, wrong weights.
     #[serde(default)]
     new_decoder_architecture: Option<bool>,
+    // ── Gemma 4 (`gemma4_text`); absent on every other family. ──
+    /// Per-layer-type RoPE: `{"full_attention": {...}, "sliding_attention": {...}}`,
+    /// each with its `rope_type`, `rope_theta` and (proportional) `partial_rotary_factor`.
+    #[serde(default)]
+    rope_parameters: Option<serde_json::Value>,
+    /// Head width of the full-attention layers.
+    #[serde(default)]
+    global_head_dim: Option<u32>,
+    /// The last this-many layers read the KV of earlier layers.
+    #[serde(default)]
+    num_kv_shared_layers: Option<u32>,
+    /// Width of each layer's per-layer input (0: none).
+    #[serde(default)]
+    hidden_size_per_layer_input: Option<u32>,
+    /// The KV-shared layers' MLP is twice as wide (E2B).
+    #[serde(default)]
+    use_double_wide_mlp: Option<bool>,
+    /// Variants dlm refuses: keys reused as values on global layers, a MoE
+    /// block beside the MLP, bidirectional attention.
+    #[serde(default)]
+    attention_k_eq_v: Option<bool>,
+    #[serde(default)]
+    enable_moe_block: Option<bool>,
+    #[serde(default)]
+    /// Gemma 4 spells it `null` or `"all"`; Gemma 3 270M ships `false`.
+    use_bidirectional_attention: Option<serde_json::Value>,
+    // ── Qwen3.5/3.6 hybrid layers (Gated DeltaNet linear attention between
+    // full-attention layers); absent on every other family. ──
+    #[serde(default)]
+    linear_num_key_heads: Option<u32>,
+    #[serde(default)]
+    linear_num_value_heads: Option<u32>,
+    #[serde(default)]
+    linear_key_head_dim: Option<u32>,
+    #[serde(default)]
+    linear_value_head_dim: Option<u32>,
+    #[serde(default)]
+    linear_conv_kernel_dim: Option<u32>,
+    /// Every n-th layer is full attention, the rest linear.
+    #[serde(default)]
+    full_attention_interval: Option<u32>,
+    /// Multi-token-prediction layers shipped beside the model (`mtp.*`).
+    #[serde(default)]
+    mtp_num_hidden_layers: Option<u32>,
+    /// Set by [`ModelConfig::from_gguf`]: llama.cpp writes Qwen3.5's `(1 + w)`
+    /// norms with the `+1` already added.
+    #[serde(default, rename = "_dlm_norms_baked")]
+    norms_baked: Option<bool>,
+    /// Set by [`ModelConfig::from_gguf`]: llama.cpp reorders the linear
+    /// attention's value heads from grouped-by-key-head to tiled.
+    #[serde(default, rename = "_dlm_v_heads_tiled")]
+    v_heads_tiled: Option<bool>,
+}
+
+/// Gated DeltaNet linear attention (Qwen3.5/3.6): the token mixer of every layer
+/// that is not a full-attention one. A layer keeps a causal-conv window and a
+/// per-head `k_head_dim × v_head_dim` recurrent state instead of a KV history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearAttnConfig {
+    pub num_k_heads: u32,
+    pub num_v_heads: u32,
+    pub k_head_dim: u32,
+    pub v_head_dim: u32,
+    /// Causal depthwise conv width (4).
+    pub conv_kernel: u32,
+    /// Layer `l` is full attention when `(l + 1) % full_attention_interval == 0`.
+    pub full_attention_interval: u32,
+    /// Value head `j` reads key head `j % num_k_heads` (llama.cpp's GGUF order)
+    /// rather than `j / (num_v_heads / num_k_heads)` (Hugging Face's).
+    pub v_heads_tiled: bool,
+}
+
+impl LinearAttnConfig {
+    /// `num_k_heads × k_head_dim`: the width of q and of k.
+    pub fn key_dim(&self) -> usize {
+        (self.num_k_heads * self.k_head_dim) as usize
+    }
+    /// `num_v_heads × v_head_dim`.
+    pub fn value_dim(&self) -> usize {
+        (self.num_v_heads * self.v_head_dim) as usize
+    }
+    /// Channels through the conv: q, k and v side by side.
+    pub fn conv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+    /// Floats of conv window one sequence keeps per layer.
+    pub fn conv_state_len(&self) -> usize {
+        self.conv_dim() * (self.conv_kernel as usize).saturating_sub(1)
+    }
+    /// Floats of recurrent state one sequence keeps per layer.
+    pub fn recurrent_state_len(&self) -> usize {
+        (self.num_v_heads * self.k_head_dim * self.v_head_dim) as usize
+    }
+    /// Whether `layer` is a linear-attention one.
+    pub fn is_linear(&self, layer: u32) -> bool {
+        (layer + 1) % self.full_attention_interval.max(1) != 0
+    }
+    /// The key head value head `j` reads.
+    pub fn k_head_of(&self, j: usize) -> usize {
+        let (nk, nv) = (self.num_k_heads as usize, self.num_v_heads as usize);
+        if self.v_heads_tiled {
+            j % nk
+        } else {
+            j / (nv / nk).max(1)
+        }
+    }
+}
+
+/// Qwen3.5/3.6's linear-attention geometry and layer pattern, or `None` for a
+/// model without linear layers. Every dimension is required once one is seen,
+/// and `layer_types` must be the regular "every n-th layer full" shape.
+fn build_linear_config(raw: &RawConfig) -> Result<Option<LinearAttnConfig>> {
+    let Some(num_v_heads) = raw.linear_num_value_heads else {
+        return Ok(None);
+    };
+    let need = |v: Option<u32>, name: &str| -> Result<u32> {
+        v.filter(|&v| v > 0).ok_or_else(|| {
+            DlmError::InvalidConfig(format!(
+                "linear-attention config (linear_num_value_heads set) is missing {name}"
+            ))
+        })
+    };
+    let num_k_heads = need(raw.linear_num_key_heads, "linear_num_key_heads")?;
+    if num_v_heads % num_k_heads != 0 {
+        return Err(DlmError::InvalidConfig(format!(
+            "linear_num_value_heads ({num_v_heads}) is not a multiple of linear_num_key_heads \
+             ({num_k_heads})"
+        )));
+    }
+    let interval = raw.full_attention_interval.unwrap_or(4).max(1);
+    if let Some(types) = &raw.layer_types {
+        let regular = types.len() == raw.num_hidden_layers as usize
+            && types.iter().enumerate().all(|(i, t)| {
+                let full = (i as u32 + 1) % interval == 0;
+                t == if full {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            });
+        if !regular {
+            return Err(DlmError::InvalidConfig(format!(
+                "layer_types {types:?} is not every {interval}-th layer full attention; dlm runs \
+                 that one hybrid layout, and a different one would run layers as the wrong kind"
+            )));
+        }
+    }
+    Ok(Some(LinearAttnConfig {
+        num_k_heads,
+        num_v_heads,
+        k_head_dim: need(raw.linear_key_head_dim, "linear_key_head_dim")?,
+        v_head_dim: need(raw.linear_value_head_dim, "linear_value_head_dim")?,
+        conv_kernel: need(raw.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+        full_attention_interval: interval,
+        v_heads_tiled: raw.v_heads_tiled.unwrap_or(false),
+    }))
 }
 
 /// The subset of HF's `quantization_config` block dlm needs to decide whether it
@@ -478,46 +634,58 @@ fn build_mla_config(raw: &RawConfig) -> Result<Option<MlaConfig>> {
 /// the tensor naming family. A model that declares experts but omits the top-k
 /// count is refused rather than guessed at — routing every token through the
 /// wrong number of experts is silent garbage, the worst failure mode.
-/// Refuse the DeepSeek-V3 router, whose four keys dlm's softmax top-k does not
-/// implement. Every one of them changes which experts a token is routed to, and
-/// routing to the wrong experts produces fluent nonsense rather than an error —
-/// so each is refused by name instead of ignored.
-///
-/// DeepSeek-V2 leaves all four at the values dlm implements, so it still loads.
-fn check_routing_supported(raw: &RawConfig) -> Result<()> {
-    let refuse = |what: String| -> Result<()> {
+/// The router's rule from DeepSeek's four routing keys: `scoring_func`
+/// (softmax or V3's sigmoid), `topk_method` (`greedy`, V2's
+/// `group_limited_greedy`, V3's `noaux_tc`, which also reads a per-expert
+/// `e_score_correction_bias`), the `n_group`/`topk_group` split, and
+/// `routed_scaling_factor`. Mixtral and Qwen set none and get plain softmax
+/// top-k. A value dlm does not implement is refused by name: routing to the
+/// wrong experts reads as fluent, wrong output rather than failing.
+fn routing_from(raw: &RawConfig, num_experts: u32) -> Result<Routing> {
+    let refuse = |what: String| -> Result<Routing> {
         Err(DlmError::InvalidConfig(format!(
-            "{what} dlm's MoE router scores gate logits with softmax and takes a plain \
-             top-k (DeepSeek-V2's routing). Running this checkpoint under that rule would \
-             route tokens through the wrong experts, which reads as fluent, wrong output \
-             rather than failing."
+            "{what} dlm routes with softmax or sigmoid scores and the greedy, \
+             group_limited_greedy or noaux_tc top-k (DeepSeek-V2/V3); running this \
+             checkpoint under another rule would route tokens through the wrong experts."
         )))
     };
-    match raw.scoring_func.as_deref().map(str::to_ascii_lowercase) {
-        None => {}
-        Some(ref f) if f == "softmax" => {}
+    let sigmoid = match raw.scoring_func.as_deref().map(str::to_ascii_lowercase) {
+        None => false,
+        Some(ref f) if f == "softmax" => false,
+        Some(ref f) if f == "sigmoid" => true,
         Some(other) => return refuse(format!("config declares scoring_func {other:?};")),
-    }
-    match raw.topk_method.as_deref().map(str::to_ascii_lowercase) {
-        None => {}
-        Some(ref m) if m == "greedy" => {}
-        // `noaux_tc` also adds a per-expert `e_score_correction_bias` tensor to
-        // the scores before the top-k, which dlm does not read.
+    };
+    let method = raw.topk_method.as_deref().map(str::to_ascii_lowercase);
+    let (grouped, by_top2, score_bias) = match method.as_deref() {
+        None | Some("greedy") => (false, false, false),
+        Some("group_limited_greedy") => (true, false, false),
+        Some("noaux_tc") => (true, true, true),
         Some(other) => return refuse(format!("config declares topk_method {other:?};")),
+    };
+    let n_group = raw.n_group.unwrap_or(1).max(1);
+    let topk_group = raw.topk_group.unwrap_or(n_group);
+    if grouped && n_group > 1 {
+        let per = num_experts / n_group;
+        if num_experts % n_group != 0 || topk_group == 0 || topk_group > n_group {
+            return refuse(format!(
+                "config groups {num_experts} experts into {n_group} (n_group), keeping \
+                 {topk_group} (topk_group), which does not divide them;"
+            ));
+        }
+        if by_top2 && per < 2 {
+            return refuse(format!(
+                "config's groups hold {per} expert, too few to score by their top two;"
+            ));
+        }
     }
-    if let Some(groups) = raw.n_group.filter(|&g| g > 1) {
-        return refuse(format!(
-            "config splits the experts into {groups} groups (n_group) and routes within \
-             {} of them (topk_group);",
-            raw.topk_group.unwrap_or(1)
-        ));
-    }
-    if let Some(scale) = raw.routed_scaling_factor.filter(|s| *s != 1.0) {
-        return refuse(format!(
-            "config scales the routed experts' output by {scale} (routed_scaling_factor);"
-        ));
-    }
-    Ok(())
+    Ok(Routing {
+        sigmoid,
+        n_group: if grouped { n_group } else { 1 },
+        topk_group: if grouped { topk_group } else { 1 },
+        group_by_top2: by_top2,
+        score_bias,
+        scale: raw.routed_scaling_factor.unwrap_or(1.0),
+    })
 }
 
 fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
@@ -531,7 +699,7 @@ fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
     if num_experts == 0 {
         return Ok(None); // an expert count of 0 is just a dense model
     }
-    check_routing_supported(raw)?;
+    let routing = routing_from(raw, num_experts)?;
     let experts_per_tok = raw.num_experts_per_tok.ok_or_else(|| {
         DlmError::InvalidConfig(
             "config declares experts but no num_experts_per_tok; dlm will not guess the \
@@ -584,6 +752,7 @@ fn build_moe_config(raw: &RawConfig) -> Result<Option<MoeConfig>> {
         norm_topk_prob: raw.norm_topk_prob.unwrap_or(true),
         naming,
         first_k_dense: raw.first_k_dense_replace.unwrap_or(0),
+        routing,
     }))
 }
 
@@ -631,6 +800,50 @@ pub struct MoeConfig {
     /// `first_k_dense_replace`). `0` — every other MoE family — means every layer
     /// is routed. Resolved per layer by [`BlockConfig::for_layer`].
     pub first_k_dense: u32,
+    /// How the router picks experts and weighs them.
+    pub routing: Routing,
+}
+
+/// How a MoE router turns a token's gate logits into experts and weights. The
+/// default is the softmax top-k Mixtral, Qwen and DeepSeek-V2 use; DeepSeek-V2's
+/// full model limits the choice to the best groups of experts, and V3 scores
+/// with a sigmoid, adds a learned bias for the choice only, and scales.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Routing {
+    /// Sigmoid scores (V3) rather than softmax.
+    pub sigmoid: bool,
+    /// Experts split into this many equal groups (1: no grouping), of which the
+    /// `topk_group` best are eligible.
+    pub n_group: u32,
+    pub topk_group: u32,
+    /// A group scores the sum of its two best (V3's `noaux_tc`); else its best
+    /// (V2's `group_limited_greedy`).
+    pub group_by_top2: bool,
+    /// The layer's `e_score_correction_bias` is added to the scores for the
+    /// choice, not for the weights (V3's `noaux_tc`).
+    pub score_bias: bool,
+    /// Multiplies the routed experts' weights (`routed_scaling_factor`).
+    pub scale: f32,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Routing {
+            sigmoid: false,
+            n_group: 1,
+            topk_group: 1,
+            group_by_top2: false,
+            score_bias: false,
+            scale: 1.0,
+        }
+    }
+}
+
+impl Routing {
+    /// The plain softmax top-k: no sigmoid, groups, bias or scale.
+    pub fn is_plain(&self) -> bool {
+        *self == Routing::default()
+    }
 }
 
 /// Validated Multi-head Latent Attention geometry (DeepSeek-V2/V3). Present only
@@ -739,6 +952,210 @@ pub struct ModelConfig {
     /// changes where the other two norms apply (see
     /// [`LayerTensors::is_gemma2_style`](crate::forward::LayerTensors::is_gemma2_style)).
     pub gemma2_norms: bool,
+    /// Qwen3.5/3.6: Gated DeltaNet layers between the full-attention ones.
+    pub linear_attn: Option<LinearAttnConfig>,
+    /// The full-attention output is multiplied by `sigmoid(gate)`, where the
+    /// gate is a second half of the query projection (Qwen3.5/3.6).
+    pub attn_output_gate: bool,
+    /// RoPE rotates only the first `rotary_dim` dimensions of each head
+    /// (`partial_rotary_factor`); `None` rotates all of them.
+    pub rotary_dim: Option<u32>,
+    /// Multi-token-prediction layers the checkpoint ships (`mtp.*`), loaded
+    /// beside the model but not run.
+    pub mtp_layers: u32,
+    /// Gemma 4: the full-attention layers' head width (`global_head_dim`), when
+    /// it differs from `head_dim`, which is then the windowed layers'.
+    pub global_head_dim: Option<u32>,
+    /// Gemma 4: the first layer that reads an earlier layer's KV cache instead
+    /// of keeping its own (`num_hidden_layers - num_kv_shared_layers`).
+    pub kv_shared_from: Option<u32>,
+    /// Gemma 4 RMS-normalizes each value head (no learned scale).
+    pub v_norm: bool,
+    /// Gemma 4: each layer's per-layer input width
+    /// (`hidden_size_per_layer_input`); 0 for every other family.
+    pub ple_dim: u32,
+    /// Gemma 4 E2B: the KV-shared layers' MLP is twice `intermediate_size`.
+    pub double_wide_shared_mlp: bool,
+}
+
+/// The text model of a multimodal Gemma 4 config (`model_type: "gemma4"`), or
+/// `json` unchanged for anything else: its `text_config`, with the top-level
+/// keys the text model needs carried over and `Gemma4TextConfig`'s defaults
+/// for what it omits. The vision and audio towers beside it are not run.
+fn gemma4_text_config(json: serde_json::Value) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let is_multimodal = json.get("model_type").and_then(Value::as_str) == Some("gemma4");
+    let Some(Value::Object(mut text)) = json.get("text_config").cloned().filter(|_| is_multimodal)
+    else {
+        return json;
+    };
+    for key in [
+        "eos_token_id",
+        "bos_token_id",
+        "pad_token_id",
+        "quantization_config",
+        "tie_word_embeddings",
+    ] {
+        if let (false, Some(v)) = (text.contains_key(key), json.get(key)) {
+            text.insert(key.to_string(), v.clone());
+        }
+    }
+    let defaults = json!({
+        "model_type": "gemma4_text",
+        "vocab_size": 262144,
+        "hidden_size": 2304,
+        "intermediate_size": 9216,
+        "num_hidden_layers": 30,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "max_position_embeddings": 131072,
+        "rms_norm_eps": 1e-6,
+        "sliding_window": 512,
+        "hidden_size_per_layer_input": 256,
+        "vocab_size_per_layer_input": 262144,
+        "num_kv_shared_layers": 0,
+        "tie_word_embeddings": true,
+    });
+    for (key, value) in defaults.as_object().expect("literal object") {
+        // A JSON `null` is an omitted key to transformers too.
+        if text.get(key).is_none_or(Value::is_null) {
+            text.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(text)
+}
+
+/// Gemma 4's per-layer settings, read from a `gemma4_text` config: the layer
+/// pattern, the two RoPE bases (and the global layers' partial rotation), the
+/// shared-KV tail and the per-layer inputs. Variants dlm does not implement are
+/// refused by name rather than run as the dense E2B/E4B shape.
+struct Gemma4 {
+    pattern: Option<u32>,
+    rope_theta: f32,
+    rope_scaling: Option<RopeScaling>,
+    rope_local_theta: f32,
+    global_head_dim: Option<u32>,
+    kv_shared_from: Option<u32>,
+    ple_dim: u32,
+    double_wide: bool,
+}
+
+fn gemma4_settings(raw: &RawConfig) -> Result<Gemma4> {
+    let refuse = |what: &str| {
+        Err(DlmError::InvalidConfig(format!(
+            "this Gemma 4 checkpoint {what}, which dlm does not implement; it runs the \
+             dense E2B/E4B shape. Running it as that would load the wrong weights or \
+             attend the wrong way."
+        )))
+    };
+    if raw.attention_k_eq_v == Some(true) {
+        return refuse("reuses its keys as values (attention_k_eq_v)");
+    }
+    if raw.enable_moe_block == Some(true) {
+        return refuse("has a Mixture-of-Experts block (enable_moe_block)");
+    }
+    if matches!(
+        raw.use_bidirectional_attention,
+        Some(serde_json::Value::Bool(true))
+    ) || raw
+        .use_bidirectional_attention
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        == Some("all")
+    {
+        return refuse("attends bidirectionally (use_bidirectional_attention: \"all\")");
+    }
+    let layers = raw.num_hidden_layers;
+    // transformers' default layout: every 6th layer global, and the last always.
+    let types = raw.layer_types.clone().unwrap_or_else(|| {
+        (0..layers)
+            .map(|i| {
+                if (i + 1) % 6 == 0 || i + 1 == layers {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect()
+    });
+    if types.len() != layers as usize {
+        return Err(DlmError::InvalidConfig(format!(
+            "layer_types lists {} layers; the model has {layers}",
+            types.len()
+        )));
+    }
+    let pattern = pattern_from_layer_types(&types)?;
+
+    // RoPE per layer kind. Absent, these are Gemma4TextConfig's defaults.
+    let rope = |kind: &str, theta: f64, rope_type: &str, partial: f64| -> Result<(f32, f32)> {
+        let p = raw.rope_parameters.as_ref().and_then(|r| r.get(kind));
+        let get = |k: &str| p.and_then(|p| p.get(k));
+        let ty = get("rope_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(rope_type);
+        let factor = get("factor")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1.0);
+        if !matches!(ty, "default" | "proportional") || factor != 1.0 {
+            return Err(DlmError::InvalidConfig(format!(
+                "Gemma 4 {kind} RoPE {ty:?} with factor {factor} is not implemented; dlm runs \
+                 the \"default\" and unscaled \"proportional\" RoPE Gemma 4 ships with."
+            )));
+        }
+        let theta = get("rope_theta")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(theta);
+        let partial = if ty == "proportional" {
+            get("partial_rotary_factor")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(partial)
+        } else {
+            1.0
+        };
+        Ok((theta as f32, partial as f32))
+    };
+    let (rope_theta, partial) = rope("full_attention", 1_000_000.0, "proportional", 0.25)?;
+    let (rope_local_theta, local_partial) = rope("sliding_attention", 10_000.0, "default", 1.0)?;
+    if local_partial < 1.0 {
+        return refuse("rotates only part of its windowed layers' heads");
+    }
+
+    let kv_shared_from = match raw.num_kv_shared_layers.unwrap_or(0) {
+        0 => None,
+        n if n >= layers => {
+            return Err(DlmError::InvalidConfig(format!(
+                "num_kv_shared_layers {n} leaves none of the {layers} layers with KV of its own"
+            )))
+        }
+        n => Some(layers - n),
+    };
+    // Every shared layer needs an earlier layer of its kind to read.
+    if let Some(first) = kv_shared_from {
+        let global = |i: usize| types[i] == "full_attention";
+        for l in first as usize..types.len() {
+            if !(0..first as usize).any(|i| global(i) == global(l)) {
+                return Err(DlmError::InvalidConfig(format!(
+                    "layer {l} shares KV, but no layer before {first} is of its kind"
+                )));
+            }
+        }
+    }
+    let head_dim = raw
+        .head_dim
+        .unwrap_or(raw.hidden_size / raw.num_attention_heads.max(1));
+    Ok(Gemma4 {
+        pattern,
+        rope_theta,
+        rope_scaling: (partial < 1.0).then_some(RopeScaling::Partial { fraction: partial }),
+        rope_local_theta,
+        global_head_dim: raw.global_head_dim.filter(|&g| g != head_dim),
+        kv_shared_from,
+        ple_dim: raw.hidden_size_per_layer_input.unwrap_or(256),
+        double_wide: raw.use_double_wide_mlp == Some(true) && kv_shared_from.is_some(),
+    })
 }
 
 /// The text model of a multimodal Gemma 3 config (`model_type: "gemma3"`, the
@@ -753,6 +1170,21 @@ pub struct ModelConfig {
 /// unless `text_config` sets them itself.
 fn gemma3_text_config(json: serde_json::Value) -> serde_json::Value {
     use serde_json::{json, Value};
+    // Qwen3.5/3.6 nest their text model the same way, complete, beside a vision
+    // tower; only the top-level ids are carried over.
+    if matches!(
+        json.get("model_type").and_then(Value::as_str),
+        Some("qwen3_5_moe" | "qwen3_5")
+    ) {
+        if let Some(Value::Object(mut text)) = json.get("text_config").cloned() {
+            for key in ["eos_token_id", "bos_token_id", "tie_word_embeddings"] {
+                if let (false, Some(v)) = (text.contains_key(key), json.get(key)) {
+                    text.insert(key.to_string(), v.clone());
+                }
+            }
+            return Value::Object(text);
+        }
+    }
     let is_multimodal_gemma3 = json.get("model_type").and_then(Value::as_str) == Some("gemma3");
     let Some(Value::Object(mut text)) = json
         .get("text_config")
@@ -860,14 +1292,20 @@ impl ModelConfig {
         // The architectures whose tensor names and block shape dlm knows. An
         // unrecognized one is refused rather than run as a Llama: the names would
         // mostly match, and the parts that did not would load as the wrong thing.
+        if arch == "gemma4" {
+            return Self::from_gemma4_gguf(metadata, has_lm_head, quant);
+        }
         let model_type = match arch {
             "llama" | "mistral" | "qwen2" | "qwen3" | "phi3" | "starcoder2" => arch,
             "gemma" => "gemma",
             "gemma2" => "gemma2",
             "gemma3" | "gemma3_text" => "gemma3_text",
+            "qwen35moe" => "qwen3_5_moe_text",
             other => {
                 return Err(DlmError::InvalidConfig(format!(
-                    "gguf: architecture {other:?} is not one dlm implements. It reads llama,                      mistral, qwen2, qwen3, phi3, starcoder2 and gemma/gemma2/gemma3 files."
+                    "gguf: architecture {other:?} is not one dlm implements. It reads llama, \
+                     mistral, qwen2, qwen3, qwen35moe, phi3, starcoder2 and \
+                     gemma/gemma2/gemma3 files."
                 )))
             }
         };
@@ -876,10 +1314,20 @@ impl ModelConfig {
                 .get(&format!("{arch}.{key}"))
                 .and_then(Value::as_f64)
         };
+        // A hybrid model may store a per-layer array where others store one
+        // value (KV heads: 0 on its recurrent layers); the largest is the
+        // attention layers' value.
         let int = |key: &str| {
-            metadata
-                .get(&format!("{arch}.{key}"))
-                .and_then(Value::as_u64)
+            let v = metadata.get(&format!("{arch}.{key}"))?;
+            v.as_u64().or_else(|| {
+                v.as_numbers()
+                    .and_then(|n| {
+                        n.iter()
+                            .copied()
+                            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))))
+                    })
+                    .map(|x| x as u64)
+            })
         };
         let need = |key: &str| {
             int(key).ok_or_else(|| {
@@ -896,10 +1344,12 @@ impl ModelConfig {
                 DlmError::InvalidConfig("gguf: metadata has no tokenizer.ggml.tokens".into())
             })?;
 
+        // llama.cpp counts the MTP layers in `block_count`; they follow the model's.
+        let mtp = int("nextn_predict_layers").unwrap_or(0);
         let mut cfg = json!({
             "model_type": model_type,
             "hidden_size": need("embedding_length")?,
-            "num_hidden_layers": need("block_count")?,
+            "num_hidden_layers": need("block_count")?.saturating_sub(mtp),
             "num_attention_heads": need("attention.head_count")?,
             "vocab_size": vocab,
             "tie_word_embeddings": !has_lm_head,
@@ -959,6 +1409,49 @@ impl ModelConfig {
                 .and_then(Value::as_u64)
                 .map(Into::into),
         );
+        if arch == "qwen35moe" {
+            // llama.cpp's names for the MoE and Gated DeltaNet geometry; the
+            // value head width is the inner size over the value head count.
+            put("num_experts", int("expert_count").map(Into::into));
+            put(
+                "num_experts_per_tok",
+                int("expert_used_count").map(Into::into),
+            );
+            put(
+                "moe_intermediate_size",
+                int("expert_feed_forward_length").map(Into::into),
+            );
+            put(
+                "shared_expert_intermediate_size",
+                int("expert_shared_feed_forward_length").map(Into::into),
+            );
+            put(
+                "linear_conv_kernel_dim",
+                int("ssm.conv_kernel").map(Into::into),
+            );
+            put("linear_key_head_dim", int("ssm.state_size").map(Into::into));
+            put(
+                "linear_num_key_heads",
+                int("ssm.group_count").map(Into::into),
+            );
+            let nv = int("ssm.time_step_rank");
+            put("linear_num_value_heads", nv.map(Into::into));
+            put(
+                "linear_value_head_dim",
+                int("ssm.inner_size")
+                    .zip(nv)
+                    .map(|(inner, nv)| (inner / nv.max(1)).into()),
+            );
+            put(
+                "full_attention_interval",
+                int("full_attention_interval").map(Into::into),
+            );
+            put("mtp_num_hidden_layers", Some(mtp.into()));
+            // The converter adds Qwen3.5's `+1` into its norms and tiles the
+            // value heads (see `LinearAttnConfig::v_heads_tiled`).
+            put("_dlm_norms_baked", Some(true.into()));
+            put("_dlm_v_heads_tiled", Some(true.into()));
+        }
         // llama.cpp spells RoPE scaling as a type plus a factor, the same two
         // fields `rope_scaling` holds.
         if let (Some(kind), Some(factor)) = (
@@ -985,6 +1478,156 @@ impl ModelConfig {
             }
         }
 
+        let bytes = serde_json::to_vec(&cfg).expect("config json is serializable");
+        let mut config = Self::from_json_bytes(&bytes, quant)?;
+        // Gemma's RMSNorm scales by `1 + w`. llama.cpp's converter bakes the 1
+        // into every Gemma, Gemma 2 and Gemma 3 norm weight it writes, so adding
+        // it again at load would scale every norm by `2 + w`.
+        if matches!(arch, "gemma" | "gemma2" | "gemma3" | "gemma3_text") {
+            config.norm_add_one = false;
+        }
+        Ok(config)
+    }
+
+    /// A Gemma 4 GGUF's metadata as a `gemma4_text` config. llama.cpp spells
+    /// the per-kind settings with a `_swa` suffix for the windowed layers, marks
+    /// those layers with a boolean array, and keeps the global layers' partial
+    /// RoPE in a `rope_freqs` tensor rather than the metadata: the 0.25 here is
+    /// Gemma 4's, which the loader checks that tensor against.
+    fn from_gemma4_gguf(
+        metadata: &std::collections::BTreeMap<String, crate::storage::gguf::Value>,
+        has_lm_head: bool,
+        quant: QuantScheme,
+    ) -> Result<Self> {
+        use crate::storage::gguf::Value;
+        use serde_json::json;
+        let get = |key: &str| metadata.get(&format!("gemma4.{key}"));
+        let num = |key: &str| get(key).and_then(Value::as_f64);
+        let need = |key: &str| {
+            get(key).and_then(Value::as_u64).ok_or_else(|| {
+                DlmError::InvalidConfig(format!("gguf: metadata has no gemma4.{key}"))
+            })
+        };
+        let layers = need("block_count")?;
+        // A per-layer list where llama.cpp writes one (the FFN width, the KV
+        // heads), else the single value.
+        let per_layer = |key: &str| -> Result<Vec<u64>> {
+            match get(key) {
+                Some(Value::Numbers(v)) if v.len() == layers as usize => {
+                    Ok(v.iter().map(|&x| x as u64).collect())
+                }
+                Some(v) => v.as_u64().map(|x| vec![x; layers as usize]).ok_or_else(|| {
+                    DlmError::InvalidConfig(format!("gguf: gemma4.{key} is not a number per layer"))
+                }),
+                None => Err(DlmError::InvalidConfig(format!(
+                    "gguf: metadata has no gemma4.{key}"
+                ))),
+            }
+        };
+        let vocab = metadata
+            .get("tokenizer.ggml.tokens")
+            .and_then(Value::as_strings)
+            .map(|t| t.len() as u64)
+            .ok_or_else(|| {
+                DlmError::InvalidConfig("gguf: metadata has no tokenizer.ggml.tokens".into())
+            })?;
+        let shared = get("attention.shared_kv_layers")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        // E2B lists a wider FFN for its shared-KV layers: Gemma 4's
+        // `use_double_wide_mlp`. Any other variation is not a shape dlm knows.
+        let ffn = per_layer("feed_forward_length")?;
+        let first_shared = (layers - shared.min(layers)) as usize;
+        let double_wide = ffn[first_shared..].iter().all(|&f| f == 2 * ffn[0]) && shared > 0;
+        if !ffn[..first_shared].iter().all(|&f| f == ffn[0])
+            || !(double_wide || ffn.iter().all(|&f| f == ffn[0]))
+        {
+            return Err(DlmError::InvalidConfig(format!(
+                "gguf: Gemma 4 FFN widths {ffn:?} are neither uniform nor doubled on the shared-KV layers"
+            )));
+        }
+        let kv_heads = per_layer("attention.head_count_kv")?;
+        if kv_heads.iter().any(|&k| k != kv_heads[0]) {
+            return Err(DlmError::InvalidConfig(format!(
+                "gguf: Gemma 4 KV head counts {kv_heads:?} differ by layer, which dlm does not run"
+            )));
+        }
+        let layer_types: Vec<&str> = match get("attention.sliding_window_pattern") {
+            Some(Value::Numbers(v)) if v.len() == layers as usize => v
+                .iter()
+                .map(|&w| {
+                    if w != 0.0 {
+                        "sliding_attention"
+                    } else {
+                        "full_attention"
+                    }
+                })
+                .collect(),
+            _ => {
+                return Err(DlmError::InvalidConfig(
+                    "gguf: Gemma 4 metadata has no per-layer sliding_window_pattern".into(),
+                ))
+            }
+        };
+        let mut cfg = json!({
+            "model_type": "gemma4_text",
+            "hidden_size": need("embedding_length")?,
+            "num_hidden_layers": layers,
+            "num_attention_heads": need("attention.head_count")?,
+            "num_key_value_heads": kv_heads[0],
+            "intermediate_size": ffn[0],
+            "use_double_wide_mlp": double_wide,
+            "vocab_size": vocab,
+            "tie_word_embeddings": !has_lm_head,
+            "head_dim": need("attention.key_length_swa")?,
+            "global_head_dim": need("attention.key_length")?,
+            "layer_types": layer_types,
+            "num_kv_shared_layers": shared,
+            "hidden_size_per_layer_input": need("embedding_length_per_layer_input")?,
+            "rope_parameters": {
+                "full_attention": {
+                    "rope_type": "proportional",
+                    "rope_theta": num("rope.freq_base").unwrap_or(1_000_000.0),
+                    "partial_rotary_factor": 0.25,
+                },
+                "sliding_attention": {
+                    "rope_type": "default",
+                    "rope_theta": num("rope.freq_base_swa").unwrap_or(10_000.0),
+                },
+            },
+        });
+        let obj = cfg.as_object_mut().expect("literal object");
+        let int = |key: &str| get(key).and_then(Value::as_u64);
+        let optional: [(&str, Option<serde_json::Value>); 5] = [
+            (
+                "max_position_embeddings",
+                int("context_length").map(Into::into),
+            ),
+            (
+                "sliding_window",
+                int("attention.sliding_window").map(Into::into),
+            ),
+            (
+                "rms_norm_eps",
+                num("attention.layer_norm_rms_epsilon").map(Into::into),
+            ),
+            (
+                "final_logit_softcapping",
+                num("final_logit_softcapping").map(Into::into),
+            ),
+            (
+                "eos_token_id",
+                metadata
+                    .get("tokenizer.ggml.eos_token_id")
+                    .and_then(Value::as_u64)
+                    .map(Into::into),
+            ),
+        ];
+        for (key, value) in optional {
+            if let Some(v) = value {
+                obj.insert(key.to_string(), v);
+            }
+        }
         let bytes = serde_json::to_vec(&cfg).expect("config json is serializable");
         Self::from_json_bytes(&bytes, quant)
     }
@@ -1057,11 +1700,18 @@ impl ModelConfig {
                 context: "config.json".to_string(),
                 source,
             })?;
-        let raw: RawConfig =
-            serde_json::from_value(gemma3_text_config(json)).map_err(|source| DlmError::Json {
-                context: "config.json".to_string(),
-                source,
-            })?;
+        let raw: RawConfig = serde_json::from_value(gemma3_text_config(gemma4_text_config(json)))
+            .map_err(|source| DlmError::Json {
+            context: "config.json".to_string(),
+            source,
+        })?;
+        let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
+        // Gemma 4 first: it is refused or resolved before the generic MoE and
+        // RoPE parsing reads keys it spells its own way (a MoE variant's
+        // `num_experts` would otherwise be taken for Qwen's).
+        let gemma4 = matches!(model_type.as_str(), "gemma4" | "gemma4_text")
+            .then(|| gemma4_settings(&raw))
+            .transpose()?;
 
         // Reject quant formats the decoder would silently mis-decode; keep the
         // layout of the one it can.
@@ -1070,7 +1720,10 @@ impl ModelConfig {
             None => None,
         };
 
-        let moe = build_moe_config(&raw)?;
+        let moe = match gemma4 {
+            Some(_) => None,
+            None => build_moe_config(&raw)?,
+        };
         let mla = build_mla_config(&raw)?;
 
         // Qwen2 declares a window and switches it off; Mistral just declares one.
@@ -1095,19 +1748,81 @@ impl ModelConfig {
                 )));
             }
         }
-        // RoPE on part of each head (Phi, GPT-NeoX, GLM): dlm rotates all of it.
-        if let Some(factor) = raw.partial_rotary_factor.filter(|f| *f < 1.0) {
+        let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
+        // Qwen3.5/3.6 MoE: Gated DeltaNet layers, three in four, between gated
+        // full-attention ones with partial RoPE and (1 + w) norms.
+        let is_qwen35 = matches!(model_type.as_str(), "qwen3_5_moe_text" | "qwen3_5_moe");
+        if matches!(
+            model_type.as_str(),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_next"
+        ) {
             return Err(DlmError::InvalidConfig(format!(
-                "config sets partial_rotary_factor {factor}, so RoPE covers only that \
-                 fraction of each head's dimensions. dlm rotates the whole head; doing that \
-                 to a model trained this way mis-places every token without erroring."
+                "model_type {model_type:?} is not supported: dlm runs the Qwen3.5/3.6 hybrid \
+                 layers for the MoE checkpoints (qwen3_5_moe). Qwen3-Next fuses its linear \
+                 attention projections in another layout, and the dense Qwen3.5 has not been \
+                 checked against transformers."
             )));
         }
+        let linear_attn = if is_qwen35 {
+            build_linear_config(&raw)?
+        } else {
+            None
+        };
+        if is_qwen35 && linear_attn.is_none() {
+            return Err(DlmError::InvalidConfig(
+                "a qwen3_5_moe config without linear_num_value_heads; dlm will not guess the \
+                 linear-attention geometry"
+                    .into(),
+            ));
+        }
+        // `rope_parameters` (newer transformers) holds what older configs keep at
+        // the top level; a top-level key wins.
+        let rope_params = raw.rope_parameters.as_ref();
+        let rope_param_f32 = |key: &str| {
+            rope_params
+                .and_then(|p| p.get(key))
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32)
+        };
+        let rope_scaling_raw: Option<RawRopeScaling> = match (&raw.rope_scaling, rope_params) {
+            (Some(_), _) | (None, None) => None,
+            (None, Some(p)) => serde_json::from_value(p.clone()).ok(),
+        };
+        let rope_scaling_raw = raw.rope_scaling.as_ref().or(rope_scaling_raw.as_ref());
+        // RoPE on part of each head: dlm rotates the first `rotary_dim` of a
+        // hybrid Qwen3.5 head (as transformers does, by halves) and refuses it
+        // elsewhere (Phi, GPT-NeoX, GLM), whose loaders it has not been wired into.
+        let partial = raw
+            .partial_rotary_factor
+            .or_else(|| rope_param_f32("partial_rotary_factor"))
+            .filter(|f| *f < 1.0);
+        let head_dim_for_rope = raw
+            .head_dim
+            .unwrap_or(raw.hidden_size / raw.num_attention_heads.max(1));
+        let rotary_dim = match partial {
+            None => None,
+            Some(factor) if linear_attn.is_some() => {
+                let dim = (head_dim_for_rope as f32 * factor) as u32;
+                if dim == 0 || dim % 2 != 0 {
+                    return Err(DlmError::InvalidConfig(format!(
+                        "partial_rotary_factor {factor} leaves {dim} rotated dimensions of \
+                         {head_dim_for_rope}; RoPE needs an even, non-zero count"
+                    )));
+                }
+                Some(dim)
+            }
+            Some(factor) => {
+                return Err(DlmError::InvalidConfig(format!(
+                    "config sets partial_rotary_factor {factor}, so RoPE covers only that \
+                     fraction of each head's dimensions. dlm rotates the whole head; doing that \
+                     to a model trained this way mis-places every token without erroring."
+                )));
+            }
+        };
 
         // Gemma architecture variants: (1+w) RMSNorm, embedding scaling, GeGLU.
         // Gemma2 adds logit softcapping, alternating window layers, a decoupled
         // attention scale, and a second norm pair per layer.
-        let model_type = raw.model_type.as_deref().unwrap_or("").to_ascii_lowercase();
         let is_gemma2 = model_type == "gemma2";
         // Gemma3: Gemma2's norm layout plus per-head Q/K norms (loaded when
         // present), a 5:1 local/global pattern, and a separate RoPE base for the
@@ -1163,11 +1878,11 @@ impl ModelConfig {
             Some(a) if a.to_ascii_lowercase().contains("gelu") => {
                 crate::forward::cpu::Activation::GeluTanh
             }
-            None if is_gemma => crate::forward::cpu::Activation::GeluTanh,
+            None if is_gemma || gemma4.is_some() => crate::forward::cpu::Activation::GeluTanh,
             _ => crate::forward::cpu::Activation::Silu,
         };
 
-        let config = ModelConfig {
+        let mut config = ModelConfig {
             hidden_size: raw.hidden_size,
             num_attention_heads: raw.num_attention_heads,
             // Default to full multi-head attention when kv-heads is unspecified.
@@ -1191,9 +1906,12 @@ impl ModelConfig {
                 Some(EosField::Many(ids)) => ids,
                 None => Vec::new(),
             },
-            rope_theta: raw.rope_theta.unwrap_or(10000.0),
+            rope_theta: raw
+                .rope_theta
+                .or_else(|| rope_param_f32("rope_theta"))
+                .unwrap_or(10000.0),
             rms_eps: raw.rms_norm_eps.unwrap_or(1e-5),
-            rope_scaling: match &raw.rope_scaling {
+            rope_scaling: match rope_scaling_raw {
                 Some(r) => parse_rope_scaling(r)?,
                 None => None,
             },
@@ -1206,7 +1924,9 @@ impl ModelConfig {
             // attention; keep it as declared and let the kernel no-op it.
             sliding_window,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
-            norm_add_one: is_gemma,
+            // Qwen3.5's norms are zero-centered `(1 + w)` too, except the linear
+            // attention's gated norm, which the loader reads plainly.
+            norm_add_one: is_gemma || (is_qwen35 && !raw.norms_baked.unwrap_or(false)),
             norm_kind,
             parallel_residual: is_falcon && raw.parallel_attn.unwrap_or(true),
             learned_positions: is_gpt2,
@@ -1241,7 +1961,42 @@ impl ModelConfig {
             final_logit_softcap: raw.final_logit_softcapping.filter(|c| *c > 0.0),
             query_pre_attn_scalar: raw.query_pre_attn_scalar.filter(|s| *s > 0.0),
             gemma2_norms: is_gemma2 || is_gemma3,
+            linear_attn,
+            // Qwen3.5's attention class always has the gate.
+            attn_output_gate: is_qwen35,
+            rotary_dim,
+            mtp_layers: raw.mtp_num_hidden_layers.unwrap_or(0),
+            global_head_dim: None,
+            kv_shared_from: None,
+            v_norm: false,
+            ple_dim: 0,
+            double_wide_shared_mlp: false,
         };
+        if config.rotary_dim.is_some() && config.rope_scaling.is_some() {
+            return Err(DlmError::InvalidConfig(
+                "rope scaling with a partial rotary factor is not implemented: the scaling's \
+                 attention factor would reach the dimensions RoPE leaves alone"
+                    .into(),
+            ));
+        }
+        // Gemma 4: Gemma 3's block with plain-`w` RMSNorm, normed values, an
+        // attention scale of 1 (the Q/K norms carry it), wider global heads
+        // with partial RoPE, a shared-KV tail and per-layer inputs.
+        if let Some(g) = gemma4 {
+            config.norm_add_one = false;
+            config.embed_scale = Some((raw.hidden_size as f32).sqrt());
+            config.gemma2_norms = true;
+            config.sliding_window_pattern = g.pattern;
+            config.rope_theta = g.rope_theta;
+            config.rope_scaling = g.rope_scaling;
+            config.rope_local_theta = Some(g.rope_local_theta);
+            config.query_pre_attn_scalar = Some(1.0);
+            config.global_head_dim = g.global_head_dim;
+            config.kv_shared_from = g.kv_shared_from;
+            config.v_norm = true;
+            config.ple_dim = g.ple_dim;
+            config.double_wide_shared_mlp = g.double_wide;
+        }
 
         config.validate()?;
         Ok(config)
@@ -1299,12 +2054,117 @@ impl ModelConfig {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    /// True when layers differ in shape (Gemma 4: wider global heads, a
+    /// KV-shared tail, per-layer inputs), so per-layer figures are sums over the
+    /// layers rather than one layer times the count.
+    fn layers_vary(&self) -> bool {
+        self.global_head_dim.is_some() || self.kv_shared_from.is_some() || self.ple_dim > 0
+    }
+
+    /// Whether `layer` attends globally rather than over the window.
+    fn is_global_layer(&self, layer: u32) -> bool {
+        match (self.sliding_window, self.sliding_window_pattern) {
+            (None, _) => true,
+            (Some(_), Some(n)) => n > 0 && (layer + 1) % n == 0,
+            (Some(_), None) => false,
+        }
+    }
+
+    /// `layer`'s head width: Gemma 4's global layers are wider.
+    fn layer_head_dim(&self, layer: u32) -> u64 {
+        match self.global_head_dim {
+            Some(g) if self.is_global_layer(layer) => g as u64,
+            _ => self.head_dim() as u64,
+        }
+    }
+
+    /// Whether `layer` keeps a KV cache of its own (Gemma 4's shared tail does not).
+    fn has_own_kv(&self, layer: u32) -> bool {
+        self.kv_shared_from.is_none_or(|first| layer < first)
+    }
+
+    /// K and V values one token stores across every layer: `2 × kv_heads ×
+    /// head_dim` per layer with a cache of its own.
+    pub fn kv_values_per_token(&self) -> u64 {
+        (0..self.num_layers)
+            .filter(|&l| self.has_own_kv(l))
+            .map(|l| 2 * self.num_kv_heads as u64 * self.layer_head_dim(l))
+            .sum()
+    }
+
+    /// Gemma 4's block parameters summed over its layers: attention as wide as
+    /// each layer's heads (no K/V on the shared tail), the MLP doubled where
+    /// E2B doubles it, each layer's per-layer-input gate and projection, and the
+    /// model-level projection that feeds them.
+    fn varying_block_params(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let ple = self.ple_dim as u64;
+        let layers: u64 = (0..self.num_layers)
+            .map(|l| {
+                let d = self.layer_head_dim(l);
+                let q_o = 2 * h * self.num_attention_heads as u64 * d;
+                let kv = if self.has_own_kv(l) {
+                    2 * h * self.num_kv_heads as u64 * d
+                } else {
+                    0
+                };
+                let wide = !self.has_own_kv(l) && self.double_wide_shared_mlp;
+                let inter = self.intermediate_size as u64 * if wide { 2 } else { 1 };
+                q_o + kv + 3 * h * inter + 2 * h * ple
+            })
+            .sum();
+        layers + h * self.num_layers as u64 * ple
+    }
+
     /// Attention-projection parameters for one layer: q + o (`h*h` each) and
     /// k + v, scaled by the GQA ratio (`2 * kv_ratio * h*h`).
     fn attn_params(&self) -> u64 {
         let h = self.hidden_size as u64;
-        let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
-        (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64
+        let Some(l) = &self.linear_attn else {
+            let kv_ratio = self.num_kv_heads as f64 / self.num_attention_heads as f64;
+            return (2.0 * (h * h) as f64 + 2.0 * kv_ratio * (h * h) as f64) as u64;
+        };
+        // A hybrid model averages its two kinds of layer.
+        let q = (self.num_attention_heads * self.head_dim()) as u64;
+        let kv = (self.num_kv_heads * self.head_dim()) as u64;
+        let gate = if self.attn_output_gate { q } else { 0 };
+        let full = (q + gate + 2 * kv) * h + h * q;
+        let (kd, vd, nv) = (
+            l.key_dim() as u64,
+            l.value_dim() as u64,
+            l.num_v_heads as u64,
+        );
+        let linear = (2 * kd + 2 * vd + 2 * nv) * h + h * vd;
+        let layers = self.num_layers as u64;
+        let n_full = self.attention_layers() as u64;
+        (full * n_full + linear * (layers - n_full)) / layers.max(1)
+    }
+
+    /// True for a hybrid model, whose linear-attention layers keep a recurrent
+    /// state instead of a KV history.
+    pub fn is_hybrid(&self) -> bool {
+        self.linear_attn.is_some()
+    }
+
+    /// Layers that keep a KV history: all of them, or a hybrid model's
+    /// full-attention ones.
+    pub fn attention_layers(&self) -> u32 {
+        match &self.linear_attn {
+            Some(l) => (0..self.num_layers).filter(|&i| !l.is_linear(i)).count() as u32,
+            None => self.num_layers,
+        }
+    }
+
+    /// Bytes of recurrent state (conv window + delta-rule state, f32) one
+    /// sequence keeps across all linear-attention layers; 0 for other models.
+    pub fn linear_state_bytes(&self) -> u64 {
+        match &self.linear_attn {
+            Some(l) => {
+                let per_layer = (l.conv_state_len() + l.recurrent_state_len()) as u64 * 4;
+                per_layer * (self.num_layers - self.attention_layers()) as u64
+            }
+            None => 0,
+        }
     }
 
     /// Parameters in one routed MoE expert's SwiGLU triple (gate + up + down),
@@ -1327,6 +2187,9 @@ impl ModelConfig {
     pub fn resident_layer_params(&self) -> u64 {
         let h = self.hidden_size as u64;
         let norms = 2 * h;
+        if self.layers_vary() {
+            return self.varying_block_params() / self.num_layers.max(1) as u64 + norms;
+        }
         let ffn = match &self.moe {
             None => 3 * h * self.intermediate_size as u64,
             Some(m) => {
@@ -1386,7 +2249,11 @@ impl ModelConfig {
         };
         let per_layer = self.attn_params() + ffn;
 
-        let blocks = per_layer * self.num_layers as u64;
+        let blocks = if self.layers_vary() {
+            self.varying_block_params()
+        } else {
+            per_layer * self.num_layers as u64
+        };
         let embed_and_head = 2 * self.vocab_size as u64 * h;
         blocks + embed_and_head
     }
@@ -1396,11 +2263,277 @@ impl ModelConfig {
 mod tests {
     use super::*;
 
+    /// A GGUF's metadata for a tiny model of `arch`: just the keys `from_gguf` needs.
+    fn gguf_meta(arch: &str) -> std::collections::BTreeMap<String, crate::storage::gguf::Value> {
+        use crate::storage::gguf::Value;
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("general.architecture".into(), Value::String(arch.into()));
+        for (k, v) in [
+            ("embedding_length", 16),
+            ("block_count", 2),
+            ("attention.head_count", 2),
+            ("attention.head_count_kv", 1),
+            ("feed_forward_length", 32),
+            ("attention.key_length", 8),
+        ] {
+            m.insert(format!("{arch}.{k}"), Value::U64(v));
+        }
+        m.insert(
+            "tokenizer.ggml.tokens".into(),
+            Value::Strings((0..64).map(|i| format!("t{i}")).collect()),
+        );
+        m
+    }
+
+    /// google/gemma-4-E4B-it's config.json, the text half verbatim but for
+    /// `layer_types` (written out below) and its towers left out.
+    fn gemma4_e4b_json(extra: &str) -> String {
+        let types: Vec<&str> = (0..42)
+            .map(|i| {
+                if (i + 1) % 6 == 0 {
+                    "\"full_attention\""
+                } else {
+                    "\"sliding_attention\""
+                }
+            })
+            .collect();
+        format!(
+            r#"{{"architectures":["Gemma4ForConditionalGeneration"],"model_type":"gemma4",
+            "eos_token_id":[1,106],"tie_word_embeddings":true,"vision_config":null,
+            "text_config":{{"attention_bias":false,"attention_k_eq_v":false,"bos_token_id":2,
+              "dtype":"bfloat16","enable_moe_block":false,"eos_token_id":1,
+              "final_logit_softcapping":30.0,"global_head_dim":512,"head_dim":256,
+              "hidden_activation":"gelu_pytorch_tanh","hidden_size":2560,
+              "hidden_size_per_layer_input":256,"intermediate_size":10240,
+              "layer_types":[{}],"max_position_embeddings":131072,"model_type":"gemma4_text",
+              "num_attention_heads":8,"num_experts":null,"num_global_key_value_heads":null,
+              "num_hidden_layers":42,"num_key_value_heads":2,"num_kv_shared_layers":18,
+              "pad_token_id":0,"rms_norm_eps":1e-06,
+              "rope_parameters":{{"full_attention":{{"partial_rotary_factor":0.25,
+                "rope_theta":1000000.0,"rope_type":"proportional"}},
+                "sliding_attention":{{"rope_theta":10000.0,"rope_type":"default"}}}},
+              "sliding_window":512,"tie_word_embeddings":true,"top_k_experts":null,
+              "use_bidirectional_attention":null,"use_cache":true,"use_double_wide_mlp":false,
+              "vocab_size":262144,"vocab_size_per_layer_input":262144{}}}}}"#,
+            types.join(","),
+            extra
+        )
+    }
+
+    /// Gemma 4 E4B's nested config resolves to its block: plain-`w` norms, a 5:1
+    /// window pattern whose global layers are twice as wide and rotate a
+    /// quarter of each head, a shared-KV tail from layer 24, per-layer inputs.
+    #[test]
+    fn gemma4_e4b_config_resolves() {
+        let c = ModelConfig::from_json_bytes(gemma4_e4b_json("").as_bytes(), QuantScheme::Fp16)
+            .unwrap();
+        assert!(!c.norm_add_one && c.gemma2_norms && c.v_norm);
+        assert_eq!(c.sliding_window_pattern, Some(6));
+        assert_eq!(c.sliding_window, Some(512));
+        assert_eq!((c.head_dim(), c.global_head_dim), (256, Some(512)));
+        assert_eq!(c.rope_theta, 1_000_000.0);
+        assert_eq!(c.rope_local_theta, Some(10_000.0));
+        assert_eq!(
+            c.rope_scaling,
+            Some(RopeScaling::Partial { fraction: 0.25 })
+        );
+        assert_eq!(c.query_pre_attn_scalar, Some(1.0));
+        assert_eq!(c.kv_shared_from, Some(24));
+        assert_eq!(c.ple_dim, 256);
+        assert!(!c.double_wide_shared_mlp && c.moe.is_none());
+        assert_eq!(c.final_logit_softcap, Some(30.0));
+        assert_eq!(c.embed_scale, Some(2560f32.sqrt()));
+        // 20 windowed layers of 2×256 and 4 global of 2×512, K and V each; the
+        // 18 shared layers keep none.
+        assert_eq!(c.kv_values_per_token(), 2 * (20 * 512 + 4 * 1024));
+    }
+
+    /// The Gemma 4 variants dlm does not run are refused by name.
+    #[test]
+    fn gemma4_variants_are_refused() {
+        for extra in [
+            r#","attention_k_eq_v":true"#,
+            r#","enable_moe_block":true"#,
+            r#","use_bidirectional_attention":"all""#,
+            r#","use_bidirectional_attention":true"#,
+        ] {
+            let json = gemma4_e4b_json("").replace(r#""attention_k_eq_v":false,"#, "");
+            let json = json.replace(r#""enable_moe_block":false,"#, "");
+            let json = json.replace(r#""use_bidirectional_attention":null,"#, "");
+            let err = ModelConfig::from_json_bytes(
+                json.replacen(
+                    "\"attention_bias\":false",
+                    &format!("\"attention_bias\":false{extra}"),
+                    1,
+                )
+                .as_bytes(),
+                QuantScheme::Fp16,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("Gemma 4"), "{extra}: {err}");
+        }
+    }
+
+    /// A Gemma 4 GGUF's metadata, as llama.cpp writes E4B's, reads as the same
+    /// config the safetensors one gives.
+    #[test]
+    fn gemma4_gguf_metadata_matches_the_json_config() {
+        use crate::storage::gguf::Value;
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "general.architecture".to_string(),
+            Value::String("gemma4".into()),
+        );
+        for (k, v) in [
+            ("block_count", 42),
+            ("context_length", 131072),
+            ("embedding_length", 2560),
+            ("feed_forward_length", 10240),
+            ("attention.head_count", 8),
+            ("attention.head_count_kv", 2),
+            ("attention.key_length", 512),
+            ("attention.key_length_swa", 256),
+            ("attention.sliding_window", 512),
+            ("attention.shared_kv_layers", 18),
+            ("embedding_length_per_layer_input", 256),
+        ] {
+            m.insert(format!("gemma4.{k}"), Value::U64(v));
+        }
+        for (k, v) in [
+            ("rope.freq_base", 1e6),
+            ("rope.freq_base_swa", 1e4),
+            ("attention.layer_norm_rms_epsilon", 1e-6),
+            ("final_logit_softcapping", 30.0),
+        ] {
+            m.insert(format!("gemma4.{k}"), Value::F64(v));
+        }
+        m.insert(
+            "gemma4.attention.sliding_window_pattern".to_string(),
+            Value::Numbers((0..42).map(|i| ((i + 1) % 6 != 0) as u8 as f64).collect()),
+        );
+        m.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            Value::Strings((0..262144).map(|i| i.to_string()).collect()),
+        );
+        m.insert("tokenizer.ggml.eos_token_id".to_string(), Value::U64(106));
+        let g = ModelConfig::from_gguf(&m, false, QuantScheme::Int4).unwrap();
+        let j = ModelConfig::from_json_bytes(gemma4_e4b_json("").as_bytes(), QuantScheme::Int4)
+            .unwrap();
+        assert_eq!(g.sliding_window_pattern, j.sliding_window_pattern);
+        assert_eq!(
+            (g.head_dim(), g.global_head_dim),
+            (j.head_dim(), j.global_head_dim)
+        );
+        assert_eq!(
+            (g.rope_theta, g.rope_local_theta),
+            (j.rope_theta, j.rope_local_theta)
+        );
+        assert_eq!(g.rope_scaling, j.rope_scaling);
+        assert_eq!((g.kv_shared_from, g.ple_dim), (j.kv_shared_from, j.ple_dim));
+        assert_eq!(
+            (g.intermediate_size, g.double_wide_shared_mlp),
+            (10240, false)
+        );
+        assert!(!g.norm_add_one && g.v_norm && g.tie_word_embeddings);
+        assert_eq!(g.eos_token_ids, vec![106]);
+        // E2B lists its FFN per layer, doubled on the shared tail.
+        let mut e2b = m.clone();
+        e2b.insert(
+            "gemma4.feed_forward_length".to_string(),
+            Value::Numbers(
+                (0..42)
+                    .map(|i| if i < 24 { 6144.0 } else { 12288.0 })
+                    .collect(),
+            ),
+        );
+        let c = ModelConfig::from_gguf(&e2b, false, QuantScheme::Int4).unwrap();
+        assert_eq!(
+            (c.intermediate_size, c.double_wide_shared_mlp),
+            (6144, true)
+        );
+    }
+
+    #[test]
+    fn gguf_gemma_norms_already_carry_the_one() {
+        for arch in ["gemma", "gemma2", "gemma3"] {
+            let c = ModelConfig::from_gguf(&gguf_meta(arch), false, QuantScheme::Int4).unwrap();
+            assert!(!c.norm_add_one, "{arch}: llama.cpp wrote 1 + w already");
+        }
+        let c = ModelConfig::from_gguf(&gguf_meta("llama"), false, QuantScheme::Int4).unwrap();
+        assert!(!c.norm_add_one);
+    }
+
     /// Gemma 3 states its layer layout two ways; both mean "every 6th layer is
     /// global". An irregular list is refused, not approximated.
     /// A multimodal Gemma 3 config as Google exports the 27B: the text model is
     /// nested and sparse. Everything omitted must come from Gemma3TextConfig's
     /// defaults, and the EOS id from the top level.
+    /// Qwen3.6-35B-A3B's own config (trimmed of the vision tower and the
+    /// 40-entry `layer_types`, which `full_attention_interval` implies): the
+    /// text model comes out of `text_config`, RoPE out of `rope_parameters`.
+    #[test]
+    fn qwen36_config_reads_its_hybrid_text_model() {
+        let json = br#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],
+            "model_type":"qwen3_5_moe","tie_word_embeddings":false,
+            "text_config":{"attention_bias":false,"attn_output_gate":true,
+              "bos_token_id":248044,"eos_token_id":248044,"full_attention_interval":4,
+              "head_dim":256,"hidden_act":"silu","hidden_size":2048,
+              "linear_conv_kernel_dim":4,"linear_key_head_dim":128,"linear_num_key_heads":16,
+              "linear_num_value_heads":32,"linear_value_head_dim":128,
+              "max_position_embeddings":262144,"model_type":"qwen3_5_moe_text",
+              "moe_intermediate_size":512,"mtp_num_hidden_layers":1,"num_attention_heads":16,
+              "num_experts":256,"num_experts_per_tok":8,"num_hidden_layers":40,
+              "num_key_value_heads":2,"partial_rotary_factor":0.25,"rms_norm_eps":1e-06,
+              "rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],
+                "partial_rotary_factor":0.25,"rope_theta":10000000,"rope_type":"default"},
+              "shared_expert_intermediate_size":512,"tie_word_embeddings":false,
+              "vocab_size":248320},
+            "vision_config":{"depth":27,"hidden_size":1152}}"#;
+        let c = ModelConfig::from_json_bytes(json, QuantScheme::Fp16).unwrap();
+        assert_eq!(
+            (c.hidden_size, c.num_layers, c.vocab_size),
+            (2048, 40, 248320)
+        );
+        assert_eq!(
+            (c.num_attention_heads, c.num_kv_heads, c.head_dim()),
+            (16, 2, 256)
+        );
+        assert_eq!(c.rope_theta, 1e7);
+        assert_eq!(c.rotary_dim, Some(64));
+        assert!(c.rope_scaling.is_none());
+        let l = c.linear_attn.unwrap();
+        assert_eq!(
+            (l.key_dim(), l.value_dim(), l.conv_dim()),
+            (2048, 4096, 8192)
+        );
+        assert!((0..40)
+            .filter(|&i| !l.is_linear(i))
+            .eq([3, 7, 11, 15, 19, 23, 27, 31, 35, 39]));
+        assert_eq!(
+            (l.k_head_of(0), l.k_head_of(1), l.k_head_of(31)),
+            (0, 0, 15)
+        );
+        let m = c.moe.unwrap();
+        assert!(m.norm_topk_prob && m.routing.is_plain());
+        assert_eq!(m.naming, MoeNaming::Qwen);
+        assert!(c.attn_output_gate && c.norm_add_one && !c.tie_word_embeddings);
+        assert_eq!(c.eos_token_ids, vec![248044]);
+        assert_eq!(c.mtp_layers, 1);
+        // 30 linear layers of a 24 KiB conv window and a 2 MiB state each.
+        assert_eq!(c.linear_state_bytes(), 30 * (8192 * 3 + 32 * 128 * 128) * 4);
+        // A layout other than "every n-th full" is refused, not guessed at.
+        let bad = String::from_utf8_lossy(json).replace(
+            r#""full_attention_interval":4"#,
+            r#""full_attention_interval":4,"layer_types":["full_attention"]"#,
+        );
+        assert!(ModelConfig::from_json_bytes(bad.as_bytes(), QuantScheme::Fp16).is_err());
+        // The dense Qwen3.5 and Qwen3-Next are refused.
+        for other in ["qwen3_5_text", "qwen3_next"] {
+            let j = String::from_utf8_lossy(json).replace("qwen3_5_moe_text", other);
+            assert!(ModelConfig::from_json_bytes(j.as_bytes(), QuantScheme::Fp16).is_err());
+        }
+    }
+
     #[test]
     fn multimodal_gemma3_config_reads_its_sparse_text_config() {
         let json = br#"{"architectures":["Gemma3ForConditionalGeneration"],
@@ -1499,8 +2632,8 @@ mod tests {
         );
     }
 
-    /// DeepSeek-V2's routing is the one dlm implements, so it must keep loading
-    /// while V3's is refused (next test).
+    /// DeepSeek-V2's plain softmax top-k keeps loading as the default routing
+    /// (V3's is the next test).
     #[test]
     fn deepseek_v2_routing_is_accepted() {
         let json = br#"{"model_type":"deepseek_v2","hidden_size":16,
@@ -1513,25 +2646,45 @@ mod tests {
             .is_moe());
     }
 
-    /// DeepSeek-V3/R1 scores with sigmoid, adds a per-expert bias, and limits the
-    /// top-k to a few expert groups. dlm's router does none of that, and routing
-    /// a token through the wrong experts reads as fluent, wrong output — so each
-    /// key is refused by name rather than ignored.
+    /// DeepSeek-V3's routing keys become its router; a value dlm does not
+    /// implement is still refused by name, since routing a token through the
+    /// wrong experts reads as fluent, wrong output.
     #[test]
-    fn deepseek_v3_routing_is_refused() {
+    fn deepseek_v3_routing_parses_and_unknown_routing_is_refused() {
         let base = r#""model_type":"deepseek_v3","hidden_size":16,
             "num_attention_heads":4,"num_hidden_layers":4,"vocab_size":32,
             "intermediate_size":8,"moe_intermediate_size":4,"n_routed_experts":64,
             "num_experts_per_tok":6"#;
+        let v3 = format!(
+            r#"{{{base},"scoring_func":"sigmoid","topk_method":"noaux_tc","n_group":8,
+                "topk_group":4,"routed_scaling_factor":2.5}}"#
+        );
+        let cfg = ModelConfig::from_json_bytes(v3.as_bytes(), QuantScheme::Fp16).unwrap();
+        let r = cfg.moe.unwrap().routing;
+        assert_eq!(
+            r,
+            Routing {
+                sigmoid: true,
+                n_group: 8,
+                topk_group: 4,
+                group_by_top2: true,
+                score_bias: true,
+                scale: 2.5,
+            }
+        );
         for (key, value) in [
-            ("scoring_func", r#""sigmoid""#),
-            ("topk_method", r#""noaux_tc""#),
-            ("n_group", "8"),
-            ("routed_scaling_factor", "2.5"),
+            ("scoring_func", r#""tanh""#),
+            ("topk_method", r#""random""#),
+            ("n_group", "7"), // 64 experts do not split into 7 groups
         ] {
-            let json = format!(r#"{{{base},"{key}":{value}}}"#);
+            let extra = if key == "n_group" {
+                r#","topk_method":"noaux_tc""#
+            } else {
+                ""
+            };
+            let json = format!(r#"{{{base},"{key}":{value}{extra}}}"#);
             let err = ModelConfig::from_json_bytes(json.as_bytes(), QuantScheme::Fp16)
-                .expect_err("V3 routing must be refused");
+                .expect_err("unknown routing must be refused");
             assert!(
                 format!("{err}").contains(key),
                 "expected the refusal to name {key}, got: {err}"

@@ -137,6 +137,56 @@ fn batch_size_one_is_sequential_but_correct() {
     assert_eq!(results[1].tokens, greedy(&generator, &[3], 4));
 }
 
+/// The same prompt ids around two different images are two prompts. The
+/// prefix cache keys on token ids, which are equal at an image's positions
+/// whatever the picture, so it may reuse only the text before the first image:
+/// each request must decode exactly as it does alone.
+#[test]
+fn prefix_cache_does_not_share_images() {
+    use dlm::generate::ImageEmbeds;
+    let generator = build_generator();
+    let prompt = vec![1, 2, 3, 4, 5, 9, 9, 9, 9, 6];
+    let mut rng = Rng::new(11);
+    let image = |rng: &mut Rng| ImageEmbeds {
+        start: 5,
+        rows: rng.vec(4 * 16, 1.0),
+    };
+    let (a, b) = (image(&mut rng), image(&mut rng));
+    let alone = |img: &ImageEmbeds| {
+        let mut s = generator
+            .start_session_deferred(&prompt, Sampler::Greedy)
+            .unwrap()
+            .with_images(vec![img.clone()])
+            .unwrap();
+        s.prefill_some(usize::MAX).unwrap();
+        (0..6).map(|_| s.step().unwrap()).collect::<Vec<u32>>()
+    };
+    let (want_a, want_b) = (alone(&a), alone(&b));
+    assert_ne!(want_a, want_b, "the images should change the output");
+
+    // One slot, so the second request is admitted after the first is cached.
+    let mut sched = BatchScheduler::new(&generator, 1).with_prefix_cache(16);
+    for (id, img) in [(1, a), (2, b)] {
+        sched
+            .submit_with_images(
+                id,
+                prompt.clone(),
+                vec![img],
+                6,
+                vec![],
+                Sampler::Greedy.into(),
+                0,
+            )
+            .unwrap();
+    }
+    let mut results = sched.run().unwrap();
+    results.sort_by_key(|f| f.id);
+    assert_eq!(results[0].tokens, want_a);
+    assert_eq!(results[1].tokens, want_b);
+    // The text before the image is shared; nothing after it is.
+    assert_eq!(sched.resume_hits(), 1);
+}
+
 #[test]
 fn prefix_cache_preserves_output() {
     let generator = build_generator();

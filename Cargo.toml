@@ -1,6 +1,6 @@
 [package]
 name = "dlm"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 # Verified by the `msrv` CI job, which builds on exactly this toolchain.
 #
@@ -60,7 +60,11 @@ memmap2 = "0.9"
 # only to keep a formatting-and-CI branch from moving dependency versions.
 prost = "=0.14.1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Image input (Gemma 3's vision tower): PNG and JPEG decoding, pure Rust and
+# permissively licensed. Resizing and normalization are dlm's own (src/vision).
+png = "0.18"
+zune-jpeg = "0.5"
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
 
 [target.'cfg(unix)'.dependencies]

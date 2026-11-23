@@ -43,6 +43,10 @@ pub enum Command {
     Search(SearchArgs),
     /// Download a model from the Hugging Face hub into a local directory.
     Pull(PullArgs),
+    /// Write a copy of a safetensors model with its weights already quantized,
+    /// so a model streamed from disk reads int4/int8 instead of converting at
+    /// every load
+    Pack(PackArgs),
     /// Print a shell completion script to stdout (e.g. `dlm completions bash`).
     Completions(CompletionsArgs),
 }
@@ -69,6 +73,24 @@ pub struct SearchArgs {
     /// List repos that ship `.gguf` files instead of safetensors ones.
     #[arg(long)]
     pub gguf: bool,
+}
+
+/// Arguments for `dlm pack`.
+#[derive(Debug, Args)]
+pub struct PackArgs {
+    /// The safetensors model directory to pack.
+    #[arg(long, value_name = "DIR")]
+    pub model_path: PathBuf,
+
+    /// Precision to store the weights at: the `--quant` the pack is then
+    /// loaded with.
+    #[arg(long, value_enum)]
+    pub quant: QuantArg,
+
+    /// Directory to write the pack into (new, or empty). Serve it with
+    /// `--model-path <out>`.
+    #[arg(long, value_name = "DIR")]
+    pub out: PathBuf,
 }
 
 /// Arguments for `dlm pull`.
@@ -124,6 +146,18 @@ pub enum DistributedMode {
     Master,
     /// Worker node driven by a master.
     Worker,
+}
+
+/// How `/v1/embeddings` pools hidden states (`--embedding-pooling`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PoolingArg {
+    /// What a sentence-transformers export says in `1_Pooling/config.json`
+    /// (mean or last token); the last token without one.
+    Auto,
+    /// The last token's hidden state.
+    Last,
+    /// The mean over every token.
+    Mean,
 }
 
 /// Compute device for generation (`--device`).
@@ -234,6 +268,9 @@ pub enum Speculative {
     Ngram,
     /// Propose with the `--draft-model-path` model.
     Draft,
+    /// Propose with the model's own multi-token-prediction head (Qwen3.5/3.6
+    /// ship one; it runs on the CPU beside the target).
+    Mtp,
 }
 
 impl Speculative {
@@ -257,13 +294,13 @@ impl Speculative {
             Speculative::Draft if !has_draft => Err(DlmError::InvalidConfig(
                 "--speculative draft needs --draft-model-path".into(),
             )),
-            Speculative::Off | Speculative::Ngram if has_draft => {
+            Speculative::Off | Speculative::Ngram | Speculative::Mtp if has_draft => {
                 Err(DlmError::InvalidConfig(format!(
                     "--draft-model-path would go unused with --speculative {}",
-                    if self == Speculative::Off {
-                        "off"
-                    } else {
-                        "ngram"
+                    match self {
+                        Speculative::Off => "off",
+                        Speculative::Ngram => "ngram",
+                        _ => "mtp",
                     }
                 )))
             }
@@ -338,6 +375,13 @@ pub struct ServeArgs {
     /// layer's projections of a safetensors checkpoint; anything else is refused.
     #[arg(long, value_name = "DIR")]
     pub lora: Option<PathBuf>,
+
+    /// The vision tower for a GGUF model: a llama.cpp `mmproj` GGUF (Gemma 3's).
+    /// Without it, an `mmproj*.gguf` beside the model file is used if there is
+    /// exactly one; a safetensors Gemma 3 4B+ carries its own tower. With a
+    /// tower, chat requests may include `image_url` parts as `data:` URLs.
+    #[arg(long, value_name = "FILE")]
+    pub mmproj: Option<PathBuf>,
 
     /// Tokens proposed per speculative round, by the draft model or n-gram
     /// lookup.
@@ -457,9 +501,16 @@ pub struct ServeArgs {
 
     /// Chat prompt template applied to chat messages. `auto` (default) detects it
     /// from the checkpoint's tokenizer_config.json; or name one: `plain`,
-    /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `phi3`, `deepseek`.
+    /// `chatml`, `llama3`, `llama2`, `mistral`, `gemma`, `gemma4`, `phi3`, `deepseek`.
     #[arg(long, value_name = "NAME", default_value = "auto")]
     pub chat_template: String,
+
+    /// How `/v1/embeddings` pools the tokens' hidden states. `auto` follows a
+    /// sentence-transformers export's `1_Pooling/config.json` (mean or last
+    /// token) and otherwise takes the last token, which most decoder embedding
+    /// models are trained for.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub embedding_pooling: PoolingArg,
 
     /// Stop generation when the model produces this token id (the model's EOS).
     /// Overrides the `eos_token_id` auto-detected from `config.json`; omit to use
@@ -476,6 +527,13 @@ pub struct ServeArgs {
     /// model (speculative sessions can't resume).
     #[arg(long, value_name = "N")]
     pub prefix_cache_size: Option<usize>,
+
+    /// Also keep cached prompt prefixes in this directory, so they survive a
+    /// restart: a long system prompt is prefilled once, not once per start.
+    /// Each model and setting (weights, `--quant`, `--kv-quant`, device, dlm
+    /// version) gets a subdirectory of its own. Needs the prefix cache on.
+    #[arg(long, value_name = "DIR")]
+    pub prefix_cache_dir: Option<PathBuf>,
 
     /// Turn away a request that has waited this many seconds to be admitted,
     /// with `503` and `Retry-After`, instead of letting a backlog grow without
@@ -627,6 +685,18 @@ pub struct GenerateArgs {
     /// Prompt as text, tokenized with the BPE tokenizer. Overrides `--prompt`.
     #[arg(long)]
     pub text: Option<String>,
+
+    /// An image (PNG or JPEG) for a model with a vision tower (Gemma 3 4B+);
+    /// repeat for several. `--text` is then the user's message, rendered with
+    /// Gemma's chat template, with the images where it says `<start_of_image>`
+    /// or else before the text.
+    #[arg(long, value_name = "FILE")]
+    pub image: Vec<std::path::PathBuf>,
+
+    /// The vision tower for a GGUF model: a llama.cpp `mmproj` GGUF. Defaults
+    /// to the one `mmproj*.gguf` beside the model file, if there is one.
+    #[arg(long, value_name = "FILE")]
+    pub mmproj: Option<std::path::PathBuf>,
 
     /// Tokenizer directory (`vocab.json` + `merges.txt`). Defaults to the model
     /// directory if it has them, else a raw byte tokenizer.

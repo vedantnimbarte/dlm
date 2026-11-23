@@ -744,7 +744,7 @@ ws      ::= | " " | "\n" [ \t]{0,20}
 /// number, integer, boolean, null, or a list of them), `properties` /
 /// `required` (no other keys allowed), `items`, `enum`, `const`, `anyOf` and
 /// `oneOf`; refuses the keywords it would otherwise silently ignore.
-/// Properties come out in key order, required ones first.
+/// Properties come out in the schema's order, required ones first.
 pub fn json_schema_to_gbnf(schema: &Value) -> Result<String, String> {
     Ok(format!("root ::= {}\n{JSON_RULES}", schema_expr(schema)?))
 }
@@ -1037,19 +1037,20 @@ mod tests {
         )
         .unwrap();
         let g = json_schema_to_gbnf(&schema).unwrap();
-        // Required first (in key order), then the optional ones, in key order.
-        assert!(matches(&g, r#"{"age": 3, "name": "x"}"#), "{g}");
+        // Required first, then the optional ones, each in the schema's order.
+        assert!(matches(&g, r#"{"name": "x", "age": 3}"#), "{g}");
+        assert!(!matches(&g, r#"{"age": 3, "name": "x"}"#), "schema order");
         assert!(matches(
             &g,
-            r#"{"age":3,"name":"x","kind":1,"tags":["a","b"]}"#
+            r#"{"name":"x","age":3,"tags":["a","b"],"kind":1}"#
         ));
-        assert!(matches(&g, r#"{"age":3,"name":"x","note":null}"#));
+        assert!(matches(&g, r#"{"name":"x","age":3,"note":null}"#));
         assert!(!matches(&g, r#"{"age":3}"#), "name is required");
-        assert!(!matches(&g, r#"{"age":3.5,"name":"x"}"#), "integer");
-        assert!(!matches(&g, r#"{"age":3,"name":"x","tags":["c"]}"#), "enum");
-        assert!(!matches(&g, r#"{"age":3,"name":"x","kind":2}"#), "const");
+        assert!(!matches(&g, r#"{"name":"x","age":3.5}"#), "integer");
+        assert!(!matches(&g, r#"{"name":"x","age":3,"tags":["c"]}"#), "enum");
+        assert!(!matches(&g, r#"{"name":"x","age":3,"kind":2}"#), "const");
         assert!(
-            !matches(&g, r#"{"age":3,"name":"x","extra":1}"#),
+            !matches(&g, r#"{"name":"x","age":3,"extra":1}"#),
             "no extra keys"
         );
 

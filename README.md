@@ -148,7 +148,10 @@ CPU.
 - [Running the tests](#running-the-tests)
 - [The VRAM budget math](#the-vram-budget-math)
 - [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
-- [Weight precision (`--quant`)](#weight-precision---quant)
+- [GGUF files](#gguf-files)
+- [Images (Gemma 3)](#images-gemma-3)
+- [LoRA adapters (`--lora`)](#lora-adapters---lora)
+- [Weight precision (`--quant`)](#weight-precision---quant), including [packs](#packs-dlm-pack)
 - [Distributed & scaling](#distributed--scaling)
 - [Contributing & license](#contributing--license)
 
@@ -165,16 +168,17 @@ CPU.
 │   PINNED ZONE     │   STREAMING ZONE  │  CACHE ZONE    │
 │  • Embedding Block│  • Resident window│ • Paged KV     │
 │  • LM Head / Norm │    of N layers    │ • Intermediate │
-│  • Draft Model    │    (LRU, async)   │   Residuals    │
+│  • Draft Model    │    (MRU, async)   │   Residuals    │
 └───────────────────┴───────────────────┴────────────────┘
 ```
 
 - **Pinned Zone** — embedding, LM head, and norms stay resident permanently
   (moving them each step would thrash the PCIe bus).
-- **Streaming Zone** — an LRU of `N` layers (`--resident-layers`, else the VRAM
-  plan's budget). A miss uploads that layer on a dedicated copy stream, so the
-  transfer overlaps compute on the default stream, and evicts the least-recently
-  used.
+- **Streaming Zone** — a window of `N` layers (`--resident-layers`, else the
+  VRAM plan's budget). A miss uploads that layer on a dedicated copy stream, so
+  the transfer overlaps compute on the default stream, and evicts the most
+  recently used layer: layers are read in a cycle, so the least recently used
+  one is exactly the one needed next.
 - **Cache Zone** — PagedAttention KV cache + residual activations. KV for *all*
   layers stays resident even as weights stream, so attention always sees full
   history.
@@ -182,20 +186,24 @@ CPU.
 The data path for a streamed layer:
 
 ```
-mmap weights ──► host RAM cache ──► pinned staging buffer ──► streaming-zone buffer ──► compute
-   (NVMe)        (--ram-cache-gb)     (page-locked host)          (VRAM)
+direct read ──► host RAM cache ──► pinned staging buffer ──► streaming-zone buffer ──► compute
+   (NVMe)       (--ram-cache-gb)     (page-locked host)          (VRAM)
 ```
 
-Memory-mapping skips the OS read-buffer copy; the optional host-RAM cache
+Each layer or expert arrives in one positioned, unbuffered read
+(`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux, a plain positioned
+read elsewhere or when refused), which leaves the OS page cache alone rather
+than duplicating the RAM cache in it; `DLM_MMAP_READS=1` copies out of the
+memory map instead, as before 0.5.0. The optional host-RAM cache
 (`--ram-cache-gb`; on by default with `--stream` when every layer fits) keeps materialized layers across token steps
 so a miss doesn't re-read and re-decode them; and the page-locked (pinned) host
 buffer lets the PCIe controller DMA into VRAM on the copy stream.
 
-Be clear-eyed about the limit: with a window smaller than the model, layers are
-touched in order and evicted long before they come round again, so the window
-does not really *cache* — its job is to overlap the next upload with the current
-compute. What streaming costs is bandwidth, and the only way to pay less is to
-send fewer bytes ([`--quant`](#weight-precision---quant)).
+Be clear-eyed about the limit: evicting the most recently used layer keeps most
+of a window in place across tokens, but every layer outside it still crosses the
+bus every token. What streaming costs is bandwidth, and the only way to pay less
+is to send fewer bytes ([`--quant`](#weight-precision---quant), or a
+[pack](#packs-dlm-pack)).
 
 The transformer math sits behind a block-level `ComputeKernel` trait (`run_block`
 runs one decoder block for one token), and a `ForwardOrchestrator` drives a
@@ -301,7 +309,7 @@ cargo run -- profile
 Example output:
 
 ```
-dlm v0.4.0
+dlm v0.5.0
   gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
@@ -479,9 +487,11 @@ names. That covers:
 | Phi-3 / Phi-3.5 | supported — fused `qkv_proj` and `gate_up_proj` are split at load; the block is otherwise Llama-shaped. The 128k `longrope` variant is **refused** (dlm does not implement that scaling, and running without it yields fluent nonsense) |
 | GPT-2 | supported — LayerNorm (not RMSNorm), learned position embeddings instead of RoPE, an ungated MLP, biases on every projection, and `Conv1D` weights transposed at load. CPU and GPU, resident and streamed — each checked against the real `openai-community/gpt2` |
 | Falcon | supported — parallel attention/FFN, multi-query (`multi_query` is a flag, not a count), LayerNorm, ungated MLP, fused `query_key_value`. **Config-verified, not run**: the smallest RoPE Falcon is 14 GB. `alibi: true` (falcon-rw-*) and `new_decoder_architecture` (Falcon-40B) are **refused** rather than mis-decoded. CPU and GPU; the GPU block is checked against the CPU oracle on synthetic Falcon-shaped weights |
-| DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU, resident or streamed. V3/R1's own router (sigmoid scoring, group-limited top-k) is **refused**: dlm routes with V2's softmax top-k, and routing a token through the wrong experts reads as fluent, wrong output |
+| DeepSeek-V2/V3 (MLA) | supported — Multi-head Latent Attention (compressed-latent KV, decoupled RoPE, YaRN), on CPU and GPU, resident or streamed. Routing as V2 (softmax top-k, or `group_limited_greedy`) and as V3/R1 (sigmoid scores, the `e_score_correction_bias`, top-2-sum group-limited top-k, `routed_scaling_factor`), each checked against `transformers` on a tiny random checkpoint; an unknown `scoring_func` or `topk_method` is **refused**, since routing a token through the wrong experts reads as fluent, wrong output. V3's multi-token-prediction layer is not used |
 | Gemma2 | supported — attention + final logit softcapping, alternating local/global attention layers, decoupled `query_pre_attn_scalar` scale, and the pre/post-FFN norm pair (CPU and GPU) |
-| Gemma 3 (270M, 1B; and the text model of 4B/12B/27B) | supported — Gemma 2's norm layout without softcapping, per-head (1+w) Q/K norms, five sliding-window layers to each global one (from `sliding_window_pattern` or `layer_types`), and a separate RoPE base for the windowed layers. CPU and GPU, resident and streamed; checked on the real `gemma-3-1b-it` by its answers and by the cross-entropy of a passage twice the window. The 4B+ checkpoints are multimodal (`Gemma3ForConditionalGeneration`): dlm reads the language model out of `text_config` and `language_model.*` and ignores the vision tower, so they serve **text only** — checked on the real `gemma-3-4b-it`, whose 8 GB of weights stream through a 4 GB card |
+| Gemma 3 (270M, 1B; and the text model of 4B/12B/27B) | supported — Gemma 2's norm layout without softcapping, per-head (1+w) Q/K norms, five sliding-window layers to each global one (from `sliding_window_pattern` or `layer_types`), and a separate RoPE base for the windowed layers. CPU and GPU, resident and streamed; checked on the real `gemma-3-1b-it` by its answers and by the cross-entropy of a passage twice the window. The 4B+ checkpoints are multimodal (`Gemma3ForConditionalGeneration`): dlm reads the language model out of `text_config` and `language_model.*`, and the SigLIP vision tower beside it (or a GGUF's `mmproj` file) for [image input](#images-gemma-3) — checked on the real `gemma-3-4b-it`, whose 8 GB of weights stream through a 4 GB card |
+| Gemma 4 E2B / E4B (text) | supported — plain-`w` RMSNorm, Q/K/V norms (V unscaled) with an attention scale of 1, five windowed layers to each global one with **wider global heads** (512 against 256) and proportional RoPE on a quarter of each global head, a **shared-KV tail** whose layers attend over an earlier layer's cache and keep none of their own, **per-layer inputs** (the 2.8B-value per-layer embedding table is read from the mapped file a row per token, never loaded or sent to the GPU), layer scalars, E2B's double-wide MLP, and the final-logit softcap. Safetensors (`Gemma4ForConditionalGeneration`, text only: the vision and audio towers are skipped) and GGUF (llama.cpp's `gemma4`, with its tokenizer). CPU and GPU, **resident only** — `--stream`, `--gpu-layers` and multi-GPU refuse it; the GPU prefills a token at a time. Held to `transformers` on a tiny random checkpoint (`tests/gemma4_parity.rs`); run on the real `gemma-4-E4B-it` Q4_K_M on CPU and GPU, which fits resident on a 4 GB GTX 1650 (18.6 tok/s decode). The MoE (`enable_moe_block`) and `attention_k_eq_v` variants are **refused** |
+| Qwen3.5 / Qwen3.6 MoE (`qwen3_5_moe`, e.g. Qwen3.6-35B-A3B) | supported, **text only** — the hybrid layout: three Gated DeltaNet linear-attention layers (causal conv, gated delta rule, gated RMSNorm) to each full-attention layer (output gate, per-head Q/K norms, partial RoPE), every layer MoE with a sigmoid-gated shared expert. From safetensors (the multimodal checkpoint's language model; the vision tower is skipped) or llama.cpp's `qwen35moe` GGUF. CPU and GPU, resident or streamed; checked against `transformers` on a tiny random checkpoint (`tests/qwen35_parity.rs`). A linear-attention layer keeps a recurrent state rather than a KV history, so **the prefix cache stays off** for these models, and speculative decoding restores the state from before a round and replays what it accepted. Run on the real 22 GB Qwen3.6-35B-A3B Q4_K_M streamed through a 4 GB card at ~2.5 tok/s, its scores matching the CPU's. `--speculative mtp` drafts with the model's own MTP head: on Qwen3.6, 74% of its guesses are kept and streamed decode runs 30–60% faster. The dense Qwen3.5 and Qwen3-Next are **refused** (not checked) |
 | anything else | **not supported** — errors on unknown tensor names |
 
 **MoE models** route each token through the top-k experts the router selects
@@ -742,8 +752,53 @@ kernels read faster; the two are equal weight for weight. On a Qwen2.5-0.5B
 `Q4_K_M` that is 10.4 MiB per layer against 18.8, and 54 tok/s against 82 when
 resident (the other way round when streaming: 19 against 16).
 
-**Not yet:** MoE `.gguf` files, whose experts are stacked into one tensor per
-layer.
+MoE `.gguf` files, whose experts are stacked into one tensor per layer, load
+for Qwen3.5/3.6 (`qwen35moe`) only; other MoE architectures in GGUF are refused.
+
+## Images (Gemma 3)
+
+Gemma 3 4B, 12B and 27B (`Gemma3ForConditionalGeneration`) take images. The
+vision tower comes from the checkpoint itself (safetensors), or for a GGUF model
+from llama.cpp's `mmproj` file: pass `--mmproj <file>`, or leave it beside the
+model as the only `mmproj*.gguf` in that directory and dlm finds it.
+
+```bash
+# One-shot: --text is the user's message; the image goes before it, or where it
+# says <start_of_image>. Gemma's chat template is applied, and generation stops
+# at <end_of_turn>.
+dlm generate --model-path models/gemma-3-4b-it-Q4_K_M.gguf \
+    --image photo.jpg --text "Describe this image." --max-new-tokens 200
+
+# Served: OpenAI chat messages with image_url parts, as base64 data: URLs.
+dlm serve --model-path models/gemma-3-4b-it-Q4_K_M.gguf --mmproj models/mmproj-model-f16.gguf
+curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0..."}},
+  {"type":"text","text":"What is in this picture?"}]}]}'
+```
+
+Each image is decoded (PNG or JPEG), resized to 896x896 and normalized the way
+`Gemma3ImageProcessor` does it (pan-and-scan, off by default there, is not
+implemented), encoded by the SigLIP tower and projector into 256 embeddings, and
+placed in the prompt as Gemma's processor lays it out: `<start_of_image>`, 256
+image tokens, `<end_of_image>`. The image's tokens attend to each other in both
+directions, as Gemma 3 was trained, on the CPU and GPU kernels alike.
+
+The tower's layers are read from the mapped file one at a time as they run; on a
+GPU build each runs on the device with buffers freed when the image is done, so
+it fits beside a resident or a streamed text model. The server encodes on its
+engine thread, so other requests pause for it (a few seconds on the GPU).
+
+Images must arrive inline as `data:` URLs; an `http(s)` URL is refused rather
+than fetched, since a server that fetches whatever URL a client names can be
+pointed at hosts only it can reach. A model without a vision tower ignores
+`image_url` parts, as before. A request with images skips the prefix cache past
+its text: two prompts that differ only in their pictures have the same token
+ids, so their KV is never shared.
+
+**Checked against `transformers`** on a tiny random Gemma 3 vision checkpoint
+(`tests/gemma3_vision.rs`, and on the GPU in `tests/gpu_parity.rs`): the
+preprocessed pixels, the image embeddings, and every log-probability of a prompt
+around the image, which is where a causal mask on the image would show.
 
 ## LoRA adapters (`--lora`)
 
@@ -813,10 +868,39 @@ check your model's output rather than assuming. Three caveats worth knowing:
   default applies only when every layer fits under a quarter of physical RAM
   (at least 4 GiB), because a smaller cache never gets a hit on a cyclic scan;
   a quantized model bigger than that re-quantizes on every miss, so raise
-  `--ram-cache-gb`, or drop `--stream` — once quantized, the model often no
-  longer needs it.
+  `--ram-cache-gb`, pack it (below), or drop `--stream` — once quantized, the
+  model often no longer needs it.
 - **A quantized weight is still lossy even if it fits.** Verify on your own
   prompts; a model that fits but answers worse is not obviously a win.
+
+### Packs (`dlm pack`)
+
+A model streamed from disk at `--quant int4`/`int8` pays for quantizing again
+every time a layer misses the RAM cache, and reads the 16-bit weights to do it.
+`dlm pack` does that work once, writing a copy with the weights already
+quantized:
+
+```sh
+dlm pack --model-path models/Qwen3-1.7B --quant int4 --out models/Qwen3-1.7B-int4
+dlm serve --model-path models/Qwen3-1.7B-int4 --stream
+```
+
+The pack is an ordinary model directory: the config, tokenizer and templates,
+beside a `model.safetensors` whose weights are stored exactly as `--quant`
+would have produced them. Loading it hands those bytes back unconverted, so it
+scores **bit for bit** what the original does at the same `--quant`
+(`tests/pack.rs`), from about half the disk. It loads only at the precision it
+was made for (omitting `--quant` picks that).
+
+On the GTX 1650, streaming Qwen3-1.7B with four layers resident and no RAM
+cache (every other layer read again each token), the original at `--quant
+int4` decoded at 0.06–0.07 tok/s and prefilled at 4–5 tok/s; its int4 pack
+decoded at 1.0–1.1 tok/s and prefilled at 48–65 tok/s.
+
+A GGUF needs no pack: its weights are already quantized and are read as they
+are. Neither does a GPTQ checkpoint. Weights the loader takes as row slices of
+a fused tensor (Phi-3's QKV, Qwen3.5's stacked experts) stay 16-bit in a pack
+and are quantized at load as before.
 
 ### Already-quantized checkpoints (GPTQ)
 
@@ -887,26 +971,34 @@ inference engine):
   the prompt, decoded together in one batch; a sampled choice `i` draws with
   seed `seed + i`, so the choices differ, and streamed chunks carry each
   choice's `index`. **Embeddings** (`/v1/embeddings`): the final-normed hidden
-  state of each input's last token, at unit length, the pooling decoder
-  embedding models (Qwen3-Embedding, gte-Qwen2) are trained for; `input` as
+  states of each input, pooled and at unit length. `--embedding-pooling auto`
+  (the default) follows a sentence-transformers export's
+  `1_Pooling/config.json` (mean or last token) and otherwise takes the last
+  token, the pooling decoder embedding models (Qwen3-Embedding, gte-Qwen2) are
+  trained for; `last` or `mean` force one. `input` as
   text or token ids, one or several, `encoding_format` `float` or `base64`,
   and `dimensions` to keep the leading ones. A chat model's embeddings work
-  but are not tuned for retrieval. **Tool calling** (chat, ChatML models such
-  as Qwen2.5 and Qwen3): `tools` go into the prompt exactly as Qwen's own
-  template writes them, and the reply's `<tool_call>` blocks come back as
-  `tool_calls` with `finish_reason: "tool_calls"`, streamed as one delta at the
-  end; an assistant message's `tool_calls` and `tool` results render back in
-  for the next turn. `tool_choice` takes `auto` or `none`. Other templates
-  refuse `tools`, as dlm has no prompt format for them. Whether a model calls
-  well is the model's: Qwen2.5-1.5B and Qwen3-0.6B do, Qwen2.5-0.5B tends to
-  answer instead. `stop` (OpenAI) / `stop_sequences`
+  but are not tuned for retrieval. **Tool calling** (chat, in the `chatml`
+  (Qwen2.5, Qwen3), `llama3` (Llama 3.1/3.2) and `mistral` (Mistral v0.3)
+  templates): `tools` go into the prompt exactly as each model's own template
+  writes them, and the reply's calls (`<tool_call>` blocks, Llama's bare
+  `{"name": …, "parameters": …}` object, Mistral's `[TOOL_CALLS] [...]`) come
+  back as `tool_calls` with `finish_reason: "tool_calls"`, streamed as one
+  delta at the end; an assistant message's `tool_calls` and `tool` results
+  render back in for the next turn. Llama 3 takes one call per turn, as its
+  template does; Mistral's 9-character call ids are made from OpenAI's when
+  they differ. `tool_choice` takes `auto` or `none`. Other templates refuse
+  `tools`: Gemma's has no tool format. Whether a model calls well is the
+  model's: Qwen2.5-1.5B and Qwen3-0.6B do, Qwen2.5-0.5B tends to answer
+  instead. The Llama 3 and Mistral formats are checked against their
+  templates' output, not yet on the models themselves. `stop` (OpenAI) / `stop_sequences`
   (Anthropic) truncate the completion, and `--eos-token` overrides the
   `eos_token_id` auto-detected from `config.json`. **Real tokenizers** load from
   HF `tokenizer.json` (BPE, with special tokens) or `vocab.json` + `merges.txt`,
   and chat messages are rendered in the model's trained format (control tokens
   become single ids via the special-token vocabulary). The format is
   **auto-detected** from the checkpoint's Jinja `chat_template` by its control
-  markers — ChatML, Llama-3, Llama-2, Mistral, Gemma, Phi-3 and DeepSeek-V2 — and
+  markers — ChatML, Llama-3, Llama-2, Mistral, Gemma, Gemma 4, Phi-3 and DeepSeek-V2 — and
   the format's end-of-turn token is added to the stop set. dlm does not run
   Jinja: an unrecognized template falls back to `plain` with a warning, and
   `--chat-template <name>` overrides detection either way. Hardening: `--api-key` requires a key on **every** route except
@@ -922,20 +1014,23 @@ inference engine):
   - `--stream [--resident-layers N]` — **layer streaming**
     ([`src/forward/streaming.rs`](src/forward/streaming.rs)): only a bounded window
     of layers is held in memory (pinned embedding/LM-head stay resident); the rest
-    are materialized on demand from the mmap'd checkpoint through an LRU and evicted
-    least-recently-used, so a model can **exceed the resident budget**. The window
+    are read on demand from the checkpoint and the most recently used layer is
+    evicted (layers come round in a cycle), so a model can **exceed the resident
+    budget**. The window
     defaults to the VRAM plan's `layers_to_load`. A background worker prefetches the
     next `--prefetch-depth N` layers ahead of compute (`--auto-prefetch` tunes the
     depth from measured load-vs-compute time); `0` disables it. Output is
     bit-for-bit identical to a fully-resident run (tested end-to-end).
-    `--ram-cache-gb N` keeps materialized layers in a host-RAM LRU of at most `N`
-    GiB, so a layer evicted from the window is not re-read and re-materialized
-    from the checkpoint the next time it comes round — roughly **2x** on the
-    streamed path, and far more where reading the mmap is slow (Gemma 3 1B
-    streamed on the GPU: 268 s → 46 s). On by default when the whole layer set
-    fits in a quarter of physical RAM (at least 4 GiB) and off otherwise, since a
-    cache smaller than the layer set never gets a hit on a cyclic scan; `0`
-    disables it. It duplicates weights on top of the OS page cache.
+    `--ram-cache-gb N` keeps materialized layers in a host-RAM cache of at most
+    `N` GiB, so a layer evicted from the window is not re-read and
+    re-materialized from the checkpoint the next time it comes round — roughly
+    **2x** on the streamed path, and far more where reading the disk is slow
+    (Gemma 3 1B streamed on the GPU: 268 s → 46 s). On by default when the whole
+    layer set fits in a quarter of physical RAM (at least 4 GiB), or for a
+    streamed MoE model enough for its experts too, up to that quarter; off
+    otherwise. A cache smaller than the layer set still hits, since it evicts the
+    most recently used layer: Qwen2.5-0.5B bf16 with a third of it cached went
+    from 2.52–2.74 to 3.65–3.96 tok/s. `0` disables it.
   - `--device gpu` — run the batched engine on the CUDA `GpuKernel`
     (all layers resident in VRAM; requires a `cuda-kernels` build).
   - `--stream --device gpu` — stream a window of layer weights **through VRAM**
@@ -959,9 +1054,12 @@ inference engine):
     independent of `--quant`: one sizes the weights, the other the KV history.
     - `auto` is the default: `int8` on the GPU, `f16` elsewhere. `f32` is exact
       (`none` is accepted as an alias).
-    - **On the GPU**, `int8` (and `int4`) keep a scale per 32 values and 32 int8
-      codes, 56% of fp16's memory, at fp16's speed; heads not a multiple of 32
-      wide keep fp16. The loader shrinks the few key channels that would set
+    - **On the GPU**, `int8` keeps a scale per 32 values and 32 int8 codes, 56%
+      of fp16's memory, at fp16's speed; `int4` keeps the scale and 16 bytes of
+      4-bit codes, 31% of fp16's memory. Heads not a multiple of 32 wide keep
+      fp16 either way. `int4` costs real accuracy: on Qwen2.5-0.5B it scored
+      4.59 nats per token where fp16 and int8 scored 3.95, so reach for it only
+      when the extra context matters more than the output. The loader shrinks the few key channels that would set
       those scales alone (Qwen's are a hundred times the rest) and grows the
       matching query channels by the same power of two, which leaves `q . k`
       unchanged to the bit; with it, int8 scored within 0.005 nats per token of
@@ -980,6 +1078,11 @@ inference engine):
       are dropped, oldest first, when a new request needs their blocks.
     - **On the CPU** each entry is a host copy of the prefix's KV, so it is off
       unless set.
+  - `--prefix-cache-dir DIR` also writes cached prefixes to `DIR`, so they
+    survive a restart. Each model and setting (weights, `--quant`,
+    `--kv-quant`, device, LoRA, dlm version) gets its own subdirectory. At
+    start-up the newest entries are loaded, up to `--prefix-cache-size` and
+    1 GiB; a restored entry is a host copy of its KV until a request uses it.
 
   **Diagnostics.** `dlm doctor` reports the GPU backend and free VRAM, runs a CPU
   inference self-check, and — on a `cuda-kernels` build with a GPU present — runs a
@@ -1002,6 +1105,13 @@ inference engine):
   copies (code being rewritten, a document being quoted). `--speculative auto`,
   the default, turns it on for a streamed model, where verifying several tokens
   costs about what generating one does.
+  `--speculative mtp` uses a model's own **multi-token-prediction head**
+  (Qwen3.5/3.6 ship one) as the draft.
+  An **EAGLE-3 head** works as the draft too (`--draft-model-path <head dir>`,
+  resident GPU only). It drafts from the target's own hidden states, so it
+  guesses far better than lookup on free text. AngelSlim's `Qwen3-1.7B_eagle3`
+  keeps 78% of single proposals. Convert a `pytorch_model.bin` head to
+  `model.safetensors` first.
 - **Continuous batching** ([`src/batching.rs`](src/batching.rs)). A scheduler
   keeps up to `--max-batch` generations in flight and admits queued requests as
   slots free. Each request's output is identical to running it alone (tested),

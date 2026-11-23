@@ -39,6 +39,11 @@ impl KvSnapshot {
         self.position
     }
 
+    /// Layers it holds history for.
+    pub fn layers(&self) -> usize {
+        self.kv_layers.len()
+    }
+
     /// The first `rows` positions of this snapshot (at most all of them). Paged
     /// device KV is shared, so `rows` must be a whole number of KV blocks for a
     /// snapshot of device history; host history is copied at any length.
@@ -48,6 +53,60 @@ impl KvSnapshot {
             kv_layers: self.kv_layers.iter().map(|kv| kv.prefix_of(rows)).collect(),
             position: rows,
         }
+    }
+
+    /// Write the snapshot, first pulling any device-resident rows to the host
+    /// (on a copy: `self` keeps sharing its device blocks).
+    pub(crate) fn write_to(&self, w: &mut impl std::io::Write) -> Result<()> {
+        let io = |e: std::io::Error| DlmError::InvalidConfig(format!("writing a KV snapshot: {e}"));
+        w.write_all(&(self.position as u64).to_le_bytes())
+            .map_err(io)?;
+        w.write_all(&(self.kv_layers.len() as u64).to_le_bytes())
+            .map_err(io)?;
+        for kv in &self.kv_layers {
+            let kv = kv.clone();
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            let kv = {
+                let mut kv = kv;
+                kv.sync_from_device()?;
+                kv
+            };
+            kv.write_host(w).map_err(io)?;
+        }
+        Ok(())
+    }
+
+    /// A snapshot written by [`write_to`](Self::write_to), its rows on the host.
+    pub(crate) fn read_from(r: &mut impl std::io::Read) -> std::io::Result<KvSnapshot> {
+        let mut b = [0u8; 8];
+        r.read_exact(&mut b)?;
+        let position = u64::from_le_bytes(b) as usize;
+        r.read_exact(&mut b)?;
+        let layers = u64::from_le_bytes(b);
+        if layers > 4096 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "layer count out of range",
+            ));
+        }
+        let kv_layers = (0..layers)
+            .map(|_| KvLayerCache::read_host(r))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        // A layer may hold nothing: Gemma 4's shared-KV layers keep no history of
+        // their own. `resume` checks which layers those are against the kernel.
+        if kv_layers
+            .iter()
+            .any(|kv| kv.len() != position && !kv.is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "layer length differs from the snapshot position",
+            ));
+        }
+        Ok(KvSnapshot {
+            kv_layers,
+            position,
+        })
     }
 }
 
@@ -67,9 +126,8 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
     /// [`KvLayerCache`] is allocated per layer at precision `kv_quant` (int8/int4
     /// shrink the KV memory, approximate).
     pub fn new(kernel: K, budget: PagedKvCache, kv_quant: crate::forward::KvQuant) -> Self {
-        let kv_dim = kernel.kv_dim();
         let kv_layers = (0..kernel.num_layers())
-            .map(|_| KvLayerCache::new_quant(kv_dim, kv_quant))
+            .map(|layer| KvLayerCache::new_quant(kernel.layer_kv_dim(layer), kv_quant))
             .collect();
         Self {
             kernel,
@@ -115,7 +173,15 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
             let shared: Option<Vec<KvLayerCache>> = self
                 .kv_layers
                 .iter()
-                .map(|kv| kv.share_device_prefix(rows))
+                // A layer with no history of its own (Gemma 4's shared-KV
+                // layers) has nothing to share and stays empty.
+                .map(|kv| {
+                    if kv.is_empty() {
+                        Some(kv.clone())
+                    } else {
+                        kv.share_device_prefix(rows)
+                    }
+                })
                 .collect();
             if let Some(kv_layers) = shared {
                 return Ok(KvSnapshot {
@@ -143,6 +209,18 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
                 snapshot.kv_layers.len(),
                 kernel.num_layers()
             )));
+        }
+        // Every layer holds the snapshot's tokens, except the ones that read
+        // another layer's KV and hold none.
+        for (layer, kv) in snapshot.kv_layers.iter().enumerate() {
+            let own = kernel.kv_source(layer as u32) as usize == layer;
+            let want = if own { snapshot.position } else { 0 };
+            if kv.len() != want {
+                return Err(DlmError::InvalidConfig(format!(
+                    "snapshot layer {layer} holds {} rows; this model needs {want}",
+                    kv.len()
+                )));
+            }
         }
         // Reserve KV budget matching the tokens already in the snapshot so the
         // pool accounting stays consistent with the restored history.
@@ -174,7 +252,7 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
             self.kernel.run_block(
                 layer,
                 hidden,
-                &mut self.kv_layers[layer as usize],
+                &mut self.kv_layers[self.kernel.kv_source(layer) as usize],
                 self.position,
             )?;
         }
@@ -225,6 +303,16 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
     /// is identical to calling [`decode_token`](Self::decode_token) on each in
     /// turn, but the kernel chooses the order ([`ComputeKernel::prefill`]).
     pub fn prefill(&mut self, hiddens: &mut [f32]) -> Result<()> {
+        self.prefill_as(hiddens, false)
+    }
+
+    /// [`prefill`](Self::prefill) for a run of tokens that attend to each other
+    /// in both directions ([`ComputeKernel::prefill_bidirectional`]).
+    pub fn prefill_bidirectional(&mut self, hiddens: &mut [f32]) -> Result<()> {
+        self.prefill_as(hiddens, true)
+    }
+
+    fn prefill_as(&mut self, hiddens: &mut [f32], bidirectional: bool) -> Result<()> {
         let hidden_size = self.kernel.hidden_size();
         if hiddens.is_empty() || hiddens.len() % hidden_size != 0 {
             return Err(DlmError::ShapeMismatch {
@@ -234,8 +322,13 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         }
         let n = hiddens.len() / hidden_size;
         self.budget.append_tokens(SEQ_ID, n as u64)?;
-        self.kernel
-            .prefill(hiddens, &mut self.kv_layers, self.position)?;
+        if bidirectional {
+            self.kernel
+                .prefill_bidirectional(hiddens, &mut self.kv_layers, self.position)?;
+        } else {
+            self.kernel
+                .prefill(hiddens, &mut self.kv_layers, self.position)?;
+        }
         self.position += n;
         Ok(())
     }
@@ -249,6 +342,35 @@ impl<K: ComputeKernel> ForwardOrchestrator<K> {
         }
         for kv in &mut self.kv_layers {
             kv.truncate(len);
+        }
+        self.budget.truncate_sequence(SEQ_ID, len as u64);
+        self.position = len;
+    }
+
+    /// Every layer's recurrent state, for [`rollback`](Self::rollback) to
+    /// return to: a hybrid model's linear-attention layers cannot be cut back
+    /// like K/V, so a speculative round keeps their state from before it.
+    pub(crate) fn checkpoint_recurrent(
+        &self,
+    ) -> Result<Vec<Option<crate::forward::cpu::LinearState>>> {
+        self.kv_layers
+            .iter()
+            .map(|kv| kv.linear_checkpoint())
+            .collect()
+    }
+
+    /// Back to the first `len` tokens, where `checkpoint` was taken: the
+    /// linear layers get their state back, the K/V layers are cut.
+    pub(crate) fn rollback(
+        &mut self,
+        checkpoint: Vec<Option<crate::forward::cpu::LinearState>>,
+        len: usize,
+    ) {
+        for (kv, state) in self.kv_layers.iter_mut().zip(checkpoint) {
+            match state {
+                Some(state) => kv.restore_linear(state, len),
+                None => kv.truncate(len),
+            }
         }
         self.budget.truncate_sequence(SEQ_ID, len as u64);
         self.position = len;

@@ -29,6 +29,36 @@ pub trait ComputeKernel {
     /// Key/value width per token (`num_kv_heads × head_dim`).
     fn kv_dim(&self) -> usize;
 
+    /// Whether some layers keep a recurrent state (a hybrid model's linear
+    /// attention) instead of a KV history. Such a sequence cannot be rolled back
+    /// to an earlier position, so speculative decoding and partial prefix reuse
+    /// refuse it.
+    fn recurrent(&self) -> bool {
+        false
+    }
+
+    /// Values at the end of each row that are not the hidden state: Gemma 4's
+    /// per-layer inputs, which the generator gathers per token and every layer
+    /// reads its slice of. `hidden_size` is the whole row; the model's own width
+    /// is `hidden_size - per_layer_input_width`. 0 everywhere else.
+    fn per_layer_input_width(&self) -> usize {
+        0
+    }
+
+    /// The layer whose KV history `layer` attends over. Itself, except in
+    /// Gemma 4's shared-KV tail, whose layers read an earlier layer's cache and
+    /// keep none of their own. Whoever hands a kernel a layer's KV hands it this
+    /// layer's.
+    fn kv_source(&self, layer: u32) -> u32 {
+        layer
+    }
+
+    /// Key/value width of `layer`'s history, which Gemma 4 varies by layer (its
+    /// global layers have wider heads).
+    fn layer_kv_dim(&self, _layer: u32) -> usize {
+        self.kv_dim()
+    }
+
     /// Run block `layer` for one token at absolute `position`, updating `hidden`
     /// and appending to `kv`.
     fn run_block(
@@ -82,7 +112,8 @@ pub trait ComputeKernel {
             hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
         {
             for layer in 0..self.num_layers() {
-                self.run_block(layer, hidden, &mut kvs[layer as usize], position)?;
+                let kv = &mut kvs[self.kv_source(layer) as usize];
+                self.run_block(layer, hidden, kv, position)?;
             }
         }
         Ok(())
@@ -107,11 +138,44 @@ pub trait ComputeKernel {
         prefill_token_by_token(self, hiddens, kv_layers, start)
     }
 
+    /// [`prefill`](Self::prefill) for tokens that attend to each other in both
+    /// directions, as well as to the history before them: Gemma 3's image
+    /// tokens. Every token of `hiddens` sees every other at each layer, which no
+    /// token-at-a-time order can compute, so a kernel implements it layer by
+    /// layer or not at all. The default refuses.
+    fn prefill_bidirectional(
+        &self,
+        _hiddens: &mut [f32],
+        _kv_layers: &mut [KvLayerCache],
+        _start: usize,
+    ) -> Result<()> {
+        Err(crate::error::DlmError::InvalidConfig(
+            "image input is not supported on this kernel (it runs on the CPU, the single-GPU \
+             kernels and layer streaming)"
+                .into(),
+        ))
+    }
+
     /// Tokens of KV the kernel's shared pools can still take at the given
     /// precision, if it pages KV from a fixed pool (the GPU kernels). `None`
     /// means no fixed limit: the CPU kernels keep KV in growable host memory.
     fn kv_free_tokens(&self, _elem: crate::forward::cpu::KvElem) -> Option<usize> {
         None
+    }
+
+    /// Record, from the next prefill or single-sequence step on, the hidden
+    /// state entering each of `layers` for every token run, until
+    /// [`take_capture`](Self::take_capture). How an EAGLE draft head gets the
+    /// target's features. `false` when the kernel cannot (the default).
+    fn capture_next(&self, _layers: &[u32]) -> bool {
+        false
+    }
+
+    /// What was recorded since [`capture_next`](Self::capture_next), token by
+    /// token, each token's states for the layers back to back
+    /// (`tokens × layers × hidden`); recording stops.
+    fn take_capture(&self) -> Vec<f32> {
+        Vec::new()
     }
 
     /// Size the kernel's shared KV pools to `tokens` tokens (per layer), for
@@ -151,6 +215,22 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         (**self).kv_dim()
     }
 
+    fn recurrent(&self) -> bool {
+        (**self).recurrent()
+    }
+
+    fn per_layer_input_width(&self) -> usize {
+        (**self).per_layer_input_width()
+    }
+
+    fn kv_source(&self, layer: u32) -> u32 {
+        (**self).kv_source(layer)
+    }
+
+    fn layer_kv_dim(&self, layer: u32) -> usize {
+        (**self).layer_kv_dim(layer)
+    }
+
     fn run_block(
         &self,
         layer: u32,
@@ -185,6 +265,14 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         (**self).kv_free_tokens(elem)
     }
 
+    fn capture_next(&self, layers: &[u32]) -> bool {
+        (**self).capture_next(layers)
+    }
+
+    fn take_capture(&self) -> Vec<f32> {
+        (**self).take_capture()
+    }
+
     fn prefill(
         &self,
         hiddens: &mut [f32],
@@ -192,6 +280,15 @@ impl<K: ComputeKernel> ComputeKernel for &K {
         start: usize,
     ) -> Result<()> {
         (**self).prefill(hiddens, kv_layers, start)
+    }
+
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        (**self).prefill_bidirectional(hiddens, kv_layers, start)
     }
 }
 
@@ -206,7 +303,8 @@ pub fn prefill_token_by_token<K: ComputeKernel + ?Sized>(
 ) -> Result<()> {
     for (i, hidden) in hiddens.chunks_mut(kernel.hidden_size()).enumerate() {
         for layer in 0..kernel.num_layers() {
-            kernel.run_block(layer, hidden, &mut kv_layers[layer as usize], start + i)?;
+            let kv = &mut kv_layers[kernel.kv_source(layer) as usize];
+            kernel.run_block(layer, hidden, kv, start + i)?;
         }
     }
     Ok(())
@@ -226,7 +324,7 @@ pub fn prefill_layer_by_layer<K: ComputeKernel + ?Sized>(
     start: usize,
 ) -> Result<()> {
     for layer in 0..kernel.num_layers() {
-        let kv = &mut kv_layers[layer as usize];
+        let kv = &mut kv_layers[kernel.kv_source(layer) as usize];
         for (i, hidden) in hiddens.chunks_mut(kernel.hidden_size()).enumerate() {
             kernel.run_block(layer, hidden, kv, start + i)?;
         }

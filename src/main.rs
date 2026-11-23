@@ -11,8 +11,8 @@ use clap::{CommandFactory, Parser};
 use dlm::cache::{KvCacheConfig, PagedKvCache};
 use dlm::cli::{
     BenchArgs, BenchOpts, Cli, Command, CompletionsArgs, Device, DistributedMode, DoctorArgs,
-    GenerateArgs, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs, Speculative,
-    TokenizeArgs,
+    GenerateArgs, PoolingArg, ProfileArgs, PullArgs, QuantArg, ScoreArgs, SearchArgs, ServeArgs,
+    Speculative, TokenizeArgs,
 };
 use dlm::forward::Weights;
 use dlm::forward::{BlockConfig, ComputeKernel, CpuKernel, ExpertFfn, Ffn, LayerTensors};
@@ -26,7 +26,7 @@ use dlm::storage::{LayerCatalog, MmapStore};
 use dlm::swap::LayerSwapPlan;
 use dlm::tokenizer::BpeTokenizer;
 use dlm::{gpu, DlmError, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -42,6 +42,7 @@ fn main() -> Result<()> {
         Command::Doctor(args) => run_doctor(args),
         Command::Search(args) => run_search(args),
         Command::Pull(args) => run_pull(args),
+        Command::Pack(args) => run_pack(args),
         Command::Completions(args) => run_completions(args),
     }
 }
@@ -155,6 +156,7 @@ fn tiny_cfg() -> BlockConfig {
         norm_kind: Default::default(),
         parallel_residual: false,
         learned_positions: false,
+        ..Default::default()
     }
 }
 
@@ -346,10 +348,35 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         None
     };
 
-    // Prompt token ids: tokenized text, or raw --prompt ids.
-    let prompt_ids: Vec<u32> = match (&args.text, &tokenizer) {
-        (Some(text), Some(tok)) => tok.encode(text)?,
-        _ => args.prompt.clone(),
+    // Images are encoded first, before the text model is loaded: on a 4 GB
+    // card the vision tower and the text model need not fit at once.
+    let mut gen_cfg = gen_cfg;
+    let (prompt_ids, images) = if args.image.is_empty() {
+        // Prompt token ids: tokenized text, or raw --prompt ids.
+        let ids: Vec<u32> = match (&args.text, &tokenizer) {
+            (Some(text), Some(tok)) => tok.encode(text)?,
+            _ => args.prompt.clone(),
+        };
+        (ids, Vec::new())
+    } else {
+        let (Some(dir), Some(tok)) = (&args.model_path, &tokenizer) else {
+            return Err(DlmError::InvalidConfig(
+                "--image needs --model-path and --text".into(),
+            ));
+        };
+        let (ids, images) = encode_images(
+            dir,
+            args.mmproj.as_deref(),
+            tok,
+            args.text.as_deref().unwrap_or_default(),
+            &args.image,
+            resolve_device(args.device) == Device::Gpu,
+        )?;
+        // Gemma ends its turn with <end_of_turn>; stop there unless told otherwise.
+        if gen_cfg.eos_token.is_none() {
+            gen_cfg.eos_token = tok.id_of("<end_of_turn>");
+        }
+        (ids, images)
     };
     if prompt_ids.is_empty() {
         return Err(DlmError::InvalidConfig("prompt is empty".into()));
@@ -406,9 +433,24 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     if let Some(text) = &args.text {
         println!("prompt text  : {text:?}");
     }
-    println!("prompt ids   : {prompt_ids:?}");
+    if images.is_empty() {
+        println!("prompt ids   : {prompt_ids:?}");
+    } else {
+        println!(
+            "prompt ids   : {} ids, {} image(s)",
+            prompt_ids.len(),
+            images.len()
+        );
+    }
 
-    generate_on_device(parts, device, &prompt_ids, &gen_cfg, tokenizer.as_ref())?;
+    generate_on_device(
+        parts,
+        device,
+        &prompt_ids,
+        images,
+        &gen_cfg,
+        tokenizer.as_ref(),
+    )?;
 
     if is_synthetic {
         println!();
@@ -568,35 +610,97 @@ fn generate_on_device(
     parts: ModelParts,
     device: Device,
     prompt_ids: &[u32],
+    images: Vec<dlm::generate::ImageEmbeds>,
     gen_cfg: &GenerationConfig,
     tokenizer: Option<&BpeTokenizer>,
 ) -> Result<()> {
     match device {
         Device::Cpu => {
             let generator = parts.into_cpu_generator()?;
-            run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
+            run_generation(&generator, prompt_ids, images, gen_cfg, tokenizer)
         }
         #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
         Device::Gpu => {
             let generator = parts.into_gpu_generator()?;
-            run_generation(&generator, prompt_ids, gen_cfg, tokenizer)
+            run_generation(&generator, prompt_ids, images, gen_cfg, tokenizer)
         }
         #[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
         Device::Gpu => Err(gpu_compute_unavailable("--device gpu")),
     }
 }
 
+/// `dlm generate --image`: find the model's vision tower, render `text` as a
+/// Gemma user turn with the images in it, and encode them. Returns the prompt
+/// ids and the images' embeddings.
+fn encode_images(
+    model: &Path,
+    mmproj: Option<&Path>,
+    tokenizer: &BpeTokenizer,
+    text: &str,
+    files: &[PathBuf],
+    gpu: bool,
+) -> Result<(Vec<u32>, Vec<dlm::generate::ImageEmbeds>)> {
+    use dlm::vision::{ImageTokens, Vision, VisionTower, IMAGE_MARKER};
+    let tower = VisionTower::find(model, mmproj)?.ok_or_else(|| {
+        DlmError::InvalidConfig(format!(
+            "{} has no vision tower: --image needs a Gemma 3 4B+ checkpoint, or a GGUF \
+             with its mmproj (--mmproj)",
+            model.display()
+        ))
+    })?;
+    println!("vision       : {}", tower.source.display());
+    let tokens = ImageTokens::new(
+        tokenizer,
+        tokenizer.vocab_size(),
+        tower.cfg.tokens_per_image,
+    )?;
+    let vision = Vision { tower, tokens, gpu };
+    let content = if text.contains(IMAGE_MARKER) {
+        text.to_string()
+    } else {
+        format!("{}{text}", IMAGE_MARKER.repeat(files.len()))
+    };
+    let prompt =
+        dlm::server::engine::ChatTemplate::Gemma.apply(&[dlm::server::engine::ChatMessage {
+            role: "user".into(),
+            content,
+            ..Default::default()
+        }]);
+    let bytes = files
+        .iter()
+        .map(|f| {
+            std::fs::read(f).map_err(|source| DlmError::Io {
+                path: f.clone(),
+                source,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let start = std::time::Instant::now();
+    let out = vision.prompt(tokenizer, &prompt, &bytes)?;
+    eprintln!(
+        "timing       : encoded {} image(s) in {:.2} s on the {}",
+        files.len(),
+        start.elapsed().as_secs_f64(),
+        if gpu { "GPU" } else { "CPU" }
+    );
+    Ok(out)
+}
+
 /// Generate and print ids, plus decoded text when a tokenizer is present.
 fn run_generation<K: ComputeKernel>(
     generator: &Generator<K>,
     prompt_ids: &[u32],
+    images: Vec<dlm::generate::ImageEmbeds>,
     gen_cfg: &GenerationConfig,
     tokenizer: Option<&BpeTokenizer>,
 ) -> Result<()> {
     // Step a session rather than calling `generate`, so prefill and decode can
     // be timed apart: a long prompt would otherwise hide the decode speed.
     let start = std::time::Instant::now();
-    let mut session = generator.start_session(prompt_ids, gen_cfg.sampler)?;
+    let mut session = generator
+        .start_session_deferred(prompt_ids, gen_cfg.sampler)?
+        .with_images(images)?;
+    session.prefill_some(usize::MAX)?;
     let prefill = start.elapsed().as_secs_f64();
     let decode_start = std::time::Instant::now();
     let mut generated = Vec::with_capacity(gen_cfg.max_new_tokens);
@@ -632,6 +736,51 @@ fn run_generation<K: ComputeKernel>(
 /// client picking a model from that list, or routing between several dlm
 /// instances, has nothing to go on — and the tools that check the reply's
 /// `model` against what they asked for see a mismatch.
+/// A name for the prefix-cache directory of this model and these settings: a
+/// KV snapshot is only valid for the weights, precision, KV format and device
+/// that produced it. FNV-1a over the model files' names, sizes and modified
+/// times, the settings, and the dlm version, so it is stable across runs.
+fn prefix_cache_fingerprint(args: &ServeArgs) -> Result<String> {
+    let mut key = format!(
+        "{:?}|{:?}|{:?}|{:?}|{}",
+        args.quant,
+        args.kv_quant,
+        args.device,
+        args.lora,
+        env!("CARGO_PKG_VERSION")
+    );
+    let path = &args.model_path;
+    let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|source| DlmError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect()
+    } else {
+        vec![path.clone()]
+    };
+    files.sort();
+    for f in files {
+        let m = std::fs::metadata(&f).map_err(|source| DlmError::Io {
+            path: f.clone(),
+            source,
+        })?;
+        let mtime = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        key.push_str(&format!("|{}|{}|{mtime}", f.display(), m.len()));
+    }
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    });
+    Ok(format!("{hash:016x}"))
+}
+
 fn model_id_from_path(path: &Path) -> String {
     let name = if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
         path.file_stem()
@@ -796,6 +945,7 @@ fn build_synthetic_parts(args: &GenerateArgs, max_context: u32) -> Result<ModelP
         embed_scale: None,
         final_logit_softcap: None,
         head_int4: false,
+        per_layer: None,
     })
 }
 
@@ -1051,7 +1201,7 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                 }
                 let plan = stream_plan(&config, &args, &store);
                 let window = resident_window(&plan, &args);
-                let ram_cache = resolve_ram_cache_bytes(&args, &plan);
+                let ram_cache = resolve_ram_cache_bytes(&args, &plan, &config);
                 // Lookup speculation pays on the GPU, and on the CPU where a pass
                 // moves layers from the checkpoint because the RAM cache cannot
                 // hold every one. A CPU pass over cached layers is compute, where
@@ -1061,7 +1211,9 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                         .is_some_and(|all| ram_cache as u64 >= all);
                 let cheap_verify =
                     device == Device::Gpu || (window < config.num_layers as usize && !cached);
-                args.speculative = args.speculative.resolve(false, cheap_verify)?;
+                args.speculative = args
+                    .speculative
+                    .resolve(false, cheap_verify && !config.is_hybrid())?;
                 publish_telemetry_snapshot(&config, &store, window as u32, true, device);
                 println!();
                 let dest = if device == Device::Gpu {
@@ -1094,6 +1246,8 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                         ram_cache as f64 / (1024.0 * 1024.0),
                         if args.ram_cache_gb.is_some() {
                             ""
+                        } else if config.is_moe() {
+                            " (default: the layers and their experts, up to a quarter of RAM)"
                         } else {
                             " (default: every layer fits)"
                         },
@@ -1155,17 +1309,20 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                 return start_batched_server(generator, None, &args, &config, &listen, None);
             }
 
-            args.speculative = args
-                .speculative
-                .resolve(args.draft_model_path.is_some(), device == Device::Gpu)?;
+            args.speculative = args.speculative.resolve(
+                args.draft_model_path.is_some(),
+                device == Device::Gpu && !config.is_hybrid(),
+            )?;
             // Non-streaming paths materialize all layers resident.
             let parts = dlm::loader::load_model_parts(&store, &config, args.context_length)?;
 
             // Optional draft model for speculative decoding. It must share the
             // target's vocabulary (same tokenizer) for the accept/reject rule to
             // be exact. Loaded as parts so it can take the same kernel as the target.
+            // An EAGLE-3 head is no model of its own: the GPU path loads it
+            // beside the target.
             let draft_parts = match &args.draft_model_path {
-                Some(dir) => {
+                Some(dir) if !is_eagle3_dir(dir) => {
                     let dcfg = dlm::loader::open_model(dir, quant)?.0;
                     if dcfg.vocab_size != config.vocab_size {
                         return Err(DlmError::InvalidConfig(format!(
@@ -1180,7 +1337,7 @@ fn run_serve(mut args: ServeArgs) -> Result<()> {
                         args.context_length,
                     )?)
                 }
-                None => None,
+                _ => None,
             };
 
             if !args.multi_gpu_ids.is_empty() {
@@ -1789,6 +1946,50 @@ fn serve_distributed(
 /// `kv_pool_tokens`: the KV tokens a GPU kernel's shared pools hold across all
 /// concurrent requests; `None` sizes them for `--max-batch` full contexts, which
 /// is what the streaming planner reserves. No effect on the CPU kernels.
+/// The served model's vision tower, if it has one: `--mmproj`, the checkpoint's
+/// own (Gemma 3 4B+ safetensors), or an `mmproj*.gguf` beside a GGUF file. A
+/// tower found by looking that cannot be used is a warning, not a failure: the
+/// model still serves text.
+fn serve_vision(
+    args: &ServeArgs,
+    tokenizer: &BpeTokenizer,
+    config: &ModelConfig,
+) -> Result<Option<dlm::vision::Vision>> {
+    use dlm::vision::{ImageTokens, Vision, VisionTower};
+    let found = VisionTower::find(&args.model_path, args.mmproj.as_deref()).and_then(|t| {
+        t.map(|tower| {
+            let tokens = ImageTokens::new(
+                tokenizer,
+                config.vocab_size as usize,
+                tower.cfg.tokens_per_image,
+            )?;
+            Ok(Vision {
+                tower,
+                tokens,
+                gpu: args.device == Device::Gpu
+                    && cfg!(any(feature = "cuda-kernels", feature = "rocm-kernels")),
+            })
+        })
+        .transpose()
+    });
+    match found {
+        Ok(Some(v)) => {
+            println!(
+                "vision       : {} (images as data: URLs, encoded on the {})",
+                v.tower.source.display(),
+                if v.gpu { "GPU" } else { "CPU" }
+            );
+            Ok(Some(v))
+        }
+        Ok(None) => Ok(None),
+        Err(e) if args.mmproj.is_none() => {
+            eprintln!("warning: serving text only; the vision tower found is unusable: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn start_batched_server<K: ComputeKernel + Send + 'static>(
     generator: Generator<K>,
     draft: Option<Generator<K>>,
@@ -1822,6 +2023,8 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         }
     }
 
+    let vision = serve_vision(args, &tokenizer, config)?;
+
     // Optional KV-cache quantization (int8/int4) — shrinks the KV memory.
     let kv_quant = args.kv_quant.to_kv_quant();
     let generator = generator.with_kv_quant(kv_quant);
@@ -1836,9 +2039,16 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     // Cached prefixes share paged device KV and give it back under pressure, so
     // they are on by default where the kernel pages KV. On the CPU each one is a
     // host copy of its KV, so only when asked for.
-    let prefix_cache = args
-        .prefix_cache_size
-        .unwrap_or(if kv_pool.is_some() { 64 } else { 0 });
+    // A recurrent (hybrid) model cannot resume from a prefix of a cached
+    // state, so its prefix cache stays off. It speculates by restoring its
+    // state and replaying what a round accepted.
+    let recurrent = generator.recurrent();
+    let prefix_cache = if recurrent {
+        0
+    } else {
+        args.prefix_cache_size
+            .unwrap_or(if kv_pool.is_some() { 64 } else { 0 })
+    };
     if let Some(opts) = &args.bench {
         return bench_generator(&generator, &tokenizer, opts, args, config);
     }
@@ -1846,7 +2056,32 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
     // Batched, streaming engine: a background scheduler interleaves concurrent
     // requests a token at a time. Speculating, a draft model or n-gram lookup
     // proposes and the target verifies.
+    let eagle = match &args.draft_model_path {
+        Some(dir) if is_eagle3_dir(dir) => {
+            if !generator.kernel().capture_next(&[]) {
+                return Err(DlmError::InvalidConfig(
+                    "an EAGLE-3 head reads the target's hidden states, which only the resident GPU \
+                     kernel records: drop --stream, --gpu-layers and --device cpu"
+                        .into(),
+                ));
+            }
+            Some(load_eagle3_head(dir, args, config)?)
+        }
+        _ => None,
+    };
+    let mtp = match args.speculative {
+        Speculative::Mtp => Some(load_mtp_head(&args.model_path, config)?),
+        _ => None,
+    };
     let mode = match (&draft, args.speculative) {
+        _ if mtp.is_some() => format!(
+            "batched + speculative: the model's MTP head, gamma {}",
+            args.draft_gamma
+        ),
+        _ if eagle.is_some() => format!(
+            "batched + speculative: EAGLE-3 head, gamma {}",
+            args.draft_gamma
+        ),
         (Some(_), _) => format!(
             "batched + speculative: draft model, gamma {}",
             args.draft_gamma
@@ -1857,7 +2092,34 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         ),
         _ => "batched".into(),
     };
+    // Without GPU kernels `eagle` is always `None`: its type is uninhabited.
+    #[cfg_attr(
+        not(any(feature = "cuda-kernels", feature = "rocm-kernels")),
+        allow(unreachable_code)
+    )]
     let engine = match draft {
+        _ if mtp.is_some() => dlm::server::EngineService::start_mtp(
+            generator,
+            mtp.expect("checked"),
+            args.draft_gamma,
+            tokenizer,
+            config.vocab_size as usize,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
+            created,
+            args.max_batch.max(1),
+        ),
+        _ if eagle.is_some() => dlm::server::EngineService::start_eagle3(
+            generator,
+            eagle.expect("checked"),
+            args.draft_gamma,
+            tokenizer,
+            config.vocab_size as usize,
+            model_id_from_path(&args.model_path),
+            usize::MAX,
+            created,
+            args.max_batch.max(1),
+        ),
         Some(d) => dlm::server::EngineService::start_speculative(
             generator,
             d,
@@ -1893,11 +2155,26 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
         ),
     }
     .with_chat_template(template)
+    .with_embedding_pooling(match args.embedding_pooling {
+        PoolingArg::Auto => dlm::generate::Pooling::for_model(&args.model_path),
+        PoolingArg::Last => dlm::generate::Pooling::Last,
+        PoolingArg::Mean => dlm::generate::Pooling::Mean,
+    })
     .with_eos_tokens(eos_tokens.clone())
     .with_context_window(args.context_length as usize)
     .with_queue_timeout(std::time::Duration::from_secs_f64(
         args.queue_timeout.unwrap_or(0.0).max(0.0),
     ));
+    let engine = match &args.prefix_cache_dir {
+        Some(dir) if prefix_cache > 0 => {
+            engine.with_prefix_cache_dir(dir.join(prefix_cache_fingerprint(args)?))
+        }
+        _ => engine,
+    };
+    let engine = match vision {
+        Some(v) => engine.with_vision(v),
+        None => engine,
+    };
     let server = dlm::server::HttpServer::bind(listen)?;
     println!();
     println!("serving      : OpenAI + Anthropic compatible API on http://{listen} ({mode})");
@@ -1963,6 +2240,102 @@ fn start_batched_server<K: ComputeKernel + Send + 'static>(
 /// expert cache see a realistic token mix rather than arbitrary ids.
 const BENCH_TEXT: &str = "The river wound through the valley for many miles before it reached the sea. Along its banks, small towns had grown up over the centuries, each with its own market, its own bridge, and its own stories about floods and dry summers. Farmers brought grain and fruit to the markets every week, and traders carried salt, cloth and tools back upstream. When the railway arrived, the river mattered less for moving goods, but people still gathered by the water in the evenings to talk, to fish, and to watch the light change over the hills. ";
 
+/// Whether `dir` holds an EAGLE-3 draft head rather than a draft model: its
+/// `config.json` names a `*Eagle3` architecture.
+fn is_eagle3_dir(dir: &std::path::Path) -> bool {
+    std::fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v["architectures"].as_array().map(|a| {
+                a.iter()
+                    .any(|x| x.as_str().is_some_and(|s| s.contains("Eagle3")))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Load the EAGLE-3 head in `dir` for `config`'s target: in the target's own
+/// precision when it was quantized at load, else as the head ships.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+fn load_eagle3(
+    dir: &std::path::Path,
+    args: &ServeArgs,
+    config: &ModelConfig,
+) -> Result<dlm::forward::eagle3::Eagle3Head> {
+    let _ = args;
+    let quant = match config.quant {
+        QuantScheme::Int4 | QuantScheme::Int8 => config.quant,
+        _ => QuantScheme::Fp16,
+    };
+    let head = dlm::forward::eagle3::Eagle3Head::load(
+        dir,
+        quant,
+        config.hidden_size as usize,
+        config.vocab_size as usize,
+    )?;
+    println!(
+        "eagle-3 head : {} ({} draft tokens, reads target layers {:?})",
+        dir.display(),
+        head.config().draft_vocab,
+        dlm::forward::eagle3::aux_layers(config.num_layers)
+    );
+    Ok(head)
+}
+
+/// [`load_eagle3`] where GPU kernels exist; refused elsewhere.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+fn load_eagle3_head(
+    dir: &std::path::Path,
+    args: &ServeArgs,
+    config: &ModelConfig,
+) -> Result<dlm::forward::eagle3::Eagle3Head> {
+    load_eagle3(dir, args, config)
+}
+
+#[cfg(not(any(feature = "cuda-kernels", feature = "rocm-kernels")))]
+fn load_eagle3_head(
+    _: &std::path::Path,
+    _: &ServeArgs,
+    _: &ModelConfig,
+) -> Result<dlm::forward::eagle3::Eagle3Head> {
+    Err(gpu_compute_unavailable("an EAGLE-3 head"))
+}
+
+/// The model's own MTP head, for `--speculative mtp`.
+fn load_mtp_head(path: &std::path::Path, config: &ModelConfig) -> Result<dlm::loader::MtpWeights> {
+    let store = MmapStore::open_path(path)?;
+    let mtp = dlm::loader::load_mtp(&store, config)?.ok_or_else(|| {
+        DlmError::InvalidConfig(
+            "--speculative mtp: this checkpoint ships no multi-token-prediction head".into(),
+        )
+    })?;
+    println!("mtp head     : {} layer(s), on the CPU", mtp.layers.len());
+    Ok(mtp)
+}
+
+/// `dlm pack`: write `args.model_path` with its weights quantized into
+/// `args.out` (see `dlm::pack`).
+fn run_pack(args: dlm::cli::PackArgs) -> Result<()> {
+    let quant = args.quant.to_scheme();
+    println!(
+        "packing {} at {quant:?} into {}",
+        args.model_path.display(),
+        args.out.display()
+    );
+    let start = std::time::Instant::now();
+    dlm::pack::write_pack(&args.model_path, &args.out, quant, |done, total| {
+        print!("\r  layer {done}/{total}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    })?;
+    println!(
+        "\npacked in {:.1} s; serve it with --model-path {}",
+        start.elapsed().as_secs_f64(),
+        args.out.display()
+    );
+    Ok(())
+}
+
 /// `dlm bench`: load the model through `serve`'s own path, then measure it
 /// instead of serving it (see [`bench_generator`]).
 fn run_bench(args: BenchArgs) -> Result<()> {
@@ -1972,9 +2345,12 @@ fn run_bench(args: BenchArgs) -> Result<()> {
     if serve.speculative == Speculative::Auto {
         serve.speculative = Speculative::Off;
     }
-    if serve.draft_model_path.is_some() || serve.distributed_mode != DistributedMode::Standalone {
+    let eagle = serve.draft_model_path.as_deref().is_some_and(is_eagle3_dir);
+    if (serve.draft_model_path.is_some() && !eagle)
+        || serve.distributed_mode != DistributedMode::Standalone
+    {
         return Err(DlmError::InvalidConfig(
-            "bench measures a single standalone model, plain or with --speculative ngram; drop --draft-model-path and --distributed-mode"
+            "bench measures a single standalone model, plain, with --speculative ngram, or with an EAGLE-3 head as --draft-model-path; drop the draft model and --distributed-mode"
                 .into(),
         ));
     }
@@ -2013,18 +2389,50 @@ fn bench_generator<K: ComputeKernel>(
             r.prefill_tok_s, r.ttft_ms, r.decode_tok_s, r.ms_per_step
         )
     };
-    // `--speculative ngram`: a lone request speculates by lookup, as served.
-    let ngram_gamma = match args.speculative {
+    // A lone request speculates as served: by lookup, or with an EAGLE-3 head.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    let eagle = match (&args.draft_model_path, args.speculative) {
+        (Some(dir), Speculative::Draft) if is_eagle3_dir(dir) => {
+            Some(load_eagle3(dir, args, config)?)
+        }
+        _ => None,
+    };
+    let mtp = match args.speculative {
+        Speculative::Mtp => Some(load_mtp_head(&args.model_path, config)?),
+        _ => None,
+    };
+    let spec = match args.speculative {
+        Speculative::Mtp => {
+            println!(
+                "speculative  : the model's MTP head, gamma {} (batch 1)",
+                args.draft_gamma
+            );
+            Some(dlm::bench::BenchSpec::Mtp {
+                mtp: mtp.as_ref().expect("loaded above"),
+                gamma: args.draft_gamma,
+            })
+        }
         Speculative::Ngram => {
             println!(
                 "speculative  : n-gram lookup, gamma {} (batch 1)",
                 args.draft_gamma
             );
-            Some(args.draft_gamma)
+            Some(dlm::bench::BenchSpec::Ngram(args.draft_gamma))
+        }
+        #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+        Speculative::Draft if eagle.is_some() => {
+            println!(
+                "speculative  : EAGLE-3 head, gamma {} (batch 1)",
+                args.draft_gamma
+            );
+            Some(dlm::bench::BenchSpec::Eagle3 {
+                head: eagle.as_ref().expect("checked"),
+                gamma: args.draft_gamma,
+            })
         }
         Speculative::Draft => {
             return Err(DlmError::InvalidConfig(
-                "dlm bench measures n-gram speculation; draft-model speculation is serve-only"
+                "dlm bench measures n-gram or EAGLE-3 speculation; a draft model is serve-only"
                     .into(),
             ))
         }
@@ -2043,7 +2451,7 @@ fn bench_generator<K: ComputeKernel>(
         "bench        : prompt {} tokens, {} generated, batch {:?}, {} run(s) each, {sampling}",
         opts.prompt_len, opts.gen_len, opts.batch, opts.runs
     );
-    let results = dlm::bench::run(generator, &prompt, opts, ngram_gamma, |r, run| {
+    let results = dlm::bench::run(generator, &prompt, opts, spec, |r, run| {
         println!("  b{:<3} run {:<2}: {}", r.batch, run + 1, row(r));
     })?;
 
@@ -2432,15 +2840,20 @@ fn ram_cache_cap() -> u64 {
 /// prompt took 268 s without the cache and 46 s with it. The cache does
 /// duplicate weights on top of the OS page cache, which is why it is bounded.
 ///
-/// All or nothing, because a partial cache buys nothing: layers stream in a
-/// fixed cycle, so an LRU smaller than the layer set evicts each layer before it
-/// comes round again and never records a hit -- it only costs RAM.
-fn resolve_ram_cache_bytes(args: &ServeArgs, plan: &VramPlan) -> usize {
+/// All or nothing, because a partial cache buys little: layers stream in a
+/// fixed cycle, so a cache smaller than the layer set holds only part of each
+/// pass. A MoE model is the exception ([`moe_ram_cache_bytes`]): most of its
+/// cache is experts, which the router reuses.
+fn resolve_ram_cache_bytes(args: &ServeArgs, plan: &VramPlan, config: &ModelConfig) -> usize {
     if let Some(gb) = args.ram_cache_gb {
         return (gb.max(0.0) * GIB as f64) as usize;
     }
     if !args.stream {
         return 0;
+    }
+    if config.is_moe() {
+        let all = config.estimated_total_params() as f64 * config.quant.bytes_per_param();
+        return moe_ram_cache_bytes(all as u64, ram_cache_cap()) as usize;
     }
     default_ram_cache_bytes(
         plan.per_layer_weight_bytes,
@@ -2459,6 +2872,21 @@ fn resolve_ram_cache_bytes(args: &ServeArgs, plan: &VramPlan) -> usize {
 /// int4 at group 128), plus the f32 norms and biases. A budget a few percent
 /// short is not a slightly worse cache but no cache at all, for the reason
 /// above; overshooting only reserves RAM the cache never fills.
+/// The default cache for a streamed MoE model: the whole model, routed experts
+/// included, plus headroom, or as much of it as `cap` allows.
+///
+/// The cache holds the layer cores and, separately, the routed experts. The
+/// layer estimate counts the core alone, so sizing from it left the experts a
+/// fraction of the room they need, and each expert miss read the expert from
+/// the checkpoint and quantized it again: 4.4 s a token streaming TinyMixtral
+/// 4x248M at `--quant int4` with an 8-expert VRAM cache. Unlike layers, which
+/// come round in a cycle, experts are reused by the router, so a cache short of
+/// all of them still keeps the hot ones: it takes what the cap allows, not
+/// nothing.
+fn moe_ram_cache_bytes(model_bytes: u64, cap: u64) -> u64 {
+    (model_bytes + model_bytes / 4).min(cap)
+}
+
 fn default_ram_cache_bytes(layer_bytes: u64, num_layers: u32, cap: u64) -> Option<u64> {
     let whole_model = layer_bytes * num_layers as u64;
     let with_headroom = whole_model + whole_model / 4; // +25%
@@ -2581,6 +3009,15 @@ mod tests {
             Some(1000 * mib)
         );
         assert_eq!(default_ram_cache_bytes(801 * mib, 1, 1000 * mib), None);
+    }
+
+    /// A MoE model's cache covers its experts too, and a partial one is kept:
+    /// the router reuses hot experts, so it hits without holding them all.
+    #[test]
+    fn moe_ram_cache_takes_what_the_cap_allows() {
+        let mib = 1024 * 1024;
+        assert_eq!(moe_ram_cache_bytes(400 * mib, 4 * GIB), 500 * mib);
+        assert_eq!(moe_ram_cache_bytes(20 * GIB, 4 * GIB), 4 * GIB);
     }
 
     #[test]

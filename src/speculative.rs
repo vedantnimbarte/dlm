@@ -143,6 +143,24 @@ trait Drafter {
     fn kv_rows(&self) -> usize {
         0
     }
+
+    /// The target layers whose input hidden states this drafter reads
+    /// (EAGLE); `None` for drafters that need only tokens.
+    fn feature_layers(&self) -> Option<&[u32]> {
+        None
+    }
+
+    /// The target's captured hidden states for positions `first..`, one row of
+    /// `layers × hidden` per position, as the target just ran them; or, for a
+    /// drafter that [`wants_hidden`](Self::wants_hidden), its final-normed
+    /// hidden state, one `hidden`-wide row per position.
+    fn observe(&mut self, _first: usize, _features: &[f32]) {}
+
+    /// Whether this drafter reads the target's final hidden states (an MTP
+    /// head) through [`observe`](Self::observe).
+    fn wants_hidden(&self) -> bool {
+        false
+    }
 }
 
 /// A draft model sampling its proposals, with its own KV cache.
@@ -189,6 +207,261 @@ impl<D: ComputeKernel> Drafter for ModelDrafter<'_, D> {
     }
 }
 
+/// Speculation rolls rejected tokens back out of the KV history; a model with a
+/// recurrent state (Qwen3.5/3.6's linear attention) has no history to cut, so
+/// it is refused up front rather than failing mid-generation.
+fn refuse_recurrent(recurrent: bool) -> Result<()> {
+    if recurrent {
+        return Err(DlmError::InvalidConfig(
+            "speculative decoding is not supported for this model: its linear-attention \
+             layers keep a recurrent state, which cannot be rolled back past rejected tokens"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// An EAGLE-3 head proposing from the target's own hidden states.
+///
+/// Draft position `p` reads the embedding of token `p + 1` and the target's
+/// feature for `p`, and predicts token `p + 2`; see
+/// [`crate::forward::eagle3`]. Positions the target has run get their real
+/// feature; the draft's own guesses past them read its previous output.
+/// `kv_len` counts the draft KV rows built from real features, and only those
+/// survive a round: the rest were built on guesses.
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+struct Eagle3Drafter<'a, T: ComputeKernel> {
+    head: &'a crate::forward::eagle3::Eagle3Head,
+    seq: crate::forward::eagle3::Eagle3Seq,
+    target: &'a Generator<T>,
+    layers: [u32; 3],
+    /// Features for positions `feat_base..`, `3 × hidden` each.
+    feats: Vec<f32>,
+    feat_base: usize,
+    kv_len: usize,
+}
+
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+impl<T: ComputeKernel> Eagle3Drafter<'_, T> {
+    fn row(&self) -> usize {
+        3 * self.head.config().hidden
+    }
+
+    /// Draw a token from the draft's state `out` under `sampler`, with the
+    /// distribution it came from. Greedy reads only the argmax off the device.
+    fn draw(&self, out: &[f32], sampler: &Sampler, rng: &mut SplitMix64) -> Result<Proposal> {
+        if matches!(sampler, Sampler::Greedy) {
+            let x = self.head.argmax(out)?;
+            return Ok((x, vec![(x, 1.0)]));
+        }
+        // The draft's distribution over the target's vocabulary: tokens outside
+        // its own vocabulary get no mass. Penalties are left out, which keeps the
+        // rejection rule exact: `q` is what the proposal was drawn from.
+        let mut logits = vec![f32::NEG_INFINITY; self.target.vocab_size()];
+        for (t, l) in self.head.logits(out)? {
+            logits[t as usize] = l;
+        }
+        let q = sampler.distribution(&logits);
+        let x = sample_from(&q, rng);
+        Ok((x, q))
+    }
+}
+
+#[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+impl<T: ComputeKernel> Drafter for Eagle3Drafter<'_, T> {
+    fn propose(
+        &mut self,
+        seq: &[u32],
+        gamma: usize,
+        (sampler, _, _): (&Sampler, &Penalties, usize),
+        rng: &mut SplitMix64,
+    ) -> Result<Vec<Proposal>> {
+        let n = seq.len() - 1; // the pending token's position
+        let row = self.row();
+        let have = self.feat_base + self.feats.len() / row;
+        // The draft needs the target's feature for every position before the
+        // pending token; without them (nothing run yet) it has nothing to say.
+        if n == 0 || self.kv_len >= n || have < n || self.kv_len < self.feat_base {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for p in self.kv_len..n {
+            let at = (p - self.feat_base) * row;
+            let embed = self.target.embed(seq[p + 1], p + 1)?;
+            out = self
+                .head
+                .step(&mut self.seq, &embed, Some(&self.feats[at..at + row]), p)?;
+        }
+        self.kv_len = n;
+        let mut proposals: Vec<Proposal> = Vec::with_capacity(gamma);
+        for j in 0..gamma {
+            if j > 0 {
+                let prev = proposals[j - 1].0;
+                let embed = self.target.embed(prev, n + j)?;
+                out = self.head.step(&mut self.seq, &embed, None, n - 1 + j)?;
+            }
+            proposals.push(self.draw(&out, sampler, rng)?);
+        }
+        Ok(proposals)
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.kv_len = self.kv_len.min(len);
+        let row = self.row();
+        let keep = len.saturating_sub(self.feat_base) * row;
+        self.feats.truncate(keep.min(self.feats.len()));
+    }
+
+    fn kv_rows(&self) -> usize {
+        self.kv_len
+    }
+
+    fn feature_layers(&self) -> Option<&[u32]> {
+        Some(&self.layers)
+    }
+
+    fn observe(&mut self, first: usize, features: &[f32]) {
+        let row = self.row();
+        // Rows already folded into the draft KV are not read again.
+        if self.kv_len > self.feat_base {
+            let used = ((self.kv_len - self.feat_base) * row).min(self.feats.len());
+            self.feats.drain(..used);
+            self.feat_base += used / row;
+        }
+        let end = self.feat_base + self.feats.len() / row;
+        if first < self.feat_base || first > end {
+            // Not contiguous with what is held: start over from these rows.
+            self.feats.clear();
+            self.feat_base = first;
+        } else {
+            self.feats.truncate((first - self.feat_base) * row);
+        }
+        self.feats.extend_from_slice(features);
+    }
+}
+
+/// A model's own multi-token-prediction head (Qwen3.5/3.6's `mtp.*`),
+/// proposing from the target's final hidden states.
+///
+/// Draft position `p` reads the embedding of token `p + 1` and the target's
+/// final-normed hidden state at `p`, each normed, concatenated and folded by
+/// `fc`; then one full-attention layer of the model's own kind and a final
+/// norm; then the target's LM head, for token `p + 2`. Past the first draft
+/// token the head's own output stands in for the target's state. As vLLM's
+/// `qwen3_5_mtp.py` runs it. The layer is small beside the target and runs
+/// on the CPU, with its own K/V.
+struct MtpDrafter<'a, T: ComputeKernel> {
+    target: &'a Generator<T>,
+    mtp: &'a crate::loader::MtpWeights,
+    cfg: crate::forward::BlockConfig,
+    kv: crate::forward::KvLayerCache,
+    /// Normed target states for positions `feat_base..`, `hidden` each.
+    feats: Vec<f32>,
+    feat_base: usize,
+    /// Draft K/V rows built from the target's states; only these survive.
+    kv_len: usize,
+}
+
+impl<T: ComputeKernel> MtpDrafter<'_, T> {
+    /// One draft position: the head's normed output for token `token` at
+    /// `position + 1` beside the state `state` at `position`.
+    fn run(&mut self, token: u32, state: &[f32], position: usize) -> Result<Vec<f32>> {
+        use crate::forward::cpu::{matvec_native, rmsnorm};
+        let h = self.cfg.hidden_size;
+        let eps = self.cfg.rms_eps;
+        let embed = self.target.embed(token, position + 1)?;
+        let mut u = rmsnorm(&embed[..h], &self.mtp.pre_fc_norm_embedding, eps);
+        u.extend(rmsnorm(state, &self.mtp.pre_fc_norm_hidden, eps));
+        let x = matvec_native(&self.mtp.fc, &u, h, 2 * h);
+        let y = crate::forward::decode_block(
+            &self.cfg,
+            &self.mtp.layers[0],
+            &x,
+            &mut self.kv,
+            position,
+        )?;
+        Ok(rmsnorm(&y, &self.mtp.norm, eps))
+    }
+
+    fn draw(&self, out: &[f32], sampler: &Sampler, rng: &mut SplitMix64) -> Result<Proposal> {
+        if matches!(sampler, Sampler::Greedy) {
+            let x = self.target.argmax_normed(out)?;
+            return Ok((x, vec![(x, 1.0)]));
+        }
+        // Penalties are left out: `q` is what the proposal was drawn from, which
+        // keeps the rejection rule exact.
+        let q = sampler.distribution(&self.target.logits_normed(out)?);
+        let x = sample_from(&q, rng);
+        Ok((x, q))
+    }
+}
+
+impl<T: ComputeKernel> Drafter for MtpDrafter<'_, T> {
+    fn propose(
+        &mut self,
+        seq: &[u32],
+        gamma: usize,
+        (sampler, _, _): (&Sampler, &Penalties, usize),
+        rng: &mut SplitMix64,
+    ) -> Result<Vec<Proposal>> {
+        let n = seq.len() - 1; // the pending token's position
+        let h = self.cfg.hidden_size;
+        let have = self.feat_base + self.feats.len() / h;
+        if n == 0 || self.kv_len >= n || have < n || self.kv_len < self.feat_base {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for p in self.kv_len..n {
+            let at = (p - self.feat_base) * h;
+            let state = self.feats[at..at + h].to_vec();
+            out = self.run(seq[p + 1], &state, p)?;
+        }
+        self.kv_len = n;
+        let mut proposals: Vec<Proposal> = Vec::with_capacity(gamma);
+        for j in 0..gamma {
+            if j > 0 {
+                let prev = proposals[j - 1].0;
+                let state = std::mem::take(&mut out);
+                out = self.run(prev, &state, n - 1 + j)?;
+            }
+            proposals.push(self.draw(&out, sampler, rng)?);
+        }
+        Ok(proposals)
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.kv_len = self.kv_len.min(len);
+        self.kv.truncate(self.kv_len);
+        let keep = len.saturating_sub(self.feat_base) * self.cfg.hidden_size;
+        self.feats.truncate(keep.min(self.feats.len()));
+    }
+
+    fn kv_rows(&self) -> usize {
+        self.kv_len
+    }
+
+    fn wants_hidden(&self) -> bool {
+        true
+    }
+
+    fn observe(&mut self, first: usize, rows: &[f32]) {
+        let h = self.cfg.hidden_size;
+        if self.kv_len > self.feat_base {
+            let used = ((self.kv_len - self.feat_base) * h).min(self.feats.len());
+            self.feats.drain(..used);
+            self.feat_base += used / h;
+        }
+        let end = self.feat_base + self.feats.len() / h;
+        if first < self.feat_base || first > end {
+            self.feats.clear();
+            self.feat_base = first;
+        } else {
+            self.feats.truncate((first - self.feat_base) * h);
+        }
+        self.feats.extend_from_slice(rows);
+    }
+}
+
 /// Longest context suffix n-gram lookup tries. Longer matches predict better;
 /// past a few tokens they mostly find the same place a shorter one does.
 const NGRAM_MAX: usize = 3;
@@ -225,6 +498,24 @@ impl Drafter for NgramDrafter {
 // ponytail: a linear scan per round, O(context). A round is a full model pass,
 // so this is noise at any context dlm serves; index n-grams in a map if it ever
 // shows in a profile.
+/// Each `hidden`-wide row of `hiddens` through the target's final norm: the
+/// state an MTP head reads.
+fn normed_rows<T: ComputeKernel>(target: &Generator<T>, hiddens: &[f32]) -> Vec<f32> {
+    let h = target.hidden_size();
+    hiddens
+        .chunks(h)
+        .flat_map(|r| target.final_norm(r))
+        .collect()
+}
+
+/// Ask the target's kernel to record the hidden states `drafter` reads on its
+/// next pass; `false` when the drafter reads none or the kernel cannot.
+fn arm_capture<T: ComputeKernel>(target: &Generator<T>, drafter: &dyn Drafter) -> bool {
+    drafter
+        .feature_layers()
+        .is_some_and(|layers| target.kernel().capture_next(layers))
+}
+
 fn ngram_lookup(seq: &[u32], gamma: usize) -> &[u32] {
     for n in (NGRAM_MIN..=NGRAM_MAX.min(seq.len().saturating_sub(1))).rev() {
         let suffix = &seq[seq.len() - n..];
@@ -270,6 +561,7 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         prompt: &[u32],
         sampler: Sampler,
     ) -> Result<Self> {
+        refuse_recurrent(draft.recurrent())?;
         let mut kv = draft.orchestrator();
         if let Some((_, head)) = prompt.split_last().filter(|(_, h)| !h.is_empty()) {
             draft.prefill(&mut kv, head)?;
@@ -287,6 +579,61 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         sampler: Sampler,
     ) -> Result<Self> {
         Self::with_drafter(target, Box::new(NgramDrafter), gamma, prompt, sampler)
+    }
+
+    /// Begin a session whose proposals come from an EAGLE-3 `head` reading
+    /// the target's own hidden states, up to `max_positions` tokens long.
+    /// Refused when the target's kernel cannot record its hidden states.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    pub fn eagle3(
+        target: &'a Generator<T>,
+        head: &'a crate::forward::eagle3::Eagle3Head,
+        gamma: usize,
+        prompt: &[u32],
+        sampler: Sampler,
+        max_positions: usize,
+    ) -> Result<Self> {
+        if !target.kernel().capture_next(&[]) {
+            return Err(DlmError::InvalidConfig(
+                "EAGLE-3 reads the target's hidden states, which only the resident GPU \
+                 kernel records"
+                    .into(),
+            ));
+        }
+        let drafter = Eagle3Drafter {
+            head,
+            seq: head.new_seq(max_positions)?,
+            target,
+            layers: crate::forward::eagle3::aux_layers(target.num_layers() as u32),
+            feats: Vec::new(),
+            feat_base: 0,
+            kv_len: 0,
+        };
+        Self::with_drafter(target, Box::new(drafter), gamma, prompt, sampler)
+    }
+
+    /// Begin a session whose proposals come from the model's own MTP head
+    /// (`mtp`, as `loader::load_mtp` reads it).
+    pub fn mtp(
+        target: &'a Generator<T>,
+        mtp: &'a crate::loader::MtpWeights,
+        gamma: usize,
+        prompt: &[u32],
+        sampler: Sampler,
+    ) -> Result<Self> {
+        if mtp.layers.is_empty() {
+            return Err(DlmError::InvalidConfig("the MTP head has no layer".into()));
+        }
+        let drafter = MtpDrafter {
+            target,
+            mtp,
+            kv: crate::forward::KvLayerCache::new(mtp.cfg.kv_dim()),
+            cfg: mtp.cfg,
+            feats: Vec::new(),
+            feat_base: 0,
+            kv_len: 0,
+        };
+        Self::with_drafter(target, Box::new(drafter), gamma, prompt, sampler)
     }
 
     /// Carry on a plain session, whose prompt is in, with n-gram speculation and
@@ -328,8 +675,21 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
             return Err(DlmError::InvalidConfig("prompt must be non-empty".into()));
         };
         let mut target_kv = target.orchestrator();
+        let mut drafter = drafter;
         if !head.is_empty() {
-            target.prefill(&mut target_kv, head)?;
+            let capturing = arm_capture(target, drafter.as_ref());
+            if drafter.wants_hidden() {
+                let mut rows = Vec::new();
+                target.prefill_with(&mut target_kv, head, |chunk| {
+                    rows.extend(normed_rows(target, chunk));
+                })?;
+                drafter.observe(0, &rows);
+            } else {
+                target.prefill(&mut target_kv, head)?;
+            }
+            if capturing {
+                drafter.observe(0, &target.kernel().take_capture());
+            }
         }
         Ok(Self {
             target,
@@ -369,8 +729,17 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
             .propose(&self.seq, gamma, sampling, &mut self.rng)?
             .into_iter()
             .unzip();
-        if proposals.is_empty() {
-            return Self::step_together(&mut [self]);
+        // A hidden-state drafter needs the target's state for this position
+        // too, so it goes through the pass below even with nothing to verify.
+        if proposals.is_empty() && !self.drafter.wants_hidden() {
+            let first = self.target_kv.position();
+            let capturing = arm_capture(self.target, self.drafter.as_ref());
+            let emitted = Self::step_together(&mut [&mut *self])?;
+            if capturing {
+                let features = self.target.kernel().take_capture();
+                self.drafter.observe(first, &features);
+            }
+            return Ok(emitted);
         }
         let gamma = proposals.len();
         self.proposed += gamma;
@@ -389,7 +758,23 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
             hiddens.extend(self.target.embed(token, start + i)?);
         }
         let h = hiddens.len() / fed.len();
+        // A linear-attention state cannot be cut back past rejected tokens:
+        // keep it from before the pass, to restore and replay.
+        let checkpoint = if self.target.recurrent() {
+            Some(self.target_kv.checkpoint_recurrent()?)
+        } else {
+            None
+        };
+        let capturing = arm_capture(self.target, self.drafter.as_ref());
         self.target_kv.prefill(&mut hiddens)?;
+        if capturing {
+            let features = self.target.kernel().take_capture();
+            self.drafter.observe(start, &features);
+        }
+        if self.drafter.wants_hidden() {
+            self.drafter
+                .observe(start, &normed_rows(self.target, &hiddens));
+        }
         let target_hidden = |j: usize| {
             let at = (fed.len() - gamma - 1 + j) * h;
             &hiddens[at..at + h]
@@ -435,7 +820,19 @@ impl<'a, T: ComputeKernel> SpeculativeSession<'a, T> {
         //    accepted proposal, i.e. exactly what both models were fed.
         self.seq.extend(&emitted);
         let keep = self.seq.len() - 1;
-        self.target_kv.truncate(keep);
+        match checkpoint {
+            // Rejected tokens went through the recurrent layers: back to the
+            // state before the round, then the accepted ones again.
+            Some(cp) if keep < start + fed.len() => {
+                self.target_kv.rollback(cp, start);
+                let mut again = Vec::with_capacity((keep - start) * h);
+                for (i, &token) in fed[..keep - start].iter().enumerate() {
+                    again.extend(self.target.embed(token, start + i)?);
+                }
+                self.target_kv.prefill(&mut again)?;
+            }
+            _ => self.target_kv.truncate(keep),
+        }
         self.drafter.truncate(keep);
         Ok(emitted)
     }

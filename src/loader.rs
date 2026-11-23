@@ -40,6 +40,10 @@ use std::path::Path;
 /// 4x. Probes a layer-0 projection — every weight matrix in a checkpoint shares
 /// one dtype — and falls back to the first weight tensor it can find.
 pub fn checkpoint_scheme(store: &MmapStore) -> Result<QuantScheme> {
+    // A pack's native precision is the one it was made for.
+    if let Some(q) = crate::pack::pack_scheme(store) {
+        return Ok(q);
+    }
     // An already-packed 4-bit checkpoint (GPTQ) has no float `.weight` to probe —
     // its precision is int4 by construction.
     if store
@@ -95,10 +99,16 @@ fn load_tensor(store: &MmapStore, name: &str, expected_len: usize) -> Result<Vec
 }
 
 /// Read a float tensor of unknown length.
-fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn load_floats(store: &MmapStore, name: &str) -> Result<Vec<f32>> {
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+    if crate::pack::is_packed(shard, name) {
+        return Err(DlmError::InvalidConfig(format!(
+            "{name:?} is a packed quantized weight, read here as floats: this pack does \
+             not fit how dlm now loads the model; pack the original checkpoint again"
+        )));
+    }
     let bytes = shard.tensor_bytes(name)?;
     if info.dtype.is_block_quantized() {
         // GGUF quantizes the embedding matrix too; dlm keeps it as floats, so it
@@ -164,7 +174,19 @@ pub(crate) fn load_native(
     let (shard, info) = store
         .locate(name)
         .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
-    let bytes = shard.tensor_bytes(name)?;
+    // A pack's weight comes back exactly as `dlm pack` recorded it here.
+    if let Some(w) = crate::pack::read_packed(shard, info, name, expected_len, quant)? {
+        if store.lora().is_some() {
+            return Err(DlmError::InvalidConfig(
+                "a LoRA adapter cannot merge into a pack's quantized weights; pack the \
+                 checkpoint the adapter was trained on instead"
+                    .into(),
+            ));
+        }
+        return Ok(w);
+    }
+    let owned = shard.read_tensor_range(name, 0..info.byte_len())?;
+    let bytes = &owned[..];
     // A GGUF weight arrives in ggml's blocks, already quantized. It is decoded to
     // dlm's group-affine form and used as it is: re-quantizing what a quantizer
     // already chose would only lose what it chose, so `--quant` does not apply
@@ -239,10 +261,12 @@ pub(crate) fn load_native(
             )));
         }
         let group = crate::forward::QUANT_GROUP_SIZE;
-        return match quant {
+        let w = match quant {
             QuantScheme::Int4 => Weights::quantize_int4(&floats, group),
             _ => Weights::quantize_int8(&floats, group),
-        };
+        }?;
+        crate::pack::record(name, &w);
+        return Ok(w);
     }
     let w = match info.dtype {
         Dtype::F32 => Weights::F32(bytes_to_f32(bytes, info.dtype)?),
@@ -547,6 +571,112 @@ fn load_bias(store: &MmapStore, base: &str, out_features: usize) -> Result<Optio
     Ok(Some(load_tensor(store, &name, out_features)?))
 }
 
+/// Gemma 4's per-layer token embeddings (`embed_tokens_per_layer`): a row of
+/// `layers × ple_dim` values per token, which the generator appends to the
+/// token's hidden state for every layer to read its slice of.
+///
+/// The table is the size of a model of its own (2.8B values on E4B, 5.6 GB as
+/// bf16, 1.9 GB as a Q5_K GGUF holds it), and a token needs one row of it. So it
+/// is neither loaded nor sent to the GPU: the file is mapped once more and a
+/// row decoded when a token is embedded.
+pub struct PerLayerEmbedding {
+    map: memmap2::Mmap,
+    /// Byte offset of row 0 in the file.
+    start: usize,
+    dtype: crate::storage::Dtype,
+    width: usize,
+    rows: usize,
+    /// transformers multiplies the row by `sqrt(ple_dim)`.
+    scale: f32,
+}
+
+impl PerLayerEmbedding {
+    /// Map tensor `name` of `store` as rows of `width` values, scaled by `scale`.
+    pub fn open(store: &MmapStore, name: &str, width: usize, scale: f32) -> Result<Self> {
+        let (shard, info) = store
+            .locate(name)
+            .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+        let dtype = info.dtype;
+        let quantized = dtype.is_block_quantized();
+        if !quantized && !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "tensor {name:?} is {dtype:?}; dlm reads per-layer embeddings as floats or \
+                 ggml blocks"
+            )));
+        }
+        if width == 0 || info.num_elements() % width != 0 || width % dtype.block_elems() != 0 {
+            return Err(DlmError::InvalidConfig(format!(
+                "tensor {name:?} ({} values, {dtype:?}) does not split into rows of {width}",
+                info.num_elements()
+            )));
+        }
+        let path = shard.path();
+        let file = std::fs::File::open(path).map_err(|source| DlmError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        // SAFETY: as `MmapShard::open`: read-only, and the checkpoint is treated
+        // as immutable for the life of the process.
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| DlmError::Mmap {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let start = shard.header().data_offset + info.begin;
+        let rows = info.num_elements() / width;
+        if start + rows * dtype.byte_len(width) > map.len() {
+            return Err(DlmError::InvalidConfig(format!(
+                "tensor {name:?} runs past the end of {}",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            map,
+            start,
+            dtype,
+            width,
+            rows,
+            scale,
+        })
+    }
+
+    /// Values per row: every layer's input for one token.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Token `token`'s row, decoded and scaled.
+    pub fn row(&self, token: u32) -> Result<Vec<f32>> {
+        let t = token as usize;
+        if t >= self.rows {
+            return Err(DlmError::InvalidConfig(format!(
+                "token {token} is past the per-layer embedding's {} rows",
+                self.rows
+            )));
+        }
+        let len = self.dtype.byte_len(self.width);
+        let bytes = &self.map[self.start + t * len..self.start + (t + 1) * len];
+        let mut row = if self.dtype.is_block_quantized() {
+            crate::storage::ggml_quant::to_f32(self.dtype, bytes, self.width)?
+        } else {
+            bytes_to_f32(bytes, self.dtype)?
+        };
+        for x in &mut row {
+            *x *= self.scale;
+        }
+        Ok(row)
+    }
+}
+
+impl std::fmt::Debug for PerLayerEmbedding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PerLayerEmbedding")
+            .field("dtype", &self.dtype)
+            .field("rows", &self.rows)
+            .field("width", &self.width)
+            .finish()
+    }
+}
+
 /// A model materialized to host `f32` weights, ready to wrap in a compute kernel
 /// of the caller's choosing (CPU or GPU).
 pub struct ModelParts {
@@ -569,6 +699,8 @@ pub struct ModelParts {
     pub final_logit_softcap: Option<f32>,
     /// Hold the device LM head in int4 (`--lm-head-int4`).
     pub head_int4: bool,
+    /// Gemma 4's per-layer token embeddings; `None` on every other family.
+    pub per_layer: Option<PerLayerEmbedding>,
 }
 
 impl ModelParts {
@@ -576,10 +708,15 @@ impl ModelParts {
     /// layers quantized at load, else the checkpoint's own.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
     fn head_quant(&self) -> crate::generate::LmHeadQuant {
-        let quantized = self
-            .layers
-            .first()
-            .is_some_and(|l| matches!(l.q_proj, Weights::Int4 { .. } | Weights::Int8 { .. }));
+        let quantized = self.layers.first().is_some_and(|l| {
+            // `o_proj`: every layer kind has one (a linear-attention layer has
+            // no `q_proj`).
+            matches!(l.o_proj, Weights::Int4 { .. } | Weights::Int8 { .. })
+                // A Gemma 4 GGUF: its 262k-row head as f32 is 2.7 GB, more than
+                // the card it is meant for has beside the layers, and its
+                // layers are quantized blocks already.
+                || (self.per_layer.is_some() && matches!(l.q_proj, Weights::Ggml { .. }))
+        });
         crate::generate::LmHeadQuant::choose(self.head_int4, quantized)
     }
 
@@ -599,8 +736,9 @@ impl ModelParts {
         let logit_cap = self.final_logit_softcap;
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
+        let per_layer = self.per_layer;
         let kernel = CpuKernel::new(self.cfg, self.layers)?;
-        Ok(Generator::new(
+        let g = Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -612,7 +750,24 @@ impl ModelParts {
         )?
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
-        .with_final_logit_softcap(logit_cap))
+        .with_final_logit_softcap(logit_cap);
+        attach_per_layer(g, per_layer)
+    }
+
+    /// Refuse a kernel arrangement that splits the layers when the model is
+    /// Gemma 4: its shared-KV layers read the KV of earlier layers, which a
+    /// split would put on another device (or the host), and its per-layer
+    /// inputs are computed by the first layer for all the others.
+    #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
+    fn refuse_split(&self, what: &str) -> Result<()> {
+        if self.cfg.ple_dim > 0 || self.cfg.kv_shared_from.is_some() {
+            return Err(DlmError::InvalidConfig(format!(
+                "{what} is not supported for Gemma 4: its later layers read the KV cache of \
+                 earlier ones, so its layers cannot be split across devices. Run it whole on \
+                 the GPU or the CPU."
+            )));
+        }
+        Ok(())
     }
 
     /// Re-pack ggml's blocks into dlm's own quantized layout, where the card has
@@ -652,8 +807,9 @@ impl ModelParts {
         let head = self.head_quant();
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
+        let per_layer = self.per_layer;
         let kernel = crate::forward::GpuKernel::new(self.cfg, self.layers, max_kv_tokens)?;
-        Ok(Generator::new(
+        let g = Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -666,7 +822,8 @@ impl ModelParts {
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
         .with_final_logit_softcap(logit_cap)
-        .with_lm_head_on_gpu(head, None))
+        .with_lm_head_on_gpu(head, None);
+        attach_per_layer(g, per_layer)
     }
 
     /// Hold the first `gpu_layers` layers in VRAM and run the rest on the CPU,
@@ -678,6 +835,7 @@ impl ModelParts {
         mut self,
         gpu_layers: usize,
     ) -> Result<Generator<crate::forward::SplitKernel<crate::forward::GpuKernel, CpuKernel>>> {
+        self.refuse_split("--gpu-layers")?;
         let gpu_layers = gpu_layers.min(self.layers.len());
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
@@ -724,6 +882,7 @@ impl ModelParts {
         self,
         gpu_ids: &[u32],
     ) -> Result<Generator<crate::forward::MultiGpuKernel>> {
+        self.refuse_split("multi-GPU")?;
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
@@ -765,8 +924,9 @@ impl ModelParts {
         let logit_cap = self.final_logit_softcap;
         let (wpe, ln_f_bias) = (self.position_embedding, self.final_norm_bias);
         let head_norm = self.cfg.norm_kind;
+        let per_layer = self.per_layer;
         let kernel = PipelineParallelKernel::new(CpuKernel::new(self.cfg, self.layers)?, gpu_ids)?;
-        Ok(Generator::new(
+        let g = Generator::new(
             kernel,
             self.embedding,
             self.final_norm,
@@ -778,7 +938,19 @@ impl ModelParts {
         )?
         .with_embed_scale(embed_scale)
         .with_head(wpe, ln_f_bias, head_norm)
-        .with_final_logit_softcap(logit_cap))
+        .with_final_logit_softcap(logit_cap);
+        attach_per_layer(g, per_layer)
+    }
+}
+
+/// `g` with Gemma 4's per-layer embedding table attached, when the model has one.
+fn attach_per_layer<K: crate::forward::ComputeKernel>(
+    g: Generator<K>,
+    table: Option<PerLayerEmbedding>,
+) -> Result<Generator<K>> {
+    match table {
+        Some(t) => g.with_per_layer_embedding(t),
+        None => Ok(g),
     }
 }
 
@@ -812,6 +984,11 @@ pub fn load_generator(
 }
 
 /// The per-block geometry a [`ModelConfig`] describes.
+/// The block config the loader builds layers with, for `dlm pack`.
+pub(crate) fn pack_block_config(config: &ModelConfig) -> BlockConfig {
+    block_config(config)
+}
+
 fn block_config(config: &ModelConfig) -> BlockConfig {
     BlockConfig {
         hidden_size: config.hidden_size as usize,
@@ -835,6 +1012,20 @@ fn block_config(config: &ModelConfig) -> BlockConfig {
         attn_logit_softcap: config.attn_logit_softcap,
         query_pre_attn_scalar: config.query_pre_attn_scalar,
         gemma2_norms: config.gemma2_norms,
+        linear: config.linear_attn,
+        attn_output_gate: config.attn_output_gate,
+        rotary_dim: config.rotary_dim.map(|r| r as usize),
+        global_head_dim: config.global_head_dim.map(|d| d as usize),
+        kv_shared_from: config.kv_shared_from,
+        shared_kv: false,
+        v_norm: config.v_norm,
+        ple_dim: config.ple_dim as usize,
+        ple_layers: if config.ple_dim > 0 {
+            config.num_layers as usize
+        } else {
+            0
+        },
+        double_wide_shared_mlp: config.double_wide_shared_mlp,
     }
 }
 
@@ -932,7 +1123,11 @@ pub(crate) fn load_layer_tensors_opt(
         include_experts,
         norm_add_one,
     )?;
-    crate::forward::key_balance::balance_keys(&mut t, cfg);
+    // Not when layers share KV (Gemma 4): balancing rescales a layer's keys
+    // against its own queries, and a layer reading those keys has other queries.
+    if cfg.kv_shared_from.is_none() {
+        crate::forward::key_balance::balance_keys(&mut t, cfg);
+    }
     Ok(t)
 }
 
@@ -947,6 +1142,26 @@ fn load_layer_tensors_raw(
     include_experts: bool,
     norm_add_one: bool,
 ) -> Result<LayerTensors> {
+    // Qwen3.5/3.6 lay a layer out their own way (linear attention, a gated and
+    // partly rotated full attention, fused experts) and take their own loader.
+    if cfg.linear.is_some() {
+        let cfg = &cfg.for_layer(layer);
+        let prefix = format!("model.layers.{layer}");
+        let more = if quant == QuantScheme::Int4 && keeps_more_bits(layer, num_layers) {
+            QuantScheme::Int8
+        } else {
+            quant
+        };
+        return load_hybrid_layer(
+            store,
+            cfg,
+            &prefix,
+            quant,
+            more,
+            include_experts,
+            norm_add_one,
+        );
+    }
     // Resolve the config for THIS layer: DeepSeek's leading dense layers report
     // `moe: None` here even though the checkpoint is MoE overall, which is what
     // routes them to the dense FFN below and satisfies `validate` afterwards.
@@ -1161,7 +1376,14 @@ fn load_layer_tensors_raw(
             up_bias: None,
             down_bias: None,
         }),
-        Some(_) => load_moe_ffn(store, cfg, layer, quant, packed, include_experts)?,
+        Some(_) => load_moe_ffn(
+            store,
+            cfg,
+            &format!("model.layers.{layer}"),
+            quant,
+            packed,
+            include_experts,
+        )?,
     };
     let input_layernorm = load_norm(store, &name("input_layernorm.weight"), hidden, norm_add_one)?;
     let post_attention_layernorm = load_norm(
@@ -1225,22 +1447,32 @@ fn load_layer_tensors_raw(
                 quant,
                 packed,
             )?,
-            k_proj: load_linear(
-                store,
-                &name("self_attn.k_proj"),
-                hidden,
-                kv_dim,
-                quant,
-                packed,
-            )?,
-            v_proj: load_linear(
-                store,
-                &name("self_attn.v_proj"),
-                hidden,
-                kv_dim,
-                more,
-                packed,
-            )?,
+            // A Gemma 4 layer that reads an earlier layer's KV has no use for
+            // the K/V projections its checkpoint still carries.
+            k_proj: if cfg.shared_kv {
+                Weights::default()
+            } else {
+                load_linear(
+                    store,
+                    &name("self_attn.k_proj"),
+                    hidden,
+                    kv_dim,
+                    quant,
+                    packed,
+                )?
+            },
+            v_proj: if cfg.shared_kv {
+                Weights::default()
+            } else {
+                load_linear(
+                    store,
+                    &name("self_attn.v_proj"),
+                    hidden,
+                    kv_dim,
+                    more,
+                    packed,
+                )?
+            },
             o_proj: load_linear(
                 store,
                 &name("self_attn.o_proj"),
@@ -1273,12 +1505,16 @@ fn load_layer_tensors_raw(
                 cfg.head_dim,
                 norm_add_one,
             )?,
-            k_norm: load_norm_optional(
-                store,
-                &name("self_attn.k_norm.weight"),
-                cfg.head_dim,
-                norm_add_one,
-            )?,
+            k_norm: if cfg.shared_kv {
+                None
+            } else {
+                load_norm_optional(
+                    store,
+                    &name("self_attn.k_norm.weight"),
+                    cfg.head_dim,
+                    norm_add_one,
+                )?
+            },
             mla: None,
             // Gemma2's extra norm pair; absent on every other architecture.
             pre_feedforward_layernorm: load_norm_optional(
@@ -1293,10 +1529,60 @@ fn load_layer_tensors_raw(
                 hidden,
                 norm_add_one,
             )?,
+            linear: None,
+            attn_gate: None,
+            ple: load_ple(store, cfg, layer, quant, packed)?,
+            // Gemma 4 scales each layer's output by a learned scalar.
+            layer_scalar: load_optional(store, &name("layer_scalar"), 1)?.map(|v| v[0]),
         }
     };
     tensors.validate(cfg)?;
     Ok(tensors)
+}
+
+/// Gemma 4's per-layer-input weights for `layer`, when the config gives the
+/// layers inputs; layer 0 also takes the model-level projection and its norm,
+/// which turn the embedding into those inputs' context half.
+fn load_ple(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    layer: u32,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+) -> Result<Option<crate::forward::PleWeights>> {
+    let (h, p) = (cfg.hidden_size, cfg.ple_dim);
+    if p == 0 {
+        return Ok(None);
+    }
+    let name = |suffix: &str| format!("model.layers.{layer}.{suffix}");
+    // A GGUF already chose these tensors' precision (llama.cpp keeps them f32
+    // and bf16); quantizing them again would only lose what it kept.
+    let quant = if store.gguf_metadata().is_some() {
+        QuantScheme::Fp16
+    } else {
+        quant
+    };
+    let model = if layer == 0 {
+        Some((
+            load_linear(
+                store,
+                "model.per_layer_model_projection",
+                h,
+                cfg.ple_layers * p,
+                quant,
+                packed,
+            )?,
+            load_tensor(store, "model.per_layer_projection_norm.weight", p)?,
+        ))
+    } else {
+        None
+    };
+    Ok(Some(crate::forward::PleWeights {
+        gate: load_linear(store, &name("per_layer_input_gate"), h, p, quant, packed)?,
+        proj: load_linear(store, &name("per_layer_projection"), p, h, quant, packed)?,
+        post_norm: load_tensor(store, &name("post_per_layer_input_norm.weight"), h)?,
+        model,
+    }))
 }
 
 /// Load a layer's MLA (DeepSeek) projection weights from the
@@ -1394,9 +1680,8 @@ struct MoeNames {
     shared: Option<(String, Option<String>)>, // (shared_expert base, optional sigmoid gate)
 }
 
-fn moe_names(naming: crate::model::MoeNaming, layer: u32) -> MoeNames {
+fn moe_names(naming: crate::model::MoeNaming, p: &str) -> MoeNames {
     use crate::model::MoeNaming::*;
-    let p = format!("model.layers.{layer}");
     match naming {
         // Mixtral: block_sparse_moe.{gate, experts.N.{w1,w3,w2}}, no shared expert.
         Mixtral => MoeNames {
@@ -1467,6 +1752,375 @@ fn load_expert(
     })
 }
 
+/// Routed expert `e`. Most checkpoints name each expert's three projections
+/// (`experts.{e}.gate_proj`, ...); Qwen3.5/3.6 stack them all in 3-D tensors,
+/// transformers' `experts.gate_up_proj` (`[experts, 2·inter, hidden]`, gate rows
+/// first) and `experts.down_proj` (`[experts, hidden, inter]`), and llama.cpp
+/// its `ffn_{gate,up,down}_exps` (read here as `experts.{gate,up,down}_exps`).
+/// An expert's rows of a stacked tensor are one contiguous run.
+fn load_routed_expert(
+    store: &MmapStore,
+    names: &MoeNames,
+    e: u32,
+    m: &crate::model::MoeConfig,
+    hidden: usize,
+    quant: QuantScheme,
+    packed: Option<PackedQuant>,
+) -> Result<ExpertFfn> {
+    let base = &names.experts_base;
+    let (n, inter, e) = (
+        m.num_experts as usize,
+        m.moe_intermediate_size as usize,
+        e as usize,
+    );
+    let rows = |first: usize, count: usize| first..first + count;
+    if store.locate(&format!("{base}.gate_up_proj")).is_some() {
+        let gate_up = format!("{base}.gate_up_proj");
+        return Ok(ExpertFfn {
+            gate: load_rows(
+                store,
+                &gate_up,
+                hidden,
+                n * 2 * inter,
+                rows(e * 2 * inter, inter),
+                quant,
+            )?,
+            up: load_rows(
+                store,
+                &gate_up,
+                hidden,
+                n * 2 * inter,
+                rows(e * 2 * inter + inter, inter),
+                quant,
+            )?,
+            down: load_rows(
+                store,
+                &format!("{base}.down_proj"),
+                inter,
+                n * hidden,
+                rows(e * hidden, hidden),
+                quant,
+            )?,
+            up_bias: None,
+            down_bias: None,
+        });
+    }
+    if store.locate(&format!("{base}.gate_exps")).is_some() {
+        let stacked = |part: &str, in_f: usize, out_f: usize| {
+            load_rows(
+                store,
+                &format!("{base}.{part}_exps"),
+                in_f,
+                n * out_f,
+                rows(e * out_f, out_f),
+                quant,
+            )
+        };
+        return Ok(ExpertFfn {
+            gate: stacked("gate", hidden, inter)?,
+            up: stacked("up", hidden, inter)?,
+            down: stacked("down", inter, hidden)?,
+            up_bias: None,
+            down_bias: None,
+        });
+    }
+    load_expert(
+        store,
+        &format!("{base}.{e}"),
+        names.proj,
+        hidden,
+        inter,
+        quant,
+        packed,
+    )
+}
+
+/// Rows `rows`, in that order, of the `[total_rows, in_features]` matrix `name`
+/// (a 3-D `[n, r, c]` tensor is its `n·r` rows), as one weight: float rows in
+/// their own dtype (or quantized by `--quant`), ggml rows as their blocks.
+///
+/// What slices Qwen3.5's stacked experts and fused query/gate projection, and
+/// reorders its query and key heads for partial RoPE.
+fn load_rows(
+    store: &MmapStore,
+    name: &str,
+    in_features: usize,
+    total_rows: usize,
+    rows: impl IntoIterator<Item = usize>,
+    quant: QuantScheme,
+) -> Result<Weights> {
+    let (shard, info) = store
+        .locate(name)
+        .ok_or_else(|| DlmError::UnknownTensor(name.to_string()))?;
+    if info.num_elements() != total_rows * in_features {
+        return Err(DlmError::InvalidConfig(format!(
+            "tensor {name:?}: expected {total_rows}x{in_features} elements, got {}",
+            info.num_elements()
+        )));
+    }
+    let kind = crate::storage::ggml_quant::GgmlKind::from_dtype(info.dtype);
+    let row_bytes = match (kind, info.dtype) {
+        (Some(k), _) if in_features % k.block_elems() == 0 => k.byte_len(in_features),
+        (Some(_), d) => {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "tensor {name:?}: a {in_features}-wide row is not a whole number of {d:?} blocks"
+            )))
+        }
+        (None, Dtype::F32) => 4 * in_features,
+        (None, Dtype::BF16 | Dtype::F16) => 2 * in_features,
+        (None, other) => {
+            return Err(DlmError::UnsupportedQuant(format!(
+                "tensor {name:?} has dtype {other:?}; dlm reads F32/F16/BF16 or ggml blocks"
+            )))
+        }
+    };
+    let rows: Vec<usize> = rows.into_iter().collect();
+    if let Some(&r) = rows.iter().find(|&&r| r >= total_rows) {
+        return Err(DlmError::InvalidConfig(format!(
+            "tensor {name:?}: row {r} of {total_rows}"
+        )));
+    }
+    // One read of the span the rows cover: a stacked expert's rows are one run.
+    let (lo, hi) = (
+        rows.iter().copied().min().unwrap_or(0),
+        rows.iter().copied().max().map_or(0, |r| r + 1),
+    );
+    let span = shard.read_tensor_range(name, lo * row_bytes..hi * row_bytes)?;
+    let mut out = Vec::with_capacity(rows.len() * row_bytes);
+    for &r in &rows {
+        out.extend_from_slice(&span[(r - lo) * row_bytes..(r - lo + 1) * row_bytes]);
+    }
+    let count = rows.len();
+    if let Some(kind) = kind {
+        return Ok(Weights::Ggml {
+            blob: out,
+            kind,
+            num_elements: count * in_features,
+        });
+    }
+    if matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
+        let floats = bytes_to_f32(&out, info.dtype)?;
+        let group = crate::forward::QUANT_GROUP_SIZE;
+        return match quant {
+            QuantScheme::Int4 => Weights::quantize_int4(&floats, group),
+            _ => Weights::quantize_int8(&floats, group),
+        };
+    }
+    Ok(match info.dtype {
+        Dtype::F32 => Weights::F32(bytes_to_f32(&out, Dtype::F32)?),
+        Dtype::BF16 => Weights::Bf16(bytes_to_u16(&out, name)?),
+        _ => Weights::F16(bytes_to_u16(&out, name)?),
+    })
+}
+
+/// One Qwen3.5/3.6 layer under `prefix` (`cfg` already resolved for it): a
+/// Gated DeltaNet layer, or a full-attention one whose query projection carries
+/// the output gate (each head's query rows, then its gate rows) and whose query
+/// and key heads are reordered for partial RoPE ([`partial_rope_order`]). The
+/// FFN is routed experts plus a gated shared expert.
+///
+/// [`partial_rope_order`]: crate::forward::cpu::partial_rope_order
+fn load_hybrid_layer(
+    store: &MmapStore,
+    cfg: &BlockConfig,
+    prefix: &str,
+    quant: QuantScheme,
+    more: QuantScheme,
+    include_experts: bool,
+    norm_add_one: bool,
+) -> Result<LayerTensors> {
+    if store.lora().is_some() {
+        return Err(DlmError::InvalidConfig(
+            "LoRA adapters are not supported for Qwen3.5/3.6 checkpoints yet".into(),
+        ));
+    }
+    let name = |s: &str| format!("{prefix}.{s}");
+    let h = cfg.hidden_size;
+    // Small and precision-sensitive (the router, beta and the decay's input):
+    // kept in the checkpoint's own dtype under `--quant`, as the router is.
+    let native = if matches!(quant, QuantScheme::Int4 | QuantScheme::Int8) {
+        QuantScheme::Fp16
+    } else {
+        quant
+    };
+    let ffn = match cfg.moe {
+        Some(_) => load_moe_ffn(store, cfg, prefix, quant, None, include_experts)?,
+        None => {
+            return Err(DlmError::InvalidConfig(
+                "a hybrid (linear-attention) layer without routed experts".into(),
+            ))
+        }
+    };
+    let input_layernorm = load_norm(store, &name("input_layernorm.weight"), h, norm_add_one)?;
+    let post_attention_layernorm = load_norm(
+        store,
+        &name("post_attention_layernorm.weight"),
+        h,
+        norm_add_one,
+    )?;
+
+    let tensors = if let Some(l) = &cfg.linear {
+        let la = |s: &str| name(&format!("linear_attn.{s}"));
+        let nv = l.num_v_heads as usize;
+        // transformers keeps `A_log`; llama.cpp stores `-exp(A_log)` already.
+        let a_neg = match load_optional(store, &la("A_log"), nv)? {
+            Some(a_log) => a_log.iter().map(|x| -x.exp()).collect(),
+            None => load_tensor(store, &la("A_neg"), nv)?,
+        };
+        LayerTensors {
+            o_proj: load_linear(store, &la("out_proj"), l.value_dim(), h, more, None)?,
+            linear: Some(crate::forward::cpu::LinearAttnWeights {
+                in_proj_qkv: load_linear(store, &la("in_proj_qkv"), h, l.conv_dim(), quant, None)?,
+                in_proj_z: load_linear(store, &la("in_proj_z"), h, l.value_dim(), quant, None)?,
+                in_proj_b: load_linear(store, &la("in_proj_b"), h, nv, native, None)?,
+                in_proj_a: load_linear(store, &la("in_proj_a"), h, nv, native, None)?,
+                conv1d: load_tensor(
+                    store,
+                    &la("conv1d.weight"),
+                    l.conv_dim() * l.conv_kernel as usize,
+                )?,
+                a_neg,
+                dt_bias: load_tensor(store, &la("dt_bias"), nv)?,
+                // The gated norm is a plain `w`, never `(1 + w)`.
+                norm: load_tensor(store, &la("norm.weight"), l.v_head_dim as usize)?,
+            }),
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
+            ..Default::default()
+        }
+    } else {
+        let (d, nh, nkv) = (cfg.head_dim, cfg.num_heads, cfg.num_kv_heads);
+        let order: Vec<usize> = match cfg.rotary_dim.filter(|&r| r < d) {
+            Some(r) => crate::forward::cpu::partial_rope_order(d, r),
+            None => (0..d).collect(),
+        };
+        let q_name = name("self_attn.q_proj.weight");
+        let gated = cfg.attn_output_gate;
+        // Per head: `d` query rows, then (gated) `d` gate rows.
+        let stride = if gated { 2 * d } else { d };
+        let heads = |n: usize, stride: usize, offset: usize, order: &[usize]| -> Vec<usize> {
+            (0..n)
+                .flat_map(|hh| order.iter().map(move |&i| hh * stride + offset + i))
+                .collect()
+        };
+        let plain: Vec<usize> = (0..d).collect();
+        let reorder = |v: Vec<f32>| order.iter().map(|&i| v[i]).collect::<Vec<f32>>();
+        LayerTensors {
+            q_proj: load_rows(
+                store,
+                &q_name,
+                h,
+                nh * stride,
+                heads(nh, stride, 0, &order),
+                quant,
+            )?,
+            attn_gate: if gated {
+                Some(load_rows(
+                    store,
+                    &q_name,
+                    h,
+                    nh * stride,
+                    heads(nh, stride, d, &plain),
+                    quant,
+                )?)
+            } else {
+                None
+            },
+            k_proj: load_rows(
+                store,
+                &name("self_attn.k_proj.weight"),
+                h,
+                nkv * d,
+                heads(nkv, d, 0, &order),
+                quant,
+            )?,
+            v_proj: load_linear(store, &name("self_attn.v_proj"), h, nkv * d, more, None)?,
+            o_proj: load_linear(store, &name("self_attn.o_proj"), nh * d, h, quant, None)?,
+            q_norm: Some(reorder(load_norm(
+                store,
+                &name("self_attn.q_norm.weight"),
+                d,
+                norm_add_one,
+            )?)),
+            k_norm: Some(reorder(load_norm(
+                store,
+                &name("self_attn.k_norm.weight"),
+                d,
+                norm_add_one,
+            )?)),
+            ffn,
+            input_layernorm,
+            post_attention_layernorm,
+            ..Default::default()
+        }
+    };
+    tensors.validate(cfg)?;
+    Ok(tensors)
+}
+
+/// Qwen3.5/3.6's multi-token-prediction head, loaded beside the model and not
+/// run: it combines the embedding of token `t+1` (`pre_fc_norm_embedding`) with
+/// the model's last hidden state at `t` (`pre_fc_norm_hidden`) through `fc`, runs
+/// that through its own full-attention MoE layer(s), and predicts token `t+2`
+/// through `norm` and the shared LM head.
+pub struct MtpWeights {
+    /// `[hidden, 2·hidden]`, over `[embedding ; hidden]`.
+    pub fc: Weights,
+    pub pre_fc_norm_embedding: Vec<f32>,
+    pub pre_fc_norm_hidden: Vec<f32>,
+    pub norm: Vec<f32>,
+    /// Full-attention layers, configured by [`cfg`](Self::cfg).
+    pub layers: Vec<LayerTensors>,
+    /// The block config the layers run with ([`MtpWeights::block_config`]).
+    pub cfg: BlockConfig,
+}
+
+impl MtpWeights {
+    /// The block config the MTP layers run with: the model's, as a
+    /// full-attention layer.
+    pub fn block_config(config: &ModelConfig) -> BlockConfig {
+        BlockConfig {
+            linear: None,
+            ..block_config(config)
+        }
+    }
+}
+
+/// The checkpoint's MTP head, or `None` when it ships none. transformers names
+/// it `mtp.*` (its layers `mtp.layers.{i}`); llama.cpp's GGUF puts the layers
+/// after the model's as `blk.{num_layers + i}` and the rest under `nextn.*`,
+/// which the GGUF reader renames to the same.
+pub fn load_mtp(store: &MmapStore, config: &ModelConfig) -> Result<Option<MtpWeights>> {
+    if config.mtp_layers == 0 || store.locate("mtp.fc.weight").is_none() {
+        return Ok(None);
+    }
+    let h = config.hidden_size as usize;
+    let add_one = config.norm_add_one;
+    let cfg = MtpWeights::block_config(config);
+    let layers = (0..config.mtp_layers)
+        .map(|i| {
+            load_hybrid_layer(
+                store,
+                &cfg,
+                &format!("mtp.layers.{i}"),
+                config.quant,
+                config.quant,
+                true,
+                add_one,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(MtpWeights {
+        fc: load_linear(store, "mtp.fc", 2 * h, h, config.quant, None)?,
+        pre_fc_norm_embedding: load_norm(store, "mtp.pre_fc_norm_embedding.weight", h, add_one)?,
+        pre_fc_norm_hidden: load_norm(store, "mtp.pre_fc_norm_hidden.weight", h, add_one)?,
+        norm: load_norm(store, "mtp.norm.weight", h, add_one)?,
+        layers,
+        cfg,
+    }))
+}
+
 /// Build a layer's [`Ffn::Moe`]: the router, the routed experts (skipped when
 /// `include_experts` is false — the GPU streaming core defers them to its
 /// per-`(layer, expert)` cache), and any shared expert.
@@ -1478,15 +2132,14 @@ fn load_expert(
 pub(crate) fn load_moe_ffn(
     store: &MmapStore,
     cfg: &BlockConfig,
-    layer: u32,
+    prefix: &str,
     quant: QuantScheme,
     packed: Option<PackedQuant>,
     include_experts: bool,
 ) -> Result<Ffn> {
     let m = cfg.moe.expect("load_moe_ffn requires MoE config");
     let hidden = cfg.hidden_size;
-    let inter = m.moe_intermediate_size as usize;
-    let names = moe_names(m.naming, layer);
+    let names = moe_names(m.naming, prefix);
 
     // The router is precision-sensitive: quantizing it can flip which experts a
     // token routes to, silently degrading a sparse model, and it is tiny
@@ -1510,10 +2163,7 @@ pub(crate) fn load_moe_ffn(
     )?;
     let experts = if include_experts {
         (0..m.num_experts)
-            .map(|e| {
-                let base = format!("{}.{e}", names.experts_base);
-                load_expert(store, &base, names.proj, hidden, inter, quant, packed)
-            })
+            .map(|e| load_routed_expert(store, &names, e, &m, hidden, quant, packed))
             .collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
@@ -1534,11 +2184,25 @@ pub(crate) fn load_moe_ffn(
         _ => (None, None),
     };
 
+    // DeepSeek-V3's choice-only score bias, a `[num_experts]` buffer beside the
+    // router weight.
+    let router_bias = if m.routing.score_bias {
+        Some(load_norm(
+            store,
+            &format!("{}.e_score_correction_bias", names.router),
+            m.num_experts as usize,
+            false,
+        )?)
+    } else {
+        None
+    };
+
     Ok(Ffn::Moe {
         router,
         experts,
         shared,
         shared_gate,
+        router_bias,
     })
 }
 
@@ -1591,14 +2255,13 @@ impl LayerSource for MmapLayerSource {
             .cfg
             .moe
             .ok_or_else(|| DlmError::InvalidConfig("load_expert on a dense model".into()))?;
-        let names = moe_names(m.naming, layer);
-        let base = format!("{}.{expert}", names.experts_base);
-        load_expert(
+        let names = moe_names(m.naming, &format!("model.layers.{layer}"));
+        load_routed_expert(
             &self.store,
-            &base,
-            names.proj,
+            &names,
+            expert,
+            &m,
             self.cfg.hidden_size,
-            m.moe_intermediate_size as usize,
             self.quant,
             self.packed,
         )
@@ -1633,6 +2296,16 @@ fn load_streaming_pieces(
     let cfg = block_config(config);
     let hidden = cfg.hidden_size;
     let vocab = config.vocab_size as usize;
+    // ponytail: Gemma 4 runs resident only; the streaming kernels would need its
+    // per-layer inputs, shared KV and per-layer head widths threaded through.
+    if cfg.ple_dim > 0 || cfg.kv_shared_from.is_some() {
+        return Err(DlmError::InvalidConfig(
+            "layer streaming (--stream) does not support Gemma 4 yet: its later layers read \
+             the KV cache of earlier ones and every layer takes a per-layer input. Run it \
+             resident on the GPU or on the CPU."
+                .into(),
+        ));
+    }
 
     let gpt2 = is_gpt2_tree(&store);
     let falcon = is_falcon_tree(&store);
@@ -1876,6 +2549,7 @@ pub fn load_model_parts(
     Ok(ModelParts {
         position_embedding,
         final_norm_bias,
+        per_layer: per_layer_embedding(store, &cfg)?,
         cfg,
         layers,
         embedding,
@@ -1889,6 +2563,53 @@ pub fn load_model_parts(
         final_logit_softcap: config.final_logit_softcap,
         head_int4: false,
     })
+}
+
+/// Gemma 4's per-layer token embedding table, mapped (see
+/// [`PerLayerEmbedding`]); `None` for a model without per-layer inputs.
+fn per_layer_embedding(store: &MmapStore, cfg: &BlockConfig) -> Result<Option<PerLayerEmbedding>> {
+    if cfg.ple_dim == 0 {
+        return Ok(None);
+    }
+    check_rope_freqs(store, cfg)?;
+    PerLayerEmbedding::open(
+        store,
+        "model.embed_tokens_per_layer.weight",
+        cfg.ple_layers * cfg.ple_dim,
+        (cfg.ple_dim as f32).sqrt(),
+    )
+    .map(Some)
+}
+
+/// A Gemma 4 GGUF keeps its global layers' partial RoPE as llama.cpp's
+/// `rope_freqs` table, a factor per rotation pair: 1 for a pair that turns, a
+/// huge divisor for one that stays put. The config took Gemma 4's own fraction
+/// (the metadata does not carry it); refuse a file whose table disagrees,
+/// since rotating the wrong pairs runs without complaint and reads wrong.
+fn check_rope_freqs(store: &MmapStore, cfg: &BlockConfig) -> Result<()> {
+    let Some(crate::forward::RopeScaling::Partial { fraction }) = cfg.rope_scaling else {
+        return Ok(());
+    };
+    if store.locate("rope_freqs.weight").is_none() {
+        return Ok(());
+    }
+    let factors = load_floats(store, "rope_freqs.weight")?;
+    let d = cfg.global_head_dim.unwrap_or(cfg.head_dim);
+    let rotated = ((fraction * d as f32) / 2.0).floor() as usize;
+    let agrees = factors.len() == d / 2
+        && factors
+            .iter()
+            .enumerate()
+            .all(|(i, &f)| (f == 1.0) == (i < rotated));
+    if !agrees {
+        return Err(DlmError::InvalidConfig(format!(
+            "the file's rope_freqs ({} factors) do not rotate the first {rotated} of {} pairs \
+             of a global head, as Gemma 4's partial RoPE does",
+            factors.len(),
+            d / 2
+        )));
+    }
+    Ok(())
 }
 
 /// Re-pack `layers`' ggml blocks into dlm's own quantized layout if the

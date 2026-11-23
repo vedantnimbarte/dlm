@@ -76,4 +76,8 @@ fetch gpt2        openai-community/gpt2                       # n_embd/n_head/n_
 # the weights are 14 GB, which is why this family is config-verified rather than
 # run end-to-end (see RELEASING.md).
 fetch falcon      tiiuae/falcon-7b                            # multi_query flag
+# Hybrid: Gated DeltaNet layers between gated full-attention ones, all MoE, in a
+# multimodal config; a pre-tokenizer that keeps marks with letters; a chat
+# template with thinking. 13 MB of tokenizer.json.
+fetch qwen3.6     Qwen/Qwen3.6-35B-A3B chat_template.jinja generation_config.json
 echo "done: $(du -sh "$dest" | cut -f1) total"

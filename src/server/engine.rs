@@ -39,8 +39,11 @@ enum Work {
     Generate(Box<Job>),
     Embed {
         tokens: Vec<u32>,
+        pooling: crate::generate::Pooling,
         reply: Sender<Result<Vec<f32>, String>>,
     },
+    /// Keep the prefix cache in this directory from now on.
+    PersistPrefixCache(std::path::PathBuf),
 }
 
 struct Job {
@@ -48,6 +51,10 @@ struct Job {
     /// Lower is admitted first.
     priority: i32,
     prompt: Vec<u32>,
+    /// Images in the prompt as `pixel_values`, with where each one's tokens
+    /// start; encoded on the engine thread, which owns the GPU.
+    images: Vec<(usize, Vec<f32>)>,
+    vision: Option<Arc<crate::vision::Vision>>,
     max_new: usize,
     eos: Vec<u32>,
     decoding: Decoding,
@@ -110,6 +117,7 @@ pub struct EngineService {
     created: u64,
     default_max_tokens: usize,
     chat_template: ChatTemplate,
+    embedding_pooling: crate::generate::Pooling,
     /// Stop generation when any of these token ids is produced (the model's
     /// EOS set). Empty means run to `max_tokens`.
     eos_tokens: Vec<u32>,
@@ -124,6 +132,8 @@ pub struct EngineService {
     /// How long a request may wait to be admitted, in milliseconds; 0 for no
     /// limit. Shared with the engine loop, which enforces it.
     queue_timeout: Arc<AtomicU64>,
+    /// The vision tower, when the model takes images (Gemma 3 4B+).
+    vision: Option<Arc<crate::vision::Vision>>,
 }
 
 impl EngineService {
@@ -141,7 +151,7 @@ impl EngineService {
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
-            None,
+            Drafting::None,
             0,
             tokenizer,
             vocab_size,
@@ -172,7 +182,7 @@ impl EngineService {
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
-            Some(draft),
+            Drafting::Model(Box::new(draft)),
             gamma,
             tokenizer,
             vocab_size,
@@ -181,6 +191,64 @@ impl EngineService {
             created,
             max_batch,
             prefix_cache_size,
+        )
+    }
+
+    /// Start the engine speculating with an EAGLE-3 `head`: it proposes `gamma`
+    /// tokens per round from `generator`'s own hidden states, and the target
+    /// verifies them. Output is identical to [`start`](Self::start).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_eagle3<K: ComputeKernel + Send + 'static>(
+        generator: Generator<K>,
+        head: crate::forward::eagle3::Eagle3Head,
+        gamma: usize,
+        tokenizer: BpeTokenizer,
+        vocab_size: usize,
+        model_id: impl Into<String>,
+        default_max_tokens: usize,
+        created: u64,
+        max_batch: usize,
+    ) -> Arc<Self> {
+        Self::start_inner(
+            generator,
+            Drafting::Eagle3(Box::new(head)),
+            gamma.max(1),
+            tokenizer,
+            vocab_size,
+            model_id,
+            default_max_tokens,
+            created,
+            max_batch,
+            0,
+        )
+    }
+
+    /// Start the engine speculating with the model's own MTP head (`mtp`,
+    /// `loader::load_mtp`), `gamma` tokens per round. Output is identical to
+    /// [`start`](Self::start).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_mtp<K: ComputeKernel + Send + 'static>(
+        generator: Generator<K>,
+        mtp: crate::loader::MtpWeights,
+        gamma: usize,
+        tokenizer: BpeTokenizer,
+        vocab_size: usize,
+        model_id: impl Into<String>,
+        default_max_tokens: usize,
+        created: u64,
+        max_batch: usize,
+    ) -> Arc<Self> {
+        Self::start_inner(
+            generator,
+            Drafting::Mtp(Box::new(mtp)),
+            gamma.max(1),
+            tokenizer,
+            vocab_size,
+            model_id,
+            default_max_tokens,
+            created,
+            max_batch,
+            0,
         )
     }
 
@@ -201,7 +269,7 @@ impl EngineService {
     ) -> Arc<Self> {
         Self::start_inner(
             generator,
-            None,
+            Drafting::None,
             gamma.max(1),
             tokenizer,
             vocab_size,
@@ -217,7 +285,7 @@ impl EngineService {
     #[allow(clippy::too_many_arguments)]
     fn start_inner<K: ComputeKernel + Send + 'static>(
         generator: Generator<K>,
-        draft: Option<Generator<K>>,
+        draft: Drafting<K>,
         gamma: usize,
         tokenizer: BpeTokenizer,
         vocab_size: usize,
@@ -253,13 +321,24 @@ impl EngineService {
             created,
             default_max_tokens,
             chat_template: ChatTemplate::default(),
+            embedding_pooling: crate::generate::Pooling::default(),
             eos_tokens: Vec::new(),
             max_context: usize::MAX,
             metrics: Metrics::default(),
             stream,
             token_bytes: OnceLock::new(),
             queue_timeout,
+            vision: None,
         })
+    }
+
+    /// Take images in chat requests, encoded by `vision` (called right after
+    /// [`start`](Self::start), while the `Arc` is still unique).
+    pub fn with_vision(mut self: Arc<Self>, vision: crate::vision::Vision) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.vision = Some(Arc::new(vision));
+        }
+        self
     }
 
     /// Each token id's bytes (`None` for special tokens). Requests that look at
@@ -307,6 +386,28 @@ impl EngineService {
         self
     }
 
+    /// Keep the prefix cache in `dir` too, loading what an earlier run left
+    /// there. `dir` must be specific to the model and its settings.
+    pub fn with_prefix_cache_dir(self: Arc<Self>, dir: std::path::PathBuf) -> Arc<Self> {
+        let _ = self
+            .job_tx
+            .lock()
+            .unwrap()
+            .send(Work::PersistPrefixCache(dir));
+        self
+    }
+
+    /// How `/v1/embeddings` pools the tokens' hidden states.
+    pub fn with_embedding_pooling(
+        mut self: Arc<Self>,
+        pooling: crate::generate::Pooling,
+    ) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.embedding_pooling = pooling;
+        }
+        self
+    }
+
     pub fn with_eos_tokens(mut self: Arc<Self>, eos_tokens: Vec<u32>) -> Arc<Self> {
         if let Some(inner) = Arc::get_mut(&mut self) {
             inner.eos_tokens = eos_tokens;
@@ -329,6 +430,7 @@ impl EngineService {
     fn submit_at(
         &self,
         prompt: Vec<u32>,
+        images: Vec<(usize, Vec<f32>)>,
         max_new: usize,
         eos: Vec<u32>,
         decoding: Decoding,
@@ -344,6 +446,8 @@ impl EngineService {
                 id,
                 priority,
                 prompt,
+                vision: self.vision.clone().filter(|_| !images.is_empty()),
+                images,
                 max_new,
                 eos,
                 decoding,
@@ -359,7 +463,11 @@ impl EngineService {
         self.job_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send(Work::Embed { tokens, reply })
+            .send(Work::Embed {
+                tokens,
+                pooling: self.embedding_pooling,
+                reply,
+            })
             .map_err(|_| "the engine has stopped".to_string())?;
         out.recv()
             .map_err(|_| "the engine has stopped".to_string())?
@@ -383,10 +491,18 @@ impl EngineService {
     }
 }
 
+/// What proposes tokens for the engine's speculative rounds, if anything.
+enum Drafting<K: ComputeKernel> {
+    None,
+    Model(Box<Generator<K>>),
+    Eagle3(Box<crate::forward::eagle3::Eagle3Head>),
+    Mtp(Box<crate::loader::MtpWeights>),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn engine_loop<K: ComputeKernel>(
     generator: Generator<K>,
-    draft: Option<Generator<K>>,
+    draft: Drafting<K>,
     gamma: usize,
     job_rx: Receiver<Work>,
     max_batch: usize,
@@ -395,11 +511,15 @@ fn engine_loop<K: ComputeKernel>(
     queue_timeout: Arc<AtomicU64>,
 ) {
     let mut sched = match &draft {
-        // Draft-model sessions can't resume, so they get no prefix cache.
-        Some(d) => BatchScheduler::with_speculative(&generator, d, max_batch, gamma),
-        None if gamma > 0 => BatchScheduler::with_ngram(&generator, max_batch, gamma)
+        // Draft sessions can't resume, so they get no prefix cache.
+        Drafting::Model(d) => BatchScheduler::with_speculative(&generator, d, max_batch, gamma),
+        Drafting::Eagle3(h) => BatchScheduler::with_eagle3(&generator, h, max_batch, gamma),
+        Drafting::Mtp(m) => BatchScheduler::with_mtp(&generator, m, max_batch, gamma),
+        Drafting::None if gamma > 0 => BatchScheduler::with_ngram(&generator, max_batch, gamma)
             .with_prefix_cache(prefix_cache_size),
-        None => BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size),
+        Drafting::None => {
+            BatchScheduler::new(&generator, max_batch).with_prefix_cache(prefix_cache_size)
+        }
     };
     let mut sinks: HashMap<u64, Sender<TokenEvent>> = HashMap::new();
     // The gauges hold from the start, not only after the first request.
@@ -409,9 +529,21 @@ fn engine_loop<K: ComputeKernel>(
     loop {
         let mut take = |work: Work, sched: &mut BatchScheduler<'_, K>| match work {
             Work::Generate(job) => enqueue(sched, &mut sinks, *job),
-            Work::Embed { tokens, reply } => {
-                let _ = reply.send(generator.embedding(&tokens).map_err(|e| e.to_string()));
+            Work::Embed {
+                tokens,
+                pooling,
+                reply,
+            } => {
+                let _ = reply.send(
+                    generator
+                        .embedding(&tokens, pooling)
+                        .map_err(|e| e.to_string()),
+                );
             }
+            Work::PersistPrefixCache(dir) => match sched.persist_prefix_cache(dir.clone()) {
+                Ok(n) => println!("prefix cache : {n} prefixes loaded from {}", dir.display()),
+                Err(e) => eprintln!("prefix cache : cannot use {}: {e}", dir.display()),
+            },
         };
         if !sched.has_work() {
             match job_rx.recv() {
@@ -501,12 +633,39 @@ fn enqueue<K: ComputeKernel>(
         id,
         priority,
         prompt,
+        images,
+        vision,
         max_new,
         eos,
         decoding,
         sink,
     } = job;
-    match sched.submit_prioritized(id, prompt, max_new, eos, decoding, priority) {
+    // Images are encoded here, on the thread that owns the GPU: other requests
+    // wait for it, as they wait for a prompt's prefill.
+    let images = match (&vision, images.is_empty()) {
+        (_, true) => Vec::new(),
+        (None, false) => unreachable!("a job with images carries the vision tower"),
+        (Some(v), false) => {
+            let encoded = images
+                .into_iter()
+                .map(|(start, pixels)| {
+                    v.tower
+                        .encode(&pixels, v.gpu)
+                        .map(|rows| crate::generate::ImageEmbeds { start, rows })
+                })
+                .collect::<crate::error::Result<Vec<_>>>();
+            match encoded {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = sink.send(TokenEvent::Rejected(format!(
+                        "cannot encode the image: {e}"
+                    )));
+                    return;
+                }
+            }
+        }
+    };
+    match sched.submit_with_images(id, prompt, images, max_new, eos, decoding, priority) {
         Ok(()) => {
             sinks.insert(id, sink);
         }
@@ -522,12 +681,60 @@ fn enqueue<K: ComputeKernel>(
 /// serving paths. An assistant message may carry the tool calls it made, and a
 /// `tool` message is a call's result.
 #[derive(Deserialize, Default)]
+#[serde(from = "RawChatMessage")]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(deserialize_with = "content_text")]
     pub content: String,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallIn>>,
+    /// On a `tool` message, the call it answers (Mistral's format names it).
+    pub tool_call_id: Option<String>,
+    /// The `image_url` parts of `content`: each one's URL, and the byte offset
+    /// in `content` (the text parts joined) where it stood.
+    pub images: Vec<(usize, String)>,
+}
+
+/// A chat message as it arrives, before its `content` parts are split into
+/// text and images.
+#[derive(Deserialize)]
+struct RawChatMessage {
+    role: String,
+    content: Content,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallIn>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+impl From<RawChatMessage> for ChatMessage {
+    fn from(m: RawChatMessage) -> Self {
+        let (content, images) = m.content.split();
+        Self {
+            role: m.role,
+            content,
+            tool_calls: m.tool_calls,
+            tool_call_id: m.tool_call_id,
+            images,
+        }
+    }
+}
+
+impl ChatMessage {
+    /// The content as Gemma's template writes it: the text trimmed, and with
+    /// images, each text part trimmed and each image a `<start_of_image>`.
+    fn gemma_content(&self) -> String {
+        if self.images.is_empty() {
+            return self.content.trim().to_string();
+        }
+        let mut out = String::new();
+        let mut from = 0;
+        for (at, _) in &self.images {
+            out.push_str(self.content[from..*at].trim());
+            out.push_str(crate::vision::IMAGE_MARKER);
+            from = *at;
+        }
+        out.push_str(self.content[from..].trim());
+        out
+    }
 }
 
 /// JSON as Hugging Face chat templates' `tojson` writes it: `", "` and `": "`
@@ -617,12 +824,344 @@ fn chatml(messages: &[ChatMessage], tools: &[serde_json::Value]) -> String {
     p
 }
 
+/// Qwen3.5/3.6's chat template without tools, followed to the character: every
+/// content trimmed; an assistant turn's `<think>…</think>` block split off its
+/// answer, and shown again (as `<think>\n{reasoning}\n</think>\n\n`) only on
+/// turns after the last user message; the reply opened with thinking on
+/// (`<|im_start|>assistant\n<think>\n`). Tool calls take Qwen3-Coder's XML
+/// format there, which dlm does not render or parse yet, so a request with
+/// tools is refused ([`ChatTemplate::apply_with_tools`]).
+fn qwen35(messages: &[ChatMessage]) -> String {
+    let mut p = String::new();
+    let mut rest = messages;
+    if let Some(system) = messages.first().filter(|m| m.role == "system") {
+        p.push_str(&format!(
+            "<|im_start|>system\n{}<|im_end|>\n",
+            system.content.trim()
+        ));
+        rest = &messages[1..];
+    }
+    // The template's `last_query_index`: the last user turn that is not just a
+    // tool result.
+    let is_query = |m: &ChatMessage| {
+        let c = m.content.trim();
+        m.role == "user" && !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))
+    };
+    let last_query = rest.iter().rposition(is_query);
+    for (i, m) in rest.iter().enumerate() {
+        let content = m.content.trim();
+        match m.role.as_str() {
+            "assistant" => {
+                let (reasoning, answer) = match content.split_once("</think>") {
+                    Some((before, _)) => {
+                        let after = content.rsplit("</think>").next().unwrap_or("");
+                        let reasoning = before.trim_end_matches('\n');
+                        let reasoning = reasoning.rsplit("<think>").next().unwrap_or("");
+                        (
+                            reasoning.trim_start_matches('\n').trim(),
+                            after.trim_start_matches('\n'),
+                        )
+                    }
+                    None => ("", content),
+                };
+                p.push_str("<|im_start|>assistant\n");
+                if last_query.is_some_and(|q| i > q) {
+                    p.push_str(&format!("<think>\n{reasoning}\n</think>\n\n{answer}"));
+                } else {
+                    p.push_str(answer);
+                }
+                p.push_str("<|im_end|>\n");
+            }
+            "tool" => {
+                if i == 0 || rest[i - 1].role != "tool" {
+                    p.push_str("<|im_start|>user");
+                }
+                p.push_str(&format!("\n<tool_response>\n{content}\n</tool_response>"));
+                if rest.get(i + 1).is_none_or(|n| n.role != "tool") {
+                    p.push_str("<|im_end|>\n");
+                }
+            }
+            role => p.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n")),
+        }
+    }
+    p.push_str("<|im_start|>assistant\n<think>\n");
+    p
+}
+
+/// A call's arguments as the model saw them: an object, where OpenAI sends a
+/// JSON string.
+fn call_arguments(c: &ToolCallIn) -> serde_json::Value {
+    match &c.function.arguments {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        }
+        v => v.clone(),
+    }
+}
+
+/// Today as Llama 3's template writes it (`strftime("%d %b %Y")`, UTC).
+fn today_dmy() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400) as i64;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!("{day:02} {} {year}", MONTHS[month as usize - 1])
+}
+
+/// JSON as Python's `json.dumps(v, indent=4)` writes it, which Llama 3's
+/// template uses for each tool.
+fn tojson_indent4(v: &serde_json::Value) -> String {
+    use serde::Serialize;
+    let mut out = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
+    v.serialize(&mut ser).expect("a JSON value serializes");
+    String::from_utf8(out).expect("serde_json writes UTF-8")
+}
+
+/// Llama 3.1/3.2 with tools, following its Jinja template to the character with
+/// its defaults (`tools_in_user_message`): an `ipython` system header, the tools
+/// and their instructions in the first user turn, a call as a bare
+/// `{"name": …, "parameters": …}` reply, and a result as an `ipython` turn.
+fn llama3_tools(
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    date: &str,
+) -> Result<String, String> {
+    let (system, mut rest) = match messages.first() {
+        Some(m) if m.role == "system" => (m.content.trim(), &messages[1..]),
+        _ => ("", messages),
+    };
+    let mut p = String::from("<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n");
+    p.push_str("Environment: ipython\nCutting Knowledge Date: December 2023\n");
+    p.push_str(&format!("Today Date: {date}\n\n{system}<|eot_id|>"));
+    let Some(first) = rest.first() else {
+        return Err(
+            "Cannot put tools in the first user message when there's no first user message!".into(),
+        );
+    };
+    rest = &rest[1..];
+    p.push_str(
+        "<|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please \
+         respond with a JSON for a function call with its proper arguments that best answers \
+         the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": \
+         dictionary of argument name and its value}.Do not use variables.\n\n",
+    );
+    for t in tools {
+        p.push_str(&tojson_indent4(t));
+        p.push_str("\n\n");
+    }
+    p.push_str(first.content.trim());
+    p.push_str("<|eot_id|>");
+    for m in rest {
+        let calls = m.tool_calls.as_deref().unwrap_or_default();
+        if !calls.is_empty() {
+            let [c] = calls else {
+                return Err("This model only supports single tool-calls at once!".into());
+            };
+            p.push_str(&format!(
+                "<|start_header_id|>assistant<|end_header_id|>\n\n{{\"name\": \"{}\", \
+                 \"parameters\": {}}}<|eot_id|>",
+                c.function.name,
+                tojson(&call_arguments(c))
+            ));
+        } else if m.role == "tool" || m.role == "ipython" {
+            // The template JSON-encodes the result: to Jinja a string is iterable.
+            p.push_str("<|start_header_id|>ipython<|end_header_id|>\n\n");
+            p.push_str(&tojson(&serde_json::Value::String(m.content.clone())));
+            p.push_str("<|eot_id|>");
+        } else {
+            p.push_str(&format!(
+                "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+                m.role,
+                m.content.trim()
+            ));
+        }
+    }
+    p.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    Ok(p)
+}
+
+/// A tool-call id as Mistral's template requires it: 9 alphanumerics. An id
+/// of that shape passes through; any other (OpenAI's `call_…`, or none) maps
+/// to one derived from it, the same for the call and the result naming it.
+fn mistral_call_id(id: Option<&str>, fallback: usize) -> String {
+    match id {
+        Some(id) if id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric()) => id.into(),
+        _ => {
+            let key = id.map_or_else(|| fallback.to_string(), str::to_string);
+            let mut h = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+            });
+            const ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            (0..9)
+                .map(|_| {
+                    let c = ALNUM[(h % ALNUM.len() as u64) as usize] as char;
+                    h /= ALNUM.len() as u64;
+                    c
+                })
+                .collect()
+        }
+    }
+}
+
+/// Mistral v0.3 with tools, following its Jinja template to the character:
+/// `[AVAILABLE_TOOLS]` before the last user turn, the system message folded
+/// into the last user turn, calls as `[TOOL_CALLS] [...]` and results as
+/// `[TOOL_RESULTS]`. BOS is left to the tokenizer, as for plain Mistral.
+fn mistral_tools(messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<String, String> {
+    let (system, rest) = match messages.first() {
+        Some(m) if m.role == "system" => (Some(m.content.as_str()), &messages[1..]),
+        _ => (None, messages),
+    };
+    let is_call = |m: &ChatMessage| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    let turns = rest.iter().filter(|m| !(m.role == "tool" || is_call(m)));
+    for (turn, m) in turns.enumerate() {
+        if (m.role == "user") != (turn % 2 == 0) {
+            return Err(
+                "After the optional system message, conversation roles must alternate \
+                        user/assistant/user/assistant/..."
+                    .into(),
+            );
+        }
+    }
+    let last_user = rest.iter().rposition(|m| m.role == "user");
+    let mut p = String::new();
+    let mut call_index = 0;
+    for (i, m) in rest.iter().enumerate() {
+        if m.role == "user" {
+            if Some(i) == last_user {
+                let listed: Vec<String> = tools
+                    .iter()
+                    .map(|t| {
+                        let fields: Vec<String> = t["function"]
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .filter(|(k, _)| k.as_str() != "return")
+                            .map(|(k, v)| match v {
+                                serde_json::Value::String(s) => format!("\"{k}\": \"{s}\""),
+                                v => format!("\"{k}\": {}", tojson(v)),
+                            })
+                            .collect();
+                        format!(
+                            "{{\"type\": \"function\", \"function\": {{{}}}}}",
+                            fields.join(", ")
+                        )
+                    })
+                    .collect();
+                p.push_str(&format!(
+                    "[AVAILABLE_TOOLS] [{}][/AVAILABLE_TOOLS]",
+                    listed.join(", ")
+                ));
+            }
+            match system {
+                Some(sys) if i + 1 == rest.len() => {
+                    p.push_str(&format!("[INST] {sys}\n\n{}[/INST]", m.content))
+                }
+                _ => p.push_str(&format!("[INST] {}[/INST]", m.content)),
+            }
+        } else if is_call(m) {
+            let calls: Vec<String> = m
+                .tool_calls
+                .iter()
+                .flatten()
+                .map(|c| {
+                    call_index += 1;
+                    format!(
+                        "{{\"name\": {}, \"arguments\": {}, \"id\": \"{}\"}}",
+                        tojson(&serde_json::Value::String(c.function.name.clone())),
+                        tojson(&call_arguments(c)),
+                        mistral_call_id(c.id.as_deref(), call_index)
+                    )
+                })
+                .collect();
+            p.push_str(&format!("[TOOL_CALLS] [{}]</s>", calls.join(", ")));
+        } else if m.role == "assistant" {
+            p.push_str(&format!(" {}</s>", m.content.trim()));
+        } else if m.role == "tool" {
+            p.push_str(&format!(
+                "[TOOL_RESULTS] {{\"content\": {}, \"call_id\": \"{}\"}}[/TOOL_RESULTS]",
+                m.content,
+                mistral_call_id(m.tool_call_id.as_deref(), call_index)
+            ));
+        } else {
+            return Err(
+                "Only user and assistant roles are supported, with the exception of an \
+                        initial optional system message!"
+                    .into(),
+            );
+        }
+    }
+    Ok(p)
+}
+
 /// Where a tool call starts in a ChatML reply.
 const TOOL_OPEN: &str = "<tool_call>";
 
-/// A reply's text before its first `<tool_call>`, and each call's name and
-/// arguments (a JSON string). A reply whose blocks do not hold a call's JSON
-/// is left as text, with no calls.
+/// The calls in a reply, as `(name, arguments JSON)`: every JSON object (or
+/// each object of a JSON array) from `start` on, taking its arguments from
+/// `arguments` or Llama's `parameters`. `None` unless all of it parses.
+fn json_calls(after: &str) -> Option<Vec<(String, String)>> {
+    let mut calls = Vec::new();
+    for v in serde_json::Deserializer::from_str(after).into_iter::<serde_json::Value>() {
+        let v = v.ok()?;
+        let items = match v {
+            serde_json::Value::Array(a) => a,
+            one => vec![one],
+        };
+        for c in items {
+            let name = c["name"].as_str()?.to_string();
+            let args = match c.get("arguments").or_else(|| c.get("parameters")) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => "{}".to_string(),
+            };
+            calls.push((name, args));
+        }
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// A reply's text before its first tool call, and each call's name and
+/// arguments, in `template`'s format: ChatML's `<tool_call>` blocks, Mistral's
+/// `[TOOL_CALLS] [...]`, or Llama 3's bare JSON object. A reply whose call does
+/// not parse is left as text, with no calls.
+fn split_tool_calls_for(template: ChatTemplate, text: &str) -> (String, Vec<(String, String)>) {
+    let open = template.tool_open();
+    if open == TOOL_OPEN {
+        return split_tool_calls(text);
+    }
+    let Some(start) = text.find(open) else {
+        return (text.to_string(), Vec::new());
+    };
+    // Mistral's marker is a token of its own; Llama's is the call's first bytes.
+    let body = if template == ChatTemplate::Mistral {
+        &text[start + open.len()..]
+    } else {
+        &text[start..]
+    };
+    match json_calls(body) {
+        Some(calls) => (text[..start].trim_end().to_string(), calls),
+        None => (text.to_string(), Vec::new()),
+    }
+}
+
+/// ChatML's [`split_tool_calls_for`]: a reply's text before its first
+/// `<tool_call>`, and each call's name and arguments (a JSON string). A reply
+/// whose blocks do not hold a call's JSON is left as text, with no calls.
 fn split_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
     const CLOSE: &str = "</tool_call>";
     let Some(start) = text.find(TOOL_OPEN) else {
@@ -662,6 +1201,8 @@ fn partial_marker(text: &str, marker: &str) -> usize {
 #[derive(Deserialize, Default)]
 pub struct ToolCallIn {
     #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
     pub function: FunctionCallIn,
 }
 
@@ -694,25 +1235,39 @@ struct ContentPart {
     kind: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    /// `{"url": "..."}`, or the URL as a bare string, which some clients send.
+    #[serde(default)]
+    image_url: Option<serde_json::Value>,
 }
 
-/// The text of a `content` field, whichever form it arrived in. Parts that are
-/// not text (an image) are dropped rather than refused: dlm serves text, and a
-/// conversation that mentions a picture is still worth answering.
-fn content_text<'de, D>(d: D) -> std::result::Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(match Content::deserialize(d)? {
-        Content::Text(s) => s,
-        Content::Null => String::new(),
-        Content::Parts(parts) => parts
-            .iter()
-            .filter(|p| p.kind.as_deref().unwrap_or("text") == "text")
-            .filter_map(|p| p.text.as_deref())
-            .collect::<Vec<_>>()
-            .join(""),
-    })
+impl Content {
+    /// The text of a `content` field, whichever form it arrived in, and the
+    /// URLs of its images with where each stood in that text. A model without
+    /// a vision tower ignores the images: a conversation that mentions a
+    /// picture is still worth answering.
+    fn split(self) -> (String, Vec<(usize, String)>) {
+        match self {
+            Content::Text(s) => (s, Vec::new()),
+            Content::Null => (String::new(), Vec::new()),
+            Content::Parts(parts) => {
+                let (mut text, mut images) = (String::new(), Vec::new());
+                for p in parts {
+                    match p.kind.as_deref().unwrap_or("text") {
+                        "text" => text.push_str(p.text.as_deref().unwrap_or_default()),
+                        "image_url" => {
+                            let url = p
+                                .image_url
+                                .as_ref()
+                                .and_then(|u| u.get("url").and_then(|u| u.as_str()).or(u.as_str()));
+                            images.push((text.len(), url.unwrap_or_default().to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+                (text, images)
+            }
+        }
+    }
 }
 
 /// OpenAI `stop`: either a single string or a list of them.
@@ -1232,15 +1787,22 @@ pub enum ChatTemplate {
     /// Gemma 1/2 (`<start_of_turn>user … <end_of_turn>`); the assistant role is
     /// `model`, and a system prompt is folded into the first user turn.
     Gemma,
+    /// Gemma 4 (`<|turn>user … <turn|>`), which has a system turn of its own.
+    Gemma4,
     /// Phi-3 (`<|user|>\n … <|end|>`).
     Phi3,
     /// DeepSeek-V2 chat (`User: …\n\nAssistant:`).
     DeepSeek,
+    /// Qwen3.5/3.6: ChatML with thinking. Earlier answers lose their
+    /// `<think>` block, turns after the last user query keep it, and the reply
+    /// opens one (`<|im_start|>assistant\n<think>\n`). See [`qwen35`].
+    Qwen35,
 }
 
 impl ChatTemplate {
     /// Every name `--chat-template` accepts, besides `auto`.
-    pub const NAMES: &'static str = "plain, chatml, llama3, llama2, mistral, gemma, phi3, deepseek";
+    pub const NAMES: &'static str =
+        "plain, chatml, llama3, llama2, mistral, gemma, gemma4, phi3, deepseek, qwen3.5";
 
     /// Parse a `--chat-template` value (`auto` is resolved by the caller).
     pub fn parse(s: &str) -> Option<Self> {
@@ -1251,8 +1813,10 @@ impl ChatTemplate {
             "llama2" | "llama-2" => Some(ChatTemplate::Llama2),
             "mistral" => Some(ChatTemplate::Mistral),
             "gemma" => Some(ChatTemplate::Gemma),
+            "gemma4" => Some(ChatTemplate::Gemma4),
             "phi3" | "phi-3" => Some(ChatTemplate::Phi3),
             "deepseek" => Some(ChatTemplate::DeepSeek),
+            "qwen3.5" | "qwen35" | "qwen3.6" => Some(ChatTemplate::Qwen35),
             _ => None,
         }
     }
@@ -1266,14 +1830,25 @@ impl ChatTemplate {
             ChatTemplate::Llama2 => "llama2",
             ChatTemplate::Mistral => "mistral",
             ChatTemplate::Gemma => "gemma",
+            ChatTemplate::Gemma4 => "gemma4",
             ChatTemplate::Phi3 => "phi3",
             ChatTemplate::DeepSeek => "deepseek",
+            ChatTemplate::Qwen35 => "qwen3.5",
         }
     }
 
     /// The checkpoint's Jinja chat template, if it ships one. `chat_template` may be
     /// a string or a list of named templates, of which `default` is the chat one.
     pub fn read_jinja(model_path: &std::path::Path) -> Option<String> {
+        // A GGUF file carries it in its metadata.
+        if model_path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            let store = crate::storage::MmapStore::open_path(model_path).ok()?;
+            let meta = store.gguf_metadata()?;
+            return meta
+                .get("tokenizer.chat_template")?
+                .as_str()
+                .map(str::to_string);
+        }
         if let Ok(s) = std::fs::read_to_string(model_path.join("chat_template.jinja")) {
             return Some(s);
         }
@@ -1301,10 +1876,15 @@ impl ChatTemplate {
         // as plain ChatML would be quietly wrong.
         if has("<|im_sep|>") {
             None
+        } else if has("<|im_start|>") && has("enable_thinking") && has("<function=") {
+            // Qwen3.5/3.6: thinking, with Qwen3-Coder's XML tool calls.
+            Some(ChatTemplate::Qwen35)
         } else if has("<|im_start|>") {
             Some(ChatTemplate::ChatMl)
         } else if has("<|start_header_id|>") {
             Some(ChatTemplate::Llama3)
+        } else if has("<|turn>") {
+            Some(ChatTemplate::Gemma4)
         } else if has("<start_of_turn>") {
             Some(ChatTemplate::Gemma)
         } else if has("<<SYS>>") {
@@ -1320,14 +1900,24 @@ impl ChatTemplate {
         }
     }
 
+    /// Where a tool call starts in this format's replies.
+    fn tool_open(&self) -> &'static str {
+        match self {
+            ChatTemplate::Llama3 => "{\"name\"",
+            ChatTemplate::Mistral => "[TOOL_CALLS]",
+            _ => TOOL_OPEN,
+        }
+    }
+
     /// The control token that closes a turn, when the format has one distinct
     /// from EOS. Generation must stop on it even when `config.json` lists only
     /// `<eos>` (gemma-1.1 does), or the model runs on into a fabricated next turn.
     pub fn end_of_turn(&self) -> Option<&'static str> {
         match self {
-            ChatTemplate::ChatMl => Some("<|im_end|>"),
+            ChatTemplate::ChatMl | ChatTemplate::Qwen35 => Some("<|im_end|>"),
             ChatTemplate::Llama3 => Some("<|eot_id|>"),
             ChatTemplate::Gemma => Some("<end_of_turn>"),
+            ChatTemplate::Gemma4 => Some("<turn|>"),
             ChatTemplate::Phi3 => Some("<|end|>"),
             _ => None,
         }
@@ -1336,9 +1926,9 @@ impl ChatTemplate {
     /// Render `messages` into the prompt string for this template. BOS is left
     /// to the tokenizer (`add_bos_token`), which skips it when the text already
     /// starts with it.
-    /// [`apply`](Self::apply), with `tools` the model may call. Only ChatML has a
-    /// tool format dlm writes (Qwen's: the tools in the system turn, calls in
-    /// `<tool_call>` tags); any other template refuses them.
+    /// [`apply`](Self::apply), with `tools` the model may call, in the format
+    /// the model was trained on: ChatML (Qwen's), Llama 3.1+ and Mistral v0.3.
+    /// Gemma's template has no tool format, and other templates refuse tools.
     pub fn apply_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -1347,8 +1937,10 @@ impl ChatTemplate {
         match self {
             _ if tools.is_empty() => Ok(self.apply(messages)),
             ChatTemplate::ChatMl => Ok(chatml(messages, tools)),
+            ChatTemplate::Llama3 => llama3_tools(messages, tools, &today_dmy()),
+            ChatTemplate::Mistral => mistral_tools(messages, tools),
             other => Err(format!(
-                "tools need the chatml chat template (Qwen); this model's is {}",
+                "tools need the chatml (Qwen), llama3 or mistral chat template; this model's is {}",
                 other.name()
             )),
         }
@@ -1367,6 +1959,7 @@ impl ChatTemplate {
                 p.push_str("assistant:");
             }
             ChatTemplate::ChatMl => p = chatml(messages, &[]),
+            ChatTemplate::Qwen35 => p = qwen35(messages),
             ChatTemplate::Llama3 => {
                 p.push_str("<|begin_of_text|>");
                 for m in messages {
@@ -1425,11 +2018,12 @@ impl ChatTemplate {
                     };
                     p.push_str(&format!(
                         "<start_of_turn>{role}\n{prefix}{}<end_of_turn>\n",
-                        m.content.trim()
+                        m.gemma_content()
                     ));
                 }
                 p.push_str("<start_of_turn>model\n");
             }
+            ChatTemplate::Gemma4 => p = gemma4(messages),
             ChatTemplate::Phi3 => {
                 for m in messages {
                     p.push_str(&format!("<|{}|>\n{}<|end|>\n", m.role, m.content));
@@ -1451,6 +2045,54 @@ impl ChatTemplate {
         }
         p
     }
+}
+
+/// Gemma 4's chat template (`chat_template.jinja`) for plain text turns, as
+/// transformers renders it with `add_generation_prompt`: `<bos>`, a system turn
+/// when the conversation opens with a system (or developer) message, then a
+/// `<|turn>role\n…<turn|>\n` per message with the assistant as `model`.
+/// Consecutive assistant messages share one turn, and an assistant's earlier
+/// thinking (`<|channel>…<channel|>`) is dropped from what it said, as the
+/// template's `strip_thinking` does. Tools and thinking mode are not rendered.
+fn gemma4(messages: &[ChatMessage]) -> String {
+    // Jinja's `trim` is Python's `strip`: whitespace both ends.
+    fn strip_thinking(text: &str) -> String {
+        let mut out = String::new();
+        for part in text.split("<channel|>") {
+            out.push_str(part.split("<|channel>").next().unwrap_or(""));
+        }
+        out.trim().to_string()
+    }
+    let mut p = String::from("<bos>");
+    let mut rest = messages;
+    if let Some(first) = messages
+        .first()
+        .filter(|m| matches!(m.role.as_str(), "system" | "developer"))
+    {
+        p.push_str("<|turn>system\n");
+        p.push_str(first.content.trim());
+        p.push_str("<turn|>\n");
+        rest = &messages[1..];
+    }
+    for (i, m) in rest.iter().enumerate() {
+        let model = m.role == "assistant";
+        let continues = i > 0 && model && rest[i - 1].role == "assistant";
+        if !continues {
+            let role = if model { "model" } else { m.role.as_str() };
+            p.push_str(&format!("<|turn>{role}\n"));
+        }
+        if model {
+            p.push_str(&strip_thinking(&m.content));
+        } else {
+            p.push_str(m.content.trim());
+        }
+        let into_next = model && rest.get(i + 1).is_some_and(|n| n.role == "assistant");
+        if !into_next {
+            p.push_str("<turn|>\n");
+        }
+    }
+    p.push_str("<|turn>model\n");
+    p
 }
 
 fn error_json(message: &str) -> Vec<u8> {
@@ -1768,7 +2410,8 @@ fn collect_completion(
     decoding: Decoding,
     stops: &[String],
 ) -> Result<Generated, String> {
-    collect_completions(engine, ids, max_tokens, vec![decoding], stops, 0).map(|mut g| g.remove(0))
+    collect_completions(engine, ids, &[], max_tokens, vec![decoding], stops, 0)
+        .map(|mut g| g.remove(0))
 }
 
 /// Each of a request's choices with its first event, once every one has
@@ -1784,11 +2427,25 @@ fn start_choices(
     decodings: Vec<Decoding>,
     priority: i32,
 ) -> Result<Started, String> {
+    start_choices_with(engine, ids, &[], max_tokens, decodings, priority)
+}
+
+/// [`start_choices`] for a prompt with images (`pixel_values`, and where each
+/// one's tokens start).
+fn start_choices_with(
+    engine: &EngineService,
+    ids: &[u32],
+    images: &[(usize, Vec<f32>)],
+    max_tokens: usize,
+    decodings: Vec<Decoding>,
+    priority: i32,
+) -> Result<Started, String> {
     let rxs: Vec<_> = decodings
         .into_iter()
         .map(|d| {
             engine.submit_at(
                 ids.to_vec(),
+                images.to_vec(),
                 max_tokens,
                 engine.eos_tokens.clone(),
                 d,
@@ -1817,13 +2474,14 @@ fn busy(body: Vec<u8>) -> Response {
 fn collect_completions(
     engine: &Arc<EngineService>,
     ids: Vec<u32>,
+    images: &[(usize, Vec<f32>)],
     max_tokens: usize,
     decodings: Vec<Decoding>,
     stops: &[String],
     priority: i32,
 ) -> Result<Vec<Generated>, String> {
     let prompt_tokens = ids.len();
-    let started = start_choices(engine, &ids, max_tokens, decodings, priority)?;
+    let started = start_choices_with(engine, &ids, images, max_tokens, decodings, priority)?;
     let out: Vec<Generated> = started
         .into_iter()
         .map(|(first, rx)| collect_from(engine, first, rx, prompt_tokens, stops))
@@ -1926,9 +2584,9 @@ struct Streamed {
     /// Tokens with log-probabilities whose text has not gone out, with their
     /// character offsets.
     pending: Vec<(u32, TokenLogprobs, usize)>,
-    /// Hold back text from the first `<tool_call>` on: the request has tools,
-    /// and calls go out whole at the end.
-    hold_tools: bool,
+    /// Hold back text from the first tool-call marker on: the request has
+    /// tools, and calls go out whole at the end.
+    hold_tools: Option<&'static str>,
 }
 
 impl Streamed {
@@ -1941,7 +2599,7 @@ impl Streamed {
             finish: "length",
             spec: None,
             pending: Vec::new(),
-            hold_tools: false,
+            hold_tools: None,
         }
     }
 
@@ -1968,10 +2626,10 @@ impl Streamed {
                 self.chars = full.chars().count();
                 let cut = earliest_stop(&full, stops);
                 let mut end = cut.unwrap_or(full.len());
-                if self.hold_tools {
-                    end = match full[..end].find(TOOL_OPEN) {
+                if let Some(open) = self.hold_tools {
+                    end = match full[..end].find(open) {
                         Some(at) => at,
-                        None => end - partial_marker(&full[..end], TOOL_OPEN),
+                        None => end - partial_marker(&full[..end], open),
                     };
                 }
                 let visible = &full[..end];
@@ -2007,7 +2665,7 @@ fn stream_choices(
     engine: &EngineService,
     started: Started,
     stops: &[String],
-    hold_tools: bool,
+    hold_tools: Option<&'static str>,
     mut send: impl FnMut(usize, &mut Streamed, String) -> std::io::Result<()>,
 ) -> std::io::Result<Vec<Streamed>> {
     use std::sync::mpsc::RecvTimeoutError;
@@ -2044,6 +2702,51 @@ fn stream_choices(
     Ok(choices)
 }
 
+/// A chat prompt with images: its ids, with each image's tokens laid out as
+/// Gemma 3's processor lays them out, and each image's `pixel_values` with
+/// where its tokens start. Images must arrive inline, as base64 `data:` URLs:
+/// the server fetches nothing on a client's behalf.
+#[allow(clippy::type_complexity)]
+fn image_prompt(
+    engine: &EngineService,
+    vision: &crate::vision::Vision,
+    messages: &[ChatMessage],
+    prompt: &str,
+) -> Result<(Vec<u32>, Vec<(usize, Vec<f32>)>), String> {
+    use crate::vision::image;
+    if engine.chat_template != ChatTemplate::Gemma {
+        return Err(format!(
+            "images need Gemma's chat template; this server uses {} (--chat-template gemma)",
+            engine.chat_template.name()
+        ));
+    }
+    let pixels = messages
+        .iter()
+        .flat_map(|m| &m.images)
+        .map(|(_, url)| {
+            let bytes = image::data_url_bytes(url)?;
+            let img = image::decode(&bytes)?;
+            Ok(image::preprocess(&img, vision.tower.cfg.image_size))
+        })
+        .collect::<crate::error::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    let (ids, starts) = vision
+        .tokens
+        .encode(&engine.tokenizer, prompt)
+        .map_err(|e| format!("tokenize: {e}"))?;
+    if starts.len() != pixels.len() {
+        return Err(format!(
+            "the prompt has {} image markers for {} images (is <start_of_image> in the text?)",
+            starts.len(),
+            pixels.len()
+        ));
+    }
+    if ids.iter().any(|&id| id as usize >= engine.vocab_size) {
+        return Err("prompt token out of model vocab range".into());
+    }
+    Ok((ids, starts.into_iter().zip(pixels).collect()))
+}
+
 fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
     let mut parsed: ChatRequest = match serde_json::from_slice(&req.body) {
         Ok(r) => r,
@@ -2064,6 +2767,17 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
             )
         }
     };
+    // Images go to a model with a vision tower; any other drops them, as it
+    // always has.
+    let vision = engine
+        .vision
+        .as_deref()
+        .filter(|_| parsed.messages.iter().any(|m| !m.images.is_empty()));
+    if vision.is_none() {
+        for m in &mut parsed.messages {
+            m.images.clear();
+        }
+    }
     let prompt = match engine
         .chat_template
         .apply_with_tools(&parsed.messages, &tools)
@@ -2071,9 +2785,15 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         Ok(p) => p,
         Err(e) => return Response::json(400, error_json(&e)),
     };
-    let ids = match engine.encode_prompt(&prompt) {
-        Ok(ids) => ids,
-        Err(e) => return Response::json(400, error_json(&e)),
+    let (ids, images) = match vision {
+        None => match engine.encode_prompt(&prompt) {
+            Ok(ids) => (ids, Vec::new()),
+            Err(e) => return Response::json(400, error_json(&e)),
+        },
+        Some(v) => match image_prompt(engine, v, &parsed.messages, &prompt) {
+            Ok(p) => p,
+            Err(e) => return Response::json(400, error_json(&e)),
+        },
     };
     let requested = parsed.max_tokens.unwrap_or(engine.default_max_tokens);
     let max_tokens = match fit_max_tokens(engine, ids.len(), requested) {
@@ -2096,7 +2816,14 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
 
     if parsed.stream {
         let tools = !tools.is_empty();
-        let started = match start_choices(engine, &ids, max_tokens, decodings, parsed.priority) {
+        let started = match start_choices_with(
+            engine,
+            &ids,
+            &images,
+            max_tokens,
+            decodings,
+            parsed.priority,
+        ) {
             Ok(s) => s,
             Err(why) => return busy(error_json(&why)),
         };
@@ -2116,6 +2843,7 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
         let gs = match collect_completions(
             engine,
             ids,
+            &images,
             max_tokens,
             decodings,
             &stops,
@@ -2138,7 +2866,7 @@ fn handle_chat(engine: &Arc<EngineService>, req: &Request) -> Response {
                     let (content, calls) = if tools.is_empty() {
                         (g.text, Vec::new())
                     } else {
-                        split_tool_calls(&g.text)
+                        split_tool_calls_for(engine.chat_template, &g.text)
                     };
                     Choice {
                         index,
@@ -2468,6 +3196,7 @@ fn handle_completion(engine: &Arc<EngineService>, req: &Request) -> Response {
         let gs = match collect_completions(
             engine,
             ids,
+            &[],
             max_tokens,
             decodings,
             &stops,
@@ -2551,7 +3280,7 @@ fn stream_completion(
             w.flush()
         };
 
-        let choices = stream_choices(&engine, started, &stops, false, |i, c, text| {
+        let choices = stream_choices(&engine, started, &stops, None, |i, c, text| {
             let lps = logprobs.then(|| {
                 let mut out = CompletionLogprobs::default();
                 for (t, lp, offset) in std::mem::take(&mut c.pending) {
@@ -3007,7 +3736,8 @@ fn stream_chat(
         }
 
         let request = engine.next_id.load(Ordering::Relaxed);
-        let mut choices = stream_choices(&engine, started, &stops, tools, |i, c, text| {
+        let hold = tools.then(|| engine.chat_template.tool_open());
+        let mut choices = stream_choices(&engine, started, &stops, hold, |i, c, text| {
             let lps = logprobs.then(|| ChatLogprobs {
                 content: std::mem::take(&mut c.pending)
                     .iter()
@@ -3029,7 +3759,7 @@ fn stream_chat(
             for (i, c) in choices.iter_mut().enumerate() {
                 let full = engine.tokenizer.decode(&c.ids).unwrap_or_default();
                 let full = &full[..earliest_stop(&full, &stops).unwrap_or(full.len())];
-                let (_, calls) = split_tool_calls(full);
+                let (_, calls) = split_tool_calls_for(engine.chat_template, full);
                 let delta = if calls.is_empty() {
                     let rest: String = full.chars().skip(c.sent).collect();
                     if rest.is_empty() {
@@ -3093,6 +3823,86 @@ fn stream_chat(
 mod tests {
     use super::*;
 
+    const WEATHER_TOOL: &str = r#"{"type": "function", "function": {
+        "description": "Get the weather in a city", "name": "get_weather",
+        "parameters": {"properties": {"city": {"description": "City name", "type": "string"}},
+                       "required": ["city"], "type": "object"}}}"#;
+
+    /// Llama 3.2's own Jinja template (rendered by `transformers` with
+    /// `date_string="17 Nov 2026"`) gave the expected string, from the request
+    /// as an OpenAI client sends it.
+    #[test]
+    fn tools_render_as_llama3s_template_does() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "18C and sunny"}]}"#,
+        )
+        .unwrap();
+        let tools = [serde_json::from_str(WEATHER_TOOL).unwrap()];
+        let got = llama3_tools(&req.messages, &tools, "17 Nov 2026").unwrap();
+        let want = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\nToday Date: 17 Nov 2026\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"description\": \"Get the weather in a city\",\n        \"name\": \"get_weather\",\n        \"parameters\": {\n            \"properties\": {\n                \"city\": {\n                    \"description\": \"City name\",\n                    \"type\": \"string\"\n                }\n            },\n            \"required\": [\n                \"city\"\n            ],\n            \"type\": \"object\"\n        }\n    }\n}\n\nWeather in Paris?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}<|eot_id|><|start_header_id|>ipython<|end_header_id|>\n\n\"18C and sunny\"<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+        assert_eq!(got, want);
+    }
+
+    /// Mistral v0.3's own Jinja template (rendered by `transformers`) gave the
+    /// expected string. Its 9-character call id passes through unchanged.
+    #[test]
+    fn tools_render_as_mistrals_template_does() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "abc123XYZ", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "abc123XYZ", "content": "18C and sunny"},
+                {"role": "assistant", "content": "It is 18C and sunny."},
+                {"role": "user", "content": "And Rome?"}]}"#,
+        )
+        .unwrap();
+        let tools = [serde_json::from_str(WEATHER_TOOL).unwrap()];
+        let got = mistral_tools(&req.messages, &tools).unwrap();
+        let want = "[INST] Weather in Paris?[/INST][TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"abc123XYZ\"}]</s>[TOOL_RESULTS] {\"content\": 18C and sunny, \"call_id\": \"abc123XYZ\"}[/TOOL_RESULTS] It is 18C and sunny.</s>[AVAILABLE_TOOLS] [{\"type\": \"function\", \"function\": {\"description\": \"Get the weather in a city\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST] Be brief.\n\nAnd Rome?[/INST]";
+        assert_eq!(got, want);
+        // An OpenAI-style id maps to 9 alphanumerics, the same for the call and
+        // the result that names it.
+        let id = mistral_call_id(Some("call_17_0"), 1);
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(id, mistral_call_id(Some("call_17_0"), 5));
+    }
+
+    /// Each format's calls come back out of a reply; text before the call is
+    /// kept, and a call that does not parse leaves the reply as text.
+    #[test]
+    fn tool_calls_parse_per_template() {
+        let llama = "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}";
+        assert_eq!(
+            split_tool_calls_for(ChatTemplate::Llama3, llama),
+            (
+                String::new(),
+                vec![("get_weather".into(), "{\"city\":\"Paris\"}".into())]
+            )
+        );
+        let mistral = "Sure.[TOOL_CALLS] [{\"name\": \"a\", \"arguments\": {\"x\": 1}}, {\"name\": \"b\", \"arguments\": {}}]";
+        let (text, calls) = split_tool_calls_for(ChatTemplate::Mistral, mistral);
+        assert_eq!(text, "Sure.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "b");
+        let broken = "[TOOL_CALLS] [{\"name\": ";
+        assert_eq!(
+            split_tool_calls_for(ChatTemplate::Mistral, broken),
+            (broken.to_string(), vec![])
+        );
+        assert_eq!(
+            split_tool_calls_for(ChatTemplate::Llama3, "Paris is sunny."),
+            ("Paris is sunny.".to_string(), vec![])
+        );
+    }
+
     /// Tools render exactly as Qwen3's own Jinja template renders them
     /// (`transformers`' `apply_chat_template` on Qwen3-0.6B gave the string
     /// below), from the request as an OpenAI client sends it: arguments as a
@@ -3115,7 +3925,7 @@ mod tests {
         )
         .unwrap();
         let tools = req.tools.unwrap();
-        let want: String = serde_json::from_str(r#""<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"function\": {\"description\": \"Weather for a city\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n24C\n</tool_response><|im_end|>\n<|im_start|>assistant\n""#).unwrap();
+        let want: String = serde_json::from_str(r#""<|im_start|>system\nYou are terse.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18C\n</tool_response>\n<tool_response>\n24C\n</tool_response><|im_end|>\n<|im_start|>assistant\n""#).unwrap();
         assert_eq!(
             ChatTemplate::ChatMl
                 .apply_with_tools(&req.messages, &tools)
@@ -3229,6 +4039,44 @@ Weather in Paris and Rome?<|im_end|>
         assert_eq!(parse(r#"{"role":"assistant","content":null}"#), "");
     }
 
+    /// Qwen3.6's own Jinja template (`transformers`' `apply_chat_template` on
+    /// Qwen/Qwen3.6-35B-A3B, `add_generation_prompt=True`) gave these strings:
+    /// contents trimmed, an earlier answer's thinking dropped, thinking kept on
+    /// turns after the last real user query, and the reply opening `<think>`.
+    #[test]
+    fn qwen35_renders_as_its_template_does() {
+        let msgs = |json: &str| -> Vec<ChatMessage> { serde_json::from_str(json).unwrap() };
+        let cases = [
+            (
+                r#"[{"role":"user","content":"What is 2+2?"}]"#,
+                "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            ),
+            (
+                r#"[{"role":"system","content":"  You are terse.\n"},
+                    {"role":"user","content":"Hi there "},
+                    {"role":"assistant","content":"<think>\nThe user greets.\n</think>\n\nHello!"},
+                    {"role":"user","content":"Name a color."}]"#,
+                "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nName a color.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            ),
+            (
+                r#"[{"role":"user","content":"Q1"},{"role":"assistant","content":"A1"},
+                    {"role":"user","content":"<tool_response>\nx\n</tool_response>"},
+                    {"role":"assistant","content":"<think>\nhmm\n</think>\n\nA2"}]"#,
+                "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\n<tool_response>\nx\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nhmm\n</think>\n\nA2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            ),
+        ];
+        for (json, want) in cases {
+            assert_eq!(ChatTemplate::Qwen35.apply(&msgs(json)), want);
+        }
+        assert_eq!(ChatTemplate::parse("qwen3.5"), Some(ChatTemplate::Qwen35));
+        assert_eq!(ChatTemplate::Qwen35.end_of_turn(), Some("<|im_end|>"));
+        // Its tool format (Qwen3-Coder's XML) is not one dlm renders yet.
+        let tool: serde_json::Value = serde_json::from_str(WEATHER_TOOL).unwrap();
+        assert!(ChatTemplate::Qwen35
+            .apply_with_tools(&msgs(cases[0].0), &[tool])
+            .is_err());
+    }
+
     #[test]
     fn chat_template_parse_and_render() {
         assert_eq!(ChatTemplate::parse("chatml"), Some(ChatTemplate::ChatMl));
@@ -3301,12 +4149,63 @@ Weather in Paris and Rome?<|im_end|>
         );
     }
 
+    /// Gemma 4's template as transformers' `apply_chat_template` renders it
+    /// (`add_generation_prompt=True`) for google/gemma-4-E4B-it's
+    /// `chat_template.jinja`: these strings are its output, not hand-written.
+    #[test]
+    fn gemma4_template_matches_transformers() {
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                vec![msg("user", "Hi there!")],
+                "<bos><|turn>user\nHi there!<turn|>\n<|turn>model\n",
+            ),
+            (
+                vec![msg("system", "  Be brief. "), msg("user", " What is 2+2? ")],
+                "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n\
+                 <|turn>model\n",
+            ),
+            (
+                vec![
+                    msg("system", "S"),
+                    msg("user", "a"),
+                    msg("assistant", "<|channel>thought\nhmm<channel|> b "),
+                    msg("user", "c"),
+                ],
+                "<bos><|turn>system\nS<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n\
+                 <|turn>user\nc<turn|>\n<|turn>model\n",
+            ),
+            (
+                vec![
+                    msg("user", "a"),
+                    msg("assistant", "b"),
+                    msg("assistant", "c"),
+                    msg("user", "d"),
+                ],
+                "<bos><|turn>user\na<turn|>\n<|turn>model\nbc<turn|>\n<|turn>user\nd<turn|>\n\
+                 <|turn>model\n",
+            ),
+        ];
+        for (convo, want) in cases {
+            assert_eq!(ChatTemplate::Gemma4.apply(&convo), want);
+        }
+        assert_eq!(ChatTemplate::Gemma4.end_of_turn(), Some("<turn|>"));
+    }
+
     #[test]
     fn chat_template_detection_by_marker() {
         let cases = [
             ("{{'<|im_start|>' + role}}", Some(ChatTemplate::ChatMl)),
             ("{{'<|start_header_id|>'}}", Some(ChatTemplate::Llama3)),
             ("{{'<start_of_turn>' + role}}", Some(ChatTemplate::Gemma)),
+            (
+                "{{- '<|turn>' + role + '\\n' }}",
+                Some(ChatTemplate::Gemma4),
+            ),
             ("{{'[INST] <<SYS>>\\n'}}", Some(ChatTemplate::Llama2)),
             ("{{'[INST] ' + content}}", Some(ChatTemplate::Mistral)),
             (

@@ -1023,7 +1023,11 @@ fn gpu_kv_in_host_ram_matches_vram() {
         head_dim: cfg.head_dim as u32,
         block_size: 16,
     };
-    for quant in [dlm::forward::KvQuant::None, dlm::forward::KvQuant::Int8] {
+    for quant in [
+        dlm::forward::KvQuant::None,
+        dlm::forward::KvQuant::Int8,
+        dlm::forward::KvQuant::Int4,
+    ] {
         let orch = |host_from: usize| {
             let mut k = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
             k.set_kv_host_layers(host_from);
@@ -1130,6 +1134,7 @@ fn random_moe_layers(cfg: &BlockConfig, n: u32, seed: u64) -> Vec<LayerTensors> 
                     down_bias: None,
                 }),
                 shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+                router_bias: None,
             };
             LayerTensors {
                 q_proj: Weights::from_f32(rng.vec(cfg.q_dim() * h, s)),
@@ -1250,6 +1255,7 @@ fn gpu_moe_matches_cpu_routed_only() {
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
             first_k_dense: 0,
+            routing: Default::default(),
         },
         "routed-only",
     );
@@ -1267,6 +1273,7 @@ fn gpu_moe_matches_cpu_with_shared_expert() {
             norm_topk_prob: true,
             naming: MoeNaming::Qwen,
             first_k_dense: 0,
+            routing: Default::default(),
         },
         "shared-expert",
     );
@@ -1480,6 +1487,7 @@ fn random_mla_layers(
                             down_bias: None,
                         }),
                         shared_gate: shared_inter.map(|_| Weights::from_f32(rng.vec(h, s))),
+                        router_bias: None,
                     }
                 }
             };
@@ -1580,6 +1588,7 @@ fn gpu_mla_moe_streaming_matches_cpu() {
         norm_topk_prob: true,
         naming: MoeNaming::Mixtral,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 6, 0xD5EE, Some(m));
@@ -1598,6 +1607,7 @@ fn gpu_mla_moe_streaming_matches_cpu_with_shared_expert() {
         norm_topk_prob: true,
         naming: MoeNaming::Qwen,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 6, 0xD5EF, Some(m));
@@ -1628,7 +1638,7 @@ fn gpu_resumed_prefix_matches_full_prefill() {
     // int8 KV needs heads a multiple of 32 wide (`int8_kv_cfg`).
     let cases = [
         (small_cfg(), &[KvQuant::None, KvQuant::F16][..]),
-        (int8_kv_cfg(), &[KvQuant::Int8][..]),
+        (int8_kv_cfg(), &[KvQuant::Int8, KvQuant::Int4][..]),
     ];
     for (cfg, quants) in cases {
         let num_layers = 3u32;
@@ -1774,6 +1784,7 @@ fn gpu_grouped_experts_match_cpu() {
             norm_topk_prob: true,
             naming: MoeNaming::Mixtral,
             first_k_dense: 0,
+            routing: Default::default(),
         },
         "grouped-top4",
     );
@@ -1836,8 +1847,13 @@ fn assert_prefill_matches_cpu_kv<K: ComputeKernel>(
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         // int8 KV rounds each value to 1/254 of its group's largest magnitude.
+        // int4 rounds to 1/14 of it, so a value the two sides compute a hair
+        // apart can land a whole step apart. Both quantize the same way: scored
+        // on Qwen2.5-0.5B, int4 KV on the GPU and on the CPU came within 0.011
+        // nats per token of each other.
         let tol = match gpu_kv {
-            dlm::forward::KvQuant::Int8 | dlm::forward::KvQuant::Int4 => 1e-2,
+            dlm::forward::KvQuant::Int8 => 1e-2,
+            dlm::forward::KvQuant::Int4 => 0.15,
             _ => prefill_tol(),
         };
         assert!(
@@ -1922,6 +1938,7 @@ fn gpu_tiled_prefill_matches_cpu() {
             (None, dlm::forward::KvQuant::None),
             (Some(11), dlm::forward::KvQuant::None),
             (None, dlm::forward::KvQuant::Int8),
+            (None, dlm::forward::KvQuant::Int4),
         ] {
             let cfg = BlockConfig {
                 hidden_size: 128,
@@ -1951,22 +1968,25 @@ fn gpu_tiled_prefill_matches_cpu() {
 fn gpu_prefill_matches_cpu_decode_with_int8_kv() {
     let cfg = int8_kv_cfg();
     let layers = random_layers(&cfg, 3, 0x1E8);
-    let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
-    assert_prefill_matches_cpu_kv(
-        cfg,
-        layers.clone(),
-        gpu,
-        "dense int8 kv",
-        dlm::forward::KvQuant::Int8,
-    );
-    let streaming = StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
-    assert_prefill_matches_cpu_kv(
-        cfg,
-        layers,
-        streaming,
-        "streaming int8 kv",
-        dlm::forward::KvQuant::Int8,
-    );
+    for quant in [dlm::forward::KvQuant::Int8, dlm::forward::KvQuant::Int4] {
+        let gpu = GpuKernel::new(cfg, layers.clone(), 64).unwrap();
+        assert_prefill_matches_cpu_kv(
+            cfg,
+            layers.clone(),
+            gpu,
+            &format!("dense {quant:?} kv"),
+            quant,
+        );
+        let streaming =
+            StreamingGpuKernel::new(cfg, VecSource(layers.clone()), 64, 2, None).unwrap();
+        assert_prefill_matches_cpu_kv(
+            cfg,
+            layers.clone(),
+            streaming,
+            &format!("streaming {quant:?} kv"),
+            quant,
+        );
+    }
 }
 
 /// Gemma2's windowed layers must clip inside a prefill chunk too: the window (2)
@@ -2005,6 +2025,7 @@ fn streaming_gpu_prefill_matches_cpu_decode_moe() {
         norm_topk_prob: true,
         naming: MoeNaming::Qwen,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let cfg = BlockConfig {
         moe: Some(m),
@@ -2035,6 +2056,7 @@ fn streaming_gpu_prefill_matches_cpu_decode_mla_moe() {
         norm_topk_prob: true,
         naming: MoeNaming::Mixtral,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let (cfg, sh) = mla_test_config(Some(m));
     let layers = random_mla_layers(&cfg, sh, 4, 0xD5F1, Some(m));
@@ -2992,19 +3014,21 @@ fn gpu_decode_batch_matches_solo_over_long_histories() {
             &|b| lens[b],
         );
     }
-    // int8 KV: both paths quantize each group the same way.
+    // int8 and int4 KV: both paths quantize each group the same way.
     let cfg = int8_kv_cfg();
     let gpu = GpuKernel::new(cfg, random_layers(&cfg, 2, 0x10F7), 320)
         .unwrap()
         .with_kv_pool_tokens(lens.len() * 320);
-    assert_decode_batch_matches_solo_after(
-        &gpu,
-        cfg,
-        lens.len(),
-        dlm::forward::KvQuant::Int8,
-        "long Int8",
-        &|b| lens[b],
-    );
+    for quant in [dlm::forward::KvQuant::Int8, dlm::forward::KvQuant::Int4] {
+        assert_decode_batch_matches_solo_after(
+            &gpu,
+            cfg,
+            lens.len(),
+            quant,
+            &format!("long {quant:?}"),
+            &|b| lens[b],
+        );
+    }
 }
 
 #[test]
@@ -3050,6 +3074,42 @@ fn gpu_decode_batch_matches_solo() {
                     &format!("streaming {quant:?}, pinned cache {pinned}"),
                 );
             }
+        }
+    }
+    // A streamed MoE model decodes a batch layer by layer with its experts
+    // grouped over the batch; alone, a token's expert misses may run on the CPU.
+    // An expert cache of 1 makes the grouped pass evict between experts.
+    let moe_cfg = BlockConfig {
+        moe: Some(MoeConfig {
+            num_experts: 4,
+            experts_per_tok: 2,
+            moe_intermediate_size: 64,
+            shared_intermediate_size: Some(64),
+            norm_topk_prob: true,
+            naming: MoeNaming::Qwen,
+            first_k_dense: 0,
+            routing: Default::default(),
+        }),
+        ..cfg
+    };
+    for cache in [1, 64] {
+        let streaming = StreamingGpuKernel::new(
+            moe_cfg,
+            MoeVecSource(random_moe_layers(&moe_cfg, 3, 0xDECD)),
+            64,
+            2,
+            Some(cache),
+        )
+        .unwrap()
+        .with_kv_pool_tokens(5 * 64);
+        for n in [2, 5] {
+            assert_decode_batch_matches_solo(
+                &streaming,
+                moe_cfg,
+                n,
+                dlm::forward::KvQuant::None,
+                &format!("streaming moe, expert cache {cache}"),
+            );
         }
     }
     let (mla_cfg, shape) = mla_test_config(None);
@@ -3110,6 +3170,7 @@ fn gpu_decode_batch_matches_solo() {
         norm_topk_prob: true,
         naming: MoeNaming::Qwen,
         first_k_dense: 0,
+        routing: Default::default(),
     };
     let moe_cfg = BlockConfig {
         moe: Some(m),
@@ -3490,4 +3551,406 @@ fn gpu_scheduler_prefix_cache_preserves_output() {
         3,
         "every request after the first resumed"
     );
+}
+
+/// Gemma 3 image input on the GPU, against `transformers` on the tiny random
+/// checkpoint in `tests/fixtures/gemma3_vision` (see `tests/gemma3_vision.rs`
+/// for the CPU case): the vision tower through `dlm_vit_block`, then the
+/// image's tokens through the GEMM prefill with its bidirectional mask.
+#[test]
+fn gpu_gemma3_image_prompt_matches_transformers() {
+    use dlm::generate::ImageEmbeds;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gemma3_vision");
+    let r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+    let floats = |v: &serde_json::Value| -> Vec<f32> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    };
+    let max_diff = |a: &[f32], b: &[f32]| {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let ids: Vec<u32> = r["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let pixels: Vec<f32> = floats(&r["pixels_u8"])
+        .into_iter()
+        .map(|u| (u - 127.5) / 127.5)
+        .collect();
+
+    let tower = dlm::vision::VisionTower::find(&dir, None).unwrap().unwrap();
+    let rows = tower.encode(&pixels, true).unwrap();
+    let d = max_diff(&rows, &floats(&r["image_embeds"]));
+    eprintln!("GPU image embeddings: max abs difference {d:e}");
+    assert!(d < prefill_tol(), "GPU image embeddings off by {d}");
+
+    let (config, store) = dlm::loader::open_model(&dir, dlm::model::QuantScheme::Fp16).unwrap();
+    let generator = dlm::loader::load_model_parts(&store, &config, 64)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    let (got, next) = generator
+        .score_with_images(&ids, &[ImageEmbeds { start: 6, rows }])
+        .unwrap();
+    let d = max_diff(&got, &floats(&r["token_logprobs"]));
+    eprintln!("GPU token logprobs: max abs difference {d:e}");
+    assert!(d < prefill_tol(), "GPU token logprobs off by {d}");
+    let d = max_diff(&next, &floats(&r["next_logprobs"]));
+    eprintln!("GPU next-token logprobs: max abs difference {d:e}");
+    assert!(d < prefill_tol(), "GPU next-token logprobs off by {d}");
+}
+
+/// The Gemma 4 fixture (`tests/fixtures/gemma4`) as host parts at `quant`, with
+/// its token ids and transformers' log-probability for each next token.
+fn gemma4_parts(quant: dlm::model::QuantScheme) -> (dlm::loader::ModelParts, Vec<u32>, Vec<f32>) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gemma4");
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+    let ids: Vec<u32> = reference["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let want = reference["token_logprobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    let (config, store) = dlm::loader::open_model(&dir, quant).unwrap();
+    let parts = dlm::loader::load_model_parts(&store, &config, 64).unwrap();
+    (parts, ids, want)
+}
+
+/// Gemma 4 on the GPU against transformers, through prefill and decode: its
+/// own layer kernel (V norm, wider global heads, the shared-KV tail reading
+/// another layer's paged cache, per-layer inputs and scalars).
+#[test]
+fn gpu_gemma4_matches_transformers() {
+    let (parts, ids, want) = gemma4_parts(dlm::model::QuantScheme::Fp16);
+    let g = parts.into_gpu_generator().unwrap();
+    for (path, got) in [
+        ("prefill", g.score(&ids).unwrap()),
+        ("decode", g.score_and_next_decoding(&ids).unwrap().0),
+    ] {
+        assert_eq!(got.len(), want.len());
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (a - b).abs() < 2e-3,
+                "{path} token {i}: gpu {a}, transformers {b}"
+            );
+        }
+    }
+}
+
+/// Gemma 4 on the GPU matches the CPU on the same weights row for row, and a
+/// batch of sequences decodes as each does alone (the batched paths fall back
+/// to one sequence at a time, each handing its shared-KV layers their source's
+/// cache). The fixture is too narrow for an int8 run: its rows are shorter than
+/// a 128-value quantization group; the real GGUF's quantized blocks are checked
+/// by `tests/gemma4_model.rs`.
+#[test]
+fn gpu_gemma4_batch_matches_cpu() {
+    let (parts, ids, _) = gemma4_parts(dlm::model::QuantScheme::Fp16);
+    let cpu = parts.into_cpu_generator().unwrap();
+    let (parts, _, _) = gemma4_parts(dlm::model::QuantScheme::Fp16);
+    let gpu = parts.into_gpu_generator().unwrap();
+    let (c, g) = (
+        cpu.score_and_next(&ids).unwrap(),
+        gpu.score_and_next(&ids).unwrap(),
+    );
+    for (i, (a, b)) in g.1.iter().zip(&c.1).enumerate() {
+        assert!((a - b).abs() < 2e-3, "next token {i}: gpu {a}, cpu {b}");
+    }
+    let cfg = dlm::generate::GenerationConfig {
+        max_new_tokens: 6,
+        ..Default::default()
+    };
+    let prompts: [&[u32]; 2] = [&ids[..5], &ids[3..10]];
+    let batch = gpu.generate_batch(&prompts, &cfg).unwrap();
+    for (p, b) in prompts.iter().zip(&batch) {
+        assert_eq!(&gpu.generate(p, &cfg).unwrap(), b);
+    }
+}
+
+// ── Qwen3.5/3.6: Gated DeltaNet linear attention + gated, partly rotated
+// full attention, all MoE ──────────────────────────────────────────────────
+
+fn qwen35_fixture() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen35_moe")
+}
+
+/// The fixture's tokens and transformers' log-probabilities for them.
+fn qwen35_reference() -> (Vec<u32>, Vec<f32>) {
+    let r: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(qwen35_fixture().join("reference.json")).unwrap())
+            .unwrap();
+    let ids = r["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let lp = r["token_logprobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    (ids, lp)
+}
+
+fn assert_logprobs_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    let worst = got
+        .iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < tol, "{what}: off transformers by {worst}");
+}
+
+/// The resident GPU kernel scores the fixture as transformers does, through a
+/// prefill and through token-by-token decoding.
+#[test]
+fn gpu_qwen35_matches_transformers() {
+    let (ids, want) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    let gen = dlm::loader::load_model_parts(&store, &config, 256)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    let (got, _) = gen.score_and_next(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "resident GPU prefill");
+    let (got, _) = gen.score_and_next_decoding(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "resident GPU decode");
+}
+
+/// The streamed path the real 22 GB model takes: a two-layer window of layer
+/// cores and a routed-expert cache smaller than the experts the prompt touches,
+/// so cores and experts are evicted and fetched again mid-sequence.
+#[test]
+fn streaming_gpu_qwen35_matches_transformers() {
+    let (ids, want) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    // Three experts' worth of cache: under one layer's four.
+    let expert_bytes = 3 * config.expert_params().unwrap() as usize * 2;
+    let gen =
+        dlm::loader::build_streaming_gpu_generator(store, &config, 256, 2, 0, expert_bytes, false)
+            .unwrap();
+    let (got, _) = gen.score_and_next(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "streamed GPU prefill");
+    let (got, _) = gen.score_and_next_decoding(&ids).unwrap();
+    assert_logprobs_close(&got, &want, 2e-3, "streamed GPU decode");
+    let stats = gen.stream_stats().unwrap();
+    assert!(
+        stats.expert_misses > 0 && stats.expert_hits > 0,
+        "{stats:?}"
+    );
+}
+
+/// Several sequences decoded together keep their own recurrent states: each
+/// matches the same prompt decoded alone, on both GPU kernels.
+#[test]
+fn gpu_qwen35_batched_decode_keeps_states_apart() {
+    use dlm::generate::Sampler;
+    let (ids, _) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    let prompts = [&ids[..12], &ids[3..23], &ids[40..47]];
+    fn check<K: ComputeKernel>(gen: &dlm::Generator<K>, prompts: &[&[u32]], what: &str) {
+        let alone: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| {
+                let mut s = gen.start_session(p, Sampler::Greedy).unwrap();
+                (0..8).map(|_| s.step().unwrap()).collect()
+            })
+            .collect();
+        let mut sessions: Vec<_> = prompts
+            .iter()
+            .map(|p| gen.start_session(p, Sampler::Greedy).unwrap())
+            .collect();
+        let mut together = vec![Vec::new(); prompts.len()];
+        for _ in 0..8 {
+            let mut refs: Vec<_> = sessions.iter_mut().collect();
+            for (t, tok) in together
+                .iter_mut()
+                .zip(gen.step_sessions(&mut refs).unwrap())
+            {
+                t.push(tok);
+            }
+        }
+        assert_eq!(together, alone, "{what}");
+    }
+    let resident = dlm::loader::load_model_parts(&store, &config, 256)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    check(&resident, &prompts, "resident");
+    let streamed =
+        dlm::loader::build_streaming_gpu_generator(store, &config, 256, 2, 0, 1 << 20, false)
+            .unwrap();
+    check(&streamed, &prompts, "streamed");
+}
+
+/// A snapshot taken on the GPU (`snapshot_synced` pulls the device state back)
+/// resumes exactly, on the GPU, as the uninterrupted session.
+#[test]
+fn gpu_qwen35_snapshot_resumes_exactly() {
+    use dlm::generate::Sampler;
+    let (ids, _) = qwen35_reference();
+    let (config, store) =
+        dlm::loader::open_model(&qwen35_fixture(), dlm::model::QuantScheme::Fp16).unwrap();
+    let gen = dlm::loader::load_model_parts(&store, &config, 256)
+        .unwrap()
+        .into_gpu_generator()
+        .unwrap();
+    let mut full = gen.start_session(&ids[..40], Sampler::Greedy).unwrap();
+    let want: Vec<u32> = (0..6).map(|_| full.step().unwrap()).collect();
+    let snap = gen
+        .start_session(&ids[..30], Sampler::Greedy)
+        .unwrap()
+        .snapshot_synced()
+        .unwrap();
+    let mut resumed = gen
+        .resume_session(snap.clone(), &ids[..40], Sampler::Greedy)
+        .unwrap();
+    let got: Vec<u32> = (0..6).map(|_| resumed.step().unwrap()).collect();
+    assert_eq!(got, want);
+    // A plain snapshot holds no device state, and says so rather than resuming
+    // from zeros.
+    let plain = gen
+        .start_session(&ids[..30], Sampler::Greedy)
+        .unwrap()
+        .snapshot();
+    let err = gen
+        .resume_session(plain, &ids[..40], Sampler::Greedy)
+        .err()
+        .expect("a snapshot without the device state must not resume");
+    assert!(err.to_string().contains("snapshot_synced"), "{err}");
+}
+
+/// Random weights at the real model's head shapes (key/value heads of 128, 32
+/// value heads over 16 key heads, a 256-wide attention head rotated on 64
+/// dimensions), so the kernels run their real thread counts and loops: CPU vs
+/// resident and streamed GPU over 24 tokens of decode.
+#[test]
+fn gpu_qwen35_matches_cpu_at_real_head_shapes() {
+    use dlm::forward::cpu::LinearAttnWeights;
+    use dlm::model::LinearAttnConfig;
+    let l = LinearAttnConfig {
+        num_k_heads: 16,
+        num_v_heads: 32,
+        k_head_dim: 128,
+        v_head_dim: 128,
+        conv_kernel: 4,
+        full_attention_interval: 2,
+        v_heads_tiled: false,
+    };
+    let m = MoeConfig {
+        num_experts: 4,
+        experts_per_tok: 2,
+        moe_intermediate_size: 64,
+        shared_intermediate_size: Some(64),
+        norm_topk_prob: true,
+        naming: MoeNaming::Qwen,
+        first_k_dense: 0,
+        routing: Default::default(),
+    };
+    let cfg = BlockConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 256,
+        intermediate_size: 64,
+        rope_theta: 1e7,
+        rms_eps: 1e-6,
+        moe: Some(m),
+        linear: Some(l),
+        attn_output_gate: true,
+        rotary_dim: Some(64),
+        ..Default::default()
+    };
+    let h = cfg.hidden_size;
+    let base = random_moe_layers(&cfg, 4, 0x0035);
+    let mut rng = Rng::new(0x3535);
+    let layers: Vec<LayerTensors> = base
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut t)| {
+            t.q_norm = Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect());
+            t.k_norm = Some(rng.vec(cfg.head_dim, 0.3).iter().map(|v| 1.0 + v).collect());
+            if l.is_linear(i as u32) {
+                t.q_proj = Weights::default();
+                t.k_proj = Weights::default();
+                t.v_proj = Weights::default();
+                t.q_norm = None;
+                t.k_norm = None;
+                t.o_proj = Weights::from_f32(rng.vec(h * l.value_dim(), 0.05));
+                t.linear = Some(LinearAttnWeights {
+                    in_proj_qkv: Weights::from_f32(rng.vec(l.conv_dim() * h, 0.05)),
+                    in_proj_z: Weights::from_f32(rng.vec(l.value_dim() * h, 0.05)),
+                    in_proj_b: Weights::from_f32(rng.vec(32 * h, 0.1)),
+                    in_proj_a: Weights::from_f32(rng.vec(32 * h, 0.1)),
+                    conv1d: rng.vec(l.conv_dim() * 4, 0.5),
+                    a_neg: rng.vec(32, 0.5).iter().map(|v| -(0.55 + v)).collect(),
+                    dt_bias: rng.vec(32, 0.5),
+                    norm: rng.vec(128, 0.2).iter().map(|v| 1.0 + v).collect(),
+                });
+            } else {
+                t.attn_gate = Some(Weights::from_f32(rng.vec(cfg.q_dim() * h, 0.05)));
+            }
+            t
+        })
+        .collect();
+    let kv_cfg = KvCacheConfig {
+        num_layers: 4,
+        num_kv_heads: 2,
+        head_dim: 256,
+        block_size: 16,
+    };
+    let mut cpu = ForwardOrchestrator::new(
+        CpuKernel::new(cfg, layers.clone()).unwrap(),
+        PagedKvCache::new(kv_cfg, 8),
+        dlm::forward::KvQuant::None,
+    );
+    let mut res = ForwardOrchestrator::new(
+        GpuKernel::new(cfg, layers.clone(), 64).unwrap(),
+        PagedKvCache::new(kv_cfg, 8),
+        dlm::forward::KvQuant::None,
+    );
+    let mut st = ForwardOrchestrator::new(
+        StreamingGpuKernel::new(cfg, MoeVecSource(layers), 64, 2, None).unwrap(),
+        PagedKvCache::new(kv_cfg, 8),
+        dlm::forward::KvQuant::None,
+    );
+    let mut rng = Rng::new(7);
+    for step in 0..24 {
+        let x = rng.vec(h, 1.0);
+        let (mut a, mut b, mut c) = (x.clone(), x.clone(), x);
+        cpu.decode_token(&mut a).unwrap();
+        res.decode_token(&mut b).unwrap();
+        st.decode_token(&mut c).unwrap();
+        for (what, g) in [("resident", &b), ("streamed", &c)] {
+            let diff = a
+                .iter()
+                .zip(g)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(diff < 2e-3, "{what}: step {step}: off the CPU by {diff}");
+        }
+    }
 }

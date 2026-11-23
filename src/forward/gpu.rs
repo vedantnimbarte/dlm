@@ -225,6 +225,36 @@ extern "C" {
     /// router and expert calls read.
     pub(crate) fn dlm_moe_take_row(hidden_size: i32, b: i32) -> i32;
 
+    /// Copy the current FFN input out to `dst` (`hidden_size` device floats).
+    pub(crate) fn dlm_moe_save_normed(hidden_size: i32, dst: *mut f32) -> i32;
+
+    /// One routed expert over `t` tokens: row `rows[i]` of `norm` (`[*, hidden]`
+    /// device FFN inputs) gathered, the expert run once over all of them, and
+    /// `x[rows[i]] += weights[i] * expert(norm[rows[i]])`. `rows` and `weights`
+    /// are host arrays of `t`; the rows must be distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_apply_expert_rows(
+        hidden_size: i32,
+        inter: i32,
+        w_dtype: i32,
+        w_group_size: i32,
+        down_dtype: i32,
+        down_group: i32,
+        gate: *const c_void,
+        up: *const c_void,
+        down: *const c_void,
+        norm: *const f32,
+        rows: *const i32,
+        weights: *const f32,
+        t: i32,
+        x: *mut f32,
+        activation: i32,
+    ) -> i32;
+
+    /// Make `src` (`hidden_size` device floats) the FFN input the router and
+    /// expert calls read.
+    pub(crate) fn dlm_moe_load_normed(hidden_size: i32, src: *const f32) -> i32;
+
     /// MoE layer, part 2: `y_host[0..out_dim] = W · normed2`, copied to host. For
     /// the router logits (`out_dim = num_experts`) and the shared gate (`out_dim = 1`).
     pub(crate) fn dlm_moe_matvec(
@@ -395,12 +425,134 @@ extern "C" {
         n_experts: i32,
         w_dtype: i32,
         w_group_size: i32,
+        down_dtype: i32,
+        down_group: i32,
         gate: *const DlmPtrs,
         up: *const DlmPtrs,
         down: *const DlmPtrs,
         weights: *const DlmWeights,
         x: *mut f32,
         activation: i32,
+    ) -> i32;
+
+    /// One token through a Gated DeltaNet layer's token mixer (Qwen3.5/3.6),
+    /// the residual folded into `x`; `conv_state` / `ssm_state` are the
+    /// sequence's own device state, updated in place. The FFN input is then
+    /// [`dlm_moe_norm`]'s, as on the MLA path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_linear_attn(
+        hidden_size: i32,
+        nk: i32,
+        nv: i32,
+        dk: i32,
+        dv: i32,
+        kern: i32,
+        v_tiled: i32,
+        rms_eps: f32,
+        weights: *const DlmLinear,
+        in_norm: *const f32,
+        x: *mut f32,
+        conv_state: *mut f32,
+        ssm_state: *mut f32,
+    ) -> i32;
+
+    /// [`dlm_linear_attn`] for up to `DLM_MAX_BATCH` rows of `x`, row `r`
+    /// against `conv_states.p[r]` / `ssm_states.p[r]`, rows in order. Leaves
+    /// each row's FFN input (`post_norm`) for [`dlm_moe_take_row`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_linear_attn_batched(
+        hidden_size: i32,
+        nk: i32,
+        nv: i32,
+        dk: i32,
+        dv: i32,
+        kern: i32,
+        v_tiled: i32,
+        rms_eps: f32,
+        weights: *const DlmLinear,
+        in_norm: *const f32,
+        post_norm: *const f32,
+        x: *mut f32,
+        rows: i32,
+        conv_states: *const DlmSlots,
+        ssm_states: *const DlmSlots,
+    ) -> i32;
+
+    /// Gemma 4, before layer 0: turn the row's per-layer inputs (`ple`, the
+    /// token-id half) into what the layers read, from the embedding `x`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_gemma4_project(
+        hidden_size: i32,
+        ple_dim: i32,
+        layers: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        proj: *const c_void,
+        norm: *const f32,
+        x: *const f32,
+        ple: *mut f32,
+    ) -> i32;
+
+    /// One Gemma 4 layer for one token up to its per-layer input (see
+    /// `src/gpu/kernels.cu`). `shared != 0`: attend over the handed KV's rows
+    /// `0..=num_positions` without writing any.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_gemma4_block(
+        hidden_size: i32,
+        q_dim: i32,
+        kv_dim: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        inter: i32,
+        rms_eps: f32,
+        w_dtype: i32,
+        w_group_size: i32,
+        q_proj: *const c_void,
+        k_proj: *const c_void,
+        v_proj: *const c_void,
+        o_proj: *const c_void,
+        gate_proj: *const c_void,
+        up_proj: *const c_void,
+        down_proj: *const c_void,
+        in_norm: *const f32,
+        post_attn_norm: *const f32,
+        pre_ffn_norm: *const f32,
+        post_ffn_norm: *const f32,
+        q_norm: *const f32,
+        k_norm: *const f32,
+        inv_freq: *const f32,
+        x: *mut f32,
+        kv_keys: *mut c_void,
+        kv_values: *mut c_void,
+        num_positions: i32,
+        position: i32,
+        sliding_window: i32,
+        activation: i32,
+        attn_scale: f32,
+        shared: i32,
+        ext: *const DlmBlockExt,
+    ) -> i32;
+
+    /// The end of a Gemma 4 layer: its per-layer input (`gate` null: none),
+    /// then the layer scalar.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dlm_gemma4_ple(
+        hidden_size: i32,
+        ple_dim: i32,
+        rms_eps: f32,
+        activation: i32,
+        gate_dtype: i32,
+        gate_group: i32,
+        gate: *const c_void,
+        proj_dtype: i32,
+        proj_group: i32,
+        proj: *const c_void,
+        post_norm: *const f32,
+        input: *const f32,
+        scalar: f32,
+        x: *mut f32,
     ) -> i32;
 
     /// MoE layer, part 3: `x += weight · down·(silu(gate·normed2) ⊙ up·normed2)`.
@@ -410,6 +562,8 @@ extern "C" {
         inter: i32,
         w_dtype: i32,
         w_group_size: i32,
+        down_dtype: i32,
+        down_group: i32,
         gate: *const c_void,
         up: *const c_void,
         down: *const c_void,
@@ -540,6 +694,221 @@ pub(crate) struct DlmBlockExt {
     /// are wrong and still generate fluent text.
     w_dtype: [i32; 7],
     w_group: [i32; 7],
+    /// Qwen3.5/3.6's attention output gate (`[q_dim, hidden]`), or null.
+    attn_gate: *const c_void,
+    attn_gate_dtype: i32,
+    attn_gate_group: i32,
+    /// 1: a prefill chunk whose tokens attend to each other in both directions
+    /// (Gemma 3's image tokens).
+    bidi: i32,
+}
+
+/// One Gated DeltaNet layer's device weights as the kernel takes them. Matches
+/// `DlmLinear` in `src/gpu/kernels.cu`.
+#[repr(C)]
+pub(crate) struct DlmLinear {
+    w: [*const c_void; 5],
+    dtype: [i32; 5],
+    group: [i32; 5],
+    conv: *const f32,
+    a_neg: *const f32,
+    dt_bias: *const f32,
+    norm: *const f32,
+}
+
+/// A Gated DeltaNet layer's weights in VRAM (Qwen3.5/3.6), beside the layer's
+/// `o_proj` (its `out_proj`) and input norm.
+pub(crate) struct GpuLinear {
+    /// in_proj_qkv, in_proj_z, in_proj_b, in_proj_a.
+    proj: [DeviceBuffer; 4],
+    dtype: [i32; 4],
+    group: [i32; 4],
+    conv: DeviceBuffer,
+    a_neg: DeviceBuffer,
+    dt_bias: DeviceBuffer,
+    norm: DeviceBuffer,
+}
+
+impl GpuLinear {
+    pub(crate) fn upload(l: &crate::forward::cpu::LinearAttnWeights) -> Result<Self> {
+        let ws = [&l.in_proj_qkv, &l.in_proj_z, &l.in_proj_b, &l.in_proj_a];
+        Ok(Self {
+            proj: [
+                upload_weight(ws[0])?,
+                upload_weight(ws[1])?,
+                upload_weight(ws[2])?,
+                upload_weight(ws[3])?,
+            ],
+            dtype: ws.map(|w| w.dtype_code()),
+            group: ws.map(|w| w.group_size() as i32),
+            conv: DeviceBuffer::from_slice(&l.conv1d)?,
+            a_neg: DeviceBuffer::from_slice(&l.a_neg)?,
+            dt_bias: DeviceBuffer::from_slice(&l.dt_bias)?,
+            norm: DeviceBuffer::from_slice(&l.norm)?,
+        })
+    }
+
+    /// The kernel's view of these weights, with the layer's `out_proj`
+    /// (`(buffer, dtype, group size)`).
+    fn ffi(&self, out_proj: (&DeviceBuffer, i32, i32)) -> DlmLinear {
+        let p = |b: &DeviceBuffer| b.as_ptr() as *const c_void;
+        DlmLinear {
+            w: [
+                p(&self.proj[0]),
+                p(&self.proj[1]),
+                p(&self.proj[2]),
+                p(&self.proj[3]),
+                p(out_proj.0),
+            ],
+            dtype: [
+                self.dtype[0],
+                self.dtype[1],
+                self.dtype[2],
+                self.dtype[3],
+                out_proj.1,
+            ],
+            group: [
+                self.group[0],
+                self.group[1],
+                self.group[2],
+                self.group[3],
+                out_proj.2,
+            ],
+            conv: self.conv.as_ptr(),
+            a_neg: self.a_neg.as_ptr(),
+            dt_bias: self.dt_bias.as_ptr(),
+            norm: self.norm.as_ptr(),
+        }
+    }
+
+    /// The token mixer for the token in `x`, against `kv`'s state, with the
+    /// residual folded in. `out_proj` is the layer's `o_proj` buffer with its
+    /// dtype and group size.
+    pub(crate) fn run(
+        &self,
+        cfg: &BlockConfig,
+        in_norm: &DeviceBuffer,
+        out_proj: (&DeviceBuffer, i32, i32),
+        x: *mut f32,
+        kv: &mut KvLayerCache,
+    ) -> Result<()> {
+        let l = linear_cfg(cfg)?;
+        let (conv_state, ssm_state) =
+            kv.linear_device_state(l.conv_state_len(), l.recurrent_state_len())?;
+        let weights = self.ffi(out_proj);
+        // SAFETY: every pointer is a live device buffer of the size the kernel
+        // reads for this geometry; the state buffers are this sequence's own.
+        let code = unsafe {
+            dlm_linear_attn(
+                cfg.hidden_size as i32,
+                l.num_k_heads as i32,
+                l.num_v_heads as i32,
+                l.k_head_dim as i32,
+                l.v_head_dim as i32,
+                l.conv_kernel as i32,
+                l.v_heads_tiled as i32,
+                cfg.rms_eps,
+                &weights,
+                in_norm.as_ptr(),
+                x,
+                conv_state,
+                ssm_state,
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_linear_attn",
+                code,
+            });
+        }
+        Ok(())
+    }
+
+    /// The token mixer for up to [`DLM_MAX_BATCH`] rows of `x`, each against its
+    /// own `(conv, recurrent)` state pointers (from
+    /// [`KvLayerCache::linear_device_state`]), in row order: rows sharing a
+    /// state are one sequence's consecutive tokens. Leaves every row's FFN
+    /// input normed in scratch for `dlm_moe_take_row`.
+    pub(crate) fn run_rows(
+        &self,
+        cfg: &BlockConfig,
+        norms: (&DeviceBuffer, &DeviceBuffer),
+        out_proj: (&DeviceBuffer, i32, i32),
+        x: *mut f32,
+        states: &[(*mut f32, *mut f32)],
+    ) -> Result<()> {
+        let l = linear_cfg(cfg)?;
+        if states.is_empty() || states.len() > DLM_MAX_BATCH {
+            return Err(DlmError::InvalidConfig(format!(
+                "{} rows for one batched linear-attention call",
+                states.len()
+            )));
+        }
+        let mut conv = DlmSlots {
+            p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+        };
+        let mut ssm = DlmSlots {
+            p: [std::ptr::null_mut(); DLM_MAX_BATCH],
+        };
+        for (i, &(c, s)) in states.iter().enumerate() {
+            conv.p[i] = c;
+            ssm.p[i] = s;
+        }
+        let weights = self.ffi(out_proj);
+        // SAFETY: as `run`; `x` holds `states.len()` rows of `hidden_size`.
+        let code = unsafe {
+            dlm_linear_attn_batched(
+                cfg.hidden_size as i32,
+                l.num_k_heads as i32,
+                l.num_v_heads as i32,
+                l.k_head_dim as i32,
+                l.v_head_dim as i32,
+                l.conv_kernel as i32,
+                l.v_heads_tiled as i32,
+                cfg.rms_eps,
+                &weights,
+                norms.0.as_ptr(),
+                norms.1.as_ptr(),
+                x,
+                states.len() as i32,
+                &conv,
+                &ssm,
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_linear_attn_batched",
+                code,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The linear-attention geometry of a hybrid model's config.
+fn linear_cfg(cfg: &BlockConfig) -> Result<crate::model::LinearAttnConfig> {
+    cfg.linear
+        .ok_or_else(|| DlmError::InvalidConfig("linear attention on a dense config".into()))
+}
+
+/// Qwen3.5/3.6's attention output gate in VRAM, with its dtype.
+pub(crate) struct GpuGate {
+    buf: DeviceBuffer,
+    dtype: i32,
+    group: i32,
+}
+
+impl GpuGate {
+    pub(crate) fn upload(w: Option<&crate::forward::Weights>) -> Result<Option<Self>> {
+        w.map(|w| {
+            Ok(Self {
+                buf: upload_weight(w)?,
+                dtype: w.dtype_code(),
+                group: w.group_size() as i32,
+            })
+        })
+        .transpose()
+    }
 }
 
 /// Where each projection's dtype sits in [`DlmBlockExt`]'s arrays.
@@ -579,13 +948,33 @@ impl DlmBlockExt {
             // kernel to use the call's single dtype for every projection.
             w_dtype: [-1; 7],
             w_group: [0; 7],
+            attn_gate: std::ptr::null(),
+            attn_gate_dtype: 0,
+            attn_gate_group: 0,
+            bidi: 0,
         }
+    }
+
+    /// Gate the attention output (Qwen3.5/3.6), when the layer has a gate.
+    pub(crate) fn with_attn_gate(mut self, gate: &Option<GpuGate>) -> Self {
+        if let Some(g) = gate {
+            self.attn_gate = g.buf.as_ptr() as *const c_void;
+            self.attn_gate_dtype = g.dtype;
+            self.attn_gate_group = g.group;
+        }
+        self
     }
 
     /// Record each projection's own dtype and group size.
     pub(crate) fn with_weight_dtypes(mut self, w: &WeightDtypes) -> Self {
         self.w_dtype = w.dtype;
         self.w_group = w.group;
+        self
+    }
+
+    /// Make a prefill chunk attend bidirectionally (see the `bidi` field).
+    pub(crate) fn bidirectional(mut self, on: bool) -> Self {
+        self.bidi = on as i32;
         self
     }
 }
@@ -877,6 +1266,10 @@ struct GpuLayer {
     post_ffn_norm: Option<DeviceBuffer>,
     /// LayerNorm, output-projection and MLP biases (GPT-2, Falcon).
     biases: GpuBlockBiases,
+    /// Gated DeltaNet weights on a Qwen3.5/3.6 linear-attention layer.
+    linear: Option<GpuLinear>,
+    /// The attention output gate on a Qwen3.5/3.6 full-attention layer.
+    attn_gate: Option<GpuGate>,
     /// A MoE layer's router, shared expert, and **every** routed expert, all
     /// resident. `None` on a dense layer, where `gate/up/down_proj` are the FFN.
     ///
@@ -892,6 +1285,57 @@ struct GpuLayer {
     w_group_size: i32,
     /// Each projection's own dtype, which a GGUF layer mixes.
     dtypes: WeightDtypes,
+    /// Gemma 4's per-layer-input weights; `None` elsewhere.
+    ple: Option<GpuPle>,
+    /// Gemma 4's per-layer output scale (1 elsewhere).
+    layer_scalar: f32,
+}
+
+/// A weight on the device with its dtype and group size.
+struct GpuWeight {
+    buf: DeviceBuffer,
+    dtype: i32,
+    group: i32,
+}
+
+impl GpuWeight {
+    fn upload(w: &crate::forward::Weights) -> Result<Self> {
+        Ok(Self {
+            buf: upload_weight(w)?,
+            dtype: w.dtype_code(),
+            group: w.group_size() as i32,
+        })
+    }
+
+    fn ptr(&self) -> *const c_void {
+        self.buf.as_ptr() as *const c_void
+    }
+}
+
+/// Gemma 4's per-layer-input weights on the device; layer 0's also carry the
+/// model-level projection and its norm.
+struct GpuPle {
+    gate: GpuWeight,
+    proj: GpuWeight,
+    post_norm: DeviceBuffer,
+    model: Option<(GpuWeight, DeviceBuffer)>,
+}
+
+impl GpuPle {
+    fn upload(p: &crate::forward::PleWeights) -> Result<Self> {
+        Ok(Self {
+            gate: GpuWeight::upload(&p.gate)?,
+            proj: GpuWeight::upload(&p.proj)?,
+            post_norm: DeviceBuffer::from_slice(&p.post_norm)?,
+            model: p
+                .model
+                .as_ref()
+                .map(|(w, n)| {
+                    Ok::<_, DlmError>((GpuWeight::upload(w)?, DeviceBuffer::from_slice(n)?))
+                })
+                .transpose()?,
+        })
+    }
 }
 
 /// One SwiGLU FFN (a dense MLP or one MoE expert), resident in VRAM.
@@ -899,20 +1343,91 @@ pub(crate) struct GpuExpert {
     pub(crate) gate: DeviceBuffer,
     pub(crate) up: DeviceBuffer,
     pub(crate) down: DeviceBuffer,
+    /// The dtype and group size of gate and up.
     pub(crate) w_dtype: i32,
     pub(crate) w_group_size: i32,
+    /// Those of down, which a GGUF often stores finer (Q6_K beside Q4_K).
+    pub(crate) down_dtype: i32,
+    pub(crate) down_group: i32,
 }
 
 impl GpuExpert {
+    /// `(gate/up dtype, group, down dtype, group)`. Read off `up`, not `gate`:
+    /// an ungated MLP (GPT-2, Falcon) has an empty gate whose default dtype
+    /// says nothing about the real projections. A gate stored unlike up has
+    /// no kernel, and is refused.
+    fn dtypes(e: &crate::forward::cpu::ExpertFfn) -> Result<(i32, i32, i32, i32)> {
+        let up = (e.up.dtype_code(), e.up.group_size() as i32);
+        if !e.gate.is_empty() && (e.gate.dtype_code(), e.gate.group_size() as i32) != up {
+            return Err(DlmError::InvalidConfig(
+                "an expert's gate and up projections are stored in different formats".into(),
+            ));
+        }
+        Ok((up.0, up.1, e.down.dtype_code(), e.down.group_size() as i32))
+    }
+
     pub(crate) fn upload(e: &crate::forward::cpu::ExpertFfn) -> Result<Self> {
+        let (w_dtype, w_group_size, down_dtype, down_group) = Self::dtypes(e)?;
         Ok(Self {
             gate: DeviceBuffer::from_bytes(e.gate.as_bytes(), e.gate.len())?,
             up: DeviceBuffer::from_bytes(e.up.as_bytes(), e.up.len())?,
             down: DeviceBuffer::from_bytes(e.down.as_bytes(), e.down.len())?,
-            // `up`, not `gate`: an ungated MLP (GPT-2, Falcon) has an empty gate
-            // whose default dtype says nothing about the real projections.
-            w_dtype: e.up.dtype_code(),
-            w_group_size: e.up.group_size() as i32,
+            w_dtype,
+            w_group_size,
+            down_dtype,
+            down_group,
+        })
+    }
+
+    /// [`upload`](Self::upload) through page-locked `staging` on `stream`,
+    /// into `reuse`'s buffers when their sizes match. A plain pageable copy
+    /// blocks the host and serializes with the kernels on the default stream,
+    /// so an expert prefetched by the worker could not load under compute; and
+    /// freeing an evicted expert's buffers waits for the whole device. The
+    /// caller makes sure nothing still queued reads `reuse`.
+    pub(crate) fn upload_staged(
+        e: &crate::forward::cpu::ExpertFfn,
+        staging: &mut crate::memory::PinnedBuffer,
+        stream: &crate::gpu::device::Stream,
+        reuse: Option<GpuExpert>,
+    ) -> Result<Self> {
+        let parts = [&e.gate, &e.up, &e.down];
+        let total: usize = parts.iter().map(|w| w.as_bytes().len()).sum();
+        if staging.len() < total {
+            *staging = crate::memory::PinnedBuffer::with_len(total)?;
+        }
+        let mut old = reuse.map(|g| [g.gate, g.up, g.down].into_iter());
+        let mut bufs = Vec::with_capacity(3);
+        let mut off = 0;
+        for w in parts {
+            let bytes = w.as_bytes();
+            staging.as_mut_slice()[off..off + bytes.len()].copy_from_slice(bytes);
+            let buf = match old.as_mut().and_then(|o| o.next()) {
+                Some(b) if b.bytes() == bytes.len().max(1) && b.len() == w.len() => b,
+                _ => DeviceBuffer::new_bytes(bytes.len(), w.len())?,
+            };
+            // SAFETY: `staging` is page-locked and holds these bytes at `off`
+            // until `stream` is synchronized below.
+            buf.upload_async_bytes(
+                unsafe { staging.as_ptr().add(off) } as *const c_void,
+                bytes.len(),
+                stream,
+            )?;
+            bufs.push(buf);
+            off += bytes.len();
+        }
+        stream.synchronize()?;
+        let (w_dtype, w_group_size, down_dtype, down_group) = Self::dtypes(e)?;
+        let mut bufs = bufs.into_iter();
+        let mut next = || bufs.next().expect("one buffer per part");
+        Ok(Self {
+            gate: next(),
+            up: next(),
+            down: next(),
+            w_dtype,
+            w_group_size,
+            down_dtype,
+            down_group,
         })
     }
 }
@@ -930,6 +1445,8 @@ pub(crate) struct GpuMoeCore {
     shared_gate: Option<DeviceBuffer>,
     shared_gate_dtype: i32,
     shared_gate_group: i32,
+    /// DeepSeek-V3's choice-only score bias, on the host where routing runs.
+    router_bias: Option<Vec<f32>>,
 }
 
 impl GpuMoeCore {
@@ -950,6 +1467,7 @@ impl GpuMoeCore {
                 .transpose()?,
             shared_gate_dtype,
             shared_gate_group,
+            router_bias: t.router_bias().map(<[f32]>::to_vec),
         })
     }
 
@@ -975,9 +1493,19 @@ impl GpuMoeCore {
         hidden: *mut f32,
         mut expert: impl FnMut(usize) -> Result<E>,
     ) -> Result<()> {
-        let m = cfg.moe.expect("GpuMoeCore::run on a dense model");
+        let selected = self.route(cfg)?;
+        let mut experts = Vec::with_capacity(selected.len());
+        for (e, weight) in selected {
+            experts.push((expert(e)?, weight));
+        }
+        self.apply_routed(cfg, &experts, hidden)?;
+        self.apply_shared(cfg, hidden)
+    }
 
-        // 1. Router logits → host, then top-k + softmax there.
+    /// Router logits for the current FFN input → host, then top-k + softmax
+    /// there: `(expert, gate weight)` pairs.
+    pub(crate) fn route(&self, cfg: &BlockConfig) -> Result<Vec<(usize, f32)>> {
+        let m = cfg.moe.expect("GpuMoeCore::route on a dense model");
         let n_exp = m.num_experts as usize;
         let mut logits = vec![0f32; n_exp];
         let code = unsafe {
@@ -996,24 +1524,33 @@ impl GpuMoeCore {
                 code,
             });
         }
+        Ok(crate::forward::cpu::route(
+            &logits,
+            &m,
+            self.router_bias.as_deref(),
+        ))
+    }
 
-        // 2. Apply the selected experts in one grouped launch (`dlm_apply_experts`:
+    /// `hidden += Σ weight · expert(normed2)` over the already-selected experts.
+    pub(crate) fn apply_routed<E: std::ops::Deref<Target = GpuExpert>>(
+        &self,
+        cfg: &BlockConfig,
+        experts: &[(E, f32)],
+        hidden: *mut f32,
+    ) -> Result<()> {
+        let m = cfg.moe.expect("GpuMoeCore::apply_routed on a dense model");
+        // Apply the selected experts in one grouped launch (`dlm_apply_experts`:
         // 3 kernels total rather than 3 per expert, each with a k-times-larger
         // grid). Same arithmetic as applying them one at a time — only the
         // summation order over experts differs.
         let inter = m.moe_intermediate_size as i32;
-        let selected =
-            crate::forward::cpu::route_topk(&logits, m.experts_per_tok as usize, m.norm_topk_prob);
-        let mut experts = Vec::with_capacity(selected.len());
-        for (e, weight) in selected {
-            experts.push((expert(e)?, weight));
-        }
         // The grouped kernel takes one dtype for the whole group and a bounded
         // expert count; both hold for every real checkpoint (one export, top-k
         // <= 8). Anything else falls back to the per-expert path rather than
         // silently applying the wrong decode.
         let uniform_dtype = experts.windows(2).all(|w| {
-            w[0].0.w_dtype == w[1].0.w_dtype && w[0].0.w_group_size == w[1].0.w_group_size
+            let key = |e: &GpuExpert| (e.w_dtype, e.w_group_size, e.down_dtype, e.down_group);
+            key(&w[0].0) == key(&w[1].0)
         });
         if !experts.is_empty() && experts.len() <= DLM_MAX_TOPK && uniform_dtype {
             let null = || DlmPtrs {
@@ -1036,6 +1573,8 @@ impl GpuMoeCore {
                     experts.len() as i32,
                     experts[0].0.w_dtype,
                     experts[0].0.w_group_size,
+                    experts[0].0.down_dtype,
+                    experts[0].0.down_group,
                     &gate,
                     &up,
                     &down,
@@ -1051,47 +1590,60 @@ impl GpuMoeCore {
                 });
             }
         } else {
-            for (expert, weight) in &experts {
+            for (expert, weight) in experts {
                 self.apply_one(cfg, expert, inter, *weight, hidden)?;
             }
-        }
-
-        // 3. Shared expert (Qwen2-MoE): gated by sigmoid(shared_gate · normed2).
-        if let Some(sh) = &self.shared {
-            let weight = match &self.shared_gate {
-                Some(g) => {
-                    let mut logit = [0f32; 1];
-                    let code = unsafe {
-                        dlm_moe_matvec(
-                            1,
-                            cfg.hidden_size as i32,
-                            self.shared_gate_dtype,
-                            self.shared_gate_group,
-                            g.as_ptr() as *const c_void,
-                            logit.as_mut_ptr(),
-                        )
-                    };
-                    if code != 0 {
-                        return Err(DlmError::Gpu {
-                            api: "dlm_moe_matvec",
-                            code,
-                        });
-                    }
-                    1.0 / (1.0 + (-logit[0]).exp())
-                }
-                // DeepSeek ships no gate: its shared expert is added whole.
-                None => 1.0,
-            };
-            let sinter = m
-                .shared_intermediate_size
-                .unwrap_or(m.moe_intermediate_size) as i32;
-            self.apply_one(cfg, sh, sinter, weight, hidden)?;
         }
         Ok(())
     }
 
+    /// The shared expert (Qwen2-MoE / DeepSeek), if any, on the current FFN input.
+    pub(crate) fn apply_shared(&self, cfg: &BlockConfig, hidden: *mut f32) -> Result<()> {
+        if let Some((sh, inter)) = self.shared(cfg) {
+            let weight = self.shared_weight(cfg)?;
+            self.apply_one(cfg, sh, inter, weight, hidden)?;
+        }
+        Ok(())
+    }
+
+    /// The shared expert and its intermediate size, if the layer has one.
+    pub(crate) fn shared(&self, cfg: &BlockConfig) -> Option<(&GpuExpert, i32)> {
+        let m = cfg.moe.expect("GpuMoeCore::shared on a dense model");
+        let inter = m
+            .shared_intermediate_size
+            .unwrap_or(m.moe_intermediate_size) as i32;
+        self.shared.as_ref().map(|sh| (sh, inter))
+    }
+
+    /// The shared expert's weight for the current FFN input: Qwen2-MoE gates it
+    /// by `sigmoid(shared_gate · normed2)`; DeepSeek ships no gate and adds it
+    /// whole.
+    pub(crate) fn shared_weight(&self, cfg: &BlockConfig) -> Result<f32> {
+        let Some(g) = &self.shared_gate else {
+            return Ok(1.0);
+        };
+        let mut logit = [0f32; 1];
+        let code = unsafe {
+            dlm_moe_matvec(
+                1,
+                cfg.hidden_size as i32,
+                self.shared_gate_dtype,
+                self.shared_gate_group,
+                g.as_ptr() as *const c_void,
+                logit.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_matvec",
+                code,
+            });
+        }
+        Ok(1.0 / (1.0 + (-logit[0]).exp()))
+    }
+
     /// `x += weight * expert(normed2)`, one expert at a time.
-    fn apply_one(
+    pub(crate) fn apply_one(
         &self,
         cfg: &BlockConfig,
         expert: &GpuExpert,
@@ -1105,6 +1657,8 @@ impl GpuMoeCore {
                 inter,
                 expert.w_dtype,
                 expert.w_group_size,
+                expert.down_dtype,
+                expert.down_group,
                 expert.gate.as_ptr() as *const c_void,
                 expert.up.as_ptr() as *const c_void,
                 expert.down.as_ptr() as *const c_void,
@@ -1215,9 +1769,13 @@ impl GpuLayer {
             pre_ffn_norm: upload_bias(t.pre_feedforward_layernorm.as_ref())?,
             post_ffn_norm: upload_bias(t.post_feedforward_layernorm.as_ref())?,
             biases: GpuBlockBiases::upload(t)?,
+            linear: t.linear.as_ref().map(GpuLinear::upload).transpose()?,
+            attn_gate: GpuGate::upload(t.attn_gate.as_ref())?,
             w_dtype,
             w_group_size,
             dtypes: WeightDtypes::of(t),
+            ple: t.ple.as_ref().map(GpuPle::upload).transpose()?,
+            layer_scalar: t.layer_scalar.unwrap_or(1.0),
         })
     }
 }
@@ -1232,6 +1790,9 @@ pub struct GpuKernel {
     inv_freq: DeviceBuffer,
     /// Gemma3's local-layer frequencies; `None` when every layer shares `inv_freq`.
     local_inv_freq: Option<DeviceBuffer>,
+    /// Gemma 4's global-layer frequencies, over their wider heads; `None`
+    /// when the global layers are as wide as the rest.
+    global_inv_freq: Option<DeviceBuffer>,
     /// Max tokens one session's KV can hold.
     kv_capacity_tokens: usize,
     /// Paged KV blocks shared by every session, one pool per layer.
@@ -1248,6 +1809,24 @@ pub struct GpuKernel {
     /// MLA decoupled-RoPE frequencies (over `qk_rope_head_dim`); `None` for
     /// standard attention.
     mla_inv_freq: Option<DeviceBuffer>,
+    /// Hidden states recorded for a speculative draft head
+    /// ([`ComputeKernel::capture_next`]).
+    capture: std::sync::Mutex<Capture>,
+}
+
+/// The layers whose input [`GpuKernel`] records, and what it has recorded:
+/// one `[tokens, hidden]` run per layer.
+#[derive(Default)]
+struct Capture {
+    layers: Vec<u32>,
+    rows: Vec<Vec<f32>>,
+}
+
+impl Capture {
+    /// Which recorded run `layer`'s input goes to, if it is recorded.
+    fn slot(&self, layer: u32) -> Option<usize> {
+        self.layers.iter().position(|&l| l == layer)
+    }
 }
 
 impl GpuKernel {
@@ -1262,19 +1841,20 @@ impl GpuKernel {
             layer.validate(&cfg.for_layer(i as u32))?;
             gpu_layers.push(GpuLayer::upload(layer)?);
         }
-        let inv_freq = DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
-            cfg.head_dim,
-            cfg.rope_theta,
-            cfg.rope_scaling,
-        ))?;
+        let inv_freq = DeviceBuffer::from_slice(&cfg.rope_freqs(cfg.rope_theta, cfg.rope_scaling))?;
         // Gemma3's windowed layers rotate with their own base, unscaled.
         let local_inv_freq = cfg
             .rope_local_theta
-            .map(|theta| {
+            .map(|theta| DeviceBuffer::from_slice(&cfg.rope_freqs(theta, None)))
+            .transpose()?;
+        // Gemma 4's global layers rotate over their own, wider heads.
+        let global_inv_freq = cfg
+            .global_head_dim
+            .map(|d| {
                 DeviceBuffer::from_slice(&crate::forward::cpu::rope_inv_freqs(
-                    cfg.head_dim,
-                    theta,
-                    None,
+                    d,
+                    cfg.rope_theta,
+                    cfg.rope_scaling,
                 ))
             })
             .transpose()?;
@@ -1289,27 +1869,37 @@ impl GpuKernel {
             )?),
             None => None,
         };
-        let d_hidden = DeviceBuffer::new(cfg.hidden_size)?;
+        // A Gemma 4 row carries every layer's input after the hidden state.
+        let d_hidden = DeviceBuffer::new(cfg.row_width())?;
         let d_batch = DeviceBuffer::new(DLM_MAX_BATCH * cfg.hidden_size)?;
         // One session's worth by default; `with_kv_pool_tokens` sizes it for many.
-        let kv_pools = crate::forward::kv_pool::KvPools::new(
-            gpu_layers.len(),
-            cfg.kv_dim(),
-            cfg.head_dim,
-            cap,
-        );
+        let kv_pools = kv_pools_for(&cfg, gpu_layers.len(), cap);
         Ok(Self {
             cfg,
             kv_pools,
             layers: gpu_layers,
             inv_freq,
             local_inv_freq,
+            global_inv_freq,
             kv_capacity_tokens: cap,
             d_hidden,
             d_batch,
+            capture: Default::default(),
             mla_inv_freq,
         })
     }
+}
+
+/// KV pools for `layers` layers of `cfg`, each as wide as its own K/V.
+fn kv_pools_for(
+    cfg: &BlockConfig,
+    layers: usize,
+    tokens: usize,
+) -> crate::forward::kv_pool::KvPools {
+    let dims = (0..layers as u32)
+        .map(|l| cfg.for_layer(l).kv_dim())
+        .collect();
+    crate::forward::kv_pool::KvPools::with_layer_dims(dims, cfg.head_dim, tokens)
 }
 
 impl GpuKernel {
@@ -1322,10 +1912,155 @@ impl GpuKernel {
 
     /// The RoPE inverse frequencies `layer` rotates with.
     fn inv_freq_for(&self, layer: u32) -> *const f32 {
-        match &self.local_inv_freq {
-            Some(local) if self.cfg.uses_local_rope(layer) => local.as_ptr(),
+        match (&self.local_inv_freq, &self.global_inv_freq) {
+            (Some(local), _) if self.cfg.uses_local_rope(layer) => local.as_ptr(),
+            (_, Some(global)) if self.cfg.window_for_layer(layer).is_none() => global.as_ptr(),
             _ => self.inv_freq.as_ptr(),
         }
+    }
+
+    /// Gemma 4 runs its layers through `dlm_gemma4_block`, a token at a time.
+    fn is_gemma4(&self) -> bool {
+        self.cfg.v_norm
+    }
+
+    /// One Gemma 4 layer for the token whose row is at `x` (its hidden state,
+    /// then every layer's input): the layer-0 projection of those inputs, the
+    /// block, and the layer's own input and scalar. A layer of the shared-KV
+    /// tail is handed its source layer's KV and leaves it as it is.
+    fn launch_gemma4_layer(
+        &self,
+        layer: u32,
+        kv: &mut KvLayerCache,
+        position: usize,
+        x: *mut f32,
+    ) -> Result<()> {
+        let w = &self.layers[layer as usize];
+        let cfg = self.cfg.for_layer(layer);
+        let check = |api: &'static str, code: i32| match code {
+            0 => Ok(()),
+            code => Err(DlmError::Gpu { api, code }),
+        };
+        // SAFETY: `x` is a live row of `row_width` floats on the device.
+        let inputs = unsafe { x.add(cfg.hidden_size) };
+        if let Some((proj, norm)) = w.ple.as_ref().and_then(|p| p.model.as_ref()) {
+            // SAFETY: the projection is `[layers × ple_dim, hidden]`, the
+            // norm `[ple_dim]`, the row's inputs `layers × ple_dim` floats.
+            check("dlm_gemma4_project", unsafe {
+                dlm_gemma4_project(
+                    cfg.hidden_size as i32,
+                    cfg.ple_dim as i32,
+                    cfg.ple_layers as i32,
+                    cfg.rms_eps,
+                    proj.dtype,
+                    proj.group,
+                    proj.ptr(),
+                    norm.as_ptr(),
+                    x,
+                    inputs,
+                )
+            })?;
+        }
+        let (dkv, row) = if cfg.shared_kv {
+            // The source layer already wrote this token's row; rows are
+            // positions, so this one attends over rows `0..=position`.
+            if position >= kv.len() {
+                return Err(DlmError::InvalidConfig(format!(
+                    "shared-KV layer {layer} at position {position}, but its source holds {} rows",
+                    kv.len()
+                )));
+            }
+            let source = self.cfg.kv_source(layer).unwrap_or(layer) as usize;
+            let rows = kv.len();
+            let dkv = kv.device_kv(&self.kv_pools, source, rows, self.kv_capacity_tokens, true)?;
+            (dkv, position)
+        } else {
+            let n = kv.len();
+            if n >= self.kv_capacity_tokens {
+                return Err(DlmError::InvalidConfig(format!(
+                    "GPU KV capacity {} exceeded at position {position}",
+                    self.kv_capacity_tokens
+                )));
+            }
+            let dkv = kv.device_kv(
+                &self.kv_pools,
+                layer as usize,
+                n + 1,
+                self.kv_capacity_tokens,
+                true,
+            )?;
+            (dkv, n)
+        };
+        let ffn = &w.dtypes;
+        // SAFETY: the weights are this layer's, the KV holds `row + 1` rows, and
+        // `x` is a live row.
+        check("dlm_gemma4_block", unsafe {
+            dlm_gemma4_block(
+                cfg.hidden_size as i32,
+                cfg.q_dim() as i32,
+                cfg.kv_dim() as i32,
+                cfg.num_heads as i32,
+                cfg.num_kv_heads as i32,
+                cfg.head_dim as i32,
+                cfg.intermediate_size as i32,
+                cfg.rms_eps,
+                w.w_dtype,
+                w.w_group_size,
+                w.q_proj.as_ptr() as *const c_void,
+                w.k_proj.as_ptr() as *const c_void,
+                w.v_proj.as_ptr() as *const c_void,
+                w.o_proj.as_ptr() as *const c_void,
+                w.gate_proj.as_ptr() as *const c_void,
+                w.up_proj.as_ptr() as *const c_void,
+                w.down_proj.as_ptr() as *const c_void,
+                w.input_layernorm.as_ptr(),
+                w.post_attention_layernorm.as_ptr(),
+                bias_ptr(&w.pre_ffn_norm),
+                bias_ptr(&w.post_ffn_norm),
+                bias_ptr(&w.q_norm),
+                bias_ptr(&w.k_norm),
+                self.inv_freq_for(layer),
+                x,
+                dkv.keys as *mut c_void,
+                dkv.values as *mut c_void,
+                row as i32,
+                position as i32,
+                cfg.sliding_window.unwrap_or(0) as i32,
+                cfg.activation.code(),
+                cfg.attn_scale(),
+                cfg.shared_kv as i32,
+                &DlmBlockExt::new(&cfg, &w.biases, dkv.elem, dkv.table).with_weight_dtypes(ffn),
+            )
+        })?;
+        let (gate, proj, post_norm) = match &w.ple {
+            Some(p) => (Some(&p.gate), Some(&p.proj), p.post_norm.as_ptr()),
+            None => (None, None, std::ptr::null()),
+        };
+        let at = layer as usize * cfg.ple_dim;
+        // SAFETY: the gate is `[ple_dim, hidden]`, the projection `[hidden,
+        // ple_dim]`, and this layer's input `ple_dim` floats of the row.
+        check("dlm_gemma4_ple", unsafe {
+            dlm_gemma4_ple(
+                cfg.hidden_size as i32,
+                cfg.ple_dim as i32,
+                cfg.rms_eps,
+                cfg.activation.code(),
+                gate.map_or(0, |g| g.dtype),
+                gate.map_or(0, |g| g.group),
+                gate.map_or(std::ptr::null(), |g| g.ptr()),
+                proj.map_or(0, |p| p.dtype),
+                proj.map_or(0, |p| p.group),
+                proj.map_or(std::ptr::null(), |p| p.ptr()),
+                post_norm,
+                inputs.add(at),
+                w.layer_scalar,
+                x,
+            )
+        })?;
+        if !cfg.shared_kv {
+            kv.advance(1);
+        }
+        Ok(())
     }
 
     /// One `dlm_decode_block_batched` call over the `[batch, hidden]` device block
@@ -1448,7 +2183,8 @@ impl GpuKernel {
                 cfg.attn_scale(),
                 cfg.attn_logit_softcap.unwrap_or(0.0),
                 &DlmBlockExt::new(cfg, &w.biases, slots.elem, std::ptr::null())
-                    .with_weight_dtypes(&w.dtypes),
+                    .with_weight_dtypes(&w.dtypes)
+                    .with_attn_gate(&w.attn_gate),
             )
         };
         if code != 0 {
@@ -1496,6 +2232,7 @@ impl GpuKernel {
         kv: &mut KvLayerCache,
         position: usize,
         t: usize,
+        bidi: bool,
     ) -> Result<bool> {
         let w = &self.layers[layer as usize];
         let history = kv.len();
@@ -1557,7 +2294,8 @@ impl GpuKernel {
                 bias_ptr(&w.pre_ffn_norm),
                 bias_ptr(&w.post_ffn_norm),
                 &DlmBlockExt::new(&cfg, &w.biases, dkv.elem, dkv.table)
-                    .with_weight_dtypes(&w.dtypes),
+                    .with_weight_dtypes(&w.dtypes)
+                    .bidirectional(bidi),
             )
         };
         match code {
@@ -1579,14 +2317,29 @@ impl ComputeKernel for GpuKernel {
         Some(self.kv_pools.free_tokens(elem))
     }
 
+    fn capture_next(&self, layers: &[u32]) -> bool {
+        let mut c = self.capture.lock().unwrap();
+        c.layers = layers.to_vec();
+        c.rows = vec![Vec::new(); layers.len()];
+        true
+    }
+
+    fn take_capture(&self) -> Vec<f32> {
+        let c = std::mem::take(&mut *self.capture.lock().unwrap());
+        let h = self.cfg.hidden_size;
+        let tokens = c.rows.first().map_or(0, |r| r.len() / h);
+        let mut out = Vec::with_capacity(tokens * h * c.rows.len());
+        for t in 0..tokens {
+            for run in &c.rows {
+                out.extend_from_slice(&run[t * h..(t + 1) * h]);
+            }
+        }
+        out
+    }
+
     fn set_kv_pool_tokens(&mut self, tokens: usize) {
         let host_from = self.kv_pools.host_from();
-        self.kv_pools = crate::forward::kv_pool::KvPools::new(
-            self.layers.len(),
-            self.cfg.kv_dim(),
-            self.cfg.head_dim,
-            tokens,
-        );
+        self.kv_pools = kv_pools_for(&self.cfg, self.layers.len(), tokens);
         self.kv_pools.set_host_layers_from(host_from);
     }
 
@@ -1599,11 +2352,27 @@ impl ComputeKernel for GpuKernel {
     }
 
     fn hidden_size(&self) -> usize {
-        self.cfg.hidden_size
+        self.cfg.row_width()
     }
 
     fn kv_dim(&self) -> usize {
         self.cfg.kv_dim()
+    }
+
+    fn recurrent(&self) -> bool {
+        self.cfg.linear.is_some()
+    }
+
+    fn per_layer_input_width(&self) -> usize {
+        self.cfg.row_width() - self.cfg.hidden_size
+    }
+
+    fn kv_source(&self, layer: u32) -> u32 {
+        self.cfg.kv_source(layer).unwrap_or(layer)
+    }
+
+    fn layer_kv_dim(&self, layer: u32) -> usize {
+        self.cfg.for_layer(layer).kv_dim()
     }
 
     /// Decode `hiddens.len()` sequences through one layer in a single device
@@ -1624,7 +2393,12 @@ impl ComputeKernel for GpuKernel {
         let batch = hiddens.len();
         // MoE joins MLA on the per-sequence path: the batched device block runs
         // one dense FFN for the whole batch, and routed experts are per token.
-        if batch <= 1 || batch > DLM_MAX_BATCH || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
+        if batch <= 1
+            || batch > DLM_MAX_BATCH
+            || self.cfg.mla.is_some()
+            || self.cfg.moe.is_some()
+            || self.is_gemma4()
+        {
             // One layer for each sequence in turn, so every hidden makes its own
             // round trip: `run_block` would leave it on the shared device buffer
             // for its next layer, where the next sequence overwrites it.
@@ -1691,11 +2465,14 @@ impl ComputeKernel for GpuKernel {
     ) -> Result<()> {
         let hidden_size = self.cfg.hidden_size;
         let n = hiddens.len() / hidden_size;
-        if n <= 1 || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
+        // ponytail: Gemma 4 prefills a token at a time through its decode path;
+        // a GEMM prefill for it would make long prompts faster.
+        if n <= 1 || self.cfg.mla.is_some() || self.cfg.moe.is_some() || self.is_gemma4() {
             return crate::forward::kernel::prefill_token_by_token(self, hiddens, kv_layers, start);
         }
         let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
         for layer in 0..self.num_layers() {
+            self.record(layer, &d_hiddens, hiddens.len())?;
             let kv = &mut kv_layers[layer as usize];
             // The GEMM prefill takes the layer a big piece at a time; a layer it
             // cannot take (its shape, or the heads) goes 16 tokens per call
@@ -1708,7 +2485,7 @@ impl ComputeKernel for GpuKernel {
             while n - done > DLM_MAX_BATCH {
                 let t = (n - done).min(DLM_PREFILL_T);
                 let x = unsafe { d_hiddens.as_mut_ptr().add(done * hidden_size) };
-                if !self.launch_prefill_block(layer, x, kv, start + done, t)? {
+                if !self.launch_prefill_block(layer, x, kv, start + done, t, false)? {
                     break;
                 }
                 done += t;
@@ -1744,6 +2521,33 @@ impl ComputeKernel for GpuKernel {
         d_hiddens.download(hiddens)
     }
 
+    /// The whole run through each layer in one GEMM prefill call, whose
+    /// attention lets every token of it see every other.
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        let n = hiddens.len() / self.cfg.hidden_size;
+        if n > DLM_PREFILL_T || self.cfg.mla.is_some() || self.cfg.moe.is_some() {
+            return Err(DlmError::InvalidConfig(format!(
+                "a bidirectional block of {n} tokens needs a dense model and at most \
+                 {DLM_PREFILL_T} tokens"
+            )));
+        }
+        let d_hiddens = DeviceBuffer::from_slice(hiddens)?;
+        for layer in 0..self.num_layers() {
+            let kv = &mut kv_layers[layer as usize];
+            if !self.launch_prefill_block(layer, d_hiddens.as_mut_ptr(), kv, start, n, true)? {
+                return Err(DlmError::InvalidConfig(format!(
+                    "layer {layer}'s shape does not fit the GPU prefill, which image input needs"
+                )));
+            }
+        }
+        d_hiddens.download(hiddens)
+    }
+
     fn decode_batch(
         &self,
         hiddens: &mut [&mut [f32]],
@@ -1752,12 +2556,13 @@ impl ComputeKernel for GpuKernel {
     ) -> Result<()> {
         // MLA has no batched block; a single sequence gains nothing from one
         // either. MoE layers batch their attention (`launch_moe_batched`).
-        if hiddens.len() <= 1 || self.cfg.mla.is_some() {
+        if hiddens.len() <= 1 || self.cfg.mla.is_some() || self.is_gemma4() {
             for ((hidden, kvs), &position) in
                 hiddens.iter_mut().zip(kv_layers.iter_mut()).zip(positions)
             {
                 for layer in 0..self.num_layers() {
-                    self.run_block(layer, hidden, &mut kvs[layer as usize], position)?;
+                    let kv = &mut kvs[self.kv_source(layer) as usize];
+                    self.run_block(layer, hidden, kv, position)?;
                 }
             }
             return Ok(());
@@ -1777,6 +2582,16 @@ impl ComputeKernel for GpuKernel {
             self.d_batch.upload(&staged[..batch * h])?;
             for layer in 0..self.num_layers() {
                 let mut slots = SlotKv::new();
+                if self.layers[layer as usize].linear.is_some() {
+                    // Each sequence steps its own recurrent state; one row at a
+                    // time through the layer.
+                    for (b, seq) in kvs.iter_mut().enumerate() {
+                        // SAFETY: row `b` of the `[batch, hidden]` block.
+                        let row = unsafe { self.d_batch.as_mut_ptr().add(b * h) };
+                        self.launch_linear_layer(layer, row, &mut seq[layer as usize])?;
+                    }
+                    continue;
+                }
                 for (b, seq) in kvs.iter_mut().enumerate() {
                     let kv = &mut seq[layer as usize];
                     let n = kv.len();
@@ -1823,6 +2638,7 @@ impl ComputeKernel for GpuKernel {
         if layer == 0 {
             self.d_hidden.upload(hidden)?;
         }
+        self.record(layer, &self.d_hidden, hidden.len())?;
         self.launch_layer(layer, kv, position, &self.d_hidden)?;
         // `download` is a blocking cudaMemcpy(D2H), so it already waits for the
         // stack's kernels — no separate synchronize() needed.
@@ -1834,6 +2650,21 @@ impl ComputeKernel for GpuKernel {
 }
 
 impl GpuKernel {
+    /// When `layer`'s input is being recorded, copy the first `len` floats of
+    /// `x` (the rows about to enter it) into the record. The copy waits for the
+    /// layers before it, so it costs a sync per recorded layer.
+    fn record(&self, layer: u32, x: &DeviceBuffer, len: usize) -> Result<()> {
+        let mut c = self.capture.lock().unwrap();
+        let Some(i) = c.slot(layer) else {
+            return Ok(());
+        };
+        let mut rows = vec![0.0f32; x.len()];
+        x.download(&mut rows)?;
+        rows.truncate(len);
+        c.rows[i].extend_from_slice(&rows);
+        Ok(())
+    }
+
     /// Enqueue layer `layer` for one token on the hidden vector in `d_hidden`,
     /// appending its K/V to `kv`. Nothing is copied to or from the host.
     fn launch_layer(
@@ -1843,7 +2674,13 @@ impl GpuKernel {
         position: usize,
         d_hidden: &DeviceBuffer,
     ) -> Result<()> {
+        if self.is_gemma4() {
+            return self.launch_gemma4_layer(layer, kv, position, d_hidden.as_mut_ptr());
+        }
         let w = &self.layers[layer as usize];
+        if w.linear.is_some() {
+            return self.launch_linear_layer(layer, d_hidden.as_mut_ptr(), kv);
+        }
         let kv_dim = self.cfg.kv_dim();
 
         // Prior sequence length. The device buffers are overwritten from slot 0
@@ -1995,7 +2832,8 @@ impl GpuKernel {
                         dkv.table,
                         crate::forward::kv_pool::KV_BLOCK_SHIFT as i32,
                         &DlmBlockExt::new(&self.cfg, &w.biases, dkv.elem, dkv.table)
-                            .with_weight_dtypes(&w.dtypes),
+                            .with_weight_dtypes(&w.dtypes)
+                            .with_attn_gate(&w.attn_gate),
                     )
                 };
                 if code != 0 {
@@ -2064,6 +2902,57 @@ impl GpuKernel {
         }
         // Keep the orchestrator's length bookkeeping in step. The real K/V is in
         // VRAM.
+        kv.advance(1);
+        Ok(())
+    }
+
+    /// A Gated DeltaNet layer (Qwen3.5/3.6) for the token at `x` (one device
+    /// row): the token mixer against `kv`'s state, then the post-attention norm
+    /// and the routed experts, as an MLA + MoE layer runs.
+    fn launch_linear_layer(&self, layer: u32, x: *mut f32, kv: &mut KvLayerCache) -> Result<()> {
+        let w = &self.layers[layer as usize];
+        let lin = w.linear.as_ref().expect("a linear-attention layer");
+        let Some((core, experts)) = &w.moe else {
+            return Err(DlmError::InvalidConfig(
+                "a linear-attention layer without routed experts".into(),
+            ));
+        };
+        if kv.len() >= self.kv_capacity_tokens {
+            return Err(DlmError::InvalidConfig(format!(
+                "GPU KV capacity {} exceeded",
+                self.kv_capacity_tokens
+            )));
+        }
+        lin.run(
+            &self.cfg,
+            &w.input_layernorm,
+            (&w.o_proj, w.dtypes.dtype[W_O], w.dtypes.group[W_O]),
+            x,
+            kv,
+        )?;
+        // SAFETY: `x` is a live device row of `hidden_size` floats.
+        let code = unsafe {
+            dlm_moe_norm(
+                self.cfg.hidden_size as i32,
+                self.cfg.rms_eps,
+                w.post_attention_layernorm.as_ptr(),
+                x,
+            )
+        };
+        if code != 0 {
+            return Err(DlmError::Gpu {
+                api: "dlm_moe_norm",
+                code,
+            });
+        }
+        core.run(&self.cfg, x, |e| {
+            experts.get(e).ok_or_else(|| {
+                DlmError::InvalidConfig(format!(
+                    "router selected expert {e} but only {} are resident",
+                    experts.len()
+                ))
+            })
+        })?;
         kv.advance(1);
         Ok(())
     }
@@ -2172,6 +3061,10 @@ impl ComputeKernel for MultiGpuKernel {
 
     fn kv_dim(&self) -> usize {
         self.stages[0].kv_dim()
+    }
+
+    fn recurrent(&self) -> bool {
+        self.stages.iter().any(|s| s.recurrent())
     }
 
     fn run_block(

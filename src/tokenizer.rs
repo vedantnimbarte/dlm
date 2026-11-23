@@ -444,13 +444,21 @@ impl BpeTokenizer {
                 // `tokenizer.json` gets.
                 tok.split = match get("pre").and_then(Value::as_str).unwrap_or("default") {
                     "qwen2" => ByteLevelSplit::Qwen2,
+                    "qwen35" => ByteLevelSplit::Qwen35,
                     "llama-bpe" | "llama3" | "llama-v3" => ByteLevelSplit::Llama3,
                     _ => ByteLevelSplit::Gpt2,
                 };
                 tok
             }
-            // SentencePiece (Llama 2, Mistral, Gemma): pieces scored against each
-            // other, with ▁ for a space and byte tokens for anything unknown.
+            // SentencePiece BPE (Llama 2, Mistral, Gemma): pieces scored against
+            // each other, with ▁ for a space and byte tokens for anything
+            // unknown. The scores are merge priorities, not unigram
+            // log-probabilities: llama.cpp joins, again and again, the adjacent
+            // pair whose joined text is the highest-scoring token. Read as
+            // unigram scores they make Viterbi prefer letters and byte pieces
+            // (Gemma's `▁` alone scores -236280, a byte piece 0), so the scores
+            // become merge ranks here and the text goes through the same
+            // SentencePiece-BPE path a `tokenizer.json` uses.
             "llama" => {
                 let scores = get("scores").and_then(Value::as_numbers).ok_or_else(|| {
                     DlmError::InvalidConfig(
@@ -458,20 +466,58 @@ impl BpeTokenizer {
                     )
                 })?;
                 let byte_fallback = types.is_some_and(|t| t.contains(&6.0));
-                let pieces: Vec<(String, f32)> = tokens
+                let vocab: HashMap<String, u32> = tokens
                     .iter()
                     .enumerate()
-                    .map(|(id, t)| (t.clone(), scores.get(id).copied().unwrap_or(0.0) as f32))
+                    .map(|(id, t)| (t.clone(), id as u32))
                     .collect();
-                let unk = get("unknown_token_id")
+                let merges = merges_from_scores(tokens, scores, types);
+                // llama.cpp prepends a space unless the file says not to (Gemma does).
+                let prepend = get("add_space_prefix")
                     .and_then(Value::as_u64)
-                    .map(|v| v as u32);
-                Self::from_unigram(pieces, byte_fallback, unk).with_special(specials)
+                    .is_none_or(|v| v != 0);
+                Self::new(vocab, merges)
+                    .with_special(specials)
+                    .with_spm(SpmBpe {
+                        prepend,
+                        byte_fallback,
+                    })
+            }
+            // Gemma 4: the same SentencePiece-style BPE as its `tokenizer.json`
+            // (▁ for a space, no prefix, byte fallback), with the merges listed.
+            // A merge is "left right" split at its one space: the pieces carry
+            // ▁ for spaces but may hold newlines and tabs, which
+            // `split_whitespace` would cut through.
+            "gemma4" => {
+                let merges = get("merges").and_then(Value::as_strings).ok_or_else(|| {
+                    DlmError::InvalidConfig(
+                        "gguf: a gemma4 tokenizer with no tokenizer.ggml.merges".into(),
+                    )
+                })?;
+                let vocab: HashMap<String, u32> = tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(id, t)| (t.clone(), id as u32))
+                    .collect();
+                let merges = merges
+                    .iter()
+                    .filter_map(|m| {
+                        let (a, b) = m.split_once(' ')?;
+                        Some((a.to_string(), b.to_string()))
+                    })
+                    .collect();
+                Self::new(vocab, merges)
+                    .with_special(specials)
+                    .with_spm(SpmBpe {
+                        prepend: false,
+                        byte_fallback: true,
+                    })
             }
             other => {
                 return Err(DlmError::InvalidConfig(format!(
                     "gguf: tokenizer {other:?} is not one dlm implements. It reads the \
-                     byte-level BPE (\"gpt2\") and SentencePiece (\"llama\") tokenizers."
+                     byte-level BPE (\"gpt2\"), SentencePiece (\"llama\") and Gemma 4 \
+                     (\"gemma4\") tokenizers."
                 )))
             }
         };
@@ -1045,6 +1091,42 @@ fn walk_spm_nodes(node: &serde_json::Value, escapes: &mut bool, prepend: &mut bo
 /// changing the result: the only vocabulary pieces that contain ▁ anywhere but
 /// the front are *runs of ▁* (indentation), and a run is never split across
 /// chunks here — so no reachable merge spans a chunk boundary.
+/// The merge list a SentencePiece-BPE vocabulary implies, best first: every
+/// way to split each normal token into two tokens that are themselves in the
+/// vocabulary, ranked by the joined token's score. Merging by these ranks
+/// joins, at each step, the adjacent pair that makes the highest-scoring
+/// token, which is how llama.cpp tokenizes a GGUF's "llama" vocabulary.
+/// Control, user-defined, unused and byte tokens are never merge results.
+fn merges_from_scores(
+    tokens: &[String],
+    scores: &[f64],
+    types: Option<&[f64]>,
+) -> Vec<(String, String)> {
+    let ids: HashMap<&str, usize> = tokens
+        .iter()
+        .enumerate()
+        .map(|(id, t)| (t.as_str(), id))
+        .collect();
+    let normal = |id: usize| types.is_none_or(|t| matches!(t.get(id).copied(), Some(1.0) | None));
+    let mut ranked: Vec<(f64, usize, String, String)> = Vec::new();
+    for (id, tok) in tokens.iter().enumerate() {
+        if !normal(id) || tok.chars().nth(1).is_none() {
+            continue;
+        }
+        let score = scores.get(id).copied().unwrap_or(0.0);
+        for (at, _) in tok.char_indices().skip(1) {
+            let (a, b) = tok.split_at(at);
+            if ids.contains_key(a) && ids.contains_key(b) {
+                ranked.push((score, id, a.to_string(), b.to_string()));
+            }
+        }
+    }
+    // Highest score first; a tie goes to the lower id, the order SentencePiece
+    // learned the pieces in.
+    ranked.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+    ranked.into_iter().map(|(_, _, a, b)| (a, b)).collect()
+}
+
 fn pretokenize_spm(text: &str) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -1079,10 +1161,14 @@ enum ByteLevelSplit {
     Qwen2,
     /// Llama 3: [`QWEN2_PATTERN`] with numbers in runs of up to three digits.
     Llama3,
+    /// Qwen3.5/3.6: [`QWEN2_PATTERN`] with combining marks (`\p{M}`) kept in
+    /// the letter runs ([`QWEN35_PATTERN`]).
+    Qwen35,
 }
 
 const QWEN2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const LLAMA3_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+const QWEN35_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// The split a `tokenizer.json` pre-tokenizer graph asks for: the Qwen2 or
 /// Llama 3 pattern when a `Split` step carries it verbatim, else GPT-2's. Other
@@ -1113,6 +1199,8 @@ fn detect_byte_level_split(pre: &serde_json::Value) -> ByteLevelSplit {
         ByteLevelSplit::Qwen2
     } else if found.contains(&LLAMA3_PATTERN) {
         ByteLevelSplit::Llama3
+    } else if found.contains(&QWEN35_PATTERN) {
+        ByteLevelSplit::Qwen35
     } else {
         ByteLevelSplit::Gpt2
     }
@@ -1121,7 +1209,7 @@ fn detect_byte_level_split(pre: &serde_json::Value) -> ByteLevelSplit {
 /// Split `text` the way `split`'s regex does, leftmost alternative first, so
 /// each piece is exactly what the model's tokenizer would merge within.
 fn pretokenize(text: &str, split: ByteLevelSplit) -> Vec<&str> {
-    use crate::unicode_class::{is_letter, is_number};
+    use crate::unicode_class::{is_letter, is_mark, is_number};
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let n = chars.len();
     let at = |i: usize| chars.get(i).map(|&(_, c)| c);
@@ -1129,8 +1217,13 @@ fn pretokenize(text: &str, split: ByteLevelSplit) -> Vec<&str> {
     let number = |i: usize| at(i).is_some_and(is_number);
     let space = |i: usize| at(i).is_some_and(char::is_whitespace);
     let crlf = |i: usize| matches!(at(i), Some('\r' | '\n'));
-    // Other: neither whitespace, letter nor number (`[^\s\p{L}\p{N}]`).
-    let other = |i: usize| i < n && !space(i) && !letter(i) && !number(i);
+    // Qwen3.5 runs letters and combining marks together; elsewhere a mark is
+    // "other".
+    let mark = |i: usize| split == ByteLevelSplit::Qwen35 && at(i).is_some_and(is_mark);
+    let letter_run = |i: usize| letter(i) || mark(i);
+    // Other: neither whitespace, letter nor number (`[^\s\p{L}\p{N}]`), nor a
+    // mark for Qwen3.5 (`[^\s\p{L}\p{M}\p{N}]`).
+    let other = |i: usize| i < n && !space(i) && !letter(i) && !number(i) && !mark(i);
     let run = |mut i: usize, f: &dyn Fn(usize) -> bool| {
         while i < n && f(i) {
             i += 1;
@@ -1176,14 +1269,14 @@ fn pretokenize(text: &str, split: ByteLevelSplit) -> Vec<&str> {
                         .map(|f| run(from, f))
                 })
                 .unwrap_or_else(|| whitespace(i)),
-            ByteLevelSplit::Qwen2 | ByteLevelSplit::Llama3 => {
+            ByteLevelSplit::Qwen2 | ByteLevelSplit::Llama3 | ByteLevelSplit::Qwen35 => {
                 if let Some(end) = contraction(i, true) {
                     end
-                } else if letter(i) {
-                    run(i, &letter)
-                } else if !crlf(i) && !number(i) && letter(i + 1) {
+                } else if letter_run(i) {
+                    run(i, &letter_run)
+                } else if !crlf(i) && !number(i) && letter_run(i + 1) {
                     // `[^\r\n\p{L}\p{N}]?\p{L}+`: one leading non-letter.
-                    run(i + 1, &letter)
+                    run(i + 1, &letter_run)
                 } else if number(i) {
                     let max = if split == ByteLevelSplit::Llama3 {
                         3
@@ -1250,8 +1343,22 @@ mod tests {
                 assert_eq!(pretokenize(text, split), want, "{split:?} {text:?}");
             }
         }
+        // Qwen3.5 keeps combining marks in the letter run they follow, so a
+        // Devanagari word is one piece where Qwen2 cuts it at every vowel sign.
+        let qwen35: [Case; 3] = [
+            ("नमस्ते दुनिया", &["नमस्ते", " दुनिया"]),
+            ("café naïve", &["café", " naïve"]),
+            ("a   b\n\n\tc", &["a", "  ", " b", "\n\n", "\tc"]),
+        ];
+        for (text, want) in qwen35 {
+            assert_eq!(pretokenize(text, ByteLevelSplit::Qwen35), want, "{text:?}");
+        }
         // Digits: one at a time for Qwen2, runs of up to three for Llama 3.
         let digits = "I don't THINK it's 12345!";
+        assert_eq!(
+            pretokenize(digits, ByteLevelSplit::Qwen35),
+            pretokenize(digits, ByteLevelSplit::Qwen2)
+        );
         assert_eq!(
             pretokenize(digits, ByteLevelSplit::Qwen2),
             ["I", " don", "'t", " THINK", " it", "'s", " ", "1", "2", "3", "4", "5", "!"]

@@ -1,6 +1,7 @@
 //! Storage engine: memory-mapped, zero-copy access to safetensors weights.
 
 pub mod catalog;
+mod direct;
 pub mod ggml_quant;
 pub mod gguf;
 mod iq_grids;

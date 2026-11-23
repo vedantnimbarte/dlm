@@ -75,8 +75,8 @@ pub trait LayerSource: Send + Sync {
 /// the cost of a miss. Layers are handed out as `Arc`, so a hit costs a refcount
 /// bump rather than a copy.
 ///
-/// The budget is in bytes; `0` disables caching (every call delegates). Eviction
-/// is LRU by last access.
+/// The budget is in bytes; `0` disables caching (every call delegates). Layers
+/// evict most-recently-used first (they are read in a cycle); experts, LRU.
 pub struct CachedLayerSource<S: LayerSource> {
     inner: S,
     state: Mutex<RamCache>,
@@ -85,6 +85,9 @@ pub struct CachedLayerSource<S: LayerSource> {
     /// expert from the checkpoint — the costly part on `--quant int4`.
     experts: Mutex<ExpertRamCache>,
 }
+
+/// Marks a RAM-tier key as a MoE layer core rather than a whole layer.
+const CORE_KEY: u32 = 1 << 31;
 
 /// LRU state for [`CachedLayerSource`].
 struct RamCache {
@@ -144,25 +147,20 @@ impl<S: LayerSource> CachedLayerSource<S> {
         (s.hits, s.misses)
     }
 
-    #[cfg(test)]
-    fn inner_for_test(&self) -> &S {
-        &self.inner
-    }
-}
-
-impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
-    fn num_layers(&self) -> u32 {
-        self.inner.num_layers()
-    }
-
-    fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+    /// `layer` from the RAM tier under `key`, loading it with `load` on a miss.
+    fn cached(
+        &self,
+        layer: u32,
+        key: u32,
+        load: impl FnOnce() -> Result<Arc<LayerTensors>>,
+    ) -> Result<Arc<LayerTensors>> {
         {
             let mut s = self.state.lock().unwrap();
-            if let Some(t) = s.map.get(&layer) {
+            if let Some(t) = s.map.get(&key) {
                 let t = Arc::clone(t);
                 s.hits += 1;
-                s.order.retain(|&l| l != layer);
-                s.order.push_back(layer);
+                s.order.retain(|&l| l != key);
+                s.order.push_back(key);
                 // A hit here means the layer never touched the disk on this
                 // pass. Hit-versus-miss at this seam is the difference between
                 // a storage-bound run and a cached one — the aggregate counters
@@ -181,7 +179,7 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
         // Load with the lock released so concurrent loads (and the prefetch
         // worker) overlap. A duplicate concurrent load of the same layer just
         // wastes one read; the second insert replaces an identical value.
-        let t = self.inner.load_layer(layer)?;
+        let t = load()?;
         crate::telemetry::emit(crate::telemetry::FlowEvent::new(
             layer,
             crate::telemetry::Stage::RamMiss,
@@ -196,9 +194,12 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
         let size = t.byte_size();
         // A layer bigger than the whole budget is never cached (caching it would
         // evict everything and still not fit).
-        if size <= s.budget && !s.map.contains_key(&layer) {
+        if size <= s.budget && !s.map.contains_key(&key) {
+            // Most recently used goes first: layers come round in a cycle, so
+            // LRU would evict the next layer needed and never hit once the
+            // model outgrows the budget (see `evict_index`).
             while s.bytes + size > s.budget {
-                match s.order.pop_front() {
+                match s.order.pop_back() {
                     Some(victim) => {
                         if let Some(v) = s.map.remove(&victim) {
                             s.bytes -= v.byte_size();
@@ -207,16 +208,37 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
                     None => break,
                 }
             }
-            s.map.insert(layer, Arc::clone(&t));
-            s.order.push_back(layer);
+            s.map.insert(key, Arc::clone(&t));
+            s.order.push_back(key);
             s.bytes += size;
         }
         Ok(t)
     }
 
-    // MoE per-expert streaming forwards straight to the inner source. The GPU
+    #[cfg(test)]
+    fn inner_for_test(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
+    fn num_layers(&self) -> u32 {
+        self.inner.num_layers()
+    }
+
+    fn load_layer(&self, layer: u32) -> Result<Arc<LayerTensors>> {
+        self.cached(layer, layer, || self.inner.load_layer(layer))
+    }
+
+    /// A MoE layer's core (attention, router, shared expert), from the same
+    /// RAM tier as whole layers. Forwarding it to the checkpoint re-read and
+    /// re-quantized every streamed core on every token: TinyMixtral 4x248M at
+    /// `--quant int4` with 4 of 12 layers resident decoded 1.8 tok/s against
+    /// 33 with all 12. Keyed apart from whole layers.
     fn load_layer_core(&self, layer: u32) -> Result<Arc<LayerTensors>> {
-        self.inner.load_layer_core(layer)
+        self.cached(layer, layer | CORE_KEY, || {
+            self.inner.load_layer_core(layer)
+        })
     }
 
     /// Serve a materialized expert from the host-RAM tier when cached, so a VRAM
@@ -260,6 +282,22 @@ impl<S: LayerSource> LayerSource for CachedLayerSource<S> {
     }
 }
 
+/// Index in `order` (least-recent first) of the entry to evict when inserting
+/// `inserting`: the most recently used one, skipping `inserting` itself in case a
+/// concurrent load already placed it there. `None` when there is nothing safe to
+/// evict.
+///
+/// Shared by every layer cache on the cyclic path (VRAM window, host window,
+/// RAM and pinned tiers). Split out so the policy — the subtle part — is
+/// testable without a GPU.
+pub(crate) fn evict_index(order: &VecDeque<u32>, inserting: u32) -> Option<usize> {
+    match order.back().copied() {
+        Some(l) if l == inserting => order.len().checked_sub(2),
+        Some(_) => order.len().checked_sub(1),
+        None => None,
+    }
+}
+
 /// Cache-effectiveness snapshot for a [`StreamingKernel`]. `prefetched` counts
 /// layers the background worker materialized ahead of the compute thread needing
 /// them — the overlap that hides load latency.
@@ -280,7 +318,8 @@ pub struct StreamStats {
     pub expert_evictions: u64,
 }
 
-/// A bounded LRU of materialized layers (front of `order` = least recent).
+/// A bounded window of materialized layers (front of `order` = least recent),
+/// evicting most-recently-used first.
 /// Layers are `Arc`ed so the compute thread can hold one for `decode_block`
 /// without keeping the cache locked — letting the prefetch worker load in
 /// parallel, and surviving eviction while in flight.
@@ -312,9 +351,13 @@ impl LayerLru {
         self.order.push_back(layer);
     }
 
-    fn insert(&mut self, layer: u32, tensors: Arc<LayerTensors>) {
+    /// Insert `layer`, evicting the most recently used entry if full — the one
+    /// a cyclic pass needs last (see `evict_index`). A layer the worker loaded
+    /// ahead of the pass goes to the front, evicted last, until the pass uses it.
+    fn insert(&mut self, layer: u32, tensors: Arc<LayerTensors>, ahead: bool) {
         while self.map.len() >= self.capacity {
-            if let Some(evict) = self.order.pop_front() {
+            if let Some(evict) = evict_index(&self.order, layer).and_then(|i| self.order.remove(i))
+            {
                 self.map.remove(&evict);
                 self.stats.evictions += 1;
                 // Which layer had to leave to make room for this one. On a
@@ -329,7 +372,11 @@ impl LayerLru {
             }
         }
         self.map.insert(layer, tensors);
-        self.order.push_back(layer);
+        if ahead {
+            self.order.push_front(layer);
+        } else {
+            self.order.push_back(layer);
+        }
     }
 }
 
@@ -405,7 +452,7 @@ struct Shared<S: LayerSource> {
 
 /// Fold `sample` into an exponential moving average in `slot` (¼ weight on the
 /// new value). Relaxed and racy on purpose — it only feeds a heuristic.
-fn ewma(slot: &AtomicU64, sample: u64) {
+pub(crate) fn ewma(slot: &AtomicU64, sample: u64) {
     let old = slot.load(Ordering::Relaxed);
     let new = if old == 0 {
         sample
@@ -425,7 +472,11 @@ impl<S: LayerSource> Shared<S> {
         loop {
             if let Some(t) = cache.map.get(&layer) {
                 let t = Arc::clone(t);
-                cache.touch(layer);
+                // A prefetch hit is not a use: touching would mark a layer the
+                // pass has yet to reach as the next victim.
+                if !by_worker {
+                    cache.touch(layer);
+                }
                 return Ok(t);
             }
             if cache.loading.contains(&layer) {
@@ -469,7 +520,7 @@ impl<S: LayerSource> Shared<S> {
             cache.loading.remove(&layer);
             self.ready.notify_all();
             let arc = loaded?;
-            cache.insert(layer, Arc::clone(&arc));
+            cache.insert(layer, Arc::clone(&arc), by_worker);
             if by_worker {
                 cache.stats.prefetched += 1;
             }
@@ -679,6 +730,10 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         self.shared.cfg.kv_dim()
     }
 
+    fn recurrent(&self) -> bool {
+        self.shared.cfg.linear.is_some()
+    }
+
     fn stream_stats(&self) -> Option<StreamStats> {
         Some(self.stats())
     }
@@ -692,6 +747,29 @@ impl<S: LayerSource + 'static> ComputeKernel for StreamingKernel<S> {
         start: usize,
     ) -> Result<()> {
         crate::forward::kernel::prefill_layer_by_layer(self, hiddens, kv_layers, start)
+    }
+
+    /// Layer by layer too, which is the only order a bidirectional block has.
+    fn prefill_bidirectional(
+        &self,
+        hiddens: &mut [f32],
+        kv_layers: &mut [KvLayerCache],
+        start: usize,
+    ) -> Result<()> {
+        for layer in 0..self.num_layers {
+            let tensors = self.shared.fetch(layer)?;
+            if let Some(tx) = &self.prefetch_tx {
+                let _ = tx.send((layer + 1) % self.num_layers);
+            }
+            crate::forward::cpu::decode_block_bidirectional(
+                &self.shared.cfg.for_layer(layer),
+                &tensors,
+                hiddens,
+                &mut kv_layers[layer as usize],
+                start,
+            )?;
+        }
+        Ok(())
     }
 
     fn run_block(
@@ -866,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn ram_cache_evicts_lru_when_over_budget() {
+    fn ram_cache_evicts_most_recent_when_over_budget() {
         let c = cfg();
         let ls = layers(&c, 4);
         let one = ls[0].byte_size();
@@ -875,14 +953,49 @@ mod tests {
 
         src.load_layer(0).unwrap();
         src.load_layer(1).unwrap();
-        src.load_layer(0).unwrap(); // touch 0 so 1 is now least-recent
-        src.load_layer(2).unwrap(); // evicts 1
+        src.load_layer(0).unwrap(); // touch 0 so it is the most recent
+        src.load_layer(2).unwrap(); // evicts 0
         assert_eq!(src_loads(&src), 3);
 
-        src.load_layer(0).unwrap(); // still cached -> no reload
+        src.load_layer(1).unwrap(); // still cached -> no reload
         assert_eq!(src_loads(&src), 3);
-        src.load_layer(1).unwrap(); // was evicted -> reloads
+        src.load_layer(0).unwrap(); // was evicted -> reloads
         assert_eq!(src_loads(&src), 4);
+    }
+
+    /// Layers come round in a cycle. With 2 of 4 layers fitting, LRU missed
+    /// every layer on every pass; evicting the most recent keeps hitting.
+    #[test]
+    fn ram_cache_keeps_hitting_on_a_cycle_bigger_than_the_budget() {
+        let c = cfg();
+        let ls = layers(&c, 4);
+        let one = ls[0].byte_size();
+        let src = CachedLayerSource::new(CountingSource(ls, AtomicU64::new(0)), one * 2);
+        for _ in 0..5 {
+            for l in 0..4 {
+                src.load_layer(l).unwrap();
+            }
+        }
+        let (hits, _) = src.stats();
+        assert!(hits >= 4, "{hits} hits over 4 warm passes");
+    }
+
+    /// A MoE layer core comes from the RAM tier like a whole layer: streaming
+    /// one re-read and re-quantized it from the checkpoint every token.
+    #[test]
+    fn ram_cache_holds_moe_layer_cores() {
+        let c = cfg();
+        let ls = layers(&c, 2);
+        let one = ls[0].byte_size();
+        let src = CachedLayerSource::new(CountingSource(ls, AtomicU64::new(0)), one * 4);
+        for _ in 0..3 {
+            src.load_layer_core(0).unwrap();
+            src.load_layer_core(1).unwrap();
+        }
+        assert_eq!(src_loads(&src), 2, "each core read once");
+        // A whole layer is keyed apart from its core.
+        src.load_layer(0).unwrap();
+        assert_eq!(src_loads(&src), 3);
     }
 
     #[test]

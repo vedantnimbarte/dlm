@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 /// Values per int8 group ([`KvElem::I8`]): a 4-byte f32 scale, then the codes.
 const I8_GROUP: usize = 32;
 const I8_GROUP_BYTES: usize = 4 + I8_GROUP;
+/// An int4 group ([`KvElem::I4`]): the scale, then two 4-bit codes a byte.
+const I4_GROUP_BYTES: usize = 4 + I8_GROUP / 2;
 
 /// Rows per block, as a shift: the kernels map rows with shifts, not division.
 pub const KV_BLOCK_SHIFT: u32 = 4;
@@ -43,10 +45,11 @@ struct Blocks {
 impl KvPool {
     /// A pool of `blocks` blocks for K/V of width `kv_dim`, held as `elem`, in
     /// VRAM or (`host`) in host RAM the kernels read over the bus.
-    /// [`KvElem::I8`] needs `kv_dim` to be a whole number of groups.
+    /// [`KvElem::I8`] and [`KvElem::I4`] need `kv_dim` to be a whole number of
+    /// groups.
     pub fn new(blocks: u32, kv_dim: usize, elem: KvElem, host: bool) -> Result<Self> {
         let elems = blocks as usize * KV_BLOCK_ROWS * kv_dim;
-        debug_assert!(elem != KvElem::I8 || kv_dim % I8_GROUP == 0);
+        debug_assert!(!matches!(elem, KvElem::I8 | KvElem::I4) || kv_dim % I8_GROUP == 0);
         let bytes = bytes_of(elem, elems);
         let alloc = || {
             if host {
@@ -129,8 +132,9 @@ impl KvPool {
         bytes_of(self.elem, block as usize * KV_BLOCK_ROWS * self.kv_dim)
     }
 
-    /// Encode f32 rows in the pool's element type. An int8 group takes its
-    /// largest magnitude over 127 as its scale, as the kernels' writes do.
+    /// Encode f32 rows in the pool's element type. An int8 (int4) group takes
+    /// its largest magnitude over 127 (7) as its scale, as the kernels' writes
+    /// do.
     fn encode(&self, rows: &[f32]) -> Vec<u8> {
         match self.elem {
             KvElem::F32 => rows.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -150,6 +154,25 @@ impl KvPool {
                         };
                         q as i8 as u8
                     });
+                    scale.to_le_bytes().into_iter().chain(codes)
+                })
+                .collect(),
+            KvElem::I4 => rows
+                .chunks(I8_GROUP)
+                .flat_map(|g| {
+                    let scale = g.iter().fold(0.0f32, |m, v| m.max(v.abs())) / 7.0;
+                    let code = |v: f32| {
+                        let q = if scale > 0.0 {
+                            (v / scale).round().clamp(-7.0, 7.0)
+                        } else {
+                            0.0
+                        };
+                        (q as i8 as u8) & 0x0F
+                    };
+                    let codes: Vec<u8> = g
+                        .chunks(2)
+                        .map(|p| code(p[0]) | p.get(1).map_or(0, |&v| code(v) << 4))
+                        .collect();
                     scale.to_le_bytes().into_iter().chain(codes)
                 })
                 .collect(),
@@ -180,6 +203,19 @@ impl KvPool {
                     }
                 }
             }
+            KvElem::I4 => {
+                for (o, g) in out
+                    .chunks_mut(I8_GROUP)
+                    .zip(bytes.chunks_exact(I4_GROUP_BYTES))
+                {
+                    let scale = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+                    for (j, v) in o.iter_mut().enumerate() {
+                        let nib = (g[4 + j / 2] >> (4 * (j % 2))) & 0x0F;
+                        // Sign-extend the 4-bit two's complement code.
+                        *v = scale * ((nib << 4) as i8 >> 4) as f32;
+                    }
+                }
+            }
         }
     }
 }
@@ -190,6 +226,7 @@ fn bytes_of(elem: KvElem, elems: usize) -> usize {
         KvElem::F32 => elems * 4,
         KvElem::F16 => elems * 2,
         KvElem::I8 => elems / I8_GROUP * I8_GROUP_BYTES,
+        KvElem::I4 => elems / I8_GROUP * I4_GROUP_BYTES,
     }
 }
 
@@ -339,9 +376,10 @@ impl Drop for PagedKv {
 /// Every layer's pools for one kernel, created on first use: one per element
 /// type a session asks for.
 pub struct KvPools {
-    layers: Vec<Mutex<[Option<Arc<KvPool>>; 3]>>,
+    layers: Vec<Mutex<[Option<Arc<KvPool>>; 4]>>,
     blocks: u32,
-    kv_dim: usize,
+    /// K/V width per layer (Gemma 4's global layers are wider).
+    kv_dims: Vec<usize>,
     /// int8 groups fit inside heads (`head_dim % 32 == 0`); else int8 asks get
     /// fp16 pools.
     int8: bool,
@@ -353,13 +391,22 @@ impl KvPools {
     /// Pools for `num_layers` layers of K/V width `kv_dim` (heads of
     /// `head_dim`) holding up to `tokens` tokens each.
     pub fn new(num_layers: usize, kv_dim: usize, head_dim: usize, tokens: usize) -> Self {
+        Self::with_layer_dims(vec![kv_dim; num_layers], head_dim, tokens)
+    }
+
+    /// Pools whose layers differ in K/V width (`kv_dims[layer]`); `head_dim`
+    /// is the narrowest head, which decides whether int8 groups fit.
+    pub fn with_layer_dims(kv_dims: Vec<usize>, head_dim: usize, tokens: usize) -> Self {
+        let num_layers = kv_dims.len();
         Self {
             layers: (0..num_layers)
-                .map(|_| Mutex::new([None, None, None]))
+                .map(|_| Mutex::new([None, None, None, None]))
                 .collect(),
             blocks: tokens.div_ceil(KV_BLOCK_ROWS).max(1).min(u32::MAX as usize) as u32,
-            kv_dim,
-            int8: head_dim > 0 && head_dim % I8_GROUP == 0 && kv_dim % I8_GROUP == 0,
+            int8: head_dim > 0
+                && head_dim % I8_GROUP == 0
+                && kv_dims.iter().all(|d| d % I8_GROUP == 0),
+            kv_dims,
             host_from: num_layers,
         }
     }
@@ -378,10 +425,10 @@ impl KvPools {
         self.host_from
     }
 
-    /// The element type a session asking for `elem` gets: int8 only where its
-    /// groups fit inside heads.
+    /// The element type a session asking for `elem` gets: int8 and int4 only
+    /// where their groups fit inside heads.
     pub fn elem_for(&self, elem: KvElem) -> KvElem {
-        if elem == KvElem::I8 && !self.int8 {
+        if matches!(elem, KvElem::I8 | KvElem::I4) && !self.int8 {
             KvElem::F16
         } else {
             elem
@@ -403,7 +450,7 @@ impl KvPools {
             return Ok(Arc::clone(pool));
         }
         let host = layer >= self.host_from;
-        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dim, elem, host)?);
+        let pool = Arc::new(KvPool::new(self.blocks, self.kv_dims[layer], elem, host)?);
         *slot = Some(Arc::clone(&pool));
         Ok(pool)
     }
