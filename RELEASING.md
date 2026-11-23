@@ -148,7 +148,7 @@ fits that job:
 |---|---|---|
 | Linux CUDA static | `ubuntu-24.04` | The toolkit comes from NVIDIA's per-Ubuntu repo, so the Ubuntu version matters. Move it on once that repo has the pinned CUDA. |
 | Apple Silicon | `macos-latest` | Rust's deployment target (11.0) decides which Macs the binary runs on, not the runner's macOS, so following the image costs nothing and survives retirements. |
-| Windows CUDA static | `windows-2025-vs2026` | nvcc refuses or crashes on an MSVC newer than it knows (CUDA 12.5 on VS 2026 did), and CI never builds CUDA on Windows. `windows-latest` moved to VS 2027 on 2026-11-20; this label is deprecated from 2026-12-01, so test a CUDA build on VS 2027 before then. |
+| Windows CUDA static | `windows-latest`, MSVC toolset `14.44` | The runner ships only a few MSVC toolsets, and nvcc's front end crashes on headers newer than its CUDA release knows: CUDA 12.5 on MSVC 14.5x, and CUDA 13.2/13.3 on 14.52 (v0.5.0 lost this build to it). CI never builds CUDA on Windows, so check the toolset is still installed, and whether a newer CUDA handles the newest MSVC, before each release. |
 | Linux CPU | `ubuntu-latest` | Safe to float. The binary's glibc floor comes from the symbols it uses: 2.39 on x86_64 and 2.18 on aarch64 at 0.4.1. A newer image could raise it, so check if Linux users report load errors. |
 
 **Before tagging**, check

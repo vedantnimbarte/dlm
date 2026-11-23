@@ -142,12 +142,8 @@ jobs:
           # no cuda-13-2, which failed v0.4.0's GPU build. Move on when it does.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
-          # Pinned: windows-latest moved to Visual Studio 2027 on 2026-11-20, and
-          # CI never runs nvcc on Windows, so CUDA 13.2 has not been seen to build
-          # with its MSVC. This is the image 0.4.1 built on; its label is
-          # deprecated from 2026-12-01, so move on after checking VS 2027 builds.
           - target: x86_64-pc-windows-msvc
-            os: windows-2025-vs2026
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -164,6 +160,15 @@ jobs:
         with:
           cuda: "13.2.0"
           method: network
+      # Pinned toolset: CUDA 13.2's and 13.3's cudafe++ crash (ACCESS_VIOLATION)
+      # on MSVC 14.52's headers, the newest toolset on windows-latest since
+      # November 2026; v0.5.0 shipped without this build because of it. 14.44 is
+      # installed beside it, and build.rs hands nvcc the toolset the dev shell
+      # selected. Move on once a CUDA release builds with the newest MSVC.
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: "14.44"
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: dlm

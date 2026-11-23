@@ -12,6 +12,22 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-23
+
+The same engine as 0.5.0, which shipped without its Windows CUDA build. Use this
+release, not 0.5.0.
+
+### Fixed
+
+- **0.5.0 published no Windows CUDA build.** CUDA 13.2's and 13.3's `cudafe++`
+  crash (`ACCESS_VIOLATION`) on the headers of MSVC 14.52, the newest toolset
+  on GitHub's Windows runner; 0.4.1's code crashes there too, so the toolchain
+  changed, not dlm. The release now selects MSVC 14.44, which is installed
+  beside it, and `build.rs` hands nvcc the toolset a Visual Studio dev shell
+  selects (`VCToolsInstallDir`) instead of always the newest. Building with
+  `--features cuda-kernels` on Windows against MSVC 14.52 fails the same way;
+  run from a dev shell with an older toolset (`vcvars64.bat -vcvars_ver=14.44`).
+
 ## [0.5.0] - 2026-11-23
 
 Models far bigger than the card, MoE models above all: Qwen3.6-35B-A3B, a 22 GB
@@ -1645,7 +1661,8 @@ Carried forward and tracked in `RELEASING.md`:
 - DeepSeek-V2/V3 (MLA + MoE) had run only on the CPU path.
 - Llama 2 was expected to work but had not been demonstrated.
 
-[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/vedantnimbarte/dlm/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/vedantnimbarte/dlm/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/vedantnimbarte/dlm/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vedantnimbarte/dlm/compare/v0.3.0...v0.4.0
