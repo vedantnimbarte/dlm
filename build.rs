@@ -62,6 +62,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=DLM_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=VCToolsInstallDir");
 }
 
 /// Compile `src/gpu/kernels.cu` into a static library with nvcc and link it.
@@ -195,6 +196,15 @@ fn compile_hip_kernels() {
 /// resolvable, in which case nvcc's own PATH lookup applies.
 #[cfg(windows)]
 fn find_msvc_bin() -> Option<std::path::PathBuf> {
+    // A Visual Studio dev shell (vcvars, `-vcvars_ver=`) names the toolset it
+    // selected; honor it, so a toolset can be pinned when the newest one breaks
+    // nvcc (CUDA 13.2/13.3's cudafe++ crashes on MSVC 14.52's headers).
+    if let Ok(dir) = std::env::var("VCToolsInstallDir") {
+        let bin = std::path::Path::new(&dir).join("bin/Hostx64/x64");
+        if bin.join("cl.exe").exists() {
+            return Some(bin);
+        }
+    }
     let program_files =
         std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
     let vswhere =
