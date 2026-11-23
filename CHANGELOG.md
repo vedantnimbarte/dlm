@@ -12,6 +12,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-23
+
+The same engine as 0.5.0 and 0.5.1, with the Windows CUDA build both of them
+lost. Use this release.
+
+### Fixed
+
+- **0.5.1 published no Windows CUDA build either.** Selecting MSVC 14.44 fixed
+  the compiler crash, but the release action builds under Git Bash, whose
+  `/usr/bin/link` then shadowed MSVC's `link.exe`, and the first build scripts
+  failed to link. The release names the linker by full path
+  (`CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER`). Checked by running the release
+  job's exact steps, upload action included, on a branch before tagging.
+
 ## [0.5.1] - 2026-11-23
 
 The same engine as 0.5.0, which shipped without its Windows CUDA build. Use this
@@ -1661,7 +1675,8 @@ Carried forward and tracked in `RELEASING.md`:
 - DeepSeek-V2/V3 (MLA + MoE) had run only on the CPU path.
 - Llama 2 was expected to work but had not been demonstrated.
 
-[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/vedantnimbarte/dlm/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/vedantnimbarte/dlm/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/vedantnimbarte/dlm/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/vedantnimbarte/dlm/compare/v0.4.0...v0.4.1
