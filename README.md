@@ -148,7 +148,10 @@ CPU.
 - [Running the tests](#running-the-tests)
 - [The VRAM budget math](#the-vram-budget-math)
 - [Building for GPU (NVIDIA / AMD)](#building-for-gpu-nvidia--amd)
-- [Weight precision (`--quant`)](#weight-precision---quant)
+- [GGUF files](#gguf-files)
+- [Images (Gemma 3)](#images-gemma-3)
+- [LoRA adapters (`--lora`)](#lora-adapters---lora)
+- [Weight precision (`--quant`)](#weight-precision---quant), including [packs](#packs-dlm-pack)
 - [Distributed & scaling](#distributed--scaling)
 - [Contributing & license](#contributing--license)
 
@@ -165,16 +168,17 @@ CPU.
 │   PINNED ZONE     │   STREAMING ZONE  │  CACHE ZONE    │
 │  • Embedding Block│  • Resident window│ • Paged KV     │
 │  • LM Head / Norm │    of N layers    │ • Intermediate │
-│  • Draft Model    │    (LRU, async)   │   Residuals    │
+│  • Draft Model    │    (MRU, async)   │   Residuals    │
 └───────────────────┴───────────────────┴────────────────┘
 ```
 
 - **Pinned Zone** — embedding, LM head, and norms stay resident permanently
   (moving them each step would thrash the PCIe bus).
-- **Streaming Zone** — an LRU of `N` layers (`--resident-layers`, else the VRAM
-  plan's budget). A miss uploads that layer on a dedicated copy stream, so the
-  transfer overlaps compute on the default stream, and evicts the least-recently
-  used.
+- **Streaming Zone** — a window of `N` layers (`--resident-layers`, else the
+  VRAM plan's budget). A miss uploads that layer on a dedicated copy stream, so
+  the transfer overlaps compute on the default stream, and evicts the most
+  recently used layer: layers are read in a cycle, so the least recently used
+  one is exactly the one needed next.
 - **Cache Zone** — PagedAttention KV cache + residual activations. KV for *all*
   layers stays resident even as weights stream, so attention always sees full
   history.
@@ -182,20 +186,24 @@ CPU.
 The data path for a streamed layer:
 
 ```
-mmap weights ──► host RAM cache ──► pinned staging buffer ──► streaming-zone buffer ──► compute
-   (NVMe)        (--ram-cache-gb)     (page-locked host)          (VRAM)
+direct read ──► host RAM cache ──► pinned staging buffer ──► streaming-zone buffer ──► compute
+   (NVMe)       (--ram-cache-gb)     (page-locked host)          (VRAM)
 ```
 
-Memory-mapping skips the OS read-buffer copy; the optional host-RAM cache
+Each layer or expert arrives in one positioned, unbuffered read
+(`FILE_FLAG_NO_BUFFERING` on Windows, `O_DIRECT` on Linux, a plain positioned
+read elsewhere or when refused), which leaves the OS page cache alone rather
+than duplicating the RAM cache in it; `DLM_MMAP_READS=1` copies out of the
+memory map instead, as before 0.5.0. The optional host-RAM cache
 (`--ram-cache-gb`; on by default with `--stream` when every layer fits) keeps materialized layers across token steps
 so a miss doesn't re-read and re-decode them; and the page-locked (pinned) host
 buffer lets the PCIe controller DMA into VRAM on the copy stream.
 
-Be clear-eyed about the limit: with a window smaller than the model, layers are
-touched in order and evicted long before they come round again, so the window
-does not really *cache* — its job is to overlap the next upload with the current
-compute. What streaming costs is bandwidth, and the only way to pay less is to
-send fewer bytes ([`--quant`](#weight-precision---quant)).
+Be clear-eyed about the limit: evicting the most recently used layer keeps most
+of a window in place across tokens, but every layer outside it still crosses the
+bus every token. What streaming costs is bandwidth, and the only way to pay less
+is to send fewer bytes ([`--quant`](#weight-precision---quant), or a
+[pack](#packs-dlm-pack)).
 
 The transformer math sits behind a block-level `ComputeKernel` trait (`run_block`
 runs one decoder block for one token), and a `ForwardOrchestrator` drives a
@@ -301,7 +309,7 @@ cargo run -- profile
 Example output:
 
 ```
-dlm v0.4.0
+dlm v0.5.0
   gpu backend  : none (host fallback)
   host page    : 4096 bytes
 
@@ -744,8 +752,8 @@ kernels read faster; the two are equal weight for weight. On a Qwen2.5-0.5B
 `Q4_K_M` that is 10.4 MiB per layer against 18.8, and 54 tok/s against 82 when
 resident (the other way round when streaming: 19 against 16).
 
-**Not yet:** MoE `.gguf` files, whose experts are stacked into one tensor per
-layer.
+MoE `.gguf` files, whose experts are stacked into one tensor per layer, load
+for Qwen3.5/3.6 (`qwen35moe`) only; other MoE architectures in GGUF are refused.
 
 ## Images (Gemma 3)
 
@@ -1006,20 +1014,23 @@ inference engine):
   - `--stream [--resident-layers N]` — **layer streaming**
     ([`src/forward/streaming.rs`](src/forward/streaming.rs)): only a bounded window
     of layers is held in memory (pinned embedding/LM-head stay resident); the rest
-    are materialized on demand from the mmap'd checkpoint through an LRU and evicted
-    least-recently-used, so a model can **exceed the resident budget**. The window
+    are read on demand from the checkpoint and the most recently used layer is
+    evicted (layers come round in a cycle), so a model can **exceed the resident
+    budget**. The window
     defaults to the VRAM plan's `layers_to_load`. A background worker prefetches the
     next `--prefetch-depth N` layers ahead of compute (`--auto-prefetch` tunes the
     depth from measured load-vs-compute time); `0` disables it. Output is
     bit-for-bit identical to a fully-resident run (tested end-to-end).
-    `--ram-cache-gb N` keeps materialized layers in a host-RAM LRU of at most `N`
-    GiB, so a layer evicted from the window is not re-read and re-materialized
-    from the checkpoint the next time it comes round — roughly **2x** on the
-    streamed path, and far more where reading the mmap is slow (Gemma 3 1B
-    streamed on the GPU: 268 s → 46 s). On by default when the whole layer set
-    fits in a quarter of physical RAM (at least 4 GiB) and off otherwise, since a
-    cache smaller than the layer set never gets a hit on a cyclic scan; `0`
-    disables it. It duplicates weights on top of the OS page cache.
+    `--ram-cache-gb N` keeps materialized layers in a host-RAM cache of at most
+    `N` GiB, so a layer evicted from the window is not re-read and
+    re-materialized from the checkpoint the next time it comes round — roughly
+    **2x** on the streamed path, and far more where reading the disk is slow
+    (Gemma 3 1B streamed on the GPU: 268 s → 46 s). On by default when the whole
+    layer set fits in a quarter of physical RAM (at least 4 GiB), or for a
+    streamed MoE model enough for its experts too, up to that quarter; off
+    otherwise. A cache smaller than the layer set still hits, since it evicts the
+    most recently used layer: Qwen2.5-0.5B bf16 with a third of it cached went
+    from 2.52–2.74 to 3.65–3.96 tok/s. `0` disables it.
   - `--device gpu` — run the batched engine on the CUDA `GpuKernel`
     (all layers resident in VRAM; requires a `cuda-kernels` build).
   - `--stream --device gpu` — stream a window of layer weights **through VRAM**
