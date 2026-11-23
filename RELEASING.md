@@ -97,12 +97,18 @@ release is a claim, and these bound it.
   one model, Qwen2.5-1.5B `Q8_0` at a 4k-token history, on the resident GPU
   kernel only. Its speed falls with the history it reads over PCIe each step;
   nothing past 4k has been measured.
-- **The newer API features are checked on few models.** Tool calling has a
-  prompt format only for ChatML and was run on Qwen2.5-1.5B and Qwen3-0.6B
-  (Qwen2.5-0.5B answers instead of calling). `--lora` was checked with one
-  adapter, rank 16 on Qwen2.5-0.5B-Instruct, against a torch merge.
-  `/v1/embeddings` pools the last token, which suits embedding models; on a
-  chat model it is only a usable summary.
+- **The newer API features are checked on few models.** Tool calling was run
+  on Qwen2.5-1.5B and Qwen3-0.6B (Qwen2.5-0.5B answers instead of calling); the
+  Llama 3 and Mistral formats are checked against their templates' rendering
+  only, never on the models. `--lora` was checked with one adapter, rank 16 on
+  Qwen2.5-0.5B-Instruct, against a torch merge. `/v1/embeddings` pooling on a
+  chat model is only a usable summary.
+- **DeepSeek-V3/R1 routing** has been checked only on a tiny random
+  checkpoint. No real V3 or R1 has been run: the smallest is far beyond this
+  machine.
+- **Gemma 4 and Qwen3.6 are partial.** Gemma 4 runs resident only and the GPU
+  prefills it a token at a time; Qwen3.6 is text only, with its XML tool calls
+  refused and the prefix cache off.
 - **Llama 2 is untested.** It shares Mistral's SentencePiece tokenizer shape,
   which is verified, so it is expected to work — expected, not demonstrated.
 
@@ -142,6 +148,7 @@ fits that job:
 |---|---|---|
 | Linux CUDA static | `ubuntu-24.04` | The toolkit comes from NVIDIA's per-Ubuntu repo, so the Ubuntu version matters. Move it on once that repo has the pinned CUDA. |
 | Apple Silicon | `macos-latest` | Rust's deployment target (11.0) decides which Macs the binary runs on, not the runner's macOS, so following the image costs nothing and survives retirements. |
+| Windows CUDA static | `windows-2025-vs2026` | nvcc refuses or crashes on an MSVC newer than it knows (CUDA 12.5 on VS 2026 did), and CI never builds CUDA on Windows. `windows-latest` moved to VS 2027 on 2026-11-20; this label is deprecated from 2026-12-01, so test a CUDA build on VS 2027 before then. |
 | Linux CPU | `ubuntu-latest` | Safe to float. The binary's glibc floor comes from the symbols it uses: 2.39 on x86_64 and 2.18 on aarch64 at 0.4.1. A newer image could raise it, so check if Linux users report load errors. |
 
 **Before tagging**, check

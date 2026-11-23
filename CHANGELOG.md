@@ -12,8 +12,55 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Ideas taken from [InferSSD](https://wici.ai/inferssd), a llama.cpp
-fork that runs large MoE models from SSD.
+## [0.5.0] - 2026-11-23
+
+Models far bigger than the card, MoE models above all: Qwen3.6-35B-A3B, a 22 GB
+file, decodes at 2.5–2.9 tok/s on a 4 GB GTX 1650 with 16 GB of RAM. Ideas
+taken from [InferSSD](https://wici.ai/inferssd), a llama.cpp fork that runs
+large MoE models from SSD.
+
+### Verified
+
+The new model families are **not** equally proven; each entry below names what
+it was checked against.
+
+- **Qwen3.5/3.6 MoE** — against `transformers` on a tiny random checkpoint,
+  and on the real 22 GB Qwen3.6-35B-A3B Q4_K_M streamed on the GPU, whose scores
+  match the CPU's within 0.09 nats a token.
+- **Gemma 4 E2B/E4B** — against `transformers` on a tiny random checkpoint; the
+  real E4B Q4_K_M answers correctly on CPU and GPU, and its GGUF tokenizer gives
+  `transformers`' ids.
+- **Gemma 3 images** — against `transformers` on a tiny random vision
+  checkpoint (pixels exact, log-probabilities to ~2e-6); the real 4B Q4_K_M
+  describes a real image.
+- **DeepSeek-V3 routing and the MLA RoPE fix** — against `transformers` on tiny
+  random V2 and V3 checkpoints only. No real V3/R1 checkpoint has been run.
+- **Speculation** — MTP and EAGLE-3 give plain decoding's greedy output token
+  for token (MTP on CPU and the resident and streamed GPU kernels; EAGLE-3 on
+  Qwen3-1.7B at gamma 1, 3 and 5).
+- **`dlm pack`** — a pack scores bit for bit what its original does at the same
+  `--quant`, on DeepSeek-V3 and Qwen3.5-MoE fixtures.
+- **Llama 3 / Mistral tool calling** — string for string against each
+  template's `transformers` rendering, not on the models themselves.
+- The manual GPU checks in `RELEASING.md` passed on a GTX 1650.
+
+### Known gaps
+
+Tracked in full in `RELEASING.md`; the 0.4.0 gaps all still hold (Turing-only
+GPU testing, ROCm unexecuted, multi-GPU untested, Gemma2 past 4096 tokens,
+DeepSeek on the streaming GPU path, Falcon and Llama 2). New in 0.5.0:
+
+- **Gemma 4** runs resident only (`--stream`, `--gpu-layers` and multi-GPU
+  refuse it), and the GPU prefills a prompt one token at a time. Its MoE and
+  `attention_k_eq_v` variants are refused.
+- **Qwen3.6** is text only, its XML tool calls are refused, and the prefix cache
+  stays off for it. Dense Qwen3.5 and Qwen3-Next are refused.
+- **EAGLE-3**'s speed gain (71 → 77 tok/s) was measured on a loaded machine; a
+  clean measurement is still owed. Resident GPU only.
+- **`--kv-quant int4`** costs real accuracy: 4.59 nats per token on
+  Qwen2.5-0.5B against 3.95 with fp16 or int8.
+- **Images:** pan-and-scan is not implemented, and remote image URLs are
+  refused rather than fetched.
 
 ### Fixed
 
@@ -1598,7 +1645,8 @@ Carried forward and tracked in `RELEASING.md`:
 - DeepSeek-V2/V3 (MLA + MoE) had run only on the CPU path.
 - Llama 2 was expected to work but had not been demonstrated.
 
-[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/vedantnimbarte/dlm/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/vedantnimbarte/dlm/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/vedantnimbarte/dlm/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vedantnimbarte/dlm/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vedantnimbarte/dlm/releases/tag/v0.3.0

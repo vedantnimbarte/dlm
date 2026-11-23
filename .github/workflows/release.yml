@@ -142,8 +142,12 @@ jobs:
           # no cuda-13-2, which failed v0.4.0's GPU build. Move on when it does.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
+          # Pinned: windows-latest moved to Visual Studio 2027 on 2026-11-20, and
+          # CI never runs nvcc on Windows, so CUDA 13.2 has not been seen to build
+          # with its MSVC. This is the image 0.4.1 built on; its label is
+          # deprecated from 2026-12-01, so move on after checking VS 2027 builds.
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2025-vs2026
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
