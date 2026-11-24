@@ -44,6 +44,9 @@ extern "C" {
     fn cudaHostUnregister(ptr: *mut c_void) -> cudaError_t;
     fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> cudaError_t;
     fn cudaFree(ptr: *mut c_void) -> cudaError_t;
+    fn cudaMallocAsync(ptr: *mut *mut c_void, size: usize, stream: cudaStream_t) -> cudaError_t;
+    fn cudaGetDevice(device: *mut c_int) -> cudaError_t;
+    fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> cudaError_t;
     fn cudaStreamCreate(stream: *mut cudaStream_t) -> cudaError_t;
     fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: c_uint) -> cudaError_t;
     fn cudaStreamDestroy(stream: cudaStream_t) -> cudaError_t;
@@ -193,24 +196,61 @@ pub(super) fn host_free(ptr: NonNull<u8>) {
     }
 }
 
+/// `cudaDevAttrMemoryPoolsSupported`.
+const CUDA_DEV_ATTR_MEMORY_POOLS_SUPPORTED: c_int = 115;
+
+/// Whether the current device has a stream-ordered memory pool.
+fn device_has_pool() -> bool {
+    let (mut dev, mut yes) = (0, 0);
+    // SAFETY: valid out-pointers.
+    unsafe {
+        cudaGetDevice(&mut dev) == CUDA_SUCCESS
+            && cudaDeviceGetAttribute(&mut yes, CUDA_DEV_ATTR_MEMORY_POOLS_SUPPORTED, dev)
+                == CUDA_SUCCESS
+            && yes != 0
+    }
+}
+
 /// Allocate `bytes` of device (VRAM) memory.
+///
+/// From the device's memory pool where it has one. `cudaMalloc` rounds every
+/// allocation of a MiB or more up to whole 2 MiB pages, and a model's weights
+/// are hundreds of such tensors: 14.06 MiB took 16, 2.81 took 4, 1.41 took 2.
+/// On Gemma 3 4B Q4_K_M that was ~330 MiB of a 4 GB card. The pool packs them.
 pub(super) fn device_malloc(bytes: usize) -> Result<*mut c_void> {
     let mut raw: *mut c_void = std::ptr::null_mut();
-    // SAFETY: valid out-pointer.
-    let code = unsafe { cudaMalloc(&mut raw, bytes.max(1)) };
+    let null = std::ptr::null_mut();
+    // SAFETY: valid out-pointer. The allocation is ordered on the legacy
+    // default stream; synchronizing it makes the memory usable from any stream,
+    // as a `cudaMalloc`'s is.
+    let (api, code) = unsafe {
+        if device_has_pool() {
+            let code = cudaMallocAsync(&mut raw, bytes.max(1), null);
+            let code = if code == CUDA_SUCCESS {
+                cudaStreamSynchronize(null)
+            } else {
+                code
+            };
+            ("cudaMallocAsync", code)
+        } else {
+            ("cudaMalloc", cudaMalloc(&mut raw, bytes.max(1)))
+        }
+    };
     if code != CUDA_SUCCESS {
-        return Err(DlmError::Gpu {
-            api: "cudaMalloc",
-            code,
-        });
+        return Err(DlmError::Gpu { api, code });
     }
     Ok(raw)
 }
 
 /// Free device memory from [`device_malloc`].
 pub(super) fn device_free(ptr: *mut c_void) {
-    // SAFETY: `ptr` came from `cudaMalloc` and is freed exactly once.
+    // `cudaFree` takes pool memory too, but unlike a `cudaMalloc`'s it frees it
+    // without waiting for the kernels still reading it: wait here instead.
+    // ponytail: syncs the *current* device; a multi-GPU teardown that frees
+    // another device's buffers mid-work would need that device synced.
+    // SAFETY: `ptr` came from `device_malloc` and is freed exactly once.
     unsafe {
+        let _ = cudaDeviceSynchronize();
         let _ = cudaFree(ptr);
     }
 }
