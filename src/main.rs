@@ -1738,7 +1738,7 @@ fn serve_on_gpu(
         );
     }
     // All weights sit resident in VRAM; each batched request adds a full-context
-    // KV cache. Refuse up front if the batch won't fit rather than OOM mid-request.
+    // KV cache. Refuse if the batch won't fit rather than OOM mid-request.
     let (free, _) = resolve_free_bytes(args.vram_budget_gb);
     let profiler = build_profiler(
         args.context_length,
@@ -1746,43 +1746,64 @@ fn serve_on_gpu(
         args.max_batch as u32,
         dlm::forward::cpu::KvElem::for_quant(args.kv_quant.to_kv_quant()),
     );
-    let weights = resident_weight_bytes(config, on_gpu);
     // KV is paged from a shared pool, so concurrent requests only need VRAM for
     // the tokens they actually hold. Give the pool whatever fits after the
     // weights, up to --max-batch full contexts.
     let per_token =
         profiler.kv_bytes_per_layer(config) * on_gpu as u64 / args.context_length.max(1) as u64;
-    let (pool, host_from) = resident_kv_pool_tokens(
-        free,
-        profiler.safety_margin_bytes,
-        weights,
-        per_token,
-        on_gpu,
-        args.max_batch,
-        args.context_length,
-    )?;
-    if host_from < on_gpu as usize {
-        println!(
-            "  kv offload : one {}-token context does not fit beside the weights: layers \
-             {host_from}..{on_gpu} keep their KV in host RAM ({:.2} GiB), read over PCIe each \
-             step",
+    // What the upload really took (layers, LM head, draft), not the parameter
+    // count's estimate of it: that fell ~0.6 GiB short on Gemma 3 4B Q4_K_M
+    // (its int8 head priced at 4 bits, the CUDA runtime's own share not at
+    // all), and the pool it sized at batch 4 filled the 4 GB card until WDDM
+    // paged it to host RAM. The pools
+    // allocate at the first session, so they are not in this figure.
+    let free_now = || gpu::mem_get_info().map_or(0, |m| m.free);
+    // With the upload measured, the cushion covers only what comes after it:
+    // the decode/prefill scratch, ~100 MiB on Gemma 3 4B. The default (a tenth
+    // of the card) also had to absorb the estimate's error, and counted twice
+    // it moved half a 4 GB card's KV to host RAM with 900 MiB of VRAM unused.
+    let safety = match args.safety_margin_gb {
+        Some(_) => profiler.safety_margin_bytes,
+        None => profiler.safety_margin_bytes.min(256 * 1024 * 1024),
+    };
+    let size_pool = |uploaded: u64| -> Result<(usize, usize)> {
+        let (pool, host_from) = resident_kv_pool_tokens(
+            free,
+            safety,
+            uploaded,
+            per_token,
+            on_gpu,
+            args.max_batch,
             args.context_length,
-            (on_gpu as usize - host_from) as f64 * pool as f64 * per_token as f64
-                / on_gpu as f64
-                / GIB as f64,
-        );
-    }
+        )?;
+        if host_from < on_gpu as usize {
+            println!(
+                "  kv offload : one {}-token context does not fit beside the weights: layers \
+                 {host_from}..{on_gpu} keep their KV in host RAM ({:.2} GiB), read over PCIe \
+                 each step",
+                args.context_length,
+                (on_gpu as usize - host_from) as f64 * pool as f64 * per_token as f64
+                    / on_gpu as f64
+                    / GIB as f64,
+            );
+        }
+        Ok((pool, host_from))
+    };
     let parts = ModelParts {
         head_int4: args.lm_head_int4,
         ..parts
     };
+    let before = free_now();
     if let Some(n) = gpu_layers {
         let generator = parts.into_split_generator(n as usize)?;
+        let (pool, host_from) = size_pool(before.saturating_sub(free_now()))?;
         let generator = generator.with_kv_host_layers(host_from);
         return start_batched_server(generator, None, args, config, listen, Some(pool));
     }
-    let generator = parts.into_gpu_generator()?.with_kv_host_layers(host_from);
+    let generator = parts.into_gpu_generator()?;
     let draft = draft_parts.map(|p| p.into_gpu_generator()).transpose()?;
+    let (pool, host_from) = size_pool(before.saturating_sub(free_now()))?;
+    let generator = generator.with_kv_host_layers(host_from);
     start_batched_server(generator, draft, args, config, listen, Some(pool))
 }
 

@@ -2241,10 +2241,26 @@ __device__ __forceinline__ void qk_rotate_shared(float* buf, int heads, int head
     __syncthreads();
 }
 
-// Grid (num_kv_heads, splits), block C threads (C >= head_dim, a multiple of 32).
-// Shared: G*head_dim (queries) + G*C (scores) + 2G (max, sum) floats, and with
-// `post` another head_dim + FA_MAX_G.
-// `part` is [splits][num_heads][head_dim + 2]: output, then max and sum.
+// Positions per chunk. Smaller than the block on purpose: a decode token's
+// span is a few hundred positions, and a block per 256 of them left a 4-KV-head
+// model 12 blocks for the whole GPU, each walking its chunk serially (Gemma 3
+// 4B: 440 us a layer). 64 gives several times the blocks and a quarter the
+// walk; the merge is cheap.
+#define FA_CHUNK 64
+
+// Lanes that score one position together, each taking 8 values of the head per
+// pass: the largest power of two up to 32 with 8 lanes' worth not past head_dim.
+__host__ __device__ __forceinline__ int fa_lanes(int head_dim) {
+    int l = 1;
+    while (l < 32 && 16 * l <= head_dim) l <<= 1;
+    return l;
+}
+
+// Grid (num_kv_heads, splits of FA_CHUNK), block C threads (C >= head_dim, a
+// multiple of 32). Shared: G*head_dim (queries) + G*C (scores) + 2G (max, sum)
+// floats + FA_CHUNK ints (cache rows), and with `post` another head_dim +
+// FA_MAX_G floats. `part` is [splits][num_heads][head_dim + 2]: output, then
+// max and sum.
 // The body of `attn_split_kernel` for chunk `split` of the span; `alone` when
 // it is the only chunk. With `post` (one token) the queries arrive raw: the
 // block normalizes and rotates its own G heads, and the last chunk's block --
@@ -2263,11 +2279,12 @@ attn_split_body(const float* __restrict__ q, const void* keys, const void* value
     float* qs = smem;
     float* sc = qs + G * head_dim;
     float* ml = sc + G * C;
+    int* rows = (int*)(ml + 2 * G);   // FA_CHUNK physical cache rows
     for (int i = t; i < G * head_dim; i += C) qs[i] = q[(long)kvh * G * head_dim + i];
     __syncthreads();
     if (post) {
-        float* kbuf = ml + 2 * G;          // head_dim floats
-        float* inv = kbuf + head_dim;      // FA_MAX_G floats
+        float* kbuf = (float*)(rows + FA_CHUNK);   // head_dim floats
+        float* inv = kbuf + head_dim;              // FA_MAX_G floats
         qk_rotate_shared(qs, G, head_dim, post->q_norm, *post, inv);
         if (split == (int)gridDim.y - 1) {
             for (int i = t; i < head_dim; i += C) kbuf[i] = post->k[(long)kvh * head_dim + i];
@@ -2298,38 +2315,53 @@ attn_split_body(const float* __restrict__ q, const void* keys, const void* value
         }
     }
 
-    const int p0 = split * C, n = min(C, span - p0);
+    const int p0 = split * FA_CHUNK, n = min(FA_CHUNK, span - p0);
     const long kv_dim = (long)num_kv_heads * head_dim;
-    if (t < n) {
-        long kh = kv_row(table, shift, start + p0 + t) * kv_dim + (long)kvh * head_dim;
+    const int warp = t >> 5, lane = t & 31, warps = C >> 5;
+    for (int i = t; i < n; i += C) rows[i] = (int)kv_row(table, shift, start + p0 + i);
+    __syncthreads();
+
+    // Scores: L lanes take one position, 8 values of the head each per pass, so
+    // a key row is read by adjacent lanes in one go; a warp scores 32/L
+    // positions at a time, and its lanes' partial dots meet by shuffles.
+    const int L = fa_lanes(head_dim), R = 32 / L, sub = lane / L, sl = lane % L;
+    for (int base = warp * R; base < n; base += warps * R) {
+        const int i = base + sub;
+        const bool live = i < n;   // the whole warp shuffles, so dead lanes stay
         float acc[FA_MAX_G];
         #pragma unroll
         for (int g = 0; g < FA_MAX_G; ++g) acc[g] = 0.0f;
-        for (int d = 0; d < head_dim; d += 8) {
-            float kk[8];
-            load_kv8<KT>(keys, kh + d, kk);
-            #pragma unroll
-            for (int g = 0; g < FA_MAX_G; ++g) {
-                if (g < G) {
-                    const float* qg = qs + g * head_dim + d;
-                    #pragma unroll
-                    for (int j = 0; j < 8; ++j) acc[g] += qg[j] * kk[j];
+        if (live) {
+            const long kh = (long)rows[i] * kv_dim + (long)kvh * head_dim;
+            for (int d = sl * 8; d < head_dim; d += L * 8) {
+                float kk[8];
+                load_kv8<KT>(keys, kh + d, kk);
+                #pragma unroll
+                for (int g = 0; g < FA_MAX_G; ++g) {
+                    if (g < G) {
+                        const float* qg = qs + g * head_dim + d;
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j) acc[g] += qg[j] * kk[j];
+                    }
                 }
             }
         }
         #pragma unroll
         for (int g = 0; g < FA_MAX_G; ++g) {
             if (g < G) {
-                float s = acc[g] * scale;
-                if (softcap > 0.0f) s = tanhf(s / softcap) * softcap;
-                sc[g * C + t] = s;
+                for (int off = L >> 1; off > 0; off >>= 1)
+                    acc[g] += __shfl_xor_sync(0xffffffffu, acc[g], off);
+                if (live && sl == 0) {
+                    float s = acc[g] * scale;
+                    if (softcap > 0.0f) s = tanhf(s / softcap) * softcap;
+                    sc[g * C + i] = s;
+                }
             }
         }
     }
     __syncthreads();
 
     // The chunk's softmax statistics, one warp per query head.
-    const int warp = t >> 5, lane = t & 31, warps = C >> 5;
     for (int g = warp; g < G; g += warps) {
         float m = -1e30f;
         for (int i = lane; i < n; i += 32) m = fmaxf(m, sc[g * C + i]);
@@ -2355,9 +2387,9 @@ attn_split_body(const float* __restrict__ q, const void* keys, const void* value
     #pragma unroll
     for (int g = 0; g < FA_MAX_G; ++g) acc[g] = 0.0f;
     if (slice < P) {
+        #pragma unroll 4
         for (int i = slice; i < n; i += P) {
-            float v = load_kv<KT>(values, kv_row(table, shift, start + p0 + i) * kv_dim +
-                                              (long)kvh * head_dim + d);
+            float v = load_kv<KT>(values, (long)rows[i] * kv_dim + (long)kvh * head_dim + d);
             #pragma unroll
             for (int g = 0; g < FA_MAX_G; ++g)
                 if (g < G) acc[g] += sc[g * C + i] * v;
@@ -2429,7 +2461,7 @@ __global__ void attn_split_slots_kernel(const float* __restrict__ q, DlmSlots ke
     const int b = blockIdx.z;
     int start, span;
     attn_span(num_positions.v[b], sliding_window, &start, &span);
-    const int splits = (span + blockDim.x - 1) / blockDim.x;
+    const int splits = (span + FA_CHUNK - 1) / FA_CHUNK;
     if ((int)blockIdx.y >= splits) return;
     const long q_dim = (long)num_heads * head_dim;
     attn_split_body<KT>(q + b * q_dim, keys.p[b], values.p[b], tables.p[b], shift, num_heads,
@@ -2486,7 +2518,7 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
     // whichever is larger at the rounded span.
     const int C = head_dim > 128 ? 256 : 128;
     int rounded = (span + 1023) & ~1023;
-    long part_need = (long)((rounded + C - 1) / C) * num_heads * (head_dim + 2);
+    long part_need = (long)((rounded + FA_CHUNK - 1) / FA_CHUNK) * num_heads * (head_dim + 2);
     long need = (long)num_heads * rounded;
     cudaError_t e = scratch_ensure(ATTN_SCORES, (int)(part_need > need ? part_need : need));
     if (e != cudaSuccess) return e;
@@ -2495,8 +2527,8 @@ static cudaError_t launch_attention(const float* q, const void* keys, const void
     const int G = num_kv_heads > 0 ? num_heads / num_kv_heads : 0;
     if (G >= 1 && G <= FA_MAX_G && G * num_kv_heads == num_heads && head_dim % 8 == 0 &&
         head_dim <= 256) {
-        const int splits = (span + C - 1) / C;
-        size_t shmem = (size_t)(G * head_dim + G * C + 2 * G) * sizeof(float);
+        const int splits = (span + FA_CHUNK - 1) / FA_CHUNK;
+        size_t shmem = (size_t)(G * head_dim + G * C + 2 * G + FA_CHUNK) * sizeof(float);
         dim3 grid(num_kv_heads, splits);
         DLM_KV_SWITCH(kv_half, attn_split_kernel<KT_><<<grid, C, shmem>>>(
             q, keys, values, table, shift, num_heads, num_kv_heads, head_dim, start, span, scale,
@@ -2546,14 +2578,14 @@ static cudaError_t launch_attention_post(float* q, float* k, const float* v, flo
     attn_span(num_positions, sliding_window, &start, &span);
     const int C = head_dim > 128 ? 256 : 128;
     const int rounded = (span + 1023) & ~1023;
-    const long part_need = (long)((rounded + C - 1) / C) * num_heads * (head_dim + 2);
+    const long part_need = (long)((rounded + FA_CHUNK - 1) / FA_CHUNK) * num_heads * (head_dim + 2);
     const long need = (long)num_heads * rounded;
     cudaError_t e = scratch_ensure(ATTN_SCORES, (int)(part_need > need ? part_need : need));
     if (e != cudaSuccess) return e;
     float* part = g_scratch[ATTN_SCORES];
-    const int splits = (span + C - 1) / C;
+    const int splits = (span + FA_CHUNK - 1) / FA_CHUNK;
     const size_t shmem =
-        (size_t)(G * head_dim + G * C + 2 * G + head_dim + FA_MAX_G) * sizeof(float);
+        (size_t)(G * head_dim + G * C + 2 * G + FA_CHUNK + head_dim + FA_MAX_G) * sizeof(float);
     const DlmQkPost post = {k, v, q_norm, k_norm, inv_freq, mscale, eps, rope, position,
                             (long)num_positions};
     dim3 grid(num_kv_heads, splits);
@@ -2911,21 +2943,21 @@ static cudaError_t launch_attention_slots(float* q, float* k, const float* v, fl
         attn_span(num_positions->v[b], sliding_window, &start, &span);
         max_span = span > max_span ? span : max_span;
     }
-    const int splits = (max_span + C - 1) / C;
+    const int splits = (max_span + FA_CHUNK - 1) / FA_CHUNK;
     const int rounded = (max_span + 1023) & ~1023;
-    const long part_stride = (long)((rounded + C - 1) / C) * num_heads * (head_dim + 2);
+    const long part_stride = (long)((rounded + FA_CHUNK - 1) / FA_CHUNK) * num_heads * (head_dim + 2);
     cudaError_t e = scratch_ensure(ATTN_SCORES, (int)(part_stride * batch));
     if (e != cudaSuccess) return e;
     float* part = g_scratch[ATTN_SCORES];
 
-    size_t shmem = (size_t)(G * head_dim + G * C + 2 * G) * sizeof(float);
+    size_t shmem = (size_t)(G * head_dim + G * C + 2 * G + FA_CHUNK) * sizeof(float);
     dim3 grid(num_kv_heads, splits, batch);
     DLM_KV_SWITCH(kv_half, attn_split_slots_kernel<KT_><<<grid, C, shmem>>>(
         q, *keys, *values, *tables, shift, num_heads, num_kv_heads, head_dim, *num_positions,
         sliding_window, scale, softcap, part, part_stride, ctx));
     if (splits > 1)
         attn_combine_slots_kernel<<<dim3(num_heads, batch), 128>>>(
-            part, part_stride, ctx, num_heads, head_dim, *num_positions, sliding_window, C);
+            part, part_stride, ctx, num_heads, head_dim, *num_positions, sliding_window, FA_CHUNK);
     return cudaSuccess;
 }
 

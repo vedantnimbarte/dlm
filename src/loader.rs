@@ -711,7 +711,12 @@ impl ModelParts {
         let quantized = self.layers.first().is_some_and(|l| {
             // `o_proj`: every layer kind has one (a linear-attention layer has
             // no `q_proj`).
-            matches!(l.o_proj, Weights::Int4 { .. } | Weights::Int8 { .. })
+            // A GGUF's blocks count too, re-packed or not: its head as f32
+            // (Gemma 3's 262k rows: 2.7 GB) would not fit beside them.
+            matches!(
+                l.o_proj,
+                Weights::Int4 { .. } | Weights::Int8 { .. } | Weights::Ggml { .. }
+            )
                 // A Gemma 4 GGUF: its 262k-row head as f32 is 2.7 GB, more than
                 // the card it is meant for has beside the layers, and its
                 // layers are quantized blocks already.
@@ -770,37 +775,24 @@ impl ModelParts {
         Ok(())
     }
 
-    /// Re-pack ggml's blocks into dlm's own quantized layout, where the card has
-    /// room for the larger form.
-    ///
-    /// The two are exactly equal in value; they differ in size and in how fast a
-    /// kernel reads them. ggml packs a K-quant's scale into six bits, which is
-    /// smaller but takes more work to unpack per weight; dlm's layout spends a
-    /// pair of f32s per group and decodes in a couple of instructions. Measured
-    /// on a Qwen2.5 Q4_K_M: 45% more weight memory for a third more decode
-    /// throughput.
-    ///
-    /// So the choice is made on what fits. A model with VRAM to spare is faster
-    /// expanded; one that would stop fitting keeps ggml's blocks, which is also
-    /// what the streaming path wants, since it moves those bytes every layer.
+    /// Re-pack ggml's blocks into dlm's own quantized layout, where RAM has
+    /// room for the larger form: the CPU kernels read dlm's layouts with SIMD,
+    /// ggml's 2-3-bit blocks only through a scalar decode. The two are exactly
+    /// equal in value.
     fn expand_quantized_weights(&mut self, free_bytes: u64, reserved: u64) {
         expand_layers(&mut self.layers, free_bytes, reserved);
     }
 
     /// Upload every layer to VRAM and build a generator over the GPU kernel.
+    ///
+    /// A GGUF's blocks go up as they are, not re-packed into dlm's layout: the
+    /// device GEMVs read every ggml format, and decode is bound by the bytes
+    /// they move, which re-packing grows by a third or more. On a GTX 1650,
+    /// Qwen2.5-1.5B Q4_K_M re-packed decoded 7% slower at batch 1 and a third
+    /// slower at batch 4 (prefill was 10% faster), and Gemma 3 4B Q4_K_M
+    /// re-packed filled the card until WDDM paged it to host RAM.
     #[cfg(any(feature = "cuda-kernels", feature = "rocm-kernels"))]
-    pub fn into_gpu_generator(mut self) -> Result<Generator<crate::forward::GpuKernel>> {
-        // Everything here becomes resident, so the weights compete with the KV
-        // cache for what the card has free.
-        let free = crate::gpu::mem_get_info().map(|m| m.free).unwrap_or(0);
-        let resident: u64 = self
-            .layers
-            .iter()
-            .map(|l| l.weights().map(|w| w.as_bytes().len() as u64).sum::<u64>())
-            .sum();
-        let kv =
-            self.kv_blocks as u64 * self.kv_config.block_size as u64 * self.cfg.kv_dim() as u64 * 8;
-        self.expand_quantized_weights(free, resident + kv);
+    pub fn into_gpu_generator(self) -> Result<Generator<crate::forward::GpuKernel>> {
         let max_kv_tokens = self.kv_blocks as usize * self.kv_config.block_size as usize;
         let embed_scale = self.embed_scale;
         let logit_cap = self.final_logit_softcap;
