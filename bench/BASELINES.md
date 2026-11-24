@@ -38,8 +38,10 @@ These numbers come from one machine:
 - **RAM:** 16 GB
 - **OS:** Windows 11
 - **Build:** `cargo build --release --features cuda-kernels` on `b0a612e`.
-  The Gemma 3 rows used the same commit plus #138, because Gemma GGUF files
-  did not load without that PR.
+  The Gemma 3 rows were re-measured on 2026-11-24 at `c8933e5` (#151), with
+  other apps holding 430-470 MiB of the card's VRAM (see the notes under each
+  table). The 2026-11-17 Gemma rows used `b0a612e` plus #138, because Gemma
+  GGUF files did not load without that PR.
 
 ## Resident on GPU
 
@@ -56,7 +58,7 @@ dlm bench --model-path <model> [--quant ...] --context-length 1024           --p
 | Qwen2.5-0.5B | bf16 | 4 | 1,648 | 319 | 340.6 | 11.7 | 2.72 GiB | 1.91 GiB | 38.7 |
 | Qwen2.5-0.5B | int4 | 1 | 1,723 | 304 | 189.5 | 5.3 | 2.58 GiB | 1.31 GiB | 35.6 |
 | Qwen2.5-0.5B | int4 | 4 | 1,690 | 311 | 523.6 | 7.6 | 2.58 GiB | 1.31 GiB | 35.1 |
-| Gemma 3 4B | GGUF Q4_K_M | 1 | 149 | 3,472 | 30.2 | 33.1 | 6.88 GiB | 4.00 GiB | 6.8 (safetensors int4) |
+| Gemma 3 4B | GGUF Q4_K_M | 1 | 145 | 3,555 | 30.4 | 32.9 | 9.23 GiB | 3.85 GiB | 6.8 (safetensors int4) |
 
 At batch 4, decode tok/s is the total over all four sequences. VRAM is now
 sampled at the end of decode, so it includes the KV caches (July's was sampled
@@ -64,6 +66,23 @@ after they were freed). Qwen2.5-1.5B was not re-measured: the checkpoint is no
 longer on this machine. Gemma 3 4B now fits without lowering the safety margin.
 Its prefill is slow next to Qwen's because the GGUF's Q4_K/Q6_K blocks go
 through the GEMV path one token at a time.
+
+The Gemma 3 row was measured on `c8933e5` from the GGUF alone (no `mmproj`
+beside it, so no vision tower loads), with other apps holding 430-470 MiB of
+VRAM. It nearly matches the 2026-11-17 row, but the two are not a fair
+comparison. Before #151 the build filled the card and WDDM paged part of it to
+host RAM, so its speed depended on what else was using the GPU:
+
+- **Same sitting:** 0.5.2 (`46b3127`) alternated with `c8933e5` decoded at
+  75.9 and 120.0 ms/step against 37.3 and 34.2.
+- **Quieter card, earlier on 2026-11-24:** this workload gave 164-170 tok/s
+  prefill and 27.7-29.6 ms/step decode with #151's changes.
+
+Batch 4 is left out: its four 576-token sequences need 2,304 KV tokens, and
+the pool sized from the VRAM left after the weights held 1,296, so `dlm bench`
+stops with `KvCacheExhausted`. With fewer apps holding VRAM, the same build
+gave a 2,768-token pool at `--context-length 2048`. Before #151 the pool was
+sized from an estimate, so batch 4 ran but spilled to host RAM.
 
 ## Streamed through VRAM
 
@@ -76,12 +95,14 @@ dlm bench --model-path <model> --stream [--quant ...] --context-length 512      
 
 | Model | Quant | Prefill tok/s | TTFT ms | Decode tok/s | ms/step | Peak RSS | VRAM in use |
 |---|---|---|---|---|---|---|---|
-| Gemma 3 4B | GGUF Q4_K_M | 187 | 714 | 34.1 | 29.3 | 8.42 GiB | 3.80 GiB |
+| Gemma 3 4B | GGUF Q4_K_M | 166 | 799 | 34.6 | 28.9 | 8.68 GiB | 3.73 GiB |
 
 At Q4_K_M, Gemma 3 4B fits the card whole, so `--stream` keeps all 34 layers
 resident and nothing is streamed. In July, at int4 from safetensors, it streamed
-at 2.07 tok/s. The first run's prefill (24 tok/s) pays for loading every layer
-into the window.
+at 2.07 tok/s. The first run's prefill (28 tok/s) pays for loading every layer
+into the window. Measured on `c8933e5` in the same sitting as the resident row,
+with the same 430-470 MiB of VRAM held by other apps. The 2026-11-17 row read
+187 / 714 / 34.1 / 29.3 on `b0a612e` plus #138.
 
 ### Streamed MoE: TinyMixtral 4x248M
 
