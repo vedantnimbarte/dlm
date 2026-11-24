@@ -2123,11 +2123,17 @@ fn gpu_long_context_attention_matches_cpu() {
 }
 
 /// The split-K attention at real head geometries: Qwen2.5's 7 query heads per
-/// KV head at `head_dim` 64 (128 positions per chunk), and `head_dim` 256 (256
-/// per chunk), each long enough to need several chunks and their merge.
+/// KV head at `head_dim` 64, Gemma 3 4B's 8/4 heads at `head_dim` 256, and
+/// `head_dim` 96 (Phi-3's), whose rows the scoring lanes cover in a full and a
+/// partial pass. Each is long enough to need several chunks and their merge.
 #[test]
 fn gpu_split_attention_matches_cpu_at_real_head_shapes() {
-    for (num_heads, num_kv_heads, head_dim, tokens) in [(14, 2, 64, 300), (4, 2, 256, 600)] {
+    for (num_heads, num_kv_heads, head_dim, tokens) in [
+        (14, 2, 64, 300),
+        (4, 2, 256, 600),
+        (8, 4, 256, 600),
+        (6, 2, 96, 200),
+    ] {
         let cfg = BlockConfig {
             hidden_size: 128,
             num_heads,
